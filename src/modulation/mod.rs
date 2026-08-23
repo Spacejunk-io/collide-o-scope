@@ -197,7 +197,7 @@ pub const TARGETS: &[(&str, f32, f32)] = &[
     ("melt_swirl", -1.0, 1.0),
     ("melt_chroma", 0.0, 1.0),
     ("melt_creep", 0.0, 1.0),
-    // B5 codec mosh: the eight continuous controls. The recycle law is
+    // B5 codec mosh: the eleven continuous controls. The recycle law is
     // discrete and has no address.
     ("mosh_amount", 0.0, 1.0),
     ("mosh_key_removal", 0.0, 1.0),
@@ -207,6 +207,9 @@ pub const TARGETS: &[(&str, f32, f32)] = &[
     ("mosh_rate", 0.0, 1.0),
     ("mosh_bitrate_starve", 0.0, 1.0),
     ("mosh_resync", 0.0, 1.0),
+    ("mosh_wipe", 0.0, 1.0),
+    ("mosh_smear", 0.0, 1.0),
+    ("mosh_trail", 0.0, 1.0),
     // B14 sync latch: the four continuous controls. The latch switch itself
     // is a discrete law and deliberately has no address — a failure switch is
     // thrown, never swept.
@@ -1782,7 +1785,7 @@ pub fn target_range(target: &str) -> Option<(f32, f32)> {
         return None;
     }
     match suffix {
-        "opacity" | "key_threshold" => Some((0.0, 1.0)),
+        "opacity" | "mosh_send" | "key_threshold" => Some((0.0, 1.0)),
         "speed" => Some((0.25, 4.0)),
         "fps" => Some((1.0, 240.0)),
         "pixelate" => Some((1.0, 32.0)),
@@ -1888,6 +1891,7 @@ pub fn is_valid_target(target: &str) -> bool {
 #[derive(Debug, Clone, Copy)]
 pub struct LayerModulation {
     pub opacity: f32,
+    pub mosh_send: f32,
     pub speed: f32,
     pub fps: f32,
     pub effects: EffectUniforms,
@@ -1939,22 +1943,25 @@ impl ModulationFrame {
     #[cfg(test)]
     pub fn modulate_layers<'a>(
         &self,
-        layers: impl IntoIterator<Item = (&'a EffectUniforms, &'a SpatialTransform, f32, f32, f32)>,
+        layers: impl IntoIterator<Item = (&'a EffectUniforms, &'a SpatialTransform, f32, f32, f32, f32)>,
     ) -> Vec<LayerModulation> {
         layers
             .into_iter()
             .enumerate()
-            .map(|(index, (effects, transform, opacity, speed, fps))| {
-                ModMatrix::modulate_layer_from_offsets(
-                    index,
-                    effects,
-                    transform,
-                    opacity,
-                    speed,
-                    fps,
-                    &self.offsets,
-                )
-            })
+            .map(
+                |(index, (effects, transform, opacity, mosh_send, speed, fps))| {
+                    ModMatrix::modulate_layer_from_offsets(
+                        index,
+                        effects,
+                        transform,
+                        opacity,
+                        mosh_send,
+                        speed,
+                        fps,
+                        &self.offsets,
+                    )
+                },
+            )
             .collect()
     }
 
@@ -1964,12 +1971,17 @@ impl ModulationFrame {
     /// or allocate from an authored target index. Shared frame planners use it
     /// while walking richer layer descriptors so render and transport values
     /// can be emitted together without first building an intermediate vector.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the evaluated layer plan keeps effects, geometry, and four independent transport/send scalars index-aligned"
+    )]
     pub(crate) fn modulate_layer(
         &self,
         index: usize,
         effects: &EffectUniforms,
         transform: &SpatialTransform,
         opacity: f32,
+        mosh_send: f32,
         speed: f32,
         fps: f32,
     ) -> LayerModulation {
@@ -1978,6 +1990,7 @@ impl ModulationFrame {
             effects,
             transform,
             opacity,
+            mosh_send,
             speed,
             fps,
             &self.offsets,
@@ -3729,11 +3742,16 @@ impl ModMatrix {
         motion.sanitized()
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "this allocation-free hot seam consumes the complete authored layer base without constructing a temporary DTO"
+    )]
     fn modulate_layer_from_offsets(
         index: usize,
         base_effects: &EffectUniforms,
         base_transform: &SpatialTransform,
         base_opacity: f32,
+        base_mosh_send: f32,
         base_speed: f32,
         base_fps: f32,
         offsets: &RoutingOffsets,
@@ -3744,6 +3762,8 @@ impl ModMatrix {
             offsets.layer_value(index, suffix) * (max - min) * 0.5
         };
         let opacity = (base_opacity + offset("opacity", 0.0, 1.0)).clamp(0.0, 1.0);
+        let mosh_send =
+            (finite_or(base_mosh_send, 1.0) + offset("mosh_send", 0.0, 1.0)).clamp(0.0, 1.0);
         let speed = (base_speed + offset("speed", 0.25, 4.0)).clamp(0.25, 4.0);
         let fps = (base_fps + offset("fps", 1.0, 240.0)).clamp(1.0, 240.0);
 
@@ -3824,6 +3844,7 @@ impl ModMatrix {
 
         LayerModulation {
             opacity,
+            mosh_send,
             speed,
             fps,
             effects,
@@ -3940,12 +3961,17 @@ impl ModMatrix {
     /// Modulate one layer. Batch callers should prefer [`Self::modulate_layers`]
     /// so all layer destinations share one routing accumulator pass.
     #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test parity helper intentionally mirrors the allocation-free production layer seam"
+    )]
     pub fn modulate_layer_full(
         &self,
         index: usize,
         base_effects: &EffectUniforms,
         base_transform: &SpatialTransform,
         base_opacity: f32,
+        base_mosh_send: f32,
         base_speed: f32,
         base_fps: f32,
     ) -> LayerModulation {
@@ -3973,6 +3999,7 @@ impl ModMatrix {
             base_effects,
             base_transform,
             base_opacity,
+            base_mosh_send,
             base_speed,
             base_fps,
             &offsets,
@@ -4283,6 +4310,8 @@ const LAYER_TARGET_SUFFIXES: &[&str] = &[
     "pattern_saturation",
     "pattern_brightness",
     "pattern_color_bands",
+    // Per-layer Codec Mosh send, appended so indices 0..=115 stay frozen.
+    "mosh_send",
 ];
 
 impl RoutingOffsets {
@@ -4459,6 +4488,7 @@ fn layer_suffix_index(suffix: &str) -> Option<usize> {
         "pattern_saturation" => 113,
         "pattern_brightness" => 114,
         "pattern_color_bands" => 115,
+        "mosh_send" => 116,
         _ => return None,
     })
 }
@@ -4782,6 +4812,9 @@ fn apply_offset(
         "mosh_rate" => &mut tp.mosh.rate,
         "mosh_bitrate_starve" => &mut tp.mosh.bitrate_starve,
         "mosh_resync" => &mut tp.mosh.resync,
+        "mosh_wipe" => &mut tp.mosh.wipe,
+        "mosh_smear" => &mut tp.mosh.smear,
+        "mosh_trail" => &mut tp.mosh.trail,
         "sync_amount" => &mut tp.sync.amount,
         "sync_rate" => &mut tp.sync.rate,
         "sync_spread" => &mut tp.sync.spread,
@@ -5150,6 +5183,7 @@ mod tests {
             &SpatialTransform::default(),
             1.0,
             1.0,
+            1.0,
             30.0,
         );
         approx(matrix.routings[1].cached, cached);
@@ -5204,33 +5238,36 @@ mod tests {
             Routing::new(ModSource::Midi(0), "layer1_opacity", -0.25),
             Routing::new(ModSource::Midi(0), "layer2_cellular_gap_softness", 0.75),
             Routing::new(ModSource::Midi(0), "layer2_fps", 0.2),
+            Routing::new(ModSource::Midi(0), "layer2_mosh_send", -0.5),
         ];
         matrix.update_at_beat(0.0, 0.0);
         let first = EffectUniforms::default();
         let second = EffectUniforms::default();
         let spatial = SpatialTransform::default();
-        let expected_first = matrix.modulate_layer_full(0, &first, &spatial, 0.9, 1.0, 30.0);
-        let expected_second = matrix.modulate_layer_full(1, &second, &spatial, 0.7, 1.5, 24.0);
+        let expected_first = matrix.modulate_layer_full(0, &first, &spatial, 0.9, 0.25, 1.0, 30.0);
+        let expected_second = matrix.modulate_layer_full(1, &second, &spatial, 0.7, 0.8, 1.5, 24.0);
 
         let batched = matrix.frame(2).modulate_layers([
-            (&first, &spatial, 0.9, 1.0, 30.0),
-            (&second, &spatial, 0.7, 1.5, 24.0),
+            (&first, &spatial, 0.9, 0.25, 1.0, 30.0),
+            (&second, &spatial, 0.7, 0.8, 1.5, 24.0),
         ]);
 
         approx(batched[0].opacity, expected_first.opacity);
+        approx(batched[0].mosh_send, 0.25);
         approx(
             batched[0].effects.brightness,
             expected_first.effects.brightness,
         );
         approx(batched[1].fps, expected_second.fps);
+        approx(batched[1].mosh_send, expected_second.mosh_send);
         approx(
             batched[1].effects.cellular_gap_softness,
             expected_second.effects.cellular_gap_softness,
         );
         let frame = matrix.frame(2);
         let cached = frame.modulate_layers([
-            (&first, &spatial, 0.9, 1.0, 30.0),
-            (&second, &spatial, 0.7, 1.5, 24.0),
+            (&first, &spatial, 0.9, 0.25, 1.0, 30.0),
+            (&second, &spatial, 0.7, 0.8, 1.5, 24.0),
         ]);
         approx(cached[0].opacity, batched[0].opacity);
         approx(cached[1].fps, batched[1].fps);
@@ -5414,6 +5451,7 @@ mod tests {
             &spatial,
             1.0,
             1.0,
+            1.0,
             30.0,
             &frame.offsets,
         );
@@ -5424,13 +5462,13 @@ mod tests {
         let one_layer_frame = matrix.frame(1);
         assert_eq!(one_layer_frame.offsets.layer.len(), 1);
         let first = one_layer_frame
-            .modulate_layers([(&base, &spatial, 1.0, 1.0, 30.0)])
+            .modulate_layers([(&base, &spatial, 1.0, 1.0, 1.0, 30.0)])
             .remove(0);
         approx(first.effects.brightness, 0.0);
 
         // The single-layer test/tooling adapter also uses one local slot,
         // even when asked to inspect the largest representable parsed index.
-        let huge = matrix.modulate_layer_full(usize::MAX - 1, &base, &spatial, 1.0, 1.0, 30.0);
+        let huge = matrix.modulate_layer_full(usize::MAX - 1, &base, &spatial, 1.0, 1.0, 1.0, 30.0);
         approx(huge.effects.brightness, 1.0);
         approx(base.brightness, 0.0);
     }
@@ -5505,7 +5543,7 @@ mod tests {
         approx(master.barrel, 1.0);
 
         let layer =
-            matrix.modulate_layer_full(0, &base, &SpatialTransform::default(), 1.0, 1.0, 30.0);
+            matrix.modulate_layer_full(0, &base, &SpatialTransform::default(), 1.0, 1.0, 1.0, 30.0);
         approx(layer.effects.bitcrush, 0.5);
         approx(layer.effects.bitcrush_levels, 9.0);
         // The optics route contributed nothing at layer scope.
@@ -5578,7 +5616,7 @@ mod tests {
         approx(master.cellular_gap_softness, 0.33);
 
         let layer =
-            matrix.modulate_layer_full(0, &base, &SpatialTransform::default(), 1.0, 1.0, 30.0);
+            matrix.modulate_layer_full(0, &base, &SpatialTransform::default(), 1.0, 1.0, 1.0, 30.0);
         approx(layer.effects.cellular_amount, 0.5);
         approx(layer.effects.cellular_scale, 25.0);
         approx(layer.effects.cellular_warp, 0.85);
@@ -5646,6 +5684,7 @@ mod tests {
             16,
             &base,
             &SpatialTransform::default(),
+            1.0,
             1.0,
             1.0,
             30.0,
@@ -5818,7 +5857,7 @@ mod tests {
         matrix.update_at_beat(0.0, 1.0 / 30.0);
         let base = EffectUniforms::default();
         let layer =
-            matrix.modulate_layer_full(0, &base, &SpatialTransform::default(), 1.0, 1.0, 30.0);
+            matrix.modulate_layer_full(0, &base, &SpatialTransform::default(), 1.0, 1.0, 1.0, 30.0);
         approx(layer.fps, 149.5);
         approx(base.key_threshold, EffectUniforms::default().key_threshold);
     }
@@ -5953,6 +5992,9 @@ mod tests {
             "mosh_rate",
             "mosh_bitrate_starve",
             "mosh_resync",
+            "mosh_wipe",
+            "mosh_smear",
+            "mosh_trail",
         ] {
             assert_eq!(target_range(target), Some((0.0, 1.0)), "{target}");
         }
@@ -5966,9 +6008,11 @@ mod tests {
         let mut matrix = ModMatrix::new();
         matrix.midi[0] = 1.0;
         matrix.midi[1] = 1.0;
+        matrix.midi[2] = 1.0;
         matrix.routings = vec![
             Routing::new(ModSource::Midi(0), "mosh_amount", 1.0),
             Routing::new(ModSource::Midi(1), "mosh_hold", 1.0),
+            Routing::new(ModSource::Midi(2), "mosh_wipe", 1.0),
         ];
         matrix.update_at_beat(0.0, 0.0);
         let frame = matrix.frame(0);
@@ -5981,8 +6025,10 @@ mod tests {
         );
         approx(tp.mosh.amount, 0.5);
         approx(tp.mosh.hold, 0.75);
+        approx(tp.mosh.wipe, 0.5);
         assert_eq!(base.mosh.amount, 0.0, "the authored base is immutable");
         assert_eq!(base.mosh.hold, 0.25, "the authored base is immutable");
+        assert_eq!(base.mosh.wipe, 0.0, "the authored base is immutable");
         // Discrete mosh state never moves under modulation.
         assert!(!tp.mosh.recycle);
     }
@@ -6348,6 +6394,7 @@ mod tests {
             16,
             &EffectUniforms::default(),
             &base,
+            1.0,
             1.0,
             1.0,
             30.0,
@@ -7400,14 +7447,6 @@ mod tests {
         ] {
             assert_eq!(target_range(refused), None, "{refused}");
         }
-        // Appended suffix indices are stable: 94..=115, key dressing intact.
-        assert_eq!(layer_suffix_index("key_shadow"), Some(93));
-        assert_eq!(layer_suffix_index("pattern_freq_x"), Some(94));
-        assert_eq!(layer_suffix_index("pattern_color_bands"), Some(115));
-        assert_eq!(LAYER_TARGET_SUFFIXES.len(), 116);
-        assert_eq!(LAYER_TARGET_SUFFIXES[94], "pattern_freq_x");
-        assert_eq!(LAYER_TARGET_SUFFIXES[115], "pattern_color_bands");
-
         // An applied offset lands in the frame copy; the authored base is
         // immutable and the discrete laws never move.
         let mut matrix = ModMatrix::new();
@@ -7436,6 +7475,22 @@ mod tests {
         // A dormant frame is the sanitized identity.
         let inert = ModMatrix::new().frame(1).modulate_layer_pattern(0, &base);
         assert_eq!(inert, base.sanitized());
+    }
+
+    #[test]
+    fn layer_mosh_send_target_is_unit_bounded_and_appended_without_renumbering() {
+        assert_eq!(target_range("layer1_mosh_send"), Some((0.0, 1.0)));
+
+        // The new control is an append-only ABI extension: every prior
+        // suffix remains at its established index.
+        assert_eq!(layer_suffix_index("key_shadow"), Some(93));
+        assert_eq!(layer_suffix_index("pattern_freq_x"), Some(94));
+        assert_eq!(layer_suffix_index("pattern_color_bands"), Some(115));
+        assert_eq!(layer_suffix_index("mosh_send"), Some(116));
+        assert_eq!(LAYER_TARGET_SUFFIXES.len(), 117);
+        assert_eq!(LAYER_TARGET_SUFFIXES[94], "pattern_freq_x");
+        assert_eq!(LAYER_TARGET_SUFFIXES[115], "pattern_color_bands");
+        assert_eq!(LAYER_TARGET_SUFFIXES[116], "mosh_send");
     }
 
     // ===== B10 performance sources =====

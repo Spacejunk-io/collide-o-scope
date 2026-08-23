@@ -13,8 +13,7 @@ use std::time::Duration;
 use crate::composition::{CompositionTree, RuntimeComposition};
 use crate::effects::EffectUniforms;
 use crate::evaluated_frame::evaluated_composition::{
-    AdvancedCompositionPlan, AdvancedNtscPath, CompositionPlanInput, EvaluatedCompositionPlan,
-    TemporalMasterPath,
+    AdvancedCompositionPlan, CompositionPlanInput, EvaluatedCompositionPlan, TemporalMasterPath,
 };
 use crate::evaluated_frame::{
     EvaluatedFramePlan, FramePlanContext, LayerFrameInput, MasterFrameInput, ResolvedImageInput,
@@ -23,10 +22,13 @@ use crate::evaluated_frame::{
 use crate::image_routing::{LayerMatte, StableLayerId};
 use crate::layers::BlendMode;
 use crate::media_safety::{MediaDeviceLimits, MediaSafetyPolicy};
+#[cfg(test)]
 use crate::ntsc::{
-    plan_selective_ntsc, process_selective_ntsc_batch_with_state_and_resolution,
-    reference_frame_for_output, NtscExportQuality, NtscFrameMetadata, NtscState,
-    SelectiveNtscBatch, SelectiveNtscGeneration, SelectiveNtscLayerDescriptor, SelectiveNtscPlan,
+    plan_selective_ntsc, NtscFrameMetadata, SelectiveNtscGeneration, SelectiveNtscLayerDescriptor,
+};
+use crate::ntsc::{
+    process_selective_ntsc_batch_with_state_and_resolution, reference_frame_for_output,
+    NtscExportQuality, NtscState, SelectiveNtscBatch, SelectiveNtscPlan,
 };
 use crate::patch::PatchState;
 use crate::performance::SavedLayerPosition;
@@ -103,13 +105,17 @@ const MAX_EXPORT_WARNING_CHARS: usize = 1_024;
 /// schema-5 key keeps its name and meaning; schema 6 is purely additive and
 /// adds one section, following the same precedent:
 ///
-/// - `codec_mosh`: the authored recipe (the eight continuous controls and
-///   the discrete recycle law), the encode dimensions, and the encoder's
+/// - `codec_mosh`: the authored recipe (the codec controls, motion-wake
+///   shaping, and discrete recycle law), the encode dimensions, and encoder
 ///   identity (`mpeg4/avcodec-<version>`). Present only when at least one
 ///   accepted frame ran the round trip. The encoder identity is the honesty
 ///   record: per-host repeatability is claimed, cross-machine bit-identity
 ///   is not. The mutated bitstream bytes are deliberately never recorded.
-const EXPORT_MOTION_SIDECAR_SCHEMA_VERSION: u16 = 6;
+///
+/// Schema 7 adds the motion-wipe, vector-smear, retained-trail recipe,
+/// accepted-frame min/max recipe observation, and bounded per-layer authored /
+/// observed Mosh Send provenance.
+const EXPORT_MOTION_SIDECAR_SCHEMA_VERSION: u16 = 7;
 const MAX_EXPORT_MOTION_SIDECAR_SOURCES: usize = 256;
 const MAX_EXPORT_MOTION_SIDECAR_SCOPES: usize = 256;
 const MAX_EXPORT_MOTION_DISTINCT_STATES: usize = 512;
@@ -594,9 +600,10 @@ struct ExportMotionSidecar {
     warnings: Vec<String>,
 }
 
-/// B5 codec-mosh export provenance: the authored recipe and the encoder's
-/// identity. Recorded once per job, only after an accepted frame actually
-/// ran the round trip; the bitstream itself never enters the sidecar.
+/// B5 codec-mosh export provenance: authored bases, accepted-frame recipe/send
+/// bounds, and encoder identity. Recorded once per job, only after an accepted
+/// frame actually ran the round trip; the bitstream itself never enters the
+/// sidecar.
 #[derive(Debug, Clone, serde::Serialize)]
 struct CodecMoshSidecar {
     /// `mpeg4/avcodec-<linked version>` — the per-host repeatability record.
@@ -611,7 +618,170 @@ struct CodecMoshSidecar {
     rate: f32,
     bitrate_starve: f32,
     resync: f32,
+    wipe: f32,
+    smear: f32,
+    trail: f32,
     recycle: bool,
+    layer_sends: Vec<CodecMoshLayerSendSidecar>,
+    layer_sends_truncated: bool,
+    /// Actual frame-evaluated recipe bounds. The scalar fields above retain
+    /// the authored patch-base shape for schema compatibility; Morph,
+    /// modulation, and replay may move the recipe during the render.
+    observed: CodecMoshObservedSidecar,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct CodecMoshLayerSendSidecar {
+    saved_position: u32,
+    stable_id: u64,
+    authored: f32,
+    observed_min: f32,
+    observed_max: f32,
+    /// True iff this layer was visible, positive-opacity, and outside the
+    /// exact Temporal dry prefix on at least one accepted Mosh frame.
+    entered_codec_mosh: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CodecMoshLayerSendObservation {
+    min: f32,
+    max: f32,
+    seen: bool,
+    entered_codec_mosh: bool,
+}
+
+impl Default for CodecMoshLayerSendObservation {
+    fn default() -> Self {
+        Self {
+            min: 1.0,
+            max: 1.0,
+            seen: false,
+            entered_codec_mosh: false,
+        }
+    }
+}
+
+impl CodecMoshLayerSendObservation {
+    fn observe(&mut self, send: f32, entered_codec_mosh: bool) {
+        let send = crate::layers::clamp_layer_mosh_send(send);
+        if self.seen {
+            self.min = self.min.min(send);
+            self.max = self.max.max(send);
+        } else {
+            self.min = send;
+            self.max = send;
+            self.seen = true;
+        }
+        self.entered_codec_mosh |= entered_codec_mosh;
+    }
+}
+
+fn codec_mosh_authored_layer_send(
+    patch: &crate::patch::PatchState,
+    source_index: usize,
+) -> Result<f32, String> {
+    patch
+        .layers
+        .get(source_index)
+        .map(|layer| crate::layers::clamp_layer_mosh_send(layer.mosh_send))
+        .ok_or_else(|| {
+            format!(
+                "Codec-Mosh sidecar layer source index {source_index} is absent from the immutable saved patch"
+            )
+        })
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+struct CodecMoshContinuousSidecar {
+    amount: f32,
+    key_removal: f32,
+    hold: f32,
+    drop: f32,
+    shuffle: f32,
+    rate: f32,
+    bitrate_starve: f32,
+    resync: f32,
+    wipe: f32,
+    smear: f32,
+    trail: f32,
+}
+
+impl From<crate::codec_mosh::CodecMoshParams> for CodecMoshContinuousSidecar {
+    fn from(params: crate::codec_mosh::CodecMoshParams) -> Self {
+        let params = params.sanitized();
+        Self {
+            amount: params.amount,
+            key_removal: params.key_removal,
+            hold: params.hold,
+            drop: params.drop,
+            shuffle: params.shuffle,
+            rate: params.rate,
+            bitrate_starve: params.bitrate_starve,
+            resync: params.resync,
+            wipe: params.wipe,
+            smear: params.smear,
+            trail: params.trail,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct CodecMoshObservedSidecar {
+    accepted_frames: u64,
+    min: CodecMoshContinuousSidecar,
+    max: CodecMoshContinuousSidecar,
+    recycle_false_seen: bool,
+    recycle_true_seen: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CodecMoshObservationAccumulator {
+    observed: CodecMoshObservedSidecar,
+}
+
+impl CodecMoshObservationAccumulator {
+    fn new(params: crate::codec_mosh::CodecMoshParams) -> Self {
+        let params = params.sanitized();
+        let values = CodecMoshContinuousSidecar::from(params);
+        Self {
+            observed: CodecMoshObservedSidecar {
+                accepted_frames: 1,
+                min: values,
+                max: values,
+                recycle_false_seen: !params.recycle,
+                recycle_true_seen: params.recycle,
+            },
+        }
+    }
+
+    fn observe(&mut self, params: crate::codec_mosh::CodecMoshParams) {
+        let params = params.sanitized();
+        let values = CodecMoshContinuousSidecar::from(params);
+        macro_rules! widen {
+            ($field:ident) => {
+                self.observed.min.$field = self.observed.min.$field.min(values.$field);
+                self.observed.max.$field = self.observed.max.$field.max(values.$field);
+            };
+        }
+        widen!(amount);
+        widen!(key_removal);
+        widen!(hold);
+        widen!(drop);
+        widen!(shuffle);
+        widen!(rate);
+        widen!(bitrate_starve);
+        widen!(resync);
+        widen!(wipe);
+        widen!(smear);
+        widen!(trail);
+        self.observed.accepted_frames = self.observed.accepted_frames.saturating_add(1);
+        self.observed.recycle_false_seen |= !params.recycle;
+        self.observed.recycle_true_seen |= params.recycle;
+    }
+
+    fn finish(self) -> CodecMoshObservedSidecar {
+        self.observed
+    }
 }
 
 struct ExportMotionSidecarAccumulator {
@@ -1911,6 +2081,7 @@ struct ExportLayer {
     effects: EffectUniforms,
     transform: SpatialTransform,
     opacity: f32,
+    mosh_send: f32,
     blend_mode: BlendMode,
     bypass_master_fx: bool,
     bypass_temporal_fx: bool,
@@ -2738,6 +2909,7 @@ struct ExportFrameLayerBase {
     effects: EffectUniforms,
     transform: SpatialTransform,
     opacity: f32,
+    mosh_send: f32,
     speed: f32,
     fps: f32,
     blend_mode: BlendMode,
@@ -2757,6 +2929,7 @@ impl From<&ExportLayer> for ExportFrameLayerBase {
             effects: layer.effects,
             transform: layer.transform,
             opacity: layer.opacity,
+            mosh_send: layer.mosh_send,
             speed: layer.speed,
             fps: layer.fps,
             blend_mode: layer.blend_mode,
@@ -2801,6 +2974,7 @@ fn modulated_export_transport_config(
         &base.effects,
         &base.transform,
         base.opacity,
+        base.mosh_send,
         rate_proxy,
         fps_proxy,
     );
@@ -3129,6 +3303,7 @@ fn black_placeholder_layer(
         effects,
         transform: layer_cfg.transform.sanitized(),
         opacity: layer_cfg.opacity,
+        mosh_send: crate::layers::clamp_layer_mosh_send(layer_cfg.mosh_send),
         blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
         bypass_master_fx: layer_cfg.bypass_master_fx,
         bypass_temporal_fx: layer_cfg.bypass_temporal_fx,
@@ -3219,6 +3394,7 @@ fn pattern_export_layer(
         effects,
         transform: layer_cfg.transform.sanitized(),
         opacity: layer_cfg.opacity,
+        mosh_send: crate::layers::clamp_layer_mosh_send(layer_cfg.mosh_send),
         blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
         bypass_master_fx: layer_cfg.bypass_master_fx,
         bypass_temporal_fx: layer_cfg.bypass_temporal_fx,
@@ -3302,6 +3478,7 @@ fn text_page_export_layer(
         effects,
         transform: layer_cfg.transform.sanitized(),
         opacity: layer_cfg.opacity,
+        mosh_send: crate::layers::clamp_layer_mosh_send(layer_cfg.mosh_send),
         blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
         bypass_master_fx: layer_cfg.bypass_master_fx,
         bypass_temporal_fx: layer_cfg.bypass_temporal_fx,
@@ -3372,6 +3549,7 @@ fn still_export_layer(
         effects,
         transform: layer_cfg.transform.sanitized(),
         opacity: layer_cfg.opacity,
+        mosh_send: crate::layers::clamp_layer_mosh_send(layer_cfg.mosh_send),
         blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
         bypass_master_fx: layer_cfg.bypass_master_fx,
         bypass_temporal_fx: layer_cfg.bypass_temporal_fx,
@@ -3832,6 +4010,9 @@ fn apply_export_morph_world(
             .find(|(_, layer)| layer.source_index == sampled.position)
         {
             world.layer_bases[position].opacity = sampled.opacity;
+            if let Some(mosh_send) = sampled.mosh_send {
+                world.layer_bases[position].mosh_send = mosh_send;
+            }
             world.layer_bases[position].speed = sampled.speed;
             if let Some(fps) = sampled.fps {
                 world.layer_bases[position].fps = fps;
@@ -3940,6 +4121,7 @@ fn evaluate_export_morph_world(
                 effects: &base.effects,
                 transform: &base.transform,
                 opacity: base.opacity,
+                mosh_send: base.mosh_send,
                 speed: base.speed,
                 fps: base.fps,
                 blend_mode: base.blend_mode,
@@ -4766,20 +4948,6 @@ fn plan_export_composition_inner(
         .map_err(|error| format!("export creative frame plan rejected: {error}"))
 }
 
-fn advanced_export_skips_global_ntsc(
-    path: AdvancedNtscPath,
-    applying: usize,
-    bypassing: usize,
-) -> Result<bool, String> {
-    match path {
-        AdvancedNtscPath::Disabled | AdvancedNtscPath::AllApplying => Ok(false),
-        AdvancedNtscPath::AllBypass => Ok(true),
-        AdvancedNtscPath::Mixed => Err(format!(
-            "advanced composition cannot enter selective NTSC: {applying} applying layer(s), {bypassing} bypassing layer(s)"
-        )),
-    }
-}
-
 /// Resolve a persisted, zero-based patch position into the deterministic ID
 /// used by this export job. Keeping the mapping independent of the current
 /// resource-vector order prevents failed media opens or future scheduling
@@ -4803,50 +4971,18 @@ fn export_runtime_matte(
 /// order while preserving the curated blend law for every contribution.
 #[allow(clippy::too_many_arguments)]
 fn plan_export_selective_ntsc(
-    frame_num: u64,
-    fps: u32,
-    paused: bool,
-    evaluated: &EvaluatedFramePlan,
+    _frame_num: u64,
+    _fps: u32,
+    _paused: bool,
+    _evaluated: &EvaluatedFramePlan,
 ) -> Option<SelectiveNtscPlan> {
-    if evaluated.layers().len() != evaluated.layer_passes().len() {
-        return None;
-    }
-    let [width, height] = evaluated.context().output_size;
-    plan_selective_ntsc(
-        SelectiveNtscGeneration {
-            visual_epoch: 1,
-            topology_generation: 1,
-            width,
-            height,
-            sample_sequence: frame_num,
-        },
-        NtscFrameMetadata {
-            params: evaluated.ntsc().clone(),
-            reference_frame: export_ntsc_reference_frame(frame_num, fps, paused),
-        },
-        evaluated
-            .layers()
-            .iter()
-            .zip(evaluated.layer_passes())
-            .map(|(layer, pass)| SelectiveNtscLayerDescriptor {
-                layer_id: layer.source.stable_id,
-                visible: layer.visible,
-                bypass_master_fx: layer.bypass_master_fx,
-                opacity: layer.opacity,
-                blend_mode: layer.blend_mode.as_u32(),
-                // Export consumes every generated batch synchronously, so no
-                // stale-control comparison is needed. Keep a deterministic
-                // value in the shared plan nevertheless.
-                transform_fingerprint: export_selective_transform_fingerprint(
-                    &pass.effects,
-                    &layer.transform,
-                    (!layer.bypass_master_fx).then_some(&evaluated.master_pass().effects),
-                    (!layer.bypass_master_fx).then_some(evaluated.master_transform()),
-                ),
-            }),
-    )
+    // Retain the old helper seam while the selective implementation remains
+    // available to historical tests. Runtime export deliberately never enters
+    // it: one final-program VHS kernel is both topology-complete and cheaper.
+    None
 }
 
+#[cfg(test)]
 fn export_selective_transform_fingerprint(
     effects: &EffectUniforms,
     transform: &SpatialTransform,
@@ -4930,6 +5066,17 @@ fn performance_take_authors_temporal_bypass(
     })
 }
 
+fn export_replayed_layer_mosh_send(
+    raw: &crate::performance_track::PerformanceRawValue,
+) -> Option<f32> {
+    match raw {
+        crate::performance_track::PerformanceRawValue::Continuous(value) => {
+            Some(crate::layers::clamp_layer_mosh_send(*value))
+        }
+        _ => None,
+    }
+}
+
 /// Apply one replayed B9 performance event to the export job's authored
 /// bases.
 ///
@@ -4989,6 +5136,11 @@ fn apply_export_performance_event(
             match (param.as_str(), raw) {
                 ("opacity", Raw::Continuous(value)) => {
                     target.opacity = crate::layers::clamp_layer_opacity(*value);
+                }
+                ("mosh_send", raw) => {
+                    if let Some(value) = export_replayed_layer_mosh_send(raw) {
+                        target.mosh_send = value;
+                    }
                 }
                 ("speed", Raw::Continuous(value)) => {
                     target.speed = crate::layers::clamp_layer_speed(*value);
@@ -5597,10 +5749,14 @@ fn run_export(
         return Err(error);
     }
 
-    // Selective VHS reads one straight-alpha slice per contributing layer.
-    // Its staging buffer stays lazy so legacy/all-inherited exports preserve
-    // their established resource profile; the allocation is independently
-    // scoped at the point of first use.
+    // Precompile the optional layer-send kernels outside both the mandatory
+    // setup scopes and the per-frame loop. The Result is consulted only when
+    // an active partial send needs the feature, so a default export retains
+    // its historical compatibility surface.
+    let mosh_influence_pipelines = crate::renderer::state::MoshInfluencePipelines::build(&device);
+
+    // Retained only for the dormant compatibility branch below. Final-program
+    // VHS never allocates this per-layer staging buffer.
     let mut selective_staging: Option<wgpu::Buffer> = None;
 
     // --- Open video decoders for each layer ---
@@ -5873,6 +6029,7 @@ fn run_export(
             effects,
             transform: layer_cfg.transform.sanitized(),
             opacity: layer_cfg.opacity,
+            mosh_send: crate::layers::clamp_layer_mosh_send(layer_cfg.mosh_send),
             blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
             bypass_master_fx: layer_cfg.bypass_master_fx,
             bypass_temporal_fx: layer_cfg.bypass_temporal_fx,
@@ -5945,8 +6102,11 @@ fn run_export(
     // makes two renders on this host byte-identical; a missing mpeg4 pair is
     // an actionable export error, never a silent bypass.
     let mut mosh_engine: Option<crate::codec_mosh::MoshEngine> = None;
+    let mut mosh_influence_gpu: Option<crate::renderer::state::MoshInfluenceGpu> = None;
     let mut mosh_interval_active = false;
     let mut mosh_used = false;
+    let mut mosh_observed: Option<CodecMoshObservationAccumulator> = None;
+    let mut mosh_layer_send_observed = vec![CodecMoshLayerSendObservation::default(); layers.len()];
 
     // --- Modulation matrix (deterministic: beat derived from frame index) ---
     // Imported audio is sampled from frame-indexed program time. Live capture,
@@ -6608,6 +6768,7 @@ fn run_export(
                         effects: &base.effects,
                         transform: &base.transform,
                         opacity: base.opacity,
+                        mosh_send: base.mosh_send,
                         speed: base.speed,
                         fps: base.fps,
                         blend_mode: base.blend_mode,
@@ -6838,20 +6999,26 @@ fn run_export(
             }
         }
 
+        if let Err(error) = encode_export_mosh_influence_frame(
+            &device,
+            &queue,
+            &mut encoder,
+            &evaluated_frame,
+            &layers,
+            &sampler,
+            &nearest_sampler,
+            &composite_views[1],
+            mosh_active,
+            &mosh_influence_pipelines,
+            &mut mosh_influence_gpu,
+            [w, h],
+        ) {
+            write_error = Some(format!("export layer Codec-Mosh influence failed: {error}"));
+            break;
+        }
+
         let (selective_frame, advanced_history_staged) = match &evaluated_composition {
             EvaluatedCompositionPlan::Advanced(advanced) => {
-                let advanced_ntsc_path = advanced.ntsc_path();
-                let skip_global_ntsc = match advanced_export_skips_global_ntsc(
-                    advanced_ntsc_path,
-                    advanced.master().selective_ntsc_layers.len(),
-                    advanced.master().selective_ntsc_bypass_layers.len(),
-                ) {
-                    Ok(skip) => skip,
-                    Err(error) => {
-                        write_error = Some(error);
-                        break;
-                    }
-                };
                 if composition_gpu.is_none() {
                     composition_gpu = match CompositionGpuExecutor::new(&device, &queue, [w, h]) {
                         Ok(executor) => Some(executor),
@@ -7045,11 +7212,9 @@ fn run_export(
                     &opaque_output_bind_group,
                     &composite_views[2],
                 );
-                // Homogeneous inherited stacks use global post-composite
-                // NTSC. Homogeneous bypass stacks must suppress that call;
-                // `Mixed` was rejected above because the advanced executor
-                // does not silently enter the legacy flat slice path.
-                (skip_global_ntsc, true)
+                // VHS is independent of per-layer Master bypass and finishes
+                // every Advanced programme with one global CPU kernel.
+                (false, true)
             }
             EvaluatedCompositionPlan::LegacyExact(_) => {
                 // Exact delegation retains the old routing attachment and GPU
@@ -7312,6 +7477,22 @@ fn run_export(
             }
         };
 
+        // Pack the layer send into alpha only for the Codec-Mosh readback.
+        // RGB is copied byte-for-byte from the opaque programme, so analysis,
+        // preview, and every non-Mosh export retain the exact old texture.
+        let use_mosh_influence_alpha = mosh_active
+            && mosh_influence_gpu
+                .as_ref()
+                .is_some_and(crate::renderer::state::MoshInfluenceGpu::valid);
+        let mosh_readback_texture = if use_mosh_influence_alpha {
+            mosh_influence_gpu
+                .as_ref()
+                .expect("validated export Mosh influence source")
+                .encode_pack(&mut encoder, &composite_textures[2])
+        } else {
+            &composite_textures[2]
+        };
+
         // Submit GPU work
         queue.submit(std::iter::once(encoder.finish()));
 
@@ -7319,7 +7500,7 @@ fn run_export(
         let mut pixels = match readback_pixels(
             &device,
             &queue,
-            &composite_textures[2],
+            mosh_readback_texture,
             &staging,
             w,
             h,
@@ -7467,26 +7648,9 @@ fn run_export(
         }
         video_analysis_primed = mod_matrix.video_analysis_armed();
 
-        // Selective mode has already applied VHS to inherited slices before
-        // Temporal. Every other frame retains the established global
-        // post-composite VHS call exactly once.
-        if !selective_frame {
-            ntsc_state.params = mod_ntsc;
-            ntsc_state.apply_at_reference_frame_with_resolution(
-                &mut pixels,
-                w,
-                h,
-                export_ntsc_reference_frame(frame_num, config.fps, patch.master_paused),
-                config.ntsc_quality,
-            );
-        }
-
-        // B5: the codec round trip, synchronously per frame, after VHS —
-        // codec-after-analog, the exact live ordering (the live worker runs
-        // the VHS kernel and the round trip in one hop, and selective frames
-        // arrive here already VHS-treated, so the mosh applies uniformly on
-        // every path). The fault clock rides the same paused-aware reference
-        // frame the NTSC phase uses, so Pause holds the fault stream still.
+        // B5: the codec round trip runs before the final-program VHS finish.
+        // Live executes both serial kernels in the same bounded worker hop, so
+        // this ordering adds no readback, queue, copy, or latency stage.
         if mosh_active {
             let mosh_result = (|| -> Result<(), String> {
                 if mosh_engine.is_none() {
@@ -7500,6 +7664,7 @@ fn run_export(
                     w,
                     h,
                     mod_temporal.mosh,
+                    use_mosh_influence_alpha,
                     ordinal,
                     master_effects.random_seed,
                 )
@@ -7608,6 +7773,32 @@ fn run_export(
             };
         }
 
+        // VHS is the final stylized programme pass, after creative composition,
+        // Temporal/display processing, Codec Mosh, and any independently dry
+        // overlay. Blackout remains a live-only absolute cut downstream.
+        if !selective_frame && mod_ntsc.enabled {
+            ntsc_state.params = mod_ntsc;
+            if !ntsc_state.apply_at_reference_frame_with_resolution(
+                &mut pixels,
+                w,
+                h,
+                export_ntsc_reference_frame(frame_num, config.fps, patch.master_paused),
+                config.ntsc_quality,
+            ) {
+                temporal_state.discard_staged();
+                gesture_canvas.discard_staged();
+                if advanced_history_staged {
+                    if let Some(executor) = composition_gpu.as_mut() {
+                        executor.discard_frame_history();
+                    }
+                }
+                write_error = Some(format!(
+                    "final-program VHS rejected export frame {frame_num} at {w}x{h}"
+                ));
+                break;
+            }
+        }
+
         // Write to ffmpeg
         if let Err(error) = ffmpeg_stdin.write_all(&pixels) {
             temporal_state.discard_staged();
@@ -7714,6 +7905,25 @@ fn run_export(
             frame_num,
         );
         motion_sidecar.observe_accepted(&frame_motion_metadata);
+        if mosh_active {
+            if let Some(observed) = mosh_observed.as_mut() {
+                observed.observe(mod_temporal.mosh);
+            } else {
+                mosh_observed = Some(CodecMoshObservationAccumulator::new(mod_temporal.mosh));
+            }
+            for (observation, layer) in mosh_layer_send_observed
+                .iter_mut()
+                .zip(evaluated_frame.layers())
+            {
+                observation.observe(
+                    layer.mosh_send,
+                    layer.visible
+                        && layer.opacity.is_finite()
+                        && layer.opacity > 0.0
+                        && !layer.bypass_temporal_fx,
+                );
+            }
+        }
         progress.publish_motion_metadata(frame_motion_metadata);
 
         // Update progress
@@ -7820,11 +8030,46 @@ fn run_export(
     // round trip: the authored recipe plus the encoder's identity — the
     // per-host repeatability record.
     if mosh_used {
+        let observed = mosh_observed
+            .take()
+            .ok_or_else(|| {
+                "codec mosh ran without an accepted frame-evaluated sidecar recipe".to_string()
+            })?
+            .finish();
         let recipe = patch
             .temporal
             .as_ref()
             .map(|temporal| temporal.mosh.sanitized())
             .unwrap_or_default();
+        let layer_sends_truncated = layers.len() > MAX_EXPORT_MOTION_SIDECAR_SOURCES;
+        let layer_sends = layers
+            .iter()
+            .zip(&mosh_layer_send_observed)
+            .take(MAX_EXPORT_MOTION_SIDECAR_SOURCES)
+            .map(|(layer, observation)| {
+                // Performance replay deliberately mutates `ExportLayer` bases
+                // in place. Authored provenance must instead remain pinned to
+                // the immutable saved patch; replay/Morph/modulation belong
+                // only in the observed bounds below.
+                let authored = codec_mosh_authored_layer_send(patch, layer.source_index)?;
+                Ok(CodecMoshLayerSendSidecar {
+                    saved_position: u32::try_from(layer.source_index).unwrap_or(u32::MAX),
+                    stable_id: export_selective_layer_id(layer.source_index),
+                    authored,
+                    observed_min: if observation.seen {
+                        observation.min
+                    } else {
+                        authored
+                    },
+                    observed_max: if observation.seen {
+                        observation.max
+                    } else {
+                        authored
+                    },
+                    entered_codec_mosh: observation.entered_codec_mosh,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let (encode_width, encode_height) = crate::codec_mosh::mosh_dimensions(w, h);
         motion_sidecar.codec_mosh = Some(CodecMoshSidecar {
             encoder: crate::codec_mosh::mosh_encoder_identity(),
@@ -7838,7 +8083,13 @@ fn run_export(
             rate: recipe.rate,
             bitrate_starve: recipe.bitrate_starve,
             resync: recipe.resync,
+            wipe: recipe.wipe,
+            smear: recipe.smear,
+            trail: recipe.trail,
             recycle: recipe.recycle,
+            layer_sends,
+            layer_sends_truncated,
+            observed,
         });
     }
     let sidecar = motion_sidecar.finish(progress.warnings());
@@ -8420,6 +8671,100 @@ fn encode_export_effect_pass(
     pass.set_bind_group(0, &textures, &[]);
     pass.set_bind_group(1, &uniform_group, &[]);
     pass.draw(0..3, 0..1);
+}
+
+/// Build the same programme-space Codec-Mosh send field used by the live
+/// renderer from the immutable export frame plan. The default all-one field
+/// deliberately keeps the historical frame path: no full-frame texture or
+/// pass is created and the ordinary opaque programme remains the readback
+/// source. Immutable optional kernels were precompiled during job setup.
+#[allow(clippy::too_many_arguments)]
+fn encode_export_mosh_influence_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
+    evaluated: &EvaluatedFramePlan,
+    layers: &[ExportLayer],
+    sampler: &wgpu::Sampler,
+    nearest_sampler: &wgpu::Sampler,
+    scratch: &wgpu::TextureView,
+    mosh_active: bool,
+    prepared: &Result<crate::renderer::state::MoshInfluencePipelines, String>,
+    influence: &mut Option<crate::renderer::state::MoshInfluenceGpu>,
+    dimensions: [u32; 2],
+) -> Result<bool, String> {
+    if layers.len() != evaluated.layers().len()
+        || evaluated.layers().len() != evaluated.layer_passes().len()
+    {
+        if let Some(influence) = influence.as_mut() {
+            influence.invalidate();
+        }
+        return Err("Codec-Mosh influence export resource/plan alignment mismatch".into());
+    }
+
+    if !mosh_active {
+        if let Some(influence) = influence.as_mut() {
+            influence.invalidate();
+        }
+        return Ok(false);
+    }
+    let first_authored =
+        crate::renderer::state::mosh_influence_stack_start(evaluated.layers(), true);
+    let Some(first_authored) = first_authored else {
+        if let Some(influence) = influence.as_mut() {
+            influence.invalidate();
+        }
+        return Ok(false);
+    };
+
+    if influence.is_none() {
+        let prepared = prepared.as_ref().map_err(Clone::clone)?;
+        *influence = Some(crate::renderer::state::MoshInfluenceGpu::new(
+            device,
+            sampler,
+            nearest_sampler,
+            scratch,
+            dimensions,
+            evaluated.layers().len(),
+            prepared,
+        )?);
+    }
+    influence
+        .as_mut()
+        .expect("export Codec-Mosh influence was initialized above")
+        .begin_frame(device, encoder, evaluated.layers().len())?;
+
+    // Bottom-to-top composition matters: a later full-send layer restores
+    // its covered pixels after a dry or partially sent layer beneath it.
+    for layer_index in (0..=first_authored).rev().filter(|&index| {
+        let layer = &evaluated.layers()[index];
+        layer.visible && !layer.bypass_temporal_fx
+    }) {
+        let evaluated_layer = &evaluated.layers()[layer_index];
+        if !evaluated_layer.opacity.is_finite() || evaluated_layer.opacity <= 0.0 {
+            continue;
+        }
+        let layer = export_layer_resource(layers, evaluated_layer.source)?;
+        influence
+            .as_mut()
+            .expect("export Codec-Mosh influence stays alive for the frame")
+            .encode_source_layer(
+                device,
+                queue,
+                encoder,
+                evaluated_layer.source,
+                &layer.texture_view,
+                &evaluated.layer_passes()[layer_index],
+                evaluated_layer.mosh_send,
+                evaluated_layer.opacity,
+                evaluated_layer.blend_mode,
+            )?;
+    }
+    influence
+        .as_mut()
+        .expect("export Codec-Mosh influence stays alive through publication")
+        .finish_frame();
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9873,6 +10218,60 @@ mod tests {
     }
 
     #[test]
+    fn codec_mosh_sidecar_bounds_the_frame_evaluated_recipe() {
+        let first = crate::codec_mosh::CodecMoshParams {
+            amount: 0.25,
+            wipe: 0.8,
+            smear: 0.1,
+            trail: 0.4,
+            recycle: false,
+            ..Default::default()
+        };
+        let second = crate::codec_mosh::CodecMoshParams {
+            amount: 0.75,
+            wipe: 0.2,
+            smear: 0.9,
+            trail: 1.0,
+            recycle: true,
+            ..Default::default()
+        };
+        let mut observed = CodecMoshObservationAccumulator::new(first);
+        observed.observe(second);
+        let observed = observed.finish();
+        assert_eq!(observed.accepted_frames, 2);
+        assert_eq!(observed.min.amount, 0.25);
+        assert_eq!(observed.max.amount, 0.75);
+        assert_eq!(observed.min.wipe, 0.2);
+        assert_eq!(observed.max.wipe, 0.8);
+        assert_eq!(observed.min.smear, 0.1);
+        assert_eq!(observed.max.smear, 0.9);
+        assert_eq!(observed.min.trail, 0.4);
+        assert_eq!(observed.max.trail, 1.0);
+        assert!(observed.recycle_false_seen);
+        assert!(observed.recycle_true_seen);
+
+        let mut layer = CodecMoshLayerSendObservation::default();
+        layer.observe(0.8, false);
+        layer.observe(0.2, true);
+        layer.observe(f32::NAN, false);
+        assert_eq!(layer.min, 0.2);
+        assert_eq!(layer.max, 1.0);
+        assert!(layer.entered_codec_mosh);
+    }
+
+    #[test]
+    fn codec_mosh_authored_layer_send_is_pinned_to_the_saved_patch() {
+        let mut patch = three_layer_legacy_patch();
+        patch.layers[0].mosh_send = 0.25;
+        // Export performance replay mutates its detached working layer to this
+        // value; authored provenance must remain the saved patch base.
+        let replayed_working_send = 0.9_f32;
+        assert_ne!(patch.layers[0].mosh_send, replayed_working_send);
+        assert_eq!(codec_mosh_authored_layer_send(&patch, 0).unwrap(), 0.25);
+        assert!(codec_mosh_authored_layer_send(&patch, patch.layers.len()).is_err());
+    }
+
+    #[test]
     fn temporal_bypass_program_candidate_is_lazy_and_checked() {
         let source = include_str!("render_export.rs");
         let start = source
@@ -9917,6 +10316,7 @@ mod tests {
                     effects: &effects,
                     transform: &transform,
                     opacity: 1.0,
+                    mosh_send: 1.0,
                     speed: 1.0,
                     fps: 30.0,
                     blend_mode: BlendMode::Normal,
@@ -10685,6 +11085,7 @@ layers:
                     effects: &effects,
                     transform: &transform,
                     opacity: 1.0,
+                    mosh_send: 1.0,
                     speed: 1.0,
                     fps: 30.0,
                     blend_mode: BlendMode::Normal,
@@ -10860,6 +11261,7 @@ layers:
                     effects: &effects,
                     transform: &transform,
                     opacity: 1.0,
+                    mosh_send: 1.0,
                     speed: 1.0,
                     fps: 30.0,
                     blend_mode: BlendMode::Normal,
@@ -10990,6 +11392,7 @@ layers:
                         effects: &effects,
                         transform: &transform,
                         opacity: 1.0,
+                        mosh_send: 1.0,
                         speed: 1.0,
                         fps: fps as f32,
                         blend_mode: BlendMode::Normal,
@@ -11062,10 +11465,9 @@ layers:
             }
         }
 
-        // Advanced composition cannot enter the legacy selective slice path:
-        // that flat CPU path has no group/rack/bus representation. The shared
-        // executor owns this admission error, and export surfaces it verbatim
-        // instead of rendering a plausible-but-incomplete fallback.
+        // Final-program VHS is independent of the Advanced topology and
+        // per-layer Master bypass. Mixed stacks must therefore remain
+        // admissible instead of being routed into the old flat slice path.
         let selective_ntsc = crate::ntsc::NtscParams {
             enabled: true,
             ..crate::ntsc::NtscParams::default()
@@ -11090,6 +11492,7 @@ layers:
                     effects: &effects,
                     transform: &transform,
                     opacity: 1.0,
+                    mosh_send: 1.0,
                     speed: 1.0,
                     fps: 30.0,
                     blend_mode: BlendMode::Normal,
@@ -11116,12 +11519,8 @@ layers:
             CreativeResourceLimits::default(),
         )
         .unwrap();
-        assert_eq!(
-            CompositionGpuExecutor::validate_plan(&selective_advanced)
-                .unwrap_err()
-                .to_string(),
-            "advanced composition cannot enter selective NTSC: 2 applying layer(s), 1 bypassing layer(s)"
-        );
+        CompositionGpuExecutor::validate_plan(&selective_advanced)
+            .expect("final-program VHS admits mixed Advanced Master bypass");
     }
 
     /// One Residual Counterpoint node whose two slots are named independently.
@@ -11370,7 +11769,7 @@ layers:
         )
         .finish(Vec::new());
 
-        assert_eq!(sidecar.schema_version, 6);
+        assert_eq!(sidecar.schema_version, 7);
         assert!(sidecar.field_collider.is_none());
         assert!(sidecar.codec_mosh.is_none());
         assert!(!sidecar.authored_residual_nodes_truncated);
@@ -11530,6 +11929,7 @@ layers:
                             effects: &effects,
                             transform: &transform,
                             opacity: 1.0,
+                            mosh_send: 1.0,
                             speed: 1.0,
                             fps: fps as f32,
                             blend_mode: BlendMode::Normal,
@@ -11856,6 +12256,7 @@ layers:
                     effects: &effects,
                     transform: &transform,
                     opacity: 1.0,
+                    mosh_send: 1.0,
                     speed: 1.0,
                     fps: fps as f32,
                     blend_mode: BlendMode::Normal,
@@ -13035,10 +13436,11 @@ layers:
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         // Schema 4 appended the per-slot Symmetry Field route section and the
         // Residual Counterpoint section; schema 5 appended the Field Collider
-        // section; schema 6 appended the codec-mosh section. Every earlier
+        // section; schema 6 appended Codec Mosh and schema 7 appended its
+        // motion shaping plus frame-evaluated recipe bounds. Every earlier
         // key below is re-asserted unchanged, and a job that never ran the
         // collider or the mosh omits both sections entirely.
-        assert_eq!(json["schema_version"], 6);
+        assert_eq!(json["schema_version"], 7);
         assert!(json.get("field_collider").is_none());
         assert!(json.get("codec_mosh").is_none());
         assert!(json["symmetry_fields"].as_array().unwrap().is_empty());
@@ -13307,6 +13709,7 @@ layers:
                         effects: &effects,
                         transform: &transform,
                         opacity: 1.0,
+                        mosh_send: 1.0,
                         speed: 1.0,
                         fps: fps as f32,
                         blend_mode: BlendMode::Normal,
@@ -13465,6 +13868,7 @@ layers:
                         effects: &effects,
                         transform: &transform,
                         opacity: 1.0,
+                        mosh_send: 1.0,
                         speed: 1.0,
                         fps: 30.0,
                         blend_mode: BlendMode::Normal,
@@ -14569,6 +14973,7 @@ layers:
                     effects: &layer_effects,
                     transform: &transform,
                     opacity: 0.625,
+                    mosh_send: 1.0,
                     speed: 1.0,
                     fps: 30.0,
                     blend_mode: BlendMode::Difference,
@@ -15040,6 +15445,7 @@ layers:
                 effects: base.effects,
                 transform: base.transform,
                 opacity: base.opacity,
+                mosh_send: base.mosh_send,
                 blend_mode: base.blend_mode,
                 bypass_master_fx: base.bypass_master_fx,
                 bypass_temporal_fx: base.bypass_temporal_fx,
@@ -15489,6 +15895,7 @@ layers:
                 effects: &effects,
                 transform: &transform,
                 opacity: 1.0,
+                mosh_send: 1.0,
                 speed: 1.0,
                 fps: 30.0,
                 blend_mode: BlendMode::Normal,
@@ -16568,6 +16975,7 @@ layers:
                 ..SpatialTransform::default()
             },
             opacity: 0.72,
+            mosh_send: 0.63,
             speed: 1.0,
             fps: 30.0,
             blend_mode: BlendMode::Difference,
@@ -16601,6 +17009,7 @@ layers:
                 ..SpatialTransform::default()
             },
             opacity: 0.58,
+            mosh_send: 1.0,
             speed: 0.9,
             fps: 24.0,
             blend_mode: BlendMode::Screen,
@@ -16743,6 +17152,7 @@ layers:
                 LayerMorphSnapshot {
                     position: 0,
                     opacity,
+                    mosh_send: Some((0.15_f32 + opacity * 0.65).clamp(0.0, 1.0)),
                     speed,
                     fps: Some(30.0),
                     effects: Some(MorphMasterSnapshot::capture(effects)),
@@ -16753,6 +17163,7 @@ layers:
                 LayerMorphSnapshot {
                     position: 1,
                     opacity: opacity2,
+                    mosh_send: Some((0.85_f32 - opacity2 * 0.55).clamp(0.0, 1.0)),
                     speed: speed2,
                     fps: Some(24.0),
                     effects: Some(MorphMasterSnapshot::capture(effects2)),
@@ -16811,8 +17222,11 @@ layers:
             Routing::new(ModSource::Lfo(0), "layer1_rotation_deg", 0.06),
             Routing::new(ModSource::Midi(0), "layer1_position_y", 0.04),
             Routing::new(ModSource::Midi(0), "layer1_opacity", -0.15),
+            Routing::new(ModSource::Lfo(0), "layer1_mosh_send", -0.2),
             Routing::new(ModSource::Lfo(0), "layer2_scale_x", 0.035),
             Routing::new(ModSource::Midi(0), "layer2_opacity", 0.1),
+            Routing::new(ModSource::Midi(0), "layer2_mosh_send", 0.15),
+            Routing::new(ModSource::Midi(0), "mosh_wipe", 0.4),
             Routing::new(ModSource::Lfo(0), "morph", 0.1),
         ];
         matrix.update_at_beat(beat, delta_seconds);
@@ -16842,6 +17256,7 @@ layers:
         layer.effects = base.effects;
         layer.transform = base.transform;
         layer.opacity = base.opacity;
+        layer.mosh_send = base.mosh_send;
         layer.speed = base.speed;
         layer.fps = base.fps;
         layer.blend_mode = base.blend_mode;
@@ -16878,6 +17293,7 @@ layers:
                 effects: &layer.effects,
                 transform: &layer.transform,
                 opacity: layer.opacity,
+                mosh_send: layer.mosh_send,
                 speed: layer.speed,
                 fps: layer.fps,
                 blend_mode: layer.blend_mode,
@@ -16922,6 +17338,9 @@ layers:
             .find(|value| value.position == 0)
             .unwrap();
         layer.opacity = sampled.opacity;
+        if let Some(value) = sampled.mosh_send {
+            layer.mosh_send = value;
+        }
         layer.speed = sampled.speed;
         if let Some(value) = sampled.fps {
             layer.fps = value;
@@ -16965,6 +17384,7 @@ layers:
                 effects: &layer.effects,
                 transform: &layer.transform,
                 opacity: layer.opacity,
+                mosh_send: layer.mosh_send,
                 speed: layer.speed,
                 fps: layer.fps,
                 blend_mode: layer.blend_mode,
@@ -16982,6 +17402,7 @@ layers:
         layer.effects = base.effects;
         layer.transform = base.transform;
         layer.opacity = base.opacity;
+        layer.mosh_send = base.mosh_send;
         layer.speed = base.speed;
         layer.fps = base.fps;
         layer.blend_mode = base.blend_mode;
@@ -16997,6 +17418,9 @@ layers:
         sampled: crate::morph::LayerMorphSnapshot,
     ) {
         layer.opacity = sampled.opacity;
+        if let Some(value) = sampled.mosh_send {
+            layer.mosh_send = value;
+        }
         layer.speed = sampled.speed;
         if let Some(value) = sampled.fps {
             layer.fps = value;
@@ -17096,6 +17520,7 @@ layers:
                     effects: &layer.effects,
                     transform: &layer.transform,
                     opacity: layer.opacity,
+                    mosh_send: layer.mosh_send,
                     speed: layer.speed,
                     fps: layer.fps,
                     blend_mode: layer.blend_mode,
@@ -17160,6 +17585,7 @@ layers:
                     effects: &layer.effects,
                     transform: &layer.transform,
                     opacity: layer.opacity,
+                    mosh_send: layer.mosh_send,
                     speed: layer.speed,
                     fps: layer.fps,
                     blend_mode: layer.blend_mode,
@@ -17229,6 +17655,7 @@ layers:
             effects: EffectUniforms::default(),
             transform: SpatialTransform::default(),
             opacity: 1.0,
+            mosh_send: 1.0,
             speed: 1.0,
             fps: 30.0,
             blend_mode: BlendMode::Normal,
@@ -17274,6 +17701,7 @@ layers:
                     effects: &effects[index],
                     transform: &transforms[index],
                     opacity: 1.0,
+                    mosh_send: 1.0,
                     speed: 1.0,
                     fps: 30.0,
                     blend_mode: BlendMode::Normal,
@@ -17386,6 +17814,7 @@ layers:
                 effects: &effects,
                 transform: &transform,
                 opacity: 1.0,
+                mosh_send: 1.0,
                 speed: 1.0,
                 fps: 30.0,
                 blend_mode: BlendMode::Normal,
@@ -17643,6 +18072,25 @@ layers:
                 "opacity diverged at {fps} fps"
             );
             assert_eq!(
+                live.layers()[0].mosh_send.to_bits(),
+                export.layers()[0].mosh_send.to_bits(),
+                "Mosh Send diverged at {fps} fps"
+            );
+            assert_ne!(
+                live.layers()[0].mosh_send.to_bits(),
+                parity_layer_base().mosh_send.to_bits(),
+                "fixture failed to exercise Mosh Send Morph + modulation"
+            );
+            assert_eq!(
+                live.temporal().mosh.wipe.to_bits(),
+                export.temporal().mosh.wipe.to_bits(),
+                "Mosh Motion Wipe modulation diverged at {fps} fps"
+            );
+            assert!(
+                live.temporal().mosh.wipe > 0.0,
+                "fixture failed to exercise global Codec-Mosh modulation"
+            );
+            assert_eq!(
                 live.layers()[0].bypass_temporal_fx,
                 export.layers()[0].bypass_temporal_fx,
                 "Temporal bypass diverged at {fps} fps"
@@ -17672,6 +18120,8 @@ layers:
             evidence.extend_from_slice(bytemuck::bytes_of(&live_master));
             evidence.extend_from_slice(bytemuck::bytes_of(&live_layer));
             evidence.extend_from_slice(&live.layers()[0].opacity.to_ne_bytes());
+            evidence.extend_from_slice(&live.layers()[0].mosh_send.to_ne_bytes());
+            evidence.extend_from_slice(&live.temporal().mosh.wipe.to_ne_bytes());
             evidence.extend_from_slice(&live_layer_pixels);
             evidence.extend_from_slice(&live_master_pixels);
             if let Some(expected) = &cross_fps_evidence {
@@ -17906,6 +18356,7 @@ layers:
                         ..SpatialTransform::default()
                     },
                     opacity: 0.38 + index as f32 * 0.055,
+                    mosh_send: 1.0,
                     speed: 1.0,
                     fps: FPS as f32,
                     blend_mode: blends[index % blends.len()],
@@ -17948,6 +18399,7 @@ layers:
                     effects: &layer.effects,
                     transform: &layer.transform,
                     opacity: layer.opacity,
+                    mosh_send: layer.mosh_send,
                     speed: layer.speed,
                     fps: layer.fps,
                     blend_mode: layer.blend_mode,
@@ -18353,27 +18805,6 @@ layers:
         assert_ne!(
             export_selective_topology_signature(&bypass_change),
             signature
-        );
-    }
-
-    #[test]
-    fn advanced_export_ntsc_policy_matches_shared_homogeneous_classification() {
-        assert_eq!(
-            advanced_export_skips_global_ntsc(AdvancedNtscPath::Disabled, 0, 0),
-            Ok(false)
-        );
-        assert_eq!(
-            advanced_export_skips_global_ntsc(AdvancedNtscPath::AllApplying, 2, 0),
-            Ok(false)
-        );
-        assert_eq!(
-            advanced_export_skips_global_ntsc(AdvancedNtscPath::AllBypass, 0, 2),
-            Ok(true)
-        );
-        let error = advanced_export_skips_global_ntsc(AdvancedNtscPath::Mixed, 2, 1).unwrap_err();
-        assert_eq!(
-            error,
-            "advanced composition cannot enter selective NTSC: 2 applying layer(s), 1 bypassing layer(s)"
         );
     }
 
@@ -19076,6 +19507,7 @@ layers:
                 filename: filename.to_string(),
                 source_path: String::new(),
                 opacity: 1.0,
+                mosh_send: 1.0,
                 blend_mode: "normal".to_string(),
                 bypass_master_fx: false,
                 bypass_temporal_fx: false,
@@ -19213,6 +19645,7 @@ mod effects_audit {
                 filename: "audit.mp4".to_string(),
                 source_path: String::new(),
                 opacity: 1.0,
+                mosh_send: 1.0,
                 blend_mode: "normal".to_string(),
                 bypass_master_fx: false,
                 bypass_temporal_fx: false,
@@ -19478,7 +19911,7 @@ mod effects_audit {
     ///   cargo test --release effects_audit -- --ignored --nocapture
     #[test]
     #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
-    fn render_selective_vhs_bypass_pipeline() {
+    fn render_final_program_vhs_over_mixed_master_bypass() {
         assert!(
             std::path::Path::new("videos/audit.mp4").is_file(),
             "create videos/audit.mp4 first"
@@ -19497,7 +19930,14 @@ mod effects_audit {
         ntsc.snow_intensity = 0.45;
         ntsc.edge_wave_enabled = true;
         ntsc.edge_wave_intensity = 4.0;
-        render("selective_vhs_bypass", patch);
+        render("final_program_vhs_mixed_master_bypass", patch);
+
+        let mut all_bypass = base_patch();
+        all_bypass.layers[0].bypass_master_fx = true;
+        let ntsc = all_bypass.ntsc.as_mut().unwrap();
+        ntsc.enabled = true;
+        ntsc.snow_intensity = 0.45;
+        render("final_program_vhs_all_master_bypass", all_bypass);
     }
 
     /// Two stacked clips where the upper layer's Displace reads the lower
@@ -20523,6 +20963,7 @@ mod effects_audit {
 
         let with_mosh = |mosh: CodecMoshParams| {
             let mut patch = base_patch();
+            patch.layers[0].mosh_send = 0.35;
             patch.temporal = Some(crate::patch::TemporalConfig {
                 mosh,
                 ..crate::patch::TemporalConfig::default()
@@ -20538,6 +20979,9 @@ mod effects_audit {
             rate: 1.0,
             bitrate_starve: 0.6,
             resync: 0.2,
+            wipe: 0.8,
+            smear: 0.65,
+            trail: 0.9,
             recycle: false,
         };
         render("codec_mosh", with_mosh(authored));
@@ -20560,7 +21004,7 @@ mod effects_audit {
             &std::fs::read("renders/audit_codec_mosh.mp4.motion.json").unwrap(),
         )
         .unwrap();
-        assert_eq!(sidecar["schema_version"], 6);
+        assert_eq!(sidecar["schema_version"], 7);
         let mosh = &sidecar["codec_mosh"];
         assert!(
             mosh["encoder"]
@@ -20568,6 +21012,35 @@ mod effects_audit {
                 .is_some_and(|encoder| encoder.starts_with("mpeg4/avcodec-")),
             "{mosh}"
         );
+        let close = |value: &serde_json::Value, expected: f32| {
+            let observed = value.as_f64().expect("sidecar scalar") as f32;
+            assert!(
+                (observed - expected).abs() < 1.0e-6,
+                "expected {expected}, observed {observed} in {mosh}"
+            );
+        };
+        close(&mosh["wipe"], authored.wipe);
+        close(&mosh["smear"], authored.smear);
+        close(&mosh["trail"], authored.trail);
+        assert!(mosh["observed"]["accepted_frames"]
+            .as_u64()
+            .is_some_and(|frames| frames > 0));
+        for (field, expected) in [
+            ("wipe", authored.wipe),
+            ("smear", authored.smear),
+            ("trail", authored.trail),
+        ] {
+            close(&mosh["observed"]["min"][field], expected);
+            close(&mosh["observed"]["max"][field], expected);
+        }
+        assert_eq!(mosh["observed"]["recycle_false_seen"], true);
+        let sends = mosh["layer_sends"].as_array().expect("layer-send evidence");
+        assert_eq!(sends.len(), 1);
+        close(&sends[0]["authored"], 0.35);
+        close(&sends[0]["observed_min"], 0.35);
+        close(&sends[0]["observed_max"], 0.35);
+        assert_eq!(sends[0]["entered_codec_mosh"], true);
+        assert_eq!(mosh["layer_sends_truncated"], false);
         let clean: serde_json::Value = serde_json::from_slice(
             &std::fs::read("renders/audit_codec_mosh_clean.mp4.motion.json").unwrap(),
         )
@@ -21389,6 +21862,22 @@ mod effects_audit {
             crate::mixing_boundary::WipePattern::Circle
         );
         assert!((gesture_canvas.radius - 0.9).abs() < 1.0e-6);
+        assert_eq!(
+            export_replayed_layer_mosh_send(&Raw::Continuous(0.375)),
+            Some(0.375)
+        );
+        assert_eq!(
+            export_replayed_layer_mosh_send(&Raw::Continuous(-4.0)),
+            Some(0.0)
+        );
+        assert_eq!(
+            export_replayed_layer_mosh_send(&Raw::Continuous(f32::NAN)),
+            Some(1.0)
+        );
+        assert_eq!(
+            export_replayed_layer_mosh_send(&Raw::Token("0.5".to_string())),
+            None
+        );
     }
 
     /// B10's labeled export case: the new sources drive the picture through

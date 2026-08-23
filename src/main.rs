@@ -838,14 +838,14 @@ fn stage_health_gpu_budget(
     accepted_creative_bytes: Option<u64>,
     accepted_motion_bytes: Option<u64>,
     stage_presenter_bytes: Option<u64>,
-    selective_ntsc_bytes: Option<u64>,
+    mosh_influence_bytes: Option<u64>,
     stage_presenter_limit: Option<u64>,
 ) -> (Option<u64>, Option<u64>) {
     let used = accepted_creative_bytes.map(|creative| {
         creative
             .saturating_add(accepted_motion_bytes.unwrap_or(0))
             .saturating_add(stage_presenter_bytes.unwrap_or(0))
-            .saturating_add(selective_ntsc_bytes.unwrap_or(0))
+            .saturating_add(mosh_influence_bytes.unwrap_or(0))
     });
     // MAX_CREATIVE_GPU_BYTES already caps the combined creative + Motion
     // allocation in the unified planner. Motion's own 128 MiB ceiling remains
@@ -853,7 +853,7 @@ fn stage_health_gpu_budget(
     let limit = stage_presenter_limit.map(|stage| {
         stage
             .saturating_add(visual_rack::MAX_CREATIVE_GPU_BYTES)
-            .saturating_add(ntsc::MAX_SELECTIVE_NTSC_LIVE_BYTES)
+            .saturating_add(renderer::state::MAX_MOSH_INFLUENCE_GPU_BYTES)
     });
     (used, limit)
 }
@@ -1430,6 +1430,17 @@ enum LiveNtscPath {
     SelectivePerLayer,
 }
 
+/// VHS is a final-program audience finish. Per-layer Master bypass has already
+/// been resolved by the GPU compositor and never changes this single bounded
+/// CPU route; blackout remains the absolute downstream cut.
+fn final_program_ntsc_path(enabled: bool, blackout: bool) -> LiveNtscPath {
+    if enabled && !blackout {
+        LiveNtscPath::LegacyGlobal
+    } else {
+        LiveNtscPath::Disabled
+    }
+}
+
 fn is_selective_path_edge(previous: LiveNtscPath, requested: LiveNtscPath) -> bool {
     previous != requested
         && (previous == LiveNtscPath::SelectivePerLayer
@@ -1504,6 +1515,7 @@ fn creative_route_diagnostic_status(
     })
 }
 
+#[cfg(test)]
 fn selective_ntsc_topology_signature(evaluated: &EvaluatedFramePlan) -> u64 {
     // Explicit FNV-1a keeps this stable across process/library versions. The
     // signature contains only topology/membership facts, not continuously
@@ -2045,8 +2057,8 @@ pub(crate) fn apply_temporal_wire_edit(
                 p.melt.creep = (n as f32).clamp(0.0, 1.0);
             }
         }
-        // The B5 codec mosh's eight continuous values plus the
-        // discrete recycle law.
+        // The B5 codec mosh's continuous codec and motion-wake values plus
+        // the discrete recycle law.
         "mosh_amount" => {
             if let Some(n) = value.as_f64() {
                 p.mosh.amount = (n as f32).clamp(0.0, 1.0);
@@ -2085,6 +2097,21 @@ pub(crate) fn apply_temporal_wire_edit(
         "mosh_resync" => {
             if let Some(n) = value.as_f64() {
                 p.mosh.resync = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "mosh_wipe" => {
+            if let Some(n) = value.as_f64() {
+                p.mosh.wipe = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "mosh_smear" => {
+            if let Some(n) = value.as_f64() {
+                p.mosh.smear = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "mosh_trail" => {
+            if let Some(n) = value.as_f64() {
+                p.mosh.trail = (n as f32).clamp(0.0, 1.0);
             }
         }
         "mosh_recycle" => {
@@ -3056,6 +3083,7 @@ const fn creative_commit_impact(
 struct StagedLayerLook {
     layer_id: image_routing::StableLayerId,
     opacity: f32,
+    mosh_send: f32,
     speed: f32,
     fps: f32,
     blend_mode: layers::BlendMode,
@@ -3090,6 +3118,7 @@ impl StagedLayerLook {
         Self {
             layer_id: layer.stable_layer_id(),
             opacity: layer.opacity,
+            mosh_send: layer.mosh_send,
             speed: layer.speed,
             fps: layer.fps,
             blend_mode: layer.blend_mode,
@@ -3108,6 +3137,7 @@ impl StagedLayerLook {
     fn install(self, layer: &mut Layer) {
         debug_assert_eq!(self.layer_id, layer.stable_layer_id());
         layer.opacity = self.opacity;
+        layer.mosh_send = self.mosh_send;
         layer.speed = self.speed;
         layer.fps = self.fps;
         layer.blend_mode = self.blend_mode;
@@ -3125,15 +3155,13 @@ impl StagedLayerLook {
     }
 }
 
-/// Refuse authored states whose safety depends on a layer remaining dormant.
+/// Refuse authored states whose master ordering cannot preserve bypass.
 /// Visibility, transport, bus weights, and modulation can all make a layer
-/// contribute on a later frame without another authoring transaction. Master
-/// ordering and the currently unsupported mixed selective-VHS path therefore
-/// validate against every authored layer, while the frame planner remains free
-/// to skip real work for non-contributors.
+/// contribute on a later frame without another authoring transaction, so this
+/// validates every authored bypass even though the frame planner may skip work
+/// for non-contributors.
 fn validate_master_bypass_capability(
     master_rack: &RuntimeVisualRack,
-    ntsc_enabled: bool,
     layers: &[(image_routing::StableLayerId, bool)],
 ) -> Result<(), String> {
     let bypassing = layers
@@ -3160,13 +3188,6 @@ fn validate_master_bypass_capability(
         }
     }
 
-    let inheriting = layers.len().saturating_sub(bypassing.len());
-    if ntsc_enabled && inheriting != 0 {
-        return Err(format!(
-            "mixed selective VHS is not yet supported: {inheriting} inheriting layer(s), {} bypassing layer(s)",
-            bypassing.len()
-        ));
-    }
     Ok(())
 }
 
@@ -4769,12 +4790,13 @@ struct App {
     /// The mosh path's admission/stale counters, on the NTSC counter law.
     mosh_live_metrics: ntsc::NtscPathMetrics,
     /// Process-lifetime diagnostics stay path-specific because global and
-    /// selective VHS shed work at different bounded pipeline stages.
+    /// retained selective work shed at different bounded pipeline stages.
     ntsc_live_metrics: ntsc::LiveNtscMetrics,
     // Last globally processed NTSC frame presented while the next CPU job runs.
     ntsc_presented: Option<(u64, Vec<u8>)>,
     ntsc_pipeline_path: LiveNtscPath,
-    // Allocated only when a contributing bypass layer requires per-layer VHS.
+    // Retained for safe teardown of a pre-v1.5 selective generation; new
+    // authored bypass populations never allocate this worker.
     selective_ntsc_worker: Option<ntsc::SelectiveNtscWorker>,
     // Program time accumulated while the asynchronous selective worker is
     // producing the next clean pre-temporal composite.
@@ -5841,10 +5863,9 @@ impl App {
         accepted
     }
 
-    /// VHS remains composition-global until the selective worker can process
-    /// mixed inheriting/bypassing layers. Validate an edited candidate before
-    /// publication, and keep Morph ownership inside the same rollback seam so
-    /// enabling VHS can never create a later frame-plan freeze.
+    /// Validate the final-program VHS route before publication. VHS is an
+    /// audience-domain finish independent of per-layer Master bypass, so mixed
+    /// bypass populations do not require a selective compositor.
     fn apply_ntsc_param_action(&mut self, param: &str, value: &serde_json::Value) -> bool {
         if !Self::valid_ntsc_edit(param, value) {
             return false;
@@ -6082,12 +6103,8 @@ impl App {
             .iter()
             .map(|layer| (layer.layer_id, layer.bypass_master_fx))
             .collect::<Vec<_>>();
-        validate_master_bypass_capability(
-            &staged.master_rack,
-            ntsc_params.enabled,
-            &bypass_capabilities,
-        )
-        .map_err(|error| format!("master bypass preflight failed: {error}"))?;
+        validate_master_bypass_capability(&staged.master_rack, &bypass_capabilities)
+            .map_err(|error| format!("master bypass preflight failed: {error}"))?;
         for (layer_id, rack) in &staged.layer_racks {
             if !live_ids.contains(layer_id) {
                 return Err(format!("rack references absent layer {}", layer_id.get()));
@@ -6154,6 +6171,7 @@ impl App {
                     effects: &layer.effects,
                     transform: &layer.transform,
                     opacity: layer.opacity,
+                    mosh_send: layer.mosh_send,
                     speed: layer.speed,
                     fps: layer.fps,
                     blend_mode: layer.blend_mode,
@@ -7198,11 +7216,7 @@ impl App {
                 .map(|existing| (existing.stable_layer_id(), existing.bypass_master_fx))
                 .collect::<Vec<_>>();
             capabilities.push((layer_id, layer.bypass_master_fx));
-            validate_master_bypass_capability(
-                &app.master_rack,
-                app.ntsc_params.enabled,
-                &capabilities,
-            )
+            validate_master_bypass_capability(&app.master_rack, &capabilities)
         };
         // Refuse an already-obvious incompatibility before an engaged Morph
         // is touched. A second check below covers the sampled Morph world.
@@ -9413,6 +9427,10 @@ impl App {
             &mut staged_mod_matrix,
             &mut staged_temporal,
         )?;
+        let bypass_capabilities = rebuilt
+            .iter()
+            .map(|layer| (layer.stable_layer_id(), layer.bypass_master_fx))
+            .collect::<Vec<_>>();
         if rebuilt.iter().any(|layer| layer.bypass_temporal_fx) {
             let staged_visuals = rebuilt
                 .iter()
@@ -9446,16 +9464,8 @@ impl App {
             )
             .map_err(|error| format!("loaded patch Temporal-bypass preflight failed: {error}"))?;
         }
-        let bypass_capabilities = rebuilt
-            .iter()
-            .map(|layer| (layer.stable_layer_id(), layer.bypass_master_fx))
-            .collect::<Vec<_>>();
-        validate_master_bypass_capability(
-            &staged_master_rack,
-            staged_ntsc.enabled,
-            &bypass_capabilities,
-        )
-        .map_err(|error| format!("loaded patch master bypass preflight failed: {error}"))?;
+        validate_master_bypass_capability(&staged_master_rack, &bypass_capabilities)
+            .map_err(|error| format!("loaded patch master bypass preflight failed: {error}"))?;
         for (layer, rack) in rebuilt.iter_mut().zip(staged_layer_racks) {
             layer.rack = rack;
         }
@@ -9704,6 +9714,7 @@ impl App {
             } if matches!(
                 param.as_str(),
                 "opacity"
+                    | "mosh_send"
                     | "blend_mode"
                     | "visible"
                     | "bypass_master_fx"
@@ -11733,7 +11744,10 @@ impl App {
             | "mosh_shuffle"
             | "mosh_rate"
             | "mosh_bitrate_starve"
-            | "mosh_resync" => value
+            | "mosh_resync"
+            | "mosh_wipe"
+            | "mosh_smear"
+            | "mosh_trail" => value
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
             "mosh_recycle" => value.is_boolean(),
@@ -11901,6 +11915,7 @@ impl App {
             }
             Control::LayerParam { param, .. } => match param.as_str() {
                 "opacity" => unit_target("layer1_opacity"),
+                "mosh_send" => unit_target("layer1_mosh_send"),
                 "speed" => unit_target("layer1_speed"),
                 "fps" => unit_target("layer1_fps"),
                 "blend_mode" => discrete(
@@ -12301,6 +12316,7 @@ impl App {
         use morph::LayerMorphControl as Control;
         match param {
             "opacity" if value.as_f64().is_some_and(f64::is_finite) => Some(Control::Opacity),
+            "mosh_send" if value.as_f64().is_some_and(f64::is_finite) => Some(Control::MoshSend),
             "speed" if value.as_f64().is_some_and(f64::is_finite) => Some(Control::Speed),
             "fps" if Self::finite_f32_edit(value) => Some(Control::Fps),
             "blend_mode" if Self::blend_mode_edit(value).is_some() => Some(Control::BlendMode),
@@ -12462,6 +12478,9 @@ impl App {
                         || self
                             .morph
                             .controls_layer_field(resolved, morph::LayerMorphControl::Motion)
+                        || self
+                            .morph
+                            .controls_layer_field(resolved, morph::LayerMorphControl::MoshSend)
                 }),
             WebAction::SetLayerVisibility {
                 index, layer_id, ..
@@ -20492,6 +20511,11 @@ impl App {
                                 layer.opacity = layers::clamp_layer_opacity(v as f32);
                             }
                         }
+                        "mosh_send" => {
+                            if let Some(v) = value.as_f64() {
+                                layer.mosh_send = layers::clamp_layer_mosh_send(v as f32);
+                            }
+                        }
                         "speed" => {
                             if let Some(v) = value.as_f64() {
                                 layer.speed = layers::clamp_layer_speed(v as f32);
@@ -20671,6 +20695,7 @@ impl App {
                         self.layers[index].motion != motion::MotionParams::default();
                     self.layers[index].effects.reset();
                     self.layers[index].reset_motion();
+                    self.layers[index].reset_mosh_send();
                     if motion_changed {
                         self.clear_motion_memory();
                         self.bump_composition_revision();
@@ -21561,15 +21586,15 @@ impl App {
             renderer::stage_map::StagePresenterLimits::for_device(&renderer.device)
                 .max_total_gpu_bytes
         });
-        let ntsc_gpu_bytes = self
+        let mosh_influence_gpu_bytes = self
             .renderer
             .as_ref()
-            .and_then(Renderer::selective_ntsc_allocation_bytes);
+            .and_then(Renderer::mosh_influence_texture_bytes);
         let (planned_gpu_bytes, planned_gpu_limit) = stage_health_gpu_budget(
             self.accepted_creative_resource_bytes,
             self.accepted_motion_resource_bytes,
             stage_gpu_bytes,
-            ntsc_gpu_bytes,
+            mosh_influence_gpu_bytes,
             stage_gpu_limit,
         );
         let cached_media_bytes = self
@@ -21600,7 +21625,7 @@ impl App {
                         unit: "bytes",
                         used: planned_gpu_bytes,
                         limit: planned_gpu_limit,
-                        detail: "accepted Advanced creative/motion plan plus selective NTSC and StageMap presenter (fixed renderer baseline is reported separately by precision evidence)",
+                        detail: "accepted Advanced creative/motion plan plus lazy Codec-Mosh layer-send textures and StageMap presenter (fixed renderer baseline is reported separately by precision evidence)",
                     },
                     media: stage_health::StageBudgetInput {
                         unit: "bytes",
@@ -21610,9 +21635,9 @@ impl App {
                     },
                     ntsc: stage_health::StageBudgetInput {
                         unit: "bytes",
-                        used: ntsc_gpu_bytes,
-                        limit: Some(ntsc::MAX_SELECTIVE_NTSC_LIVE_BYTES),
-                        detail: "selective VHS ceiling",
+                        used: mosh_influence_gpu_bytes,
+                        limit: Some(renderer::state::MAX_MOSH_INFLUENCE_GPU_BYTES),
+                        detail: "final-program VHS reuses the bounded audience readback; this optional budget is the lazy Codec-Mosh layer-send texture payload",
                     },
                     motion: stage_health::StageBudgetInput {
                         unit: "bytes",
@@ -21688,7 +21713,14 @@ impl App {
             selective: self.ntsc_live_metrics.selective,
             busy: match self.ntsc_pipeline_path {
                 LiveNtscPath::Disabled => false,
-                LiveNtscPath::LegacyGlobal => self.ntsc_worker.is_busy(),
+                LiveNtscPath::LegacyGlobal => {
+                    self.ntsc_worker.is_busy()
+                        || (self.mosh_interval_active
+                            && self
+                                .mosh_worker
+                                .as_ref()
+                                .is_some_and(codec_mosh::MoshWorker::is_busy))
+                }
                 LiveNtscPath::SelectivePerLayer => {
                     self.selective_ntsc_worker
                         .as_ref()
@@ -21701,6 +21733,19 @@ impl App {
             },
         };
         ntsc_snapshot.error = self.ntsc_worker.error().to_string();
+        if self.ntsc_pipeline_path == LiveNtscPath::LegacyGlobal && self.mosh_interval_active {
+            if let Some(error) = self
+                .mosh_worker
+                .as_ref()
+                .map(codec_mosh::MoshWorker::error)
+                .filter(|error| !error.is_empty())
+            {
+                if !ntsc_snapshot.error.is_empty() {
+                    ntsc_snapshot.error.push_str("; ");
+                }
+                ntsc_snapshot.error.push_str(error);
+            }
+        }
         if let Some(error) = self
             .selective_ntsc_worker
             .as_ref()
@@ -21984,6 +22029,7 @@ impl App {
                         visible: layer.visible,
                         paused: layer.paused,
                         opacity: layer.opacity,
+                        mosh_send: layer.mosh_send,
                         speed: layer.speed,
                         fps: layer.fps,
                         blend_mode: layer.blend_mode.key().to_string(),
@@ -24078,6 +24124,7 @@ impl ApplicationHandler for App {
                                     &layer.effects,
                                     &layer.transform,
                                     layer.opacity,
+                                    layer.mosh_send,
                                     proxy_speed,
                                     proxy_fps,
                                 ),
@@ -24321,6 +24368,7 @@ impl ApplicationHandler for App {
                                 effects: &layer.effects,
                                 transform: &layer.transform,
                                 opacity: layer.opacity,
+                                mosh_send: layer.mosh_send,
                                 speed: layer.speed,
                                 fps: layer.fps,
                                 blend_mode: layer.blend_mode,
@@ -24920,6 +24968,26 @@ impl ApplicationHandler for App {
                         }
                     }
 
+                    // Layer Mosh sends are a compact programme-space control
+                    // matte built from this same immutable frame sample. It is
+                    // packed into the existing RGBA readback only when armed;
+                    // the creative picture, queue depth, codec count, and
+                    // asynchronous latency are unchanged.
+                    if let Err(error) = renderer.encode_mosh_influence_frame(
+                        &mut encoder,
+                        &frame_resources,
+                        &evaluated_frame,
+                        mosh_active,
+                    ) {
+                        let diagnostic = format!(
+                            "Layer Codec-Mosh influence unavailable; using full-program send: {error}"
+                        );
+                        if diagnostic != self.output_error {
+                            log::error!("{diagnostic}");
+                            self.output_error = diagnostic;
+                        }
+                    }
+
                     // Prepare and encode Advanced only into executor-owned
                     // RGBA16F surfaces plus compat slot0. Slot2 (the accepted
                     // audience) remains untouched until the entire advanced
@@ -25195,45 +25263,12 @@ impl ApplicationHandler for App {
                             self.blackout_presented = false;
                         }
 
-                        let legacy_exact_frame = matches!(
-                        evaluated_creative.as_ref(),
-                        Some(
-                            evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::LegacyExact(_)
-                        )
-                    );
-                        let selective_required = legacy_exact_frame
-                            && mod_ntsc.enabled
-                            && !self.blackout
-                            && ntsc::selective_ntsc_required(live_selective_ntsc_descriptors(
-                                &evaluated_frame,
-                            ));
-                        let selective_contributing_layers = evaluated_frame
-                            .layers()
-                            .iter()
-                            .filter(|layer| {
-                                layer.visible && layer.opacity.is_finite() && layer.opacity > 0.0
-                            })
-                            .count();
-                        // Reject unsupported topology before the rebuild is
-                        // allowed to clear the audience. The same preflight also
-                        // owns memory admission, so every policy failure follows
-                        // one visible hold/skip path.
-                        let selective_policy_error = selective_required
-                            .then(|| {
-                                renderer::compositor::validate_selective_matte_topology(
-                                    evaluated_frame.image_routing().is_active(),
-                                )?;
-                                let memory = ntsc::validate_selective_ntsc_live_memory(
-                                    renderer.output_width,
-                                    renderer.output_height,
-                                    selective_contributing_layers,
-                                )?;
-                                ntsc::validate_selective_ntsc_gpu_staging_limit(
-                                    memory,
-                                    renderer.device.limits().max_buffer_size,
-                                )
-                            })
-                            .and_then(Result::err);
+                        // v1.5 routes VHS once over the finished programme. The
+                        // selective machinery remains available for retained
+                        // generation cleanup, but no authored bypass population
+                        // selects it or pays its per-layer readback/CPU cost.
+                        let selective_required = false;
+                        let selective_policy_error: Option<String> = None;
                         let next_runtime_error = selective_policy_error.clone().unwrap_or_default();
                         if next_runtime_error != self.selective_ntsc_runtime_error {
                             if !next_runtime_error.is_empty() {
@@ -25241,33 +25276,15 @@ impl ApplicationHandler for App {
                             }
                             self.selective_ntsc_runtime_error = next_runtime_error;
                         }
-                        let requested_ntsc_path = match evaluated_creative.as_ref() {
-                        Some(
-                            evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::Advanced(
-                                plan,
-                            ),
-                        ) if mod_ntsc.enabled && !self.blackout => match plan.ntsc_path() {
-                            evaluated_frame::evaluated_composition::AdvancedNtscPath::AllApplying => {
-                                LiveNtscPath::LegacyGlobal
-                            }
-                            evaluated_frame::evaluated_composition::AdvancedNtscPath::Disabled
-                            | evaluated_frame::evaluated_composition::AdvancedNtscPath::AllBypass => {
-                                LiveNtscPath::Disabled
-                            }
-                            evaluated_frame::evaluated_composition::AdvancedNtscPath::Mixed => {
-                                unreachable!("mixed Advanced NTSC was rejected before encoding")
-                            }
-                        },
-                        _ if !mod_ntsc.enabled || self.blackout => LiveNtscPath::Disabled,
-                        _ if selective_required => LiveNtscPath::SelectivePerLayer,
-                        _ => LiveNtscPath::LegacyGlobal,
-                    };
+                        let requested_ntsc_path =
+                            final_program_ntsc_path(mod_ntsc.enabled, self.blackout);
                         let mut selective_audience_sample = None;
                         let ntsc_path_changed = requested_ntsc_path != self.ntsc_pipeline_path;
                         let selective_edge =
                             is_selective_path_edge(self.ntsc_pipeline_path, requested_ntsc_path);
-                        let topology_signature =
-                            selective_ntsc_topology_signature(&evaluated_frame);
+                        // Final-program VHS is topology-independent, so avoid
+                        // the former O(layer-count) selective hash every frame.
+                        let topology_signature = self.selective_topology_signature;
                         let selective_topology_changed = selective_required
                             && topology_signature != self.selective_topology_signature;
                         let selective_rebuild = selective_edge || selective_topology_changed;
@@ -25351,9 +25368,9 @@ impl ApplicationHandler for App {
                             }
                         }
 
-                        // The established global pipeline remains literally the
-                        // same command order unless a visible, positive-opacity
-                        // bypass layer requires selective VHS.
+                        // v1.5's direct final-program route owns every authored
+                        // bypass population. The retained selective arm below
+                        // exists only to drain/retire an older in-memory path.
                         if !selective_required {
                             if direct_path_may_replace_selective_hold(
                                 program_transport_paused,
@@ -25390,6 +25407,7 @@ impl ApplicationHandler for App {
                                             renderer.render_opaque_output(&mut encoder);
                                             let metadata = codec_mosh::MoshFrameMetadata {
                                                 params: mod_temporal.mosh.sanitized(),
+                                                use_influence_alpha: false,
                                                 ordinal: ntsc::reference_frame_for_time(
                                                     elapsed_duration.as_secs_f64(),
                                                 )
@@ -25554,6 +25572,7 @@ impl ApplicationHandler for App {
                                                 renderer.render_opaque_output(&mut encoder);
                                                 let metadata = codec_mosh::MoshFrameMetadata {
                                                     params: mod_temporal.mosh.sanitized(),
+                                                    use_influence_alpha: false,
                                                     ordinal: ntsc::reference_frame_for_time(
                                                         elapsed_duration.as_secs_f64(),
                                                     )
@@ -26308,6 +26327,13 @@ impl ApplicationHandler for App {
                                 if frame.mosh_metadata.is_some() {
                                     self.mosh_live_metrics.record_stale();
                                 }
+                                if frame
+                                    .mosh_metadata
+                                    .as_ref()
+                                    .is_some_and(|metadata| metadata.ntsc.is_some())
+                                {
+                                    self.ntsc_live_metrics.global.record_stale();
+                                }
                                 if frame.selective_sample.is_some() {
                                     self.ntsc_live_metrics.selective.record_stale();
                                 }
@@ -26339,6 +26365,7 @@ impl ApplicationHandler for App {
                                     self.selective_hold_spout_readback_epoch = None;
                                 }
                             } else if let Some(metadata) = frame.mosh_metadata {
+                                let carries_ntsc = metadata.ntsc.is_some();
                                 if !mosh_sample_is_current(
                                     frame.epoch,
                                     metadata.generation,
@@ -26347,14 +26374,18 @@ impl ApplicationHandler for App {
                                     mosh_active,
                                 ) {
                                     self.mosh_live_metrics.record_stale();
+                                    if carries_ntsc {
+                                        self.ntsc_live_metrics.global.record_stale();
+                                    }
                                 } else {
                                     // B5: the mosh eats the finished programme.
-                                    // On the global-VHS path the metadata carries
-                                    // the sampled NTSC params and the worker runs
-                                    // the VHS kernel first in the same hop, so
+                                    // On the final-program VHS path the metadata
+                                    // carries the sampled NTSC params and the
+                                    // worker runs VHS after mosh in the same hop, so
                                     // the NTSC worker is deliberately unfed while
-                                    // the mosh is armed — one admission, one
-                                    // frame of latency, the exact offline order.
+                                    // the mosh is armed — one latest-only admission,
+                                    // no second queue, and the exact offline order;
+                                    // completion is host-dependent.
                                     let worker = self
                                         .mosh_worker
                                         .get_or_insert_with(codec_mosh::MoshWorker::new);
@@ -26366,6 +26397,9 @@ impl ApplicationHandler for App {
                                         frame.epoch,
                                     );
                                     self.mosh_live_metrics.record_admission(outcome);
+                                    if carries_ntsc {
+                                        self.ntsc_live_metrics.global.record_admission(outcome);
+                                    }
                                 }
                             } else if ntsc_path == LiveNtscPath::LegacyGlobal {
                                 if let Some(metadata) = frame.ntsc_metadata {
@@ -26439,6 +26473,7 @@ impl ApplicationHandler for App {
                         // stage still being armed this frame.
                         if let Some(worker) = self.mosh_worker.as_mut() {
                             if let Some(processed) = worker.try_recv() {
+                                let ntsc_processed = processed.ntsc_processed;
                                 if mosh_sample_is_current(
                                     processed.epoch,
                                     processed.generation,
@@ -26461,6 +26496,9 @@ impl ApplicationHandler for App {
                                     ));
                                 } else {
                                     self.mosh_live_metrics.record_stale();
+                                    if ntsc_processed {
+                                        self.ntsc_live_metrics.global.record_stale();
+                                    }
                                 }
                             }
                         }
@@ -26492,6 +26530,7 @@ impl ApplicationHandler for App {
                             let mosh_metadata =
                                 mosh_active.then(|| codec_mosh::MoshFrameMetadata {
                                     params: mod_temporal.mosh.sanitized(),
+                                    use_influence_alpha: false,
                                     ordinal: ntsc::reference_frame_for_time(
                                         elapsed_duration.as_secs_f64(),
                                     ) as u64,
@@ -26507,7 +26546,7 @@ impl ApplicationHandler for App {
                             ) {
                                 Ok(slot) => slot,
                                 Err(error) => {
-                                    if ntsc_path == LiveNtscPath::LegacyGlobal && !mosh_active {
+                                    if ntsc_path == LiveNtscPath::LegacyGlobal {
                                         self.ntsc_live_metrics
                                             .global
                                             .record_admission(ntsc::NtscSubmitOutcome::Unavailable);
@@ -26557,10 +26596,10 @@ impl ApplicationHandler for App {
                                 }
                             }
                         }
-                        // The mosh replacement sits downstream of the VHS one
-                        // and owns the write while armed: until its first
-                        // result lands the audience keeps the clean composite
-                        // rather than a frozen VHS-only frame.
+                        // The combined replacement contains mosh followed by
+                        // final-program VHS and owns the write while armed.
+                        // Until its first result lands the audience keeps the
+                        // clean composite rather than a partly processed frame.
                         let mut mosh_replacement_written = false;
                         if mosh_active
                             && (!temporal_bypass_overlay_active || temporal_frame_accepted)
@@ -27473,11 +27512,10 @@ mod app_state_tests {
     }
 
     #[test]
-    fn authored_bypass_capability_closes_dormant_master_and_vhs_freeze_paths() {
+    fn authored_bypass_capability_is_independent_of_final_program_vhs() {
         use visual_rack::{NodeId, RuntimeVisualNode, RuntimeVisualNodeKind, RuntimeVisualRack};
 
         let mixed = [(stable_layer(1), true), (stable_layer(2), false)];
-        let all_bypass = [(stable_layer(1), true), (stable_layer(2), true)];
         let mut canonical_then_global =
             RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
         canonical_then_global
@@ -27486,16 +27524,10 @@ mod app_state_tests {
             ))
             .unwrap();
 
-        // A later global custom segment is compatible with canonical bypass,
-        // but VHS remains blocked for a mixed authored population even if the
-        // bypassing layer happens to be hidden or zero-weight this frame.
-        assert!(validate_master_bypass_capability(&canonical_then_global, false, &mixed).is_ok());
-        let error =
-            validate_master_bypass_capability(&canonical_then_global, true, &mixed).unwrap_err();
-        assert!(error.contains("mixed selective VHS is not yet supported"));
-        assert!(
-            validate_master_bypass_capability(&canonical_then_global, true, &all_bypass).is_ok()
-        );
+        // A later global custom segment is compatible with canonical bypass.
+        // VHS is a final-program stage and therefore adds no per-layer bypass
+        // restriction, including for a mixed authored population.
+        assert!(validate_master_bypass_capability(&canonical_then_global, &mixed).is_ok());
 
         let global_then_canonical = RuntimeVisualRack::try_from_parts(
             vec![
@@ -27515,15 +27547,12 @@ mod app_state_tests {
             Some(4),
         )
         .unwrap();
-        let error =
-            validate_master_bypass_capability(&global_then_canonical, false, &mixed).unwrap_err();
+        let error = validate_master_bypass_capability(&global_then_canonical, &mixed).unwrap_err();
         assert!(error.contains("advanced master ordering"));
 
         // No bypass capability means neither restriction applies.
         let inheriting = [(stable_layer(1), false), (stable_layer(2), false)];
-        assert!(
-            validate_master_bypass_capability(&global_then_canonical, true, &inheriting).is_ok()
-        );
+        assert!(validate_master_bypass_capability(&global_then_canonical, &inheriting).is_ok());
     }
 
     #[test]
@@ -27710,6 +27739,7 @@ mod app_state_tests {
                 effects: &effects,
                 transform: &transform,
                 opacity: 1.0,
+                mosh_send: 1.0,
                 speed: 1.0,
                 fps: 30.0,
                 blend_mode: layers::BlendMode::Normal,
@@ -30578,7 +30608,7 @@ mod app_state_tests {
             Some(
                 50_u64
                     .saturating_add(visual_rack::MAX_CREATIVE_GPU_BYTES)
-                    .saturating_add(ntsc::MAX_SELECTIVE_NTSC_LIVE_BYTES)
+                    .saturating_add(renderer::state::MAX_MOSH_INFLUENCE_GPU_BYTES)
             )
         );
 
@@ -30905,6 +30935,7 @@ mod app_state_tests {
                     effects: &layer_effects,
                     transform: &transform,
                     opacity: 1.0,
+                    mosh_send: 1.0,
                     speed: 1.0,
                     fps: 30.0,
                     blend_mode: layers::BlendMode::Normal,
@@ -33293,6 +33324,27 @@ mod app_state_tests {
             &action,
             &legacy_look_scope(vec![18], false, false),
         ));
+    }
+
+    #[test]
+    fn layer_mosh_send_uses_one_unit_performance_law_and_continuous_morph_control() {
+        use performance_track::{PerformanceControl, PerformanceValueLaw};
+
+        assert_eq!(
+            App::layer_param_morph_control("mosh_send", &serde_json::json!(0.375)),
+            Some(morph::LayerMorphControl::MoshSend)
+        );
+        assert_eq!(
+            App::layer_param_morph_control("mosh_send", &serde_json::json!("0.375")),
+            None
+        );
+        assert_eq!(
+            App::performance_value_law_for(&PerformanceControl::LayerParam {
+                layer: 0,
+                param: "mosh_send".to_string(),
+            }),
+            Some(PerformanceValueLaw::Unit { min: 0.0, max: 1.0 })
+        );
     }
 
     #[test]

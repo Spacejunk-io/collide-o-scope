@@ -10,11 +10,11 @@ use std::fmt;
 
 use crate::composition::{BusAssignment, RuntimeRootItem};
 use crate::evaluated_frame::evaluated_composition::{
-    AdvancedCompositionPlan, AdvancedNtscPath, CompositePrefix, EvaluatedCompositionPlan,
-    EvaluatedCorruptionKind, EvaluatedCorruptionPlan, EvaluatedRefreshGardenSignalPlan,
-    EvaluatedScanProcessorPlan, EvaluatedScopeExecution, EvaluatedScopeStep, EvaluatedStudyPlan,
-    EvaluatedSymmetryFieldPlan, ImageTapConsumer, LegacyCanonicalApplication,
-    MotionFieldAttachment, PlannedImageSource, PlannedImageTap,
+    AdvancedCompositionPlan, CompositePrefix, EvaluatedCompositionPlan, EvaluatedCorruptionKind,
+    EvaluatedCorruptionPlan, EvaluatedRefreshGardenSignalPlan, EvaluatedScanProcessorPlan,
+    EvaluatedScopeExecution, EvaluatedScopeStep, EvaluatedStudyPlan, EvaluatedSymmetryFieldPlan,
+    ImageTapConsumer, LegacyCanonicalApplication, MotionFieldAttachment, PlannedImageSource,
+    PlannedImageTap,
 };
 use crate::image_routing::{LayerImageStage, StableLayerId};
 use crate::layers::BlendMode;
@@ -182,10 +182,6 @@ pub(crate) enum CompositionGpuError {
         requested: [u32; 2],
         limit: u32,
     },
-    UnsupportedSelectiveNtsc {
-        applying: usize,
-        bypassing: usize,
-    },
     DuplicateSource(StableLayerId),
     MissingSource(StableLayerId),
     UnknownSource(StableLayerId),
@@ -224,13 +220,6 @@ impl fmt::Display for CompositionGpuError {
                 formatter,
                 "advanced composition dimensions {}x{} exceed device limit {limit}",
                 requested[0], requested[1]
-            ),
-            Self::UnsupportedSelectiveNtsc {
-                applying,
-                bypassing,
-            } => write!(
-                formatter,
-                "advanced composition cannot enter selective NTSC: {applying} applying layer(s), {bypassing} bypassing layer(s)"
             ),
             Self::DuplicateSource(layer_id) => write!(
                 formatter,
@@ -1209,17 +1198,7 @@ impl CompositionGpuExecutor {
     }
 
     pub fn validate_plan(plan: &EvaluatedCompositionPlan) -> Result<(), CompositionGpuError> {
-        let EvaluatedCompositionPlan::Advanced(plan) = plan else {
-            return Ok(());
-        };
-        let applying = plan.master().selective_ntsc_layers.len();
-        let bypassing = plan.master().selective_ntsc_bypass_layers.len();
-        if plan.ntsc_path() == AdvancedNtscPath::Mixed {
-            return Err(CompositionGpuError::UnsupportedSelectiveNtsc {
-                applying,
-                bypassing,
-            });
-        }
+        let _ = plan;
         Ok(())
     }
 
@@ -4938,18 +4917,6 @@ mod tests {
     };
 
     #[test]
-    fn selective_error_is_stable_and_operator_visible() {
-        assert_eq!(
-            CompositionGpuError::UnsupportedSelectiveNtsc {
-                applying: 2,
-                bypassing: 1,
-            }
-            .to_string(),
-            "advanced composition cannot enter selective NTSC: 2 applying layer(s), 1 bypassing layer(s)"
-        );
-    }
-
-    #[test]
     fn composition_timing_preserves_the_full_temporal_event_batch() {
         let input = TemporalFrameInput::new(
             1.0 / 59.94,
@@ -5291,6 +5258,7 @@ mod tests {
                     effects: &effects[slot],
                     transform: &transforms[slot],
                     opacity: 1.0,
+                    mosh_send: 1.0,
                     speed: 1.0,
                     fps: 30.0,
                     blend_mode: BlendMode::Normal,
@@ -6489,6 +6457,7 @@ mod tests {
                 effects: &effects,
                 transform: &transform,
                 opacity: 1.0,
+                mosh_send: 1.0,
                 speed: 1.0,
                 fps: 30.0,
                 blend_mode: BlendMode::Normal,

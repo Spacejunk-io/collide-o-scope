@@ -1,9 +1,9 @@
 //! The display-physics stage executor: the one seam every audience path
 //! shares.
 //!
-//! Live LegacyExact, live Advanced, the selective-VHS path, and export all
-//! converge on composite slot 0 immediately before `render_opaque_output`,
-//! so a single slot-0 stage here serves all four with one implementation
+//! Live LegacyExact, live Advanced, and export all converge on composite slot
+//! 0 immediately before `render_opaque_output` and the final-program VHS
+//! finish, so a single slot-0 stage here serves all three with one implementation
 //! and one shader — export-identical by construction, the
 //! `encode_opaque_output` precedent rather than the dual-implementation
 //! temporal one.

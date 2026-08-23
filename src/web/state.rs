@@ -1786,15 +1786,14 @@ pub struct NtscSnapshot {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NtscLiveMetricsSnapshot {
-    /// off | global | selective
+    /// off | global. `selective` remains readable for older snapshots.
     #[serde(default)]
     pub active_path: String,
     #[serde(default)]
     pub global: crate::ntsc::NtscPathMetrics,
     #[serde(default)]
     pub selective: crate::ntsc::NtscPathMetrics,
-    /// True while the active path owns bounded CPU work or, for selective VHS,
-    /// a GPU staging readback.
+    /// True while the active final-program path owns bounded CPU work.
     #[serde(default)]
     pub busy: bool,
 }
@@ -3771,9 +3770,9 @@ pub struct LayerSnapshot {
     pub layer_id: String,
     pub filename: String,
     pub visible: bool,
-    /// True when the layer skips Digital/Analog/Cellular/Motion/VHS master
-    /// processing. Any contributing bypass links the complete shared
-    /// program Temporal family dry while its history continues to warm.
+    /// True when the layer skips inherited Digital/Analog/Cellular/Motion
+    /// processing. VHS remains a final-program finish. Any contributing bypass
+    /// links the complete shared Temporal family dry while history stays warm.
     #[serde(default)]
     pub bypass_master_fx: bool,
     /// Independently authored request to bypass inherited Temporal FX for
@@ -3785,6 +3784,9 @@ pub struct LayerSnapshot {
     pub reroll_on_loop: bool,
     pub paused: bool,
     pub opacity: f32,
+    /// Continuous spatial contribution to the one shared Codec Mosh stage.
+    #[serde(default = "default_layer_mosh_send")]
+    pub mosh_send: f32,
     pub speed: f32,
     #[serde(default = "default_layer_fps")]
     pub fps: f32,
@@ -3855,6 +3857,10 @@ pub struct LayerSnapshot {
 
 fn default_layer_fps() -> f32 {
     30.0
+}
+
+fn default_layer_mosh_send() -> f32 {
+    1.0
 }
 
 /// Browser-safe view of one prepared source. Host paths never cross the web
@@ -4529,7 +4535,7 @@ pub enum WebAction {
         layer_id: Option<String>,
         transform: SpatialTransform,
     },
-    /// Reset all direct effects on one layer.
+    /// Reset direct effects, Motion, and Codec-Mosh Send on one layer.
     #[serde(rename = "reset_layer_fx")]
     ResetLayerFx {
         index: usize,
@@ -7925,6 +7931,8 @@ mod protocol_tests {
             "card.dataset.index = String(index)",
             "...currentLayerSelector(card, layer, index)",
             "editing a captured control disengages A/B",
+            "const moshSendId = `layer-mosh-send-${stableLayerToken}`",
+            "data-param=\"mosh_send\"",
         ] {
             assert!(
                 js.contains(contract),
@@ -7944,6 +7952,7 @@ mod protocol_tests {
             reroll_on_loop: false,
             paused: false,
             opacity: 1.0,
+            mosh_send: 0.25,
             speed: 1.0,
             fps: 30.0,
             blend_mode: "normal".into(),
@@ -7977,6 +7986,7 @@ mod protocol_tests {
         assert!(value.get("proxy_note").is_none());
         value.as_object_mut().unwrap().remove("bypass_master_fx");
         value.as_object_mut().unwrap().remove("bypass_temporal_fx");
+        value.as_object_mut().unwrap().remove("mosh_send");
         value.as_object_mut().unwrap().remove("reroll_on_loop");
         value.as_object_mut().unwrap().remove("transform");
         value.as_object_mut().unwrap().remove("motion");
@@ -7984,6 +7994,7 @@ mod protocol_tests {
         let legacy: LayerSnapshot = serde_json::from_value(value).unwrap();
         assert!(!legacy.bypass_master_fx);
         assert!(!legacy.bypass_temporal_fx);
+        assert_eq!(legacy.mosh_send, 1.0);
         assert_eq!(legacy.motion, MotionSnapshot::default());
         assert!(!legacy.reroll_on_loop);
         assert_eq!(legacy.transform, SpatialTransform::default());
@@ -8528,7 +8539,7 @@ mod protocol_tests {
         // sliders (28 small effects plus the 3 master-only optics). B1's Scan
         // Processor rows render through the existing generated-card template,
         // so the literal tag counts do not move. B4 added the 17 display-
-        // physics sliders to the temporal group. B5 added the 8 codec-mosh
+        // physics sliders to the temporal group. B5 now owns 11 codec-mosh
         // sliders there too (the recycle law is a toggle, not a range).
         // B8 added the seventeen bus-mixer sliders (wipe 5, dirt 6, melt 6),
         // the six master melting-edge sliders, and the key-dressing pair at
@@ -8547,7 +8558,7 @@ mod protocol_tests {
         // B15's snapshot bank added one more: the recall glide.
         // Long Exposure Ghosting adds its amount and bounded shutter-length
         // sliders to the static Temporal Originals section.
-        assert_eq!(assert_range_tags_are_bounded(html, true), 205);
+        assert_eq!(assert_range_tags_are_bounded(html, true), 208);
         assert_eq!(assert_range_tags_are_bounded(js, false), 24);
 
         for contract in [
@@ -8628,7 +8639,7 @@ mod protocol_tests {
         assert!(html.contains("id=\"btn-revert-master\""));
         assert!(html.contains("Revert master visual state"));
         assert!(js.contains(
-            "title=\"Reset layer effects (opacity and transport unchanged)\" aria-label=\"Reset layer effects (opacity and transport unchanged)\""
+            "title=\"Reset direct effects, Motion, and Mosh Send (rack, transform, opacity, and transport unchanged)\" aria-label=\"Reset direct effects, Motion, and Mosh Send; rack, transform, opacity, and transport stay unchanged\""
         ));
     }
 
@@ -8830,7 +8841,7 @@ mod protocol_tests {
             "param: 'bypass_master_fx'",
             "...currentLayerSelector(card, layer, index)",
             "bypassMasterFx.checked = !!layer.bypass_master_fx",
-            "Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain; any contributing bypass links the shared Temporal family dry for the whole program while history stays warm.",
+            "Skips inherited Digital/Analog/Cellular/Motion processing; own Layer FX/opacity/key/blend remain. VHS still finishes the complete program once; any contributing bypass links the shared Temporal family dry while history stays warm.",
         ] {
             assert!(js.contains(contract), "missing bypass UI contract: {contract}");
         }
@@ -10052,8 +10063,8 @@ mod protocol_tests {
         assert!(js.contains("window.confirm("));
         assert!(js.contains("authoritativeMediaSafetyMode === 'expert'"));
         assert!(js.contains("toggleAttribute('aria-busy', false)"));
-        assert!(js.contains("Global live"));
-        assert!(js.contains("Selective live"));
+        assert!(js.contains("Final-program live"));
+        assert!(!js.contains("Selective live"));
         assert!(js.contains("skipped"));
         assert!(js.contains("unavailable"));
         assert!(js.contains("stale"));

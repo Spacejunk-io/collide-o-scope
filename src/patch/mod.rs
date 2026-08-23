@@ -3280,6 +3280,10 @@ pub struct LayerConfig {
     pub source_path: String,
     #[serde(default = "one")]
     pub opacity: f32,
+    /// Spatial contribution to the one shared Program Codec Mosh stage.
+    /// Full send is the legacy law and stays omitted from canonical patches.
+    #[serde(default = "one", skip_serializing_if = "is_one_f32")]
+    pub mosh_send: f32,
     #[serde(default = "default_blend")]
     pub blend_mode: String,
     #[serde(default = "one")]
@@ -3355,6 +3359,8 @@ impl<'de> Deserialize<'de> for LayerConfig {
             source_path: String,
             #[serde(default = "one")]
             opacity: f32,
+            #[serde(default = "one")]
+            mosh_send: f32,
             #[serde(default = "default_blend")]
             blend_mode: String,
             #[serde(default = "one")]
@@ -3411,6 +3417,7 @@ impl<'de> Deserialize<'de> for LayerConfig {
             filename: raw.filename,
             source_path: raw.source_path,
             opacity: raw.opacity,
+            mosh_send: finite_or(raw.mosh_send, 1.0).clamp(0.0, 1.0),
             blend_mode: raw.blend_mode,
             speed: raw.speed,
             fps: raw.fps,
@@ -4687,6 +4694,7 @@ impl LayerConfig {
             filename,
             source_path,
             opacity: layer.opacity,
+            mosh_send: layer.mosh_send,
             blend_mode: layer.blend_mode.key().to_string(),
             speed: layer.speed,
             fps: layer.fps,
@@ -4775,6 +4783,7 @@ impl LayerConfig {
 
     pub fn apply_to_layer(&self, layer: &mut Layer) {
         layer.opacity = finite_or(self.opacity, 1.0).clamp(0.0, 1.0);
+        layer.mosh_send = finite_or(self.mosh_send, 1.0).clamp(0.0, 1.0);
         layer.blend_mode =
             BlendMode::from_key(self.blend_mode.as_str()).unwrap_or(BlendMode::Normal);
         layer.speed = finite_or(self.speed, 1.0).clamp(0.25, 4.0);
@@ -4804,6 +4813,7 @@ impl LayerConfig {
     pub fn apply_look_to_layer(&self, layer: &mut Layer) {
         self.apply_look_to_fields(
             &mut layer.opacity,
+            &mut layer.mosh_send,
             &mut layer.blend_mode,
             &mut layer.visible,
             &mut layer.bypass_master_fx,
@@ -4830,6 +4840,7 @@ impl LayerConfig {
     fn apply_look_to_fields(
         &self,
         opacity: &mut f32,
+        mosh_send: &mut f32,
         blend_mode: &mut BlendMode,
         visible: &mut bool,
         bypass_master_fx: &mut bool,
@@ -4838,6 +4849,7 @@ impl LayerConfig {
         transform: &mut SpatialTransform,
     ) {
         *opacity = finite_or(self.opacity, 1.0).clamp(0.0, 1.0);
+        *mosh_send = finite_or(self.mosh_send, 1.0).clamp(0.0, 1.0);
         *blend_mode = BlendMode::from_key(self.blend_mode.as_str()).unwrap_or(BlendMode::Normal);
         *visible = self.visible;
         *bypass_master_fx = self.bypass_master_fx;
@@ -4854,6 +4866,7 @@ impl LayerConfig {
         vec![
             ("filename", self.filename.clone()),
             ("opacity", format!("{:.2}", self.opacity)),
+            ("mosh_send", format!("{:.2}", self.mosh_send)),
             ("blend_mode", self.blend_mode.clone()),
             ("speed", format!("{:.2}", self.speed)),
             ("fps", format!("{:.1}", self.fps)),
@@ -4902,6 +4915,12 @@ impl LayerConfig {
             "opacity" => {
                 if let Ok(v) = value.parse() {
                     self.opacity = v;
+                    return true;
+                }
+            }
+            "mosh_send" => {
+                if let Ok(v) = value.parse::<f32>() {
+                    self.mosh_send = finite_or(v, 1.0).clamp(0.0, 1.0);
                     return true;
                 }
             }
@@ -6775,6 +6794,7 @@ mod tests {
             filename: filename.to_string(),
             source_path: source_path.clone(),
             opacity,
+            mosh_send: 1.0,
             blend_mode: blend_mode.to_string(),
             speed: 4.0,
             fps: 240.0,
@@ -6816,6 +6836,7 @@ mod tests {
         paused: bool,
         reroll_on_loop: bool,
         opacity: f32,
+        mosh_send: f32,
         blend_mode: BlendMode,
         visible: bool,
         bypass_master_fx: bool,
@@ -6834,6 +6855,7 @@ mod tests {
             paused: topology_id.is_multiple_of(2),
             reroll_on_loop: topology_id.is_multiple_of(3),
             opacity,
+            mosh_send: 1.0,
             blend_mode: BlendMode::Multiply,
             visible: true,
             bypass_master_fx: false,
@@ -6845,6 +6867,35 @@ mod tests {
             },
             transform: SpatialTransform::new_layer_default(),
         }
+    }
+
+    #[test]
+    fn layer_mosh_send_is_legacy_full_omitted_bounded_and_round_trips_when_authored() {
+        let legacy: LayerConfig =
+            serde_yaml::from_str("filename: legacy.mov\neffects: {}\n").unwrap();
+        assert_eq!(legacy.mosh_send, 1.0);
+
+        let full = saved_layer("full.mov", 1.0, "normal", true, false, 0.0, 0);
+        assert!(!serde_yaml::to_string(&full).unwrap().contains("mosh_send"));
+
+        let mut authored = full.clone();
+        authored.mosh_send = 0.375;
+        let yaml = serde_yaml::to_string(&authored).unwrap();
+        assert!(yaml.contains("mosh_send: 0.375"));
+        assert_eq!(
+            serde_yaml::from_str::<LayerConfig>(&yaml)
+                .unwrap()
+                .mosh_send,
+            0.375
+        );
+
+        let low: LayerConfig = serde_yaml::from_str("filename: low.mov\nmosh_send: -4\n").unwrap();
+        let high: LayerConfig = serde_yaml::from_str("filename: high.mov\nmosh_send: 9\n").unwrap();
+        let hostile: LayerConfig =
+            serde_yaml::from_str("filename: hostile.mov\nmosh_send: .nan\n").unwrap();
+        assert_eq!(low.mosh_send, 0.0);
+        assert_eq!(high.mosh_send, 1.0);
+        assert_eq!(hostile.mosh_send, 1.0);
     }
 
     #[test]
@@ -6879,6 +6930,7 @@ mod tests {
 
             let mut applied = BlendMode::Normal;
             let mut opacity = 0.0;
+            let mut mosh_send = 0.0;
             let mut visible = false;
             let mut bypass_master_fx = true;
             let mut bypass_temporal_fx = true;
@@ -6886,6 +6938,7 @@ mod tests {
             let mut transform = SpatialTransform::default();
             from_json.apply_look_to_fields(
                 &mut opacity,
+                &mut mosh_send,
                 &mut applied,
                 &mut visible,
                 &mut bypass_master_fx,
@@ -6903,6 +6956,7 @@ mod tests {
         let unknown = saved_layer("future.mov", 1.0, "future_blend", true, false, 0.0, 0);
         let mut applied = BlendMode::Difference;
         let mut opacity = 0.0;
+        let mut mosh_send = 0.0;
         let mut visible = false;
         let mut bypass_master_fx = true;
         let mut bypass_temporal_fx = true;
@@ -6910,6 +6964,7 @@ mod tests {
         let mut transform = SpatialTransform::default();
         unknown.apply_look_to_fields(
             &mut opacity,
+            &mut mosh_send,
             &mut applied,
             &mut visible,
             &mut bypass_master_fx,
@@ -6952,6 +7007,7 @@ mod tests {
             .collect();
         let untouched_visual_before = (
             live[2].opacity,
+            live[2].mosh_send,
             live[2].blend_mode,
             live[2].visible,
             live[2].bypass_master_fx,
@@ -6964,6 +7020,7 @@ mod tests {
         let summary = apply_positional_looks(&saved, &mut live, |config, layer| {
             config.apply_look_to_fields(
                 &mut layer.opacity,
+                &mut layer.mosh_send,
                 &mut layer.blend_mode,
                 &mut layer.visible,
                 &mut layer.bypass_master_fx,
@@ -7001,6 +7058,7 @@ mod tests {
         assert_eq!(
             (
                 live[2].opacity,
+                live[2].mosh_send,
                 live[2].blend_mode,
                 live[2].visible,
                 live[2].bypass_master_fx,
@@ -7499,6 +7557,7 @@ autopilot:
                 filename: "clip.mp4".to_string(),
                 source_path: String::new(),
                 opacity: 1.0,
+                mosh_send: 1.0,
                 blend_mode: "normal".to_string(),
                 speed: 1.0,
                 fps: 30.0,
@@ -8255,6 +8314,7 @@ autopilot:
                 bitrate_starve: 0.6,
                 resync: 0.25,
                 recycle: true,
+                ..CodecMoshParams::default()
             },
             ..TemporalParams::default()
         };
@@ -8367,6 +8427,7 @@ autopilot:
             ..EffectsConfig::default()
         };
         let mut opacity = 1.0;
+        let mut mosh_send = 1.0;
         let mut blend_mode = BlendMode::Normal;
         let mut visible = true;
         let mut bypass = false;
@@ -8375,6 +8436,7 @@ autopilot:
         let mut transform = SpatialTransform::default();
         layer_config.apply_look_to_fields(
             &mut opacity,
+            &mut mosh_send,
             &mut blend_mode,
             &mut visible,
             &mut bypass,
@@ -9097,6 +9159,7 @@ autopilot:
             &crate::effects::EffectUniforms::default(),
             &SpatialTransform::default(),
             0.4,
+            1.0,
             1.0,
             30.0,
         );
@@ -11405,6 +11468,7 @@ lfos:
             filename: "clip.mp4".into(),
             source_path: String::new(),
             opacity: 1.0,
+            mosh_send: 1.0,
             blend_mode: "normal".into(),
             speed: 1.0,
             fps: 30.0,

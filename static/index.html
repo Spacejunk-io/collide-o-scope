@@ -1350,6 +1350,15 @@
                     <div class="param-row" data-temporal="mosh_amount" data-min="0" data-max="1" data-step="0.01">
                       <label>Mosh</label><input type="range"><span class="value">0</span>
                     </div>
+                    <div class="param-row" data-temporal="mosh_wipe" data-min="0" data-max="1" data-step="0.01">
+                      <label>Motion Wipe</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row" data-temporal="mosh_smear" data-min="0" data-max="1" data-step="0.01">
+                      <label>Vector Smear</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row" data-temporal="mosh_trail" data-min="0" data-max="1" data-step="0.01">
+                      <label>Motion Trail</label><input type="range"><span class="value">0</span>
+                    </div>
                     <div class="param-row" data-temporal="mosh_key_removal" data-min="0" data-max="1" data-step="0.01">
                       <label>Key Removal</label><input type="range"><span class="value">0.95</span>
                     </div>
@@ -1374,7 +1383,7 @@
                     <div class="param-row toggle-row" data-temporal="mosh_recycle">
                       <label>Recycled Feed</label><label class="toggle"><input type="checkbox" aria-label="Feed the encoder the moshed output"><span class="toggle-slider"></span></label>
                     </div>
-                    <div class="audio-status">A real encoder and decoder wired back to back with the bitstream broken between them: keys removed, deltas held, dropped, and re-injected out of order. The picture lands a frame or two behind, which is the price of a real codec.</div>
+                    <div class="audio-status">A real encoder and decoder wired back to back with the bitstream broken between them. Motion Wipe reveals damaged pixels where objects move, Vector Smear drags them along codec motion, and Motion Trail keeps the corridor alive—all inside the existing bounded worker hop. Use Mosh Send on each wet layer to vary its spatial share of that one shared codec history.</div>
                   </div>
                 </details>
                 <details class="temporal-study">

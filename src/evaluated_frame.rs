@@ -110,6 +110,7 @@ pub struct LayerFrameInput<'a> {
     pub effects: &'a EffectUniforms,
     pub transform: &'a SpatialTransform,
     pub opacity: f32,
+    pub mosh_send: f32,
     pub speed: f32,
     pub fps: f32,
     pub blend_mode: BlendMode,
@@ -137,6 +138,8 @@ pub struct EvaluatedLayer {
     /// metadata lets production renderers consume one plan-owned record
     /// instead of consulting either authored layers or a parallel tuple.
     pub opacity: f32,
+    /// Final modulated spatial contribution to the shared Codec Mosh stage.
+    pub mosh_send: f32,
     pub speed: f32,
     pub fps: f32,
     pub blend_mode: BlendMode,
@@ -294,6 +297,7 @@ impl EvaluatedFramePlan {
                 input.effects,
                 input.transform,
                 input.opacity,
+                input.mosh_send,
                 input.speed,
                 input.fps,
             );
@@ -322,6 +326,7 @@ impl EvaluatedFramePlan {
                 transform: modulated.transform,
                 spatial: pass.spatial,
                 opacity: modulated.opacity,
+                mosh_send: modulated.mosh_send,
                 speed: modulated.speed,
                 fps: modulated.fps,
                 blend_mode: input.blend_mode,
@@ -636,6 +641,7 @@ mod tests {
         effects: EffectUniforms,
         transform: SpatialTransform,
         opacity: f32,
+        mosh_send: f32,
         speed: f32,
         fps: f32,
         blend_mode: BlendMode,
@@ -652,6 +658,7 @@ mod tests {
             effects: &base.effects,
             transform: &base.transform,
             opacity: base.opacity,
+            mosh_send: base.mosh_send,
             speed: base.speed,
             fps: base.fps,
             blend_mode: base.blend_mode,
@@ -685,6 +692,7 @@ mod tests {
                     ..SpatialTransform::new_layer_default()
                 },
                 opacity: 0.55 + index as f32 * 0.05,
+                mosh_send: 1.0 - index as f32 * 0.05,
                 speed: 0.75 + index as f32 * 0.1,
                 fps: 24.0 + index as f32,
                 blend_mode: match index % 4 {
@@ -724,6 +732,7 @@ mod tests {
             Routing::new(ModSource::Midi(0), "brightness", 0.25),
             Routing::new(ModSource::Midi(0), "position_x", 0.1),
             Routing::new(ModSource::Midi(0), "layer2_opacity", -0.5),
+            Routing::new(ModSource::Midi(0), "layer2_mosh_send", -0.4),
             Routing::new(ModSource::Midi(0), "layer2_speed", 0.2),
             Routing::new(ModSource::Midi(0), "layer2_rotation_deg", 0.1),
         ];
@@ -752,6 +761,7 @@ mod tests {
         assert!(!plan.layers()[1].bypass_temporal_fx);
         assert!(plan.layers()[1].speed > layers[1].speed);
         assert!(plan.layers()[1].opacity < layers[1].opacity);
+        assert!(plan.layers()[1].mosh_send < layers[1].mosh_send);
         assert_ne!(
             plan.layers()[1].transform.rotation_deg,
             layers[1].transform.rotation_deg
@@ -788,6 +798,7 @@ mod tests {
             ..SpatialTransform::new_layer_default()
         };
         layers[0].opacity = 0.01;
+        layers[0].mosh_send = 0.0;
         layers[0].blend_mode = BlendMode::Difference;
         layers[0].visible = false;
         layers[0].paused = true;

@@ -1887,6 +1887,9 @@ const TEMPORAL_PARAM_DEFAULTS = Object.freeze({
       mosh_hold: 0.25,
       mosh_rate: 0.5,
       mosh_bitrate_starve: 0.35,
+      mosh_wipe: 0,
+      mosh_smear: 0,
+      mosh_trail: 0,
       sync_rate: 0.35,
       sync_spread: 0.25,
       // Every bipolar control below defaults to zero while its slider minimum
@@ -2564,6 +2567,9 @@ function syncTemporal(t) {
     mosh_rate: mosh.rate,
     mosh_bitrate_starve: mosh.bitrate_starve,
     mosh_resync: mosh.resync,
+    mosh_wipe: Number(mosh.wipe ?? 0),
+    mosh_smear: Number(mosh.smear ?? 0),
+    mosh_trail: Number(mosh.trail ?? 0),
     mosh_recycle: mosh.recycle,
     sync_amount: syncLatch.amount,
     sync_rate: syncLatch.rate,
@@ -3321,9 +3327,7 @@ function syncNtscMetrics(metrics) {
   if (!el) return;
   const path = metrics?.active_path || 'off';
   const global = metrics?.global || {};
-  const selective = metrics?.selective || {};
-  const totalObserved = Number(global.attempted || 0) + Number(global.stale || 0)
-    + Number(selective.attempted || 0) + Number(selective.stale || 0);
+  const totalObserved = Number(global.attempted || 0) + Number(global.stale || 0);
   if (path === 'off' && totalObserved === 0) {
     if (el.textContent !== 'Live worker: no samples yet') el.textContent = 'Live worker: no samples yet';
     return;
@@ -3339,10 +3343,7 @@ function syncNtscMetrics(metrics) {
     const failed = unavailable > 0 ? ` · ${formatCount(unavailable)} unavailable` : '';
     return `${label} · ${formatCount(accepted)}/${formatCount(attempted)} admitted · ${formatCount(skipped)} skipped${rate}${failed} · ${formatCount(stale)} stale${busy}`;
   };
-  const text = [
-    formatBucket('Global live', global, path === 'global'),
-    formatBucket('Selective live', selective, path === 'selective'),
-  ].join(' | ');
+  const text = formatBucket('Final-program live', global, path === 'global');
   if (el.textContent !== text) el.textContent = text;
 }
 
@@ -4997,6 +4998,8 @@ function createLayerCard(layer, index) {
   const blendMode = layerBlendModeInfo(layer.blend_mode);
   const blendSelectId = `layer-blend-${index}`;
   const blendDescriptionId = `layer-blend-description-${index}`;
+  const stableLayerToken = String(layer.layer_id || `position-${index}`).replace(/[^A-Za-z0-9_-]/g, '-');
+  const moshSendId = `layer-mosh-send-${stableLayerToken}`;
 
   card.innerHTML = `
     <div class="layer-header">
@@ -5026,6 +5029,11 @@ function createLayerCard(layer, index) {
         <label>Opacity</label>
         <input type="range" min="0" max="1" step="0.01" value="${layer.opacity}">
         <span class="value">${layer.opacity.toFixed(2)}</span>
+      </div>
+      <div class="param-row" data-layer="${index}" data-param="mosh_send" title="Scales this layer's spatial contribution to the one shared Codec Mosh result; it does not create an independent codec history.">
+        <label for="${moshSendId}">Mosh Send</label>
+        <input id="${moshSendId}" type="range" min="0" max="1" step="0.01" value="${Number(layer.mosh_send ?? 1)}" aria-label="Layer ${index + 1} Codec Mosh send">
+        <span class="value">${Number(layer.mosh_send ?? 1).toFixed(2)}</span>
       </div>
       <div class="param-row" data-layer="${index}" data-param="speed">
         <label>Speed</label>
@@ -5116,13 +5124,13 @@ function createLayerCard(layer, index) {
         <span class="value">${Number(layer.effects?.key_shadow ?? 0).toFixed(2)}</span>
       </div>
       <div class="audio-status">This layer's key reveals layers beneath it. Chroma modes use the RGB target and tolerance.</div>
-      <div class="param-row toggle-row layer-master-bypass" title="Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain; any contributing bypass links the shared Temporal family dry for the whole program while history stays warm.">
+      <div class="param-row toggle-row layer-master-bypass" title="Skips inherited Digital/Analog/Cellular/Motion processing; own Layer FX/opacity/key/blend remain. VHS still finishes the complete program once; any contributing bypass links the shared Temporal family dry while history stays warm.">
         <label>Bypass Master FX</label>
         <label class="toggle">
           <input type="checkbox" ${layer.bypass_master_fx ? 'checked' : ''} aria-label="Bypass Master FX for layer ${index + 1}" aria-describedby="layer-master-bypass-help-${index}">
           <span class="toggle-slider"></span>
         </label>
-        <span id="layer-master-bypass-help-${index}" class="visually-hidden">Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain. By itself, any contributing Master bypass links the shared Temporal family dry for the whole program while history stays warm; an admitted explicit Temporal bypass uses its separate isolated route.</span>
+        <span id="layer-master-bypass-help-${index}" class="visually-hidden">Skips inherited Digital/Analog/Cellular/Motion processing; own Layer FX/opacity/key/blend remain. VHS still finishes the complete program once. By itself, any contributing Master bypass links the shared Temporal family dry for the whole program while history stays warm; an admitted explicit Temporal bypass uses its separate isolated route.</span>
       </div>
       <div class="param-row toggle-row layer-temporal-bypass" title="Keeps this layer dry above the shared Temporal result. Available for Layer 1 or a contiguous top prefix; move it above every wet layer first. Authored independently from Bypass Master FX.">
         <label>Bypass Temporal FX</label>
@@ -5143,7 +5151,7 @@ function createLayerCard(layer, index) {
         <button class="layer-fx-toggle" type="button" aria-expanded="false" aria-controls="layer-fx-body-${index}">
           <span class="layer-disclosure-chevron" aria-hidden="true">&#x25B6;</span><span>Layer effects</span>
         </button>
-        <button class="layer-reset-fx" type="button" title="Reset layer effects (opacity and transport unchanged)" aria-label="Reset layer effects (opacity and transport unchanged)">Reset FX</button>
+        <button class="layer-reset-fx" type="button" title="Reset direct effects, Motion, and Mosh Send (rack, transform, opacity, and transport unchanged)" aria-label="Reset direct effects, Motion, and Mosh Send; rack, transform, opacity, and transport stay unchanged">Reset FX</button>
       </div>
       <div class="layer-fx-body" id="layer-fx-body-${index}" role="region" aria-label="Layer ${index + 1} effects" hidden>${layerEffectsHtml(layer.effects || {}, index)}</div>
     </div>
@@ -5257,7 +5265,7 @@ function createLayerCard(layer, index) {
         sendAction({ action: 'set_layer_param', ...currentLayerSelector(card, layer, index), param, value: v });
       });
       const defaults = {
-        opacity: 1, speed: 1, fps: 30, key_threshold: 0.5, key_softness: 0.1,
+        opacity: 1, mosh_send: 1, speed: 1, fps: 30, key_threshold: 0.5, key_softness: 0.1,
         key_color_r: 0, key_color_g: 1, key_color_b: 0, key_tolerance: 0.15,
       };
       resetRangeOnDoubleActivation(slider, defaults[param] ?? parseFloat(slider.min));
@@ -5406,13 +5414,14 @@ function updateLayerCard(card, layer, index) {
     }
   }
 
-  for (const [param, digits] of [['speed', 2], ['fps', 0]]) {
+  for (const [param, digits, fallback] of [['mosh_send', 2, 1], ['speed', 2, 1], ['fps', 0, 30]]) {
     const row = card.querySelector(`.param-row[data-param="${param}"]`);
     const slider = row?.querySelector('input[type="range"]');
     const valEl = row?.querySelector('.value');
     if (slider && canSync(slider)) {
-      slider.value = layer[param];
-      if (valEl) valEl.textContent = Number(layer[param]).toFixed(digits);
+      const value = Number(layer[param] ?? fallback);
+      slider.value = value;
+      if (valEl) valEl.textContent = value.toFixed(digits);
     }
   }
 
@@ -6363,6 +6372,9 @@ const MOD_TARGETS = [
   ['mosh_rate', 'Mosh Rate'],
   ['mosh_bitrate_starve', 'Mosh Bitrate Starve'],
   ['mosh_resync', 'Mosh Resync'],
+  ['mosh_wipe', 'Mosh Motion Wipe'],
+  ['mosh_smear', 'Mosh Vector Smear'],
+  ['mosh_trail', 'Mosh Motion Trail'],
   ['sync_amount', 'Sync Amount'],
   ['sync_rate', 'Sync Rate'],
   ['sync_spread', 'Sync Spread'],
@@ -6452,6 +6464,7 @@ const LAYER_FX_TARGETS = [
   ['pattern_warp', 'Pattern Warp'], ['pattern_hue', 'Pattern Hue'],
   ['pattern_hue_spread', 'Pattern Hue Spread'], ['pattern_saturation', 'Pattern Saturation'],
   ['pattern_brightness', 'Pattern Brightness'], ['pattern_color_bands', 'Pattern Colour Bands'],
+  ['mosh_send', 'Mosh Send'],
 ];
 
 const ROUTING_CURVES = [
@@ -8291,7 +8304,7 @@ function syncStageHealth(health = {}) {
   const budgets = health?.budgets || {};
   document.getElementById('stage-health-budgets').textContent = [
     budgetText('GPU', budgets.gpu), budgetText('media', budgets.media),
-    budgetText('NTSC', budgets.ntsc), budgetText('motion', budgets.motion),
+    budgetText('Mosh send', budgets.ntsc), budgetText('motion', budgets.motion),
   ].join(' · ');
   const rows = (Array.isArray(health?.layers) ? health.layers : []).slice(0, 256).map(layer => {
     const row = document.createElement('div');

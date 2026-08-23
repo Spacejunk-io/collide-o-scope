@@ -46,6 +46,17 @@ pub(crate) fn clamp_layer_opacity(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
 }
 
+/// The authored per-layer contribution to the one shared Codec Mosh stage.
+/// Non-finite state can enter through hand-edited patches or internal replay,
+/// so it resolves to the legacy full-send value rather than poisoning a frame.
+pub(crate) fn clamp_layer_mosh_send(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
 pub(crate) fn clamp_layer_speed(value: f32) -> f32 {
     value.clamp(0.25, 4.0)
 }
@@ -453,6 +464,9 @@ pub struct Layer {
     /// uploads.
     source_resource_epoch: u64,
     pub opacity: f32,
+    /// Continuous contribution to the one shared Program Codec Mosh result.
+    /// This is a spatial send, not an independent codec history or recipe.
+    pub mosh_send: f32,
     pub blend_mode: BlendMode,
     pub paused: bool,
     pub visible: bool,
@@ -619,6 +633,7 @@ impl Layer {
             texture_view,
             source_resource_epoch: 1,
             opacity: 1.0,
+            mosh_send: 1.0,
             blend_mode: BlendMode::Normal,
             paused: false,
             visible: true,
@@ -704,6 +719,7 @@ impl Layer {
             texture_view,
             source_resource_epoch: 1,
             opacity: 1.0,
+            mosh_send: 1.0,
             blend_mode: BlendMode::Normal,
             paused: false,
             visible: true,
@@ -801,6 +817,7 @@ impl Layer {
             texture_view,
             source_resource_epoch: 1,
             opacity: 1.0,
+            mosh_send: 1.0,
             blend_mode: BlendMode::Normal,
             paused: false,
             visible: true,
@@ -874,6 +891,7 @@ impl Layer {
             texture_view,
             source_resource_epoch: 1,
             opacity: 1.0,
+            mosh_send: 1.0,
             blend_mode: BlendMode::Normal,
             paused: false,
             visible: true,
@@ -951,6 +969,7 @@ impl Layer {
             texture_view,
             source_resource_epoch: 1,
             opacity: 1.0,
+            mosh_send: 1.0,
             blend_mode: BlendMode::Normal,
             paused: false,
             visible: true,
@@ -1038,6 +1057,11 @@ impl Layer {
     /// stable identity, geometry, effects, and routing remain untouched.
     pub fn reset_motion(&mut self) {
         reset_layer_motion(&mut self.motion);
+    }
+
+    /// Restore the legacy full contribution to the shared Codec Mosh stage.
+    pub fn reset_mosh_send(&mut self) {
+        self.mosh_send = 1.0;
     }
 
     /// Immutable identity of this live layer instance.
@@ -2000,13 +2024,14 @@ fn extension_in(extension: &str, allowed: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        allocate_layer_id, content_identity_for_proxy_reference, create_layer_texture,
-        default_bypass_master_fx, default_bypass_temporal_fx, default_layer_motion,
-        default_layer_rack, evaluate_transport_selection, is_still_image_file,
-        is_supported_visual_extension, is_supported_visual_file, is_video_file,
-        layer_texture_upload_error, reset_layer_motion, source_reference_for_persistence,
-        spout_sender_from_source_path, take_matching_codec_motion,
-        validate_source_texture_dimensions, write_layer_texture_checked, BlendMode,
+        allocate_layer_id, clamp_layer_mosh_send, content_identity_for_proxy_reference,
+        create_layer_texture, default_bypass_master_fx, default_bypass_temporal_fx,
+        default_layer_motion, default_layer_rack, evaluate_transport_selection,
+        is_still_image_file, is_supported_visual_extension, is_supported_visual_file,
+        is_video_file, layer_texture_upload_error, reset_layer_motion,
+        source_reference_for_persistence, spout_sender_from_source_path,
+        take_matching_codec_motion, validate_source_texture_dimensions,
+        write_layer_texture_checked, BlendMode,
     };
     use crate::transport::{
         ClipTransportConfig, ClipTransportState, EndBehavior, NormalizedTime, PlaybackDirection,
@@ -2185,6 +2210,17 @@ mod tests {
         // preventing one source kind from unexpectedly entering bypass mode.
         assert!(!default_bypass_master_fx());
         assert!(!default_bypass_temporal_fx());
+    }
+
+    #[test]
+    fn layer_mosh_send_is_finite_bounded_and_defaults_to_full_send() {
+        assert_eq!(clamp_layer_mosh_send(0.0), 0.0);
+        assert_eq!(clamp_layer_mosh_send(0.375), 0.375);
+        assert_eq!(clamp_layer_mosh_send(1.0), 1.0);
+        assert_eq!(clamp_layer_mosh_send(-0.1), 0.0);
+        assert_eq!(clamp_layer_mosh_send(1.1), 1.0);
+        assert_eq!(clamp_layer_mosh_send(f32::NAN), 1.0);
+        assert_eq!(clamp_layer_mosh_send(f32::INFINITY), 1.0);
     }
 
     #[test]

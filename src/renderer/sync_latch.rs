@@ -1,8 +1,8 @@
 //! The B14 sync-latch stage executor: the tape/NTSC horizontal shear on the
 //! one slot-0 seam every audience path shares. Live LegacyExact, live
-//! Advanced, the selective-VHS path, and export all converge on composite
-//! slot 0 between the B8 melting edge and the B4 display stage, so this
-//! single implementation and single shader serve all four — the
+//! Advanced, and export all converge on composite slot 0 between the B8
+//! melting edge and the B4 display stage, before the final-program VHS finish,
+//! so this single implementation and single shader serve all three — the
 //! `encode_opaque_output` precedent, exactly the B8 and B4 shape.
 //!
 //! The stage owns **no texture at all**. Its entire state is the bounded

@@ -1,9 +1,9 @@
 //! The B8 melting-edge stage executor: the master melt over the program's
 //! own coverage, on the one slot-0 seam every audience path shares. Live
-//! LegacyExact, live Advanced, the selective-VHS path, and export all
-//! converge on composite slot 0 immediately before the B4 display stage and
-//! `render_opaque_output`, so this single implementation and single shader
-//! serve all four — the `encode_opaque_output` precedent, exactly the B4
+//! LegacyExact, live Advanced, and export all converge on composite slot 0
+//! immediately before the B4 display stage, `render_opaque_output`, and the
+//! final-program VHS finish, so this single implementation and single shader
+//! serve all three — the `encode_opaque_output` precedent, exactly the B4
 //! shape.
 //!
 //! The stage's matte is the composite's alpha channel, so every coverage

@@ -532,11 +532,6 @@ pub struct EvaluatedMasterScopePlan {
     pub canonical_layers: Box<[StableLayerId]>,
     /// Contributing layers retaining inherited `bypass_master_fx` behavior.
     pub canonical_bypass_layers: Box<[StableLayerId]>,
-    /// Existing selective NTSC is also a pre-composite per-layer operation.
-    /// Temporal remains downstream and composition-global; its linked-dry
-    /// disposition lives on the enclosing composition plan.
-    pub selective_ntsc_layers: Box<[StableLayerId]>,
-    pub selective_ntsc_bypass_layers: Box<[StableLayerId]>,
 }
 
 #[derive(Debug, Clone)]
@@ -1713,18 +1708,6 @@ pub struct AdvancedCompositionPlan {
     temporal_dry_layers: Box<[StableLayerId]>,
 }
 
-/// Frame-local NTSC routing classification shared by live and offline
-/// executors. Only pixels with a finite positive effective admission weight
-/// participate, so dormant zero-opacity/group/bus branches cannot create a
-/// false selective-VHS split.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdvancedNtscPath {
-    Disabled,
-    AllApplying,
-    AllBypass,
-    Mixed,
-}
-
 impl AdvancedCompositionPlan {
     pub fn base(&self) -> &EvaluatedFramePlan {
         &self.base
@@ -1882,21 +1865,6 @@ impl AdvancedCompositionPlan {
 
     pub const fn topology_signature(&self) -> u64 {
         self.topology_signature
-    }
-
-    pub fn ntsc_path(&self) -> AdvancedNtscPath {
-        if !self.base.ntsc().enabled {
-            return AdvancedNtscPath::Disabled;
-        }
-        match (
-            self.master.selective_ntsc_layers.is_empty(),
-            self.master.selective_ntsc_bypass_layers.is_empty(),
-        ) {
-            (true, true) => AdvancedNtscPath::Disabled,
-            (false, true) => AdvancedNtscPath::AllApplying,
-            (true, false) => AdvancedNtscPath::AllBypass,
-            (false, false) => AdvancedNtscPath::Mixed,
-        }
     }
 }
 
@@ -2170,10 +2138,10 @@ pub enum CompositionPlanError {
         layers: Vec<StableLayerId>,
         blockers: Vec<TemporalBypassBlocker>,
     },
-    /// VHS is a separate audience-domain processor. Until its selective
-    /// worker retains the dry overlay as a generation-coherent payload, an
-    /// isolated Temporal partition cannot also enter VHS without making the
-    /// overlay bypass an effect it still inherits.
+    /// VHS is the final audience-domain processor after the CPU Codec-Mosh
+    /// replacement. Correctly restoring an isolated Temporal-dry overlay and
+    /// then applying VHS would require another audience readback/CPU hop;
+    /// refusing that topology preserves the one-hop latency contract.
     TemporalBypassWithNtsc {
         layers: Vec<StableLayerId>,
     },
@@ -2719,8 +2687,6 @@ impl<'a> Planner<'a> {
             .any(|node| matches!(node.kind, RuntimeVisualNodeKind::LegacyCanonical));
         let mut canonical_layers = Vec::new();
         let mut canonical_bypass_layers = Vec::new();
-        let mut selective_ntsc_layers = Vec::new();
-        let mut selective_ntsc_bypass_layers = Vec::new();
         let mut contributing_bypass = Vec::new();
         let mut contributing_temporal_bypass = false;
         for layer in &layer_plans {
@@ -2738,13 +2704,6 @@ impl<'a> Planner<'a> {
                 contributing_bypass.push(layer.stable_id);
             }
             contributing_temporal_bypass |= evaluated.bypass_temporal_fx;
-            if self.base.ntsc().enabled {
-                if evaluated.bypass_master_fx {
-                    selective_ntsc_bypass_layers.push(layer.stable_id);
-                } else {
-                    selective_ntsc_layers.push(layer.stable_id);
-                }
-            }
             if master_has_canonical {
                 if evaluated.bypass_master_fx {
                     canonical_bypass_layers.push(layer.stable_id);
@@ -2808,8 +2767,6 @@ impl<'a> Planner<'a> {
             )?,
             canonical_layers: canonical_layers.into_boxed_slice(),
             canonical_bypass_layers: canonical_bypass_layers.into_boxed_slice(),
-            selective_ntsc_layers: selective_ntsc_layers.into_boxed_slice(),
-            selective_ntsc_bypass_layers: selective_ntsc_bypass_layers.into_boxed_slice(),
         };
 
         let below = below_topology(self.input.composition)?;
@@ -5671,6 +5628,7 @@ mod tests {
                     effects: &effects[index],
                     transform: &transforms[index],
                     opacity: opacities[index],
+                    mosh_send: 1.0,
                     speed: 1.0,
                     fps: 30.0,
                     blend_mode: BlendMode::Normal,
@@ -5743,6 +5701,7 @@ mod tests {
                     effects: &effects[index],
                     transform: &transforms[index],
                     opacity: 1.0,
+                    mosh_send: 1.0,
                     speed: 1.0,
                     fps: 30.0,
                     blend_mode: BlendMode::Normal,
@@ -6426,6 +6385,7 @@ mod tests {
                 effects: &effects,
                 transform: &authored,
                 opacity: 1.0,
+                mosh_send: 1.0,
                 speed: 1.0,
                 fps: 30.0,
                 blend_mode: BlendMode::Normal,
@@ -7229,7 +7189,7 @@ mod tests {
     }
 
     #[test]
-    fn dormant_zero_weight_bypass_does_not_create_master_or_ntsc_split() {
+    fn dormant_zero_weight_bypass_does_not_create_master_or_temporal_split() {
         let base = base_with_ntsc_and_opacities(&[1, 2], &[1], true, &[0.0, 1.0]);
         let composition = legacy_composition(&[1, 2]);
         let racks = legacy_racks(&[1, 2]);
@@ -7238,12 +7198,6 @@ mod tests {
             .push(RuntimeVisualNodeKind::Transform(SpatialTransform::default()))
             .unwrap();
         let advanced = advanced(plan(&base, &composition, &master, &racks).unwrap());
-        assert_eq!(advanced.ntsc_path(), AdvancedNtscPath::AllApplying);
-        assert_eq!(
-            advanced.master().selective_ntsc_layers.as_ref(),
-            &[layer_id(2)]
-        );
-        assert!(advanced.master().selective_ntsc_bypass_layers.is_empty());
         assert!(advanced.master().canonical_bypass_layers.is_empty());
         assert_eq!(
             advanced.temporal_master_path(),
@@ -7291,12 +7245,6 @@ mod tests {
             .unwrap();
         let racks = legacy_racks(&[1, 2, 3]);
         let advanced = advanced(plan(&base, &composition, &master, &racks).unwrap());
-        assert_eq!(advanced.ntsc_path(), AdvancedNtscPath::AllApplying);
-        assert_eq!(
-            advanced.master().selective_ntsc_layers.as_ref(),
-            &[layer_id(3)]
-        );
-        assert!(advanced.master().selective_ntsc_bypass_layers.is_empty());
         assert_eq!(
             advanced.temporal_master_path(),
             TemporalMasterPath::Inherited
@@ -7304,12 +7252,12 @@ mod tests {
     }
 
     #[test]
-    fn homogeneous_all_bypass_is_classified_without_false_global_ntsc() {
+    fn homogeneous_all_bypass_links_temporal_dry_in_advanced_group() {
         let base = base_with_ntsc(&[1], &[1], true);
         let racks = legacy_racks(&[1]);
         // A custom/global step *before* the canonical marker is ambiguous for
         // bypass. Use a grouped advanced topology with the exact master to
-        // exercise homogeneous NTSC classification independently.
+        // exercise linked-dry admission independently.
         let group = RuntimeGroup {
             id: group_id(9),
             name: GroupName::new("G").unwrap(),
@@ -7333,7 +7281,6 @@ mod tests {
         .unwrap();
         let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
         let advanced = advanced(plan(&base, &composition, &master, &racks).unwrap());
-        assert_eq!(advanced.ntsc_path(), AdvancedNtscPath::AllBypass);
         assert_eq!(
             advanced.temporal_master_path(),
             TemporalMasterPath::LinkedDry
@@ -7844,14 +7791,6 @@ mod tests {
         );
         assert!(!advanced.master().canonical_layers.contains(&layer_id(2)));
         assert!(advanced.master().canonical_layers.contains(&layer_id(3)));
-        assert_eq!(
-            advanced.master().selective_ntsc_bypass_layers.as_ref(),
-            &[layer_id(2)]
-        );
-        assert!(advanced
-            .master()
-            .selective_ntsc_layers
-            .contains(&layer_id(3)));
     }
 
     #[test]

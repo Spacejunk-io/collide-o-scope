@@ -25,9 +25,9 @@ with Rec.709 luma.
   covered bilinear for the sag-warped base read), following the CPU
   reference expression for expression.
 - `src/renderer/display_physics.rs` — the single-seam executor. Live
-  LegacyExact, live Advanced, selective-VHS, and export all converge on
-  composite slot 0 immediately before `render_opaque_output`, so ONE
-  implementation serves all four (the `encode_opaque_output` precedent,
+  LegacyExact, live Advanced, and export all converge on composite slot 0
+  immediately before `render_opaque_output` and the final-program VHS finish,
+  so ONE implementation serves them (the `encode_opaque_output` precedent,
   deliberately not the dual-implementation temporal one). The stage owns
   its own 30 Hz rational-accumulator reference clock (the
   `history_ticks_for_delta` law) because the Exact temporal state does not

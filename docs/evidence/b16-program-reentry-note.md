@@ -27,11 +27,10 @@ the `GestureCanvas` recipe verbatim:
   995,328,000). Export owns a job-lifetime twin built beside the composite
   textures.
 - **What the tap holds.** The **pre-blackout opaque audience image**: final
-  composite slot 2 after the opaque resolve — including display physics,
-  the melting edge, temporal, and synchronous selective VHS — before the
-  blackout clear and before asynchronous global-VHS replacement, which on
-  both paths lands only after the copy, so live and export publish the same
-  image by construction.
+  composite slot 2 after the opaque resolve — including display physics, the
+  melting edge, and temporal — before the blackout clear and before the
+  asynchronous final-program VHS replacement. The replacement lands only
+  after the copy, so the tap remains the deterministic pre-VHS seam.
 - **The N-1 law.** `Renderer::publish_program_tap` copies slot 2 in its own
   encoder at the frame-acceptance decision, after
   `commit_temporal_frame` — the only point at which acceptance is known,
@@ -133,10 +132,9 @@ a pinned worktree at the base merge (8f59aac) and on this branch —
 
 - No group-scope or per-layer tap variants: the programme is one singleton.
   A second tap (e.g. per-bus) would be a new route token, not a parameter.
-- No NTSC-inclusive tap: live global VHS is an asynchronous CPU replacement
-  whose latency the export contract cannot reproduce, so the tap reads the
-  deterministic pre-NTSC seam on both paths. Synchronous selective VHS is
-  upstream of the resolve and therefore included.
+- No NTSC-inclusive tap: live final-program VHS is an asynchronous CPU
+  replacement whose latency the export contract cannot reproduce, so the tap
+  reads the deterministic pre-VHS seam on both paths.
 - No modulation, Morph, Dice, or generator surface: a route is topology,
   and equality-based route matching covers the new variant with no new arm
   anywhere.

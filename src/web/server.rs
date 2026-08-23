@@ -1215,7 +1215,7 @@ fn valid_temporal_edit(param: &str, value: &serde_json::Value) -> bool {
         "melt_hold" => number_in(value, 0.0, 1.5),
         "melt_swirl" => number_in(value, -1.0, 1.0),
         "melt_chroma" | "melt_creep" => number_in(value, 0.0, 1.0),
-        // The B5 codec mosh's eight continuous wire params plus its one
+        // The B5 codec mosh's eleven continuous wire params plus its one
         // discrete recycle law.
         "mosh_amount"
         | "mosh_key_removal"
@@ -1224,7 +1224,10 @@ fn valid_temporal_edit(param: &str, value: &serde_json::Value) -> bool {
         | "mosh_shuffle"
         | "mosh_rate"
         | "mosh_bitrate_starve"
-        | "mosh_resync" => number_in(value, 0.0, 1.0),
+        | "mosh_resync"
+        | "mosh_wipe"
+        | "mosh_smear"
+        | "mosh_trail" => number_in(value, 0.0, 1.0),
         "mosh_recycle" => value.is_boolean(),
         // The B14 sync latch's four continuous wire params plus the switch.
         "sync_amount" | "sync_rate" | "sync_spread" => number_in(value, 0.0, 1.0),
@@ -1867,11 +1870,14 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
             valid_optional_layer_id(layer_id)
                 && valid_identifier(param, 64)
                 && valid_json_value(value)
-                && (param != "blend_mode"
-                    || value
+                && match param.as_str() {
+                    "blend_mode" => value
                         .as_str()
                         .and_then(crate::layers::BlendMode::from_key)
-                        .is_some())
+                        .is_some(),
+                    "mosh_send" => number_in(value, 0.0, 1.0),
+                    _ => true,
+                }
         }
         WebAction::SetLayerEffect {
             layer_id,
@@ -4277,6 +4283,9 @@ mod tests {
             ("mosh_rate", serde_json::json!(0.5)),
             ("mosh_bitrate_starve", serde_json::json!(1.0)),
             ("mosh_resync", serde_json::json!(0.3)),
+            ("mosh_wipe", serde_json::json!(0.75)),
+            ("mosh_smear", serde_json::json!(1.0)),
+            ("mosh_trail", serde_json::json!(0.4)),
             ("mosh_recycle", serde_json::json!(true)),
             ("mosh_recycle", serde_json::json!(false)),
             ("sync_amount", serde_json::json!(1.0)),
@@ -4325,6 +4334,9 @@ mod tests {
             ("reset_downbeat", serde_json::json!("carrier")),
             ("mosh_amount", serde_json::json!(1.001)),
             ("mosh_key_removal", serde_json::json!(-0.1)),
+            ("mosh_wipe", serde_json::json!(1.001)),
+            ("mosh_smear", serde_json::json!(-0.001)),
+            ("mosh_trail", serde_json::json!(false)),
             ("mosh_recycle", serde_json::json!(1)),
             ("sync_amount", serde_json::json!(1.001)),
             ("sync_rate", serde_json::json!(-0.1)),
@@ -4713,6 +4725,32 @@ mod tests {
                 value,
             };
             assert!(!valid_action(&action, 0));
+        }
+    }
+
+    #[test]
+    fn layer_mosh_send_ingress_requires_a_unit_interval_number() {
+        let action = |value| WebAction::SetLayerParam {
+            index: 0,
+            layer_id: Some("17".into()),
+            param: "mosh_send".into(),
+            value,
+        };
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(0.375),
+            serde_json::json!(1),
+        ] {
+            assert!(valid_action(&action(value), 0));
+        }
+        for value in [
+            serde_json::json!(-0.001),
+            serde_json::json!(1.001),
+            serde_json::json!("0.5"),
+            serde_json::Value::Bool(true),
+            serde_json::Value::Null,
+        ] {
+            assert!(!valid_action(&action(value), 0));
         }
     }
 

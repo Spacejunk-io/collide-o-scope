@@ -161,7 +161,7 @@ declares a single-frame/no-drop policy.
 
 The health HUD exposes bounded FPS and p50/p95/p99 frame time, missed deadlines,
 per-layer decoded age/queue/drop health, active output identity/resolution/rate,
-and known media/performance/NTSC/motion budgets. Its painter requires an
+and known media/performance/Mosh-Send/motion budgets. Its painter requires an
 `EditorPreview` permit; audience, Composite, Spout, recording, and export paths
 cannot call it.
 

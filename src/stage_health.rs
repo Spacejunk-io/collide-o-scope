@@ -358,7 +358,7 @@ pub fn paint_editor_preview_health(
             snapshot.output.identity
         ));
         ui.label(format!(
-            "GPU {} ({})  |  media {}  |  NTSC {}  |  motion {}",
+            "GPU {} ({})  |  media {}  |  Mosh send {}  |  motion {}",
             snapshot.gpu.adapter,
             snapshot.gpu.backend,
             budget_label(&snapshot.budgets.media),
