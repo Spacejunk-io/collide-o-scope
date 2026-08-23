@@ -1642,10 +1642,24 @@ mod tests {
         let packet = encode_feedback(address, 1.0).unwrap();
         sender.send_to(&packet, bound).unwrap();
 
+        // UDP never promises delivery, even on loopback. A loaded hosted
+        // runner has occasionally discarded the one-shot probe despite the
+        // worker and socket remaining healthy. Retransmit the identical typed
+        // packet on a bounded cadence; the assertion is about decoding and
+        // origin, not datagram reliability.
+        const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+        let mut last_send = Instant::now();
         let received = poll_until(|| {
             let mut events = Vec::new();
             engine.drain_events(&mut events);
-            events.into_iter().next()
+            if let Some(event) = events.into_iter().next() {
+                return Some(event);
+            }
+            if last_send.elapsed() >= RETRY_INTERVAL {
+                sender.send_to(&packet, bound).unwrap();
+                last_send = Instant::now();
+            }
+            None
         });
         let event = received.expect("OSC worker should publish the loopback event");
         assert_eq!(event.address, address);
