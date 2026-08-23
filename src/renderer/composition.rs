@@ -159,6 +159,16 @@ pub(crate) struct CompositionGpuOutput<'a> {
     pub format: wgpu::TextureFormat,
 }
 
+/// One executor-retained post-local dry layer. The view is RGBA16Float and
+/// remains valid until the next topology prepare; callers composite these in
+/// the returned order after the shared Temporal family. No legacy source
+/// rerender may substitute for this image because it already contains the
+/// advanced rack and layer-Motion result.
+pub(crate) struct CompositionTemporalBypassOverlay<'a> {
+    pub stable_id: StableLayerId,
+    pub view: &'a wgpu::TextureView,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompositionEncodeKind {
     LegacyExact,
@@ -543,6 +553,10 @@ struct PreparedAdvanced {
     /// deduplicated by stable layer ID. They cannot alias a single transient
     /// Pong surface when more than one donor is used in an authored rack.
     prelocal_surfaces: BTreeMap<StableLayerId, RetainedSurface>,
+    /// Post-local/post-layer-Motion images for the authored dry prefix. One
+    /// surface per authored member is preflighted in the shared resource
+    /// ledger and overwritten exactly once per encoded frame.
+    temporal_dry_surfaces: BTreeMap<StableLayerId, RetainedSurface>,
     root_schedule: Box<[RootScheduleEntry]>,
     member_schedules: BTreeMap<GroupId, Box<[MemberScheduleEntry]>>,
     external_effects: BTreeMap<StableLayerId, HostEffectSource>,
@@ -1388,6 +1402,46 @@ impl CompositionGpuExecutor {
         }
     }
 
+    /// Borrow the exact post-local dry surfaces in compositor order. A plan
+    /// mismatch or absent retained member is a hard schedule error: callers
+    /// must never fall back to re-rendering the raw legacy layer source.
+    pub(crate) fn temporal_bypass_overlays<'a>(
+        &'a self,
+        plan: &AdvancedCompositionPlan,
+    ) -> Result<Vec<CompositionTemporalBypassOverlay<'a>>, CompositionGpuError> {
+        let prepared = self
+            .prepared
+            .as_ref()
+            .ok_or(CompositionGpuError::TopologyNotPrepared {
+                prepared: None,
+                requested: plan.topology_signature(),
+            })?;
+        if prepared.topology_signature != plan.topology_signature() {
+            return Err(CompositionGpuError::TopologyNotPrepared {
+                prepared: Some(prepared.topology_signature),
+                requested: plan.topology_signature(),
+            });
+        }
+        plan.temporal_dry_layers()
+            .iter()
+            .map(|stable_id| {
+                let surface = prepared
+                    .temporal_dry_surfaces
+                    .get(stable_id)
+                    .ok_or_else(|| {
+                        CompositionGpuError::InvalidSchedule(format!(
+                            "Temporal dry layer {} has no retained post-local surface",
+                            stable_id.get()
+                        ))
+                    })?;
+                Ok(CompositionTemporalBypassOverlay {
+                    stable_id: *stable_id,
+                    view: &surface.view,
+                })
+            })
+            .collect()
+    }
+
     /// Final RGBA16Float -> target conversion is intentionally a render/blit,
     /// never a texture copy into the existing Rgba8UnormSrgb composites.
     pub fn encode_present(
@@ -1506,11 +1560,23 @@ impl PreparedAdvanced {
             )?;
             let taps = prepare_tap_surfaces(device, dimensions, plan.image_taps())?;
             let prelocal_surfaces = prepare_current_prelocal_surfaces(device, dimensions, &taps);
+            let temporal_dry_surfaces = plan
+                .temporal_dry_layers()
+                .iter()
+                .copied()
+                .map(|layer_id| {
+                    (
+                        layer_id,
+                        create_retained_surface(device, dimensions, "Advanced Temporal dry layer"),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
             validate_actual_surface_ledger(
                 plan,
                 retain_program_history,
                 &taps,
                 prelocal_surfaces.len(),
+                temporal_dry_surfaces.len(),
             )?;
 
             let source_lookup: BTreeMap<_, _> = sources
@@ -1885,6 +1951,9 @@ impl PreparedAdvanced {
             for surface in prelocal_surfaces.values() {
                 host.encode_clear(&mut initialize, &surface.view, wgpu::Color::TRANSPARENT);
             }
+            for surface in temporal_dry_surfaces.values() {
+                host.encode_clear(&mut initialize, &surface.view, wgpu::Color::TRANSPARENT);
+            }
             queue.submit(Some(initialize.finish()));
 
             let retained_textures = taps
@@ -1895,7 +1964,8 @@ impl PreparedAdvanced {
                     _ => 0,
                 })
                 .sum::<u64>()
-                + prelocal_surfaces.len() as u64;
+                + prelocal_surfaces.len() as u64
+                + temporal_dry_surfaces.len() as u64;
             Ok(Self {
                 topology_signature: plan.topology_signature(),
                 source_keys,
@@ -1916,6 +1986,7 @@ impl PreparedAdvanced {
                 motion,
                 taps: taps.into_boxed_slice(),
                 prelocal_surfaces,
+                temporal_dry_surfaces,
                 root_schedule,
                 member_schedules,
                 external_effects,
@@ -2123,6 +2194,9 @@ impl PreparedAdvanced {
                         HostSurface::Ping,
                         scope_readback,
                     )?;
+                    if plan.is_temporal_dry_layer(layer_id) {
+                        self.retain_temporal_dry_layer(encoder, layer_id)?;
+                    }
                 }
                 RootTask::Group(group_id) => {
                     self.execute_group(
@@ -2138,12 +2212,15 @@ impl PreparedAdvanced {
 
             for drain_index in 0..self.root_schedule[schedule_index].drains.len() {
                 let admission = self.root_schedule[schedule_index].drains[drain_index];
-                self.load_scheduled_source(encoder, admission.source)?;
                 match admission.item {
                     RootTask::Layer(layer_id) => {
-                        self.admit_layer(queue, encoder, plan, layer_id, None)?;
+                        if !plan.is_temporal_dry_layer(layer_id) {
+                            self.load_scheduled_source(encoder, admission.source)?;
+                            self.admit_layer(queue, encoder, plan, layer_id, None)?;
+                        }
                     }
                     RootTask::Group(group_id) => {
+                        self.load_scheduled_source(encoder, admission.source)?;
                         self.admit_group(queue, encoder, plan, group_id)?;
                     }
                 }
@@ -2227,6 +2304,26 @@ impl PreparedAdvanced {
                 "warmed encode changed the GPU allocation snapshot".into(),
             ));
         }
+        Ok(())
+    }
+
+    fn retain_temporal_dry_layer(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        layer_id: StableLayerId,
+    ) -> Result<(), CompositionGpuError> {
+        let surface = self.temporal_dry_surfaces.get(&layer_id).ok_or_else(|| {
+            CompositionGpuError::InvalidSchedule(format!(
+                "Temporal dry layer {} reached encode without a retained surface",
+                layer_id.get()
+            ))
+        })?;
+        copy_texture(
+            encoder,
+            self.host.surface(HostSurface::Ping).texture,
+            &surface.texture,
+            self.host.dimensions(),
+        );
         Ok(())
     }
 
@@ -3747,6 +3844,7 @@ fn validate_actual_surface_ledger(
     retain_program_history: bool,
     taps: &[PreparedTap],
     current_prelocal_surfaces: usize,
+    temporal_dry_surfaces: usize,
 ) -> Result<(), CompositionGpuError> {
     // Spelled exhaustively rather than with a wildcard: this is the fail-closed
     // reconcile seam, so a new backing must be charged deliberately instead of
@@ -3768,6 +3866,7 @@ fn validate_actual_surface_ledger(
         .and_then(|value| value.checked_add(2 * u32::from(retain_program_history)))
         .and_then(|value| value.checked_add(tap_surfaces))
         .and_then(|value| value.checked_add(current_prelocal_surfaces as u32))
+        .and_then(|value| value.checked_add(temporal_dry_surfaces as u32))
         .ok_or_else(|| CompositionGpuError::InvalidSchedule("surface ledger overflowed".into()))?;
     if actual != plan.resources().rgba16_surface_layers {
         return Err(CompositionGpuError::InvalidSchedule(format!(
@@ -5159,6 +5258,15 @@ mod tests {
         dimensions: [u32; 2],
         temporal: &TemporalParams,
     ) -> EvaluatedFramePlan {
+        evaluated_base_with_temporal_bypass(ids_front_to_back, dimensions, temporal, &[])
+    }
+
+    fn evaluated_base_with_temporal_bypass(
+        ids_front_to_back: &[u64],
+        dimensions: [u32; 2],
+        temporal: &TemporalParams,
+        bypass_temporal: &[u64],
+    ) -> EvaluatedFramePlan {
         let effects = vec![EffectUniforms::default(); ids_front_to_back.len()];
         let transforms = vec![SpatialTransform::new_layer_default(); ids_front_to_back.len()];
         let master_effects = EffectUniforms::default();
@@ -5189,10 +5297,72 @@ mod tests {
                     visible: true,
                     paused: false,
                     bypass_master_fx: false,
-                    bypass_temporal_fx: false,
+                    bypass_temporal_fx: bypass_temporal.contains(id),
                     pattern: None,
                 }),
         )
+    }
+
+    #[test]
+    fn temporal_dry_surfaces_reconcile_one_for_one_with_the_advanced_ledger() {
+        let base = evaluated_base_with_temporal_bypass(
+            &[1, 2, 3],
+            [64, 48],
+            &TemporalParams::default(),
+            &[1, 2],
+        );
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(3),
+                    bus: BusAssignment::Program,
+                },
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(2),
+                    bus: BusAssignment::Program,
+                },
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(1),
+                    bus: BusAssignment::Program,
+                },
+            ],
+            None,
+            0.5,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut racks = [1, 2, 3]
+            .map(|id| {
+                (
+                    stable_layer(id),
+                    RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+                )
+            })
+            .to_vec();
+        racks[0]
+            .1
+            .push(RuntimeVisualNodeKind::DigitalColor(DigitalColorParams {
+                invert: 1.0,
+                ..DigitalColorParams::default()
+            }))
+            .unwrap();
+        let planned = EvaluatedCompositionPlan::evaluate(
+            &base,
+            CompositionPlanInput::new(&composition, &master, &racks),
+        )
+        .unwrap();
+        let EvaluatedCompositionPlan::Advanced(advanced) = planned else {
+            panic!("the custom layer rack must select Advanced");
+        };
+        assert_eq!(
+            advanced.temporal_dry_layers(),
+            &[stable_layer(2), stable_layer(1)]
+        );
+        validate_actual_surface_ledger(&advanced, false, &[], 0, 2)
+            .expect("two planned dry layers must reconcile with two retained surfaces");
+        assert!(validate_actual_surface_ledger(&advanced, false, &[], 0, 1).is_err());
+        assert!(validate_actual_surface_ledger(&advanced, false, &[], 0, 3).is_err());
     }
 
     struct GpuHarness {
@@ -5674,12 +5844,12 @@ mod tests {
                 backing: TapBacking::GestureCanvas,
             })
             .collect();
-        validate_actual_surface_ledger(&plan, false, &taps, 0)
+        validate_actual_surface_ledger(&plan, false, &taps, 0, 0)
             .expect("a canvas route charges zero retained surfaces on both sides");
 
         // The validator really is live: one extra actual surface fails closed.
-        assert!(validate_actual_surface_ledger(&plan, false, &taps, 1).is_err());
-        assert!(validate_actual_surface_ledger(&plan, true, &taps, 0).is_err());
+        assert!(validate_actual_surface_ledger(&plan, false, &taps, 1, 0).is_err());
+        assert!(validate_actual_surface_ledger(&plan, true, &taps, 0, 0).is_err());
     }
 
     /// A programme-tap route is charged exactly once — by the renderer-owned
@@ -5759,12 +5929,12 @@ mod tests {
                 backing: TapBacking::ProgramTap,
             })
             .collect();
-        validate_actual_surface_ledger(&plan, false, &taps, 0)
+        validate_actual_surface_ledger(&plan, false, &taps, 0, 0)
             .expect("a programme-tap route charges zero retained surfaces on both sides");
 
         // The validator really is live: one extra actual surface fails closed.
-        assert!(validate_actual_surface_ledger(&plan, false, &taps, 1).is_err());
-        assert!(validate_actual_surface_ledger(&plan, true, &taps, 0).is_err());
+        assert!(validate_actual_surface_ledger(&plan, false, &taps, 1, 0).is_err());
+        assert!(validate_actual_surface_ledger(&plan, true, &taps, 0, 0).is_err());
     }
 
     /// One layer carrying one Displace node whose donor is the etched gesture

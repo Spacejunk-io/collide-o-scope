@@ -13,7 +13,8 @@ use std::time::Duration;
 use crate::composition::{CompositionTree, RuntimeComposition};
 use crate::effects::EffectUniforms;
 use crate::evaluated_frame::evaluated_composition::{
-    AdvancedNtscPath, CompositionPlanInput, EvaluatedCompositionPlan, TemporalMasterPath,
+    AdvancedCompositionPlan, AdvancedNtscPath, CompositionPlanInput, EvaluatedCompositionPlan,
+    TemporalMasterPath,
 };
 use crate::evaluated_frame::{
     EvaluatedFramePlan, FramePlanContext, LayerFrameInput, MasterFrameInput, ResolvedImageInput,
@@ -6989,6 +6990,47 @@ fn run_export(
                     &mod_temporal.display,
                     temporal_input.program_advancing_delta(),
                 );
+                if temporal_bypass_mode == ExportTemporalBypassMode::BeforeOpaque {
+                    match render_planned_temporal_bypass_overlay_export(
+                        Some(&*executor),
+                        &evaluated_composition,
+                        &device,
+                        &queue,
+                        &mut encoder,
+                        &layers,
+                        &evaluated_frame,
+                        &composite_textures,
+                        &composite_views,
+                        &effects_pipeline,
+                        &effects_bind_group_layout,
+                        &effects_uniform_layout,
+                        &composite_pipeline,
+                        &composite_bind_group_layout,
+                        &composite_uniform_layout,
+                        &sampler,
+                        &nearest_sampler,
+                        w,
+                        h,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            executor.discard_frame_history();
+                            gesture_canvas.discard_staged();
+                            write_error = Some(
+                                "Advanced temporal bypass export had no contributing dry overlay"
+                                    .to_string(),
+                            );
+                            break;
+                        }
+                        Err(error) => {
+                            executor.discard_frame_history();
+                            gesture_canvas.discard_staged();
+                            write_error =
+                                Some(format!("Advanced temporal bypass export failed: {error}"));
+                            break;
+                        }
+                    }
+                }
                 crate::renderer::state::encode_opaque_output(
                     &mut encoder,
                     &opaque_output_pipeline,
@@ -7209,7 +7251,9 @@ fn run_export(
                     temporal_input.program_advancing_delta(),
                 );
                 if temporal_bypass_mode == ExportTemporalBypassMode::BeforeOpaque {
-                    let overlay = render_temporal_bypass_overlay_export(
+                    let overlay = render_planned_temporal_bypass_overlay_export(
+                        composition_gpu.as_ref(),
+                        &evaluated_composition,
                         &device,
                         &queue,
                         &mut encoder,
@@ -7300,7 +7344,9 @@ fn run_export(
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Export Pre-Mosh Temporal Bypass Overlay"),
                 });
-            let overlay = render_temporal_bypass_overlay_export(
+            let overlay = render_planned_temporal_bypass_overlay_export(
+                composition_gpu.as_ref(),
+                &evaluated_composition,
                 &device,
                 &queue,
                 &mut overlay_encoder,
@@ -7488,7 +7534,9 @@ fn run_export(
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Export Post-Mosh Temporal Bypass Overlay"),
                 });
-            let overlay = render_temporal_bypass_overlay_export(
+            let overlay = render_planned_temporal_bypass_overlay_export(
+                composition_gpu.as_ref(),
+                &evaluated_composition,
                 &device,
                 &queue,
                 &mut final_overlay_encoder,
@@ -8995,6 +9043,243 @@ fn render_temporal_bypass_overlay_export(
     Ok(true)
 }
 
+/// Offline counterpart of live's precomposed Advanced overlay route. Every
+/// view comes from the shared executor after the layer's ordered rack and
+/// layer Motion; export never substitutes a legacy raw-source pass.
+#[allow(clippy::too_many_arguments)]
+fn render_advanced_temporal_bypass_overlay_export(
+    executor: &CompositionGpuExecutor,
+    advanced: &AdvancedCompositionPlan,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
+    composite_textures: &[wgpu::Texture; 3],
+    composite_views: &[wgpu::TextureView; 3],
+    effects_pipeline: &wgpu::RenderPipeline,
+    effects_bind_group_layout: &wgpu::BindGroupLayout,
+    effects_uniform_layout: &wgpu::BindGroupLayout,
+    composite_pipeline: &wgpu::RenderPipeline,
+    composite_bind_group_layout: &wgpu::BindGroupLayout,
+    composite_uniform_layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    nearest_sampler: &wgpu::Sampler,
+    output_width: u32,
+    output_height: u32,
+) -> Result<bool, String> {
+    let retained = executor
+        .temporal_bypass_overlays(advanced)
+        .map_err(|error| error.to_string())?;
+    let expected = advanced.temporal_dry_layers();
+    if retained.len() != expected.len() {
+        return Err(format!(
+            "Advanced Temporal bypass retained {} export overlays for {} planned dry layers",
+            retained.len(),
+            expected.len()
+        ));
+    }
+    let mut overlays = Vec::with_capacity(retained.len());
+    for (index, retained) in retained.into_iter().enumerate() {
+        if expected.get(index).copied() != Some(retained.stable_id) {
+            return Err(format!(
+                "Advanced Temporal bypass retained export layer {} out of planned order at slot {index}",
+                retained.stable_id.get()
+            ));
+        }
+        let layer_plan = advanced
+            .layers()
+            .iter()
+            .find(|layer| layer.stable_id == retained.stable_id)
+            .ok_or_else(|| {
+                format!(
+                    "Advanced Temporal bypass retained unknown export layer {}",
+                    retained.stable_id.get()
+                )
+            })?;
+        let layer = advanced
+            .base()
+            .layers()
+            .get(layer_plan.base_layer_index)
+            .ok_or_else(|| {
+                format!(
+                    "Advanced Temporal bypass export layer {} has invalid base index {}",
+                    retained.stable_id.get(),
+                    layer_plan.base_layer_index
+                )
+            })?;
+        if layer.visible && (layer.opacity > 0.0 || !layer.opacity.is_finite()) {
+            overlays.push((retained.view, layer));
+        }
+    }
+    if overlays.is_empty() {
+        return Ok(false);
+    }
+    for (view, layer) in overlays {
+        let overlay_view = if layer.bypass_master_fx {
+            view
+        } else {
+            encode_export_effect_pass(
+                device,
+                queue,
+                encoder,
+                view,
+                &composite_views[1],
+                advanced.base().master_pass(),
+                effects_pipeline,
+                effects_bind_group_layout,
+                effects_uniform_layout,
+                sampler,
+                nearest_sampler,
+                "Export Advanced Temporal Bypass Inherited Master FX",
+            );
+            &composite_views[1]
+        };
+        let composite_buffer = create_uploaded_uniform(
+            device,
+            queue,
+            "Export Advanced Temporal Bypass Composite Uniforms",
+            &CompositeUniforms {
+                opacity: layer.opacity,
+                blend_mode: layer.blend_mode.as_u32(),
+                _pad: [0.0; 2],
+            },
+        );
+        let composite_texture_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Export Advanced Temporal Bypass Composite Inputs"),
+            layout: composite_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&composite_views[0]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(overlay_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+        let composite_uniform_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Export Advanced Temporal Bypass Composite Uniforms BG"),
+            layout: composite_uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: composite_buffer.as_entire_binding(),
+            }],
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Export Advanced Temporal Bypass Final Composite"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &composite_views[2],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(composite_pipeline);
+            pass.set_bind_group(0, &composite_texture_group, &[]);
+            pass.set_bind_group(1, &composite_uniform_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &composite_textures[2],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &composite_textures[0],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: output_width,
+                height: output_height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_planned_temporal_bypass_overlay_export(
+    executor: Option<&CompositionGpuExecutor>,
+    composition: &EvaluatedCompositionPlan,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
+    layers: &[ExportLayer],
+    evaluated: &EvaluatedFramePlan,
+    composite_textures: &[wgpu::Texture; 3],
+    composite_views: &[wgpu::TextureView; 3],
+    effects_pipeline: &wgpu::RenderPipeline,
+    effects_bind_group_layout: &wgpu::BindGroupLayout,
+    effects_uniform_layout: &wgpu::BindGroupLayout,
+    composite_pipeline: &wgpu::RenderPipeline,
+    composite_bind_group_layout: &wgpu::BindGroupLayout,
+    composite_uniform_layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    nearest_sampler: &wgpu::Sampler,
+    output_width: u32,
+    output_height: u32,
+) -> Result<bool, String> {
+    match composition {
+        EvaluatedCompositionPlan::LegacyExact(_) => render_temporal_bypass_overlay_export(
+            device,
+            queue,
+            encoder,
+            layers,
+            evaluated,
+            composite_textures,
+            composite_views,
+            effects_pipeline,
+            effects_bind_group_layout,
+            effects_uniform_layout,
+            composite_pipeline,
+            composite_bind_group_layout,
+            composite_uniform_layout,
+            sampler,
+            nearest_sampler,
+            output_width,
+            output_height,
+        ),
+        EvaluatedCompositionPlan::Advanced(advanced) => {
+            render_advanced_temporal_bypass_overlay_export(
+                executor.ok_or_else(|| {
+                    "Advanced Temporal bypass has no prepared export executor".to_string()
+                })?,
+                advanced,
+                device,
+                queue,
+                encoder,
+                composite_textures,
+                composite_views,
+                effects_pipeline,
+                effects_bind_group_layout,
+                effects_uniform_layout,
+                composite_pipeline,
+                composite_bind_group_layout,
+                composite_uniform_layout,
+                sampler,
+                nearest_sampler,
+                output_width,
+                output_height,
+            )
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_layers_with_conditional_master_export(
     device: &wgpu::Device,
@@ -9723,6 +10008,98 @@ mod tests {
         assert!(
             partition_reset.contains("resources.history_valid = false;"),
             "every partition edge must invalidate retained legacy ProgramHistory"
+        );
+    }
+
+    #[test]
+    fn advanced_temporal_bypass_export_reuses_retained_surfaces_on_both_mosh_paths() {
+        let source = include_str!("render_export.rs").replace("\r\n", "\n");
+        let helper_start = source
+            .find("fn render_advanced_temporal_bypass_overlay_export(")
+            .expect("Advanced dry-overlay helper");
+        let helper_end = source[helper_start..]
+            .find("fn render_planned_temporal_bypass_overlay_export(")
+            .map(|offset| helper_start + offset)
+            .expect("Advanced dry-overlay helper boundary");
+        let helper = &source[helper_start..helper_end];
+        let compact = helper
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(compact.contains(".temporal_bypass_overlays(advanced)"));
+        assert!(compact.contains("retained.len()!=expected.len()"));
+        assert!(compact.contains("expected.get(index).copied()!=Some(retained.stable_id)"));
+        assert!(compact.contains(".get(layer_plan.base_layer_index)"));
+        assert!(
+            !helper.contains("ExportLayer") && !helper.contains("texture_view"),
+            "Advanced export must never substitute a raw legacy source for a retained layer"
+        );
+
+        let run_start = source.find("fn run_export(").expect("offline export entry");
+        let run_end = source[run_start..]
+            .find("/// Readback composite_textures[0]")
+            .map(|offset| run_start + offset)
+            .expect("offline export body boundary");
+        let run = &source[run_start..run_end];
+        assert_eq!(
+            run.matches("render_planned_temporal_bypass_overlay_export(")
+                .count(),
+            4,
+            "Advanced/Legacy no-Mosh and pre/post-Mosh seams must all use one dispatcher"
+        );
+
+        // Advanced no-Mosh: shared executor output -> external Temporal family
+        // -> retained dry surfaces -> the sole opaque audience boundary.
+        let advanced = run
+            .find("// The shared executor owns LegacyTemporal for Advanced")
+            .expect("Advanced presentation handoff");
+        let before_opaque = run[advanced..]
+            .find("if temporal_bypass_mode == ExportTemporalBypassMode::BeforeOpaque")
+            .map(|offset| advanced + offset)
+            .expect("Advanced before-opaque policy");
+        let advanced_overlay = run[before_opaque..]
+            .find("render_planned_temporal_bypass_overlay_export(")
+            .map(|offset| before_opaque + offset)
+            .expect("Advanced retained overlay call");
+        let advanced_opaque = run[advanced_overlay..]
+            .find("crate::renderer::state::encode_opaque_output(")
+            .map(|offset| advanced_overlay + offset)
+            .expect("Advanced opaque boundary");
+        assert!(before_opaque < advanced_overlay && advanced_overlay < advanced_opaque);
+
+        // Around Codec Mosh: reconstruct the complete pre-Mosh programme for
+        // analysis/tap provenance, but feed only the wet readback to the CPU;
+        // then upload that replacement and reuse the same retained surfaces.
+        let pre_label = run
+            .find("label: Some(\"Export Pre-Mosh Temporal Bypass Overlay\")")
+            .expect("pre-Mosh overlay encoder");
+        let pre_overlay = run[pre_label..]
+            .find("render_planned_temporal_bypass_overlay_export(")
+            .map(|offset| pre_label + offset)
+            .expect("pre-Mosh retained overlay");
+        let candidate_copy = run[pre_overlay..]
+            .find("texture: candidate,")
+            .map(|offset| pre_overlay + offset)
+            .expect("pre-Mosh candidate publication");
+        assert!(pre_label < pre_overlay && pre_overlay < candidate_copy);
+
+        let wet_upload = run
+            .find("\"Export Moshed Temporal Wet Program\"")
+            .expect("CPU Mosh wet upload");
+        let post_label = run[wet_upload..]
+            .find("label: Some(\"Export Post-Mosh Temporal Bypass Overlay\")")
+            .map(|offset| wet_upload + offset)
+            .expect("post-Mosh overlay encoder");
+        let post_overlay = run[post_label..]
+            .find("render_planned_temporal_bypass_overlay_export(")
+            .map(|offset| post_label + offset)
+            .expect("post-Mosh retained overlay");
+        let final_opaque = run[post_overlay..]
+            .find("crate::renderer::state::encode_opaque_output(")
+            .map(|offset| post_overlay + offset)
+            .expect("post-Mosh opaque boundary");
+        assert!(
+            wet_upload < post_label && post_label < post_overlay && post_overlay < final_opaque
         );
     }
 

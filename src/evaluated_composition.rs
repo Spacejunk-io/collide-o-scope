@@ -1706,6 +1706,11 @@ pub struct AdvancedCompositionPlan {
     corruption_resources: CorruptionResourcePlan,
     topology_signature: u64,
     temporal_master_path: TemporalMasterPath,
+    /// Authored top-prefix layers whose post-local image is retained outside
+    /// the one shared Temporal machine. Stable IDs are stored in compositor
+    /// order (bottom dry layer first, UI Layer 1 last) so live and export can
+    /// rebuild the same dry prefix without sorting mutable application state.
+    temporal_dry_layers: Box<[StableLayerId]>,
 }
 
 /// Frame-local NTSC routing classification shared by live and offline
@@ -1751,6 +1756,14 @@ impl AdvancedCompositionPlan {
 
     pub const fn temporal_master_path(&self) -> TemporalMasterPath {
         self.temporal_master_path
+    }
+
+    pub fn temporal_dry_layers(&self) -> &[StableLayerId] {
+        &self.temporal_dry_layers
+    }
+
+    pub fn is_temporal_dry_layer(&self, layer_id: StableLayerId) -> bool {
+        self.temporal_dry_layers.contains(&layer_id)
     }
 
     pub fn image_taps(&self) -> &[PlannedImageTap] {
@@ -2038,6 +2051,39 @@ impl BelowTopology {
     }
 }
 
+/// A precise reason an authored dry/wet partition cannot be represented by
+/// the one-history compositor. Each item names a real algebraic or resource
+/// boundary; the planner never flattens, reorders, or drops the offending
+/// authored operation to make the request appear valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TemporalBypassBlocker {
+    Groups,
+    NonProgramBus,
+    CompositionOrder,
+    ActiveLayerMatte,
+    RoutedLayerRack,
+    CustomMasterRack,
+    RoutedRefreshGarden,
+    AdvancedMasterMotion,
+}
+
+impl fmt::Display for TemporalBypassBlocker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Groups => "groups couple dry and wet admissions",
+            Self::NonProgramBus => "an A/B bus or mixing-boundary route is active",
+            Self::CompositionOrder => "the composition root does not preserve the flat layer order",
+            Self::ActiveLayerMatte => "an authored enabled layer matte couples dry and wet images",
+            Self::RoutedLayerRack => {
+                "an authored enabled layer-rack image route crosses composition domains"
+            }
+            Self::CustomMasterRack => "the master rack contains custom ordering around Temporal",
+            Self::RoutedRefreshGarden => "Refresh Garden uses a routed Matte/Motion gate",
+            Self::AdvancedMasterMotion => "Master Motion is active after the Temporal boundary",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompositionPlanError {
     InvalidBaseLayerId {
@@ -2117,12 +2163,12 @@ pub enum CompositionPlanError {
     TemporalBypassNotTopPrefix {
         layers: Vec<StableLayerId>,
     },
-    /// The one-history overlay path deliberately starts with the frozen flat
-    /// LegacyExact topology. Groups, buses, mattes, routed Garden, custom
-    /// racks, and advanced Motion must be represented explicitly before they
-    /// can cross this boundary.
+    /// The one-history overlay path admits every topology whose dry result can
+    /// be retained independently and recomposited after Temporal. Remaining
+    /// non-decomposable boundaries are reported individually.
     TemporalBypassUnsupportedTopology {
         layers: Vec<StableLayerId>,
+        blockers: Vec<TemporalBypassBlocker>,
     },
     /// VHS is a separate audience-domain processor. Until its selective
     /// worker retains the dry overlay as a generation-coherent payload, an
@@ -2276,10 +2322,19 @@ impl fmt::Display for CompositionPlanError {
                 formatter,
                 "Bypass Temporal FX layers {layers:?} must form the top contiguous layer prefix; move them above every inheriting layer"
             ),
-            Self::TemporalBypassUnsupportedTopology { layers } => write!(
-                formatter,
-                "Bypass Temporal FX layers {layers:?} require a flat Program stack with legacy layer/master racks, no active mattes, and legacy Motion"
-            ),
+            Self::TemporalBypassUnsupportedTopology { layers, blockers } => {
+                write!(
+                    formatter,
+                    "Bypass Temporal FX layers {layers:?} cannot form an exact dry overlay: "
+                )?;
+                for (index, blocker) in blockers.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str("; ")?;
+                    }
+                    write!(formatter, "{blocker}")?;
+                }
+                Ok(())
+            }
             Self::TemporalBypassWithNtsc { layers } => write!(
                 formatter,
                 "Bypass Temporal FX layers {layers:?} cannot be isolated while VHS is enabled; disable VHS before enabling this route"
@@ -2484,20 +2539,20 @@ impl<'a> Planner<'a> {
         }
         let motion = self.evaluate_motion(&flat_ids)?;
         if !authored_temporal_bypass.is_empty() {
-            // Garden amount is modulatable. Treat an authored routed gate as
-            // topology even while its current amount is zero; otherwise an
-            // LFO could wake the route on a later frame without crossing an
-            // authoring transaction and turn the last accepted picture into
-            // a permanent safe-hold.
-            if !self.is_global_legacy_exact(&flat_ids)
-                || !motion.is_legacy_exact()
-                || routed_garden_gate_authored
-            {
+            let blockers =
+                self.temporal_bypass_blockers(&flat_ids, &motion, routed_garden_gate_authored);
+            if !blockers.is_empty() {
                 return Err(CompositionPlanError::TemporalBypassUnsupportedTopology {
                     layers: authored_temporal_bypass,
+                    blockers,
                 });
             }
         }
+        let temporal_dry_layers = authored_temporal_bypass
+            .iter()
+            .rev()
+            .copied()
+            .collect::<Vec<_>>();
         if self.is_global_legacy_exact(&flat_ids)
             && motion.is_legacy_exact()
             && !routed_garden_active
@@ -2667,6 +2722,7 @@ impl<'a> Planner<'a> {
         let mut selective_ntsc_layers = Vec::new();
         let mut selective_ntsc_bypass_layers = Vec::new();
         let mut contributing_bypass = Vec::new();
+        let mut contributing_temporal_bypass = false;
         for layer in &layer_plans {
             let evaluated = &self.base.layers()[layer.base_layer_index];
             if !layer_effectively_contributes(
@@ -2681,6 +2737,7 @@ impl<'a> Planner<'a> {
             if evaluated.bypass_master_fx {
                 contributing_bypass.push(layer.stable_id);
             }
+            contributing_temporal_bypass |= evaluated.bypass_temporal_fx;
             if self.base.ntsc().enabled {
                 if evaluated.bypass_master_fx {
                     selective_ntsc_bypass_layers.push(layer.stable_id);
@@ -2696,10 +2753,12 @@ impl<'a> Planner<'a> {
                 }
             }
         }
-        let temporal_master_path = if contributing_bypass.is_empty() {
-            TemporalMasterPath::Inherited
-        } else {
+        let temporal_master_path = if contributing_temporal_bypass {
+            TemporalMasterPath::IsolatedDryOverlay
+        } else if !contributing_bypass.is_empty() {
             TemporalMasterPath::LinkedDry
+        } else {
+            TemporalMasterPath::Inherited
         };
         let mut saw_global_master_step = false;
         let mut canonical_after_global = false;
@@ -3000,6 +3059,7 @@ impl<'a> Planner<'a> {
             &motion,
             refresh_garden_signal,
             symmetry_field_resources,
+            &temporal_dry_layers,
         )?;
         let topology_signature = advanced_topology_signature(
             self.input.composition,
@@ -3015,6 +3075,7 @@ impl<'a> Planner<'a> {
             study_identity,
             scan_processor_resources,
             residual_resources,
+            &temporal_dry_layers,
         );
 
         Ok(EvaluatedCompositionPlan::Advanced(Box::new(
@@ -3042,6 +3103,7 @@ impl<'a> Planner<'a> {
                 corruption_resources,
                 topology_signature,
                 temporal_master_path,
+                temporal_dry_layers: temporal_dry_layers.into_boxed_slice(),
             },
         )))
     }
@@ -3572,6 +3634,75 @@ impl<'a> Planner<'a> {
         )))
     }
 
+    fn temporal_bypass_blockers(
+        &self,
+        flat_ids: &[StableLayerId],
+        motion: &EvaluatedMotionPlan,
+        routed_garden_gate_authored: bool,
+    ) -> Vec<TemporalBypassBlocker> {
+        let mut blockers = Vec::new();
+        if self.input.composition.groups().len() != 0 {
+            blockers.push(TemporalBypassBlocker::Groups);
+        }
+        if self.input.composition.root().iter().any(|item| {
+            matches!(
+                item,
+                RuntimeRootItem::Layer { bus, .. } if *bus != BusAssignment::Program
+            )
+        }) {
+            blockers.push(TemporalBypassBlocker::NonProgramBus);
+        }
+        if !flat_ids
+            .iter()
+            .copied()
+            .eq(self.base_ids.iter().rev().copied())
+        {
+            blockers.push(TemporalBypassBlocker::CompositionOrder);
+        }
+        // Matte amount is modulatable. Any authored enabled matte therefore
+        // owns cross-domain topology even on a frame where its evaluated
+        // amount is exactly zero; accepting that frame would let modulation
+        // wake the route without an authoring transaction or resource rebuild.
+        let raw_matte_authored = self
+            .input
+            .layer_mattes
+            .is_some_and(|mattes| mattes.iter().any(|matte| matte.sanitized().enabled));
+        if self.base.image_routing().is_active() || raw_matte_authored {
+            blockers.push(TemporalBypassBlocker::ActiveLayerMatte);
+        }
+        if self
+            .racks
+            .values()
+            .copied()
+            .any(runtime_rack_has_authored_image_route)
+        {
+            blockers.push(TemporalBypassBlocker::RoutedLayerRack);
+        }
+        if !self
+            .input
+            .master_rack
+            .is_exact_legacy(LegacyRackScope::Master)
+        {
+            blockers.push(TemporalBypassBlocker::CustomMasterRack);
+        }
+        // Garden amount is modulatable. Treat an authored routed gate as
+        // topology even while its current amount is zero; otherwise an LFO
+        // could wake the route without another authoring transaction.
+        if routed_garden_gate_authored {
+            blockers.push(TemporalBypassBlocker::RoutedRefreshGarden);
+        }
+        if motion.advanced().is_some_and(|motion| {
+            motion
+                .scope(VisualScopeId::Master)
+                .is_some_and(motion_scope_has_pixel_effect)
+        }) {
+            blockers.push(TemporalBypassBlocker::AdvancedMasterMotion);
+        }
+        blockers.sort_unstable();
+        blockers.dedup();
+        blockers
+    }
+
     fn is_global_legacy_exact(&self, flat_ids: &[StableLayerId]) -> bool {
         !self.base.image_routing().is_active()
             && !self.input.layer_mattes.is_some_and(|mattes| {
@@ -3604,6 +3735,38 @@ impl<'a> Planner<'a> {
                 .iter()
                 .all(|id| self.racks[id].is_exact_legacy(LegacyRackScope::Layer))
     }
+}
+
+fn motion_scope_has_pixel_effect(scope: &EvaluatedMotionScopePlan) -> bool {
+    !scope.params.is_exact_zero()
+        || scope.required_as_donor
+        || scope.required_as_garden_signal
+        || scope.transplant_admitted
+        || scope.collider_admitted
+}
+
+/// Detect authored cross-domain image topology independently of its current
+/// continuous values. Node wet and every route gain are modulatable, so an
+/// enabled route at exact-zero cannot be treated as permanently local merely
+/// because this frame happens to compile no tap for it. A disabled node is
+/// safe: enabled state is not modulatable and an authoring transaction that
+/// enables it necessarily performs a fresh preflight.
+fn runtime_rack_has_authored_image_route(rack: &RuntimeVisualRack) -> bool {
+    rack.iter().any(|node| {
+        if !node.enabled {
+            return false;
+        }
+        match node.kind {
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(_))
+            | RuntimeVisualNodeKind::Displace(_)
+            | RuntimeVisualNodeKind::Residual(_) => true,
+            RuntimeVisualNodeKind::Symmetry(symmetry) => symmetry
+                .admitted_donor_taps()
+                .into_iter()
+                .any(|tap| tap.is_some()),
+            _ => false,
+        }
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -4666,6 +4829,7 @@ fn resource_preflight(
     motion: &EvaluatedMotionPlan,
     refresh_garden_signal: EvaluatedRefreshGardenSignalPlan,
     symmetry_field: SymmetryFieldResourcePlan,
+    temporal_dry_layers: &[StableLayerId],
 ) -> Result<(CreativeResourcePlan, ResidualResourcePlan), CompositionPlanError> {
     let mut racks = Vec::with_capacity(
         input
@@ -4762,10 +4926,16 @@ fn resource_preflight(
         .collect::<BTreeSet<_>>();
     let current_prelocal_surfaces = u32::try_from(current_prelocal_donors.len())
         .map_err(|_| CompositionPlanError::Resource(ResourcePreflightError::ArithmeticOverflow))?;
+    let temporal_dry_surfaces = u32::try_from(temporal_dry_layers.len())
+        .map_err(|_| CompositionPlanError::Resource(ResourcePreflightError::ArithmeticOverflow))?;
     let additional_rgba16 = ADVANCED_RACK_SURFACE_LAYERS
         .checked_add(previous_scope_staging)
         .and_then(|value| value.checked_add(program_history_staging))
         .and_then(|value| value.checked_add(current_prelocal_surfaces))
+        // One post-local surface per authored dry layer is the bounded price
+        // of retaining arbitrary layer blend modes across delayed Codec Mosh.
+        // It is charged before allocation and reused by live/export.
+        .and_then(|value| value.checked_add(temporal_dry_surfaces))
         .ok_or(CompositionPlanError::Resource(
             ResourcePreflightError::ArithmeticOverflow,
         ))?;
@@ -5048,6 +5218,7 @@ fn advanced_topology_signature(
     study_identity: u64,
     scan_processor: ScanProcessorResourcePlan,
     residual: ResidualResourcePlan,
+    temporal_dry_layers: &[StableLayerId],
 ) -> u64 {
     let mut hash = hash_value(FNV_OFFSET, 0x4144_5641_4e43_4544);
     hash = hash_value(hash, master.topology_signature());
@@ -5117,6 +5288,12 @@ fn advanced_topology_signature(
     if !motion.is_legacy_exact() {
         hash = hash_value(hash, 0x4d4f_5449_4f4e);
         hash = hash_value(hash, motion.topology_signature());
+    }
+    if !temporal_dry_layers.is_empty() {
+        hash = hash_value(hash, 0x5445_4d50_4452_5958);
+        for layer_id in temporal_dry_layers {
+            hash = hash_value(hash, layer_id.get());
+        }
     }
     hash = hash_value(
         hash,
@@ -7275,6 +7452,246 @@ mod tests {
     }
 
     #[test]
+    fn advanced_layer_rack_and_layer_motion_keep_an_exact_isolated_dry_prefix() {
+        let mut base = base(&[1, 2, 3], &[]);
+        base.layers[0].bypass_temporal_fx = true;
+        base.layers[1].bypass_temporal_fx = true;
+        let composition = legacy_composition(&[1, 2, 3]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut racks = legacy_racks(&[1, 2, 3]);
+        racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::DigitalColor(DigitalColorParams {
+                invert: 1.0,
+                ..DigitalColorParams::default()
+            }))
+            .unwrap();
+        let mut motion = zero_motion_layers(&[1, 2, 3]);
+        motion[0].params.shutter.angle_degrees = 180.0;
+
+        let planned =
+            plan_with_motion_at_device_floor(&base, &composition, &master, &racks, &motion)
+                .expect("layer-local racks and Motion are independently retainable");
+        let advanced = advanced(planned);
+        assert_eq!(
+            advanced.temporal_master_path(),
+            TemporalMasterPath::IsolatedDryOverlay
+        );
+        assert_eq!(
+            advanced.temporal_dry_layers(),
+            &[layer_id(2), layer_id(1)],
+            "dry surfaces must be returned in bottom-to-top compositor order"
+        );
+        assert!(advanced.is_temporal_dry_layer(layer_id(1)));
+        assert!(advanced.is_temporal_dry_layer(layer_id(2)));
+        assert!(!advanced.is_temporal_dry_layer(layer_id(3)));
+        assert!(advanced.root().contains(&RuntimeRootItem::Layer {
+            layer_id: layer_id(3),
+            bus: BusAssignment::Program,
+        }));
+        assert!(advanced
+            .layers()
+            .iter()
+            .find(|layer| layer.stable_id == layer_id(2))
+            .is_some_and(|layer| !layer.execution.is_exact_legacy()));
+        let motion = advanced.motion().advanced().expect("layer Motion plan");
+        assert!(motion
+            .scope(VisualScopeId::Layer(layer_id(1)))
+            .is_some_and(motion_scope_has_pixel_effect));
+        assert_eq!(
+            advanced.resources().rgba16_surface_layers,
+            crate::visual_rack::BASE_CREATIVE_SURFACE_LAYERS + ADVANCED_RACK_SURFACE_LAYERS + 2,
+            "one preflighted RGBA16 surface is charged per dry layer"
+        );
+    }
+
+    #[test]
+    fn dormant_modulatable_layer_routes_and_mattes_block_isolation_before_gpu_work() {
+        let mut base = base(&[1, 2], &[]);
+        base.layers[0].bypass_temporal_fx = true;
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let donor = ResolvedImageSource::SelectedLayer {
+            layer_id: layer_id(2),
+            saved_position: saved_position(1),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+
+        // Both values are exact bypasses on this frame, but node wet and the
+        // displacement amounts are LFO targets. The authored donor topology
+        // must therefore be rejected before either value can wake it.
+        for dormant in ["zero_amount", "zero_wet"] {
+            let mut racks = legacy_racks(&[1, 2]);
+            let node = push_displace(
+                &mut racks[0].1,
+                donor,
+                EdgeTiming::CurrentFrame,
+                if dormant == "zero_amount" { 0.0 } else { 0.75 },
+            );
+            if dormant == "zero_wet" {
+                racks[0].1.get_mut(node).unwrap().wet = 0.0;
+            }
+            assert!(matches!(
+                plan(&base, &composition, &master, &racks),
+                Err(CompositionPlanError::TemporalBypassUnsupportedTopology {
+                    layers,
+                    blockers,
+                }) if layers == vec![layer_id(1)]
+                    && blockers == vec![TemporalBypassBlocker::RoutedLayerRack]
+            ));
+        }
+
+        // Layer-matte amount is likewise modulatable. An enabled authored
+        // route at zero stays topology and cannot be admitted opportunistically.
+        let racks = legacy_racks(&[1, 2]);
+        let mattes = [
+            LayerMatte {
+                enabled: true,
+                input: ImageInput::OneBelow,
+                amount: 0.0,
+                ..LayerMatte::default()
+            },
+            LayerMatte::default(),
+        ];
+        assert!(matches!(
+            EvaluatedCompositionPlan::evaluate(
+                &base,
+                CompositionPlanInput::new(&composition, &master, &racks)
+                    .with_layer_mattes(&mattes, false),
+            ),
+            Err(CompositionPlanError::TemporalBypassUnsupportedTopology {
+                layers,
+                blockers,
+            }) if layers == vec![layer_id(1)]
+                && blockers == vec![TemporalBypassBlocker::ActiveLayerMatte]
+        ));
+    }
+
+    #[test]
+    fn active_master_motion_names_its_non_decomposable_boundary() {
+        let mut base = base(&[1, 2], &[]);
+        base.layers[0].bypass_temporal_fx = true;
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let racks = legacy_racks(&[1, 2]);
+        let layers = zero_motion_layers(&[1, 2]);
+        let mut master_motion = MotionParams::default();
+        master_motion.shutter.angle_degrees = 180.0;
+        let mut input = CompositionPlanInput::new(&composition, &master, &racks).with_motion(
+            master_motion,
+            &layers,
+            MotionDeviceLimits::new(8_192, u64::MAX),
+        );
+        input.resource_limits.max_sampled_textures_per_shader_stage = 16;
+
+        assert!(matches!(
+            EvaluatedCompositionPlan::evaluate(&base, input),
+            Err(CompositionPlanError::TemporalBypassUnsupportedTopology {
+                layers,
+                blockers,
+            }) if layers == vec![layer_id(1)]
+                && blockers == vec![TemporalBypassBlocker::AdvancedMasterMotion]
+        ));
+    }
+
+    #[test]
+    fn structural_temporal_blockers_name_groups_buses_and_order_independently() {
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+
+        let mut grouped_base = base(&[1, 2, 3], &[]);
+        grouped_base.layers[0].bypass_temporal_fx = true;
+        let group = RuntimeGroup {
+            id: group_id(9),
+            name: GroupName::new("dry partition blocker").unwrap(),
+            members: RuntimeGroupMembers::try_from_vec(vec![layer_id(3), layer_id(2)]).unwrap(),
+            opacity: 1.0,
+            transform: SpatialTransform::default(),
+            rack: RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Group),
+            matte: None,
+            solo: false,
+            bypass: false,
+            bus: BusAssignment::Program,
+        };
+        let grouped = RuntimeComposition::try_from_parts(
+            vec![group],
+            vec![
+                RuntimeRootItem::Group {
+                    group_id: group_id(9),
+                },
+                RuntimeRootItem::Layer {
+                    layer_id: layer_id(1),
+                    bus: BusAssignment::Program,
+                },
+            ],
+            None,
+            0.5,
+        )
+        .unwrap();
+        let grouped_racks = legacy_racks(&[1, 2, 3]);
+        assert!(matches!(
+            plan(&grouped_base, &grouped, &master, &grouped_racks),
+            Err(CompositionPlanError::TemporalBypassUnsupportedTopology {
+                layers,
+                blockers,
+            }) if layers == vec![layer_id(1)]
+                && blockers == vec![TemporalBypassBlocker::Groups]
+        ));
+
+        let mut flat_base = base(&[1, 2], &[]);
+        flat_base.layers[0].bypass_temporal_fx = true;
+        let racks = legacy_racks(&[1, 2]);
+        let non_program = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![
+                RuntimeRootItem::Layer {
+                    layer_id: layer_id(2),
+                    bus: BusAssignment::Program,
+                },
+                RuntimeRootItem::Layer {
+                    layer_id: layer_id(1),
+                    bus: BusAssignment::A,
+                },
+            ],
+            None,
+            0.5,
+        )
+        .unwrap();
+        assert!(matches!(
+            plan(&flat_base, &non_program, &master, &racks),
+            Err(CompositionPlanError::TemporalBypassUnsupportedTopology {
+                layers,
+                blockers,
+            }) if layers == vec![layer_id(1)]
+                && blockers == vec![TemporalBypassBlocker::NonProgramBus]
+        ));
+
+        let reordered = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![
+                RuntimeRootItem::Layer {
+                    layer_id: layer_id(1),
+                    bus: BusAssignment::Program,
+                },
+                RuntimeRootItem::Layer {
+                    layer_id: layer_id(2),
+                    bus: BusAssignment::Program,
+                },
+            ],
+            None,
+            0.5,
+        )
+        .unwrap();
+        assert!(matches!(
+            plan(&flat_base, &reordered, &master, &racks),
+            Err(CompositionPlanError::TemporalBypassUnsupportedTopology {
+                layers,
+                blockers,
+            }) if layers == vec![layer_id(1)]
+                && blockers == vec![TemporalBypassBlocker::CompositionOrder]
+        ));
+    }
+
+    #[test]
     fn temporal_bypass_below_an_inheriting_layer_is_rejected_before_gpu_work() {
         let mut base = base(&[1, 2, 3], &[]);
         base.layers[1].bypass_temporal_fx = true;
@@ -7340,8 +7757,9 @@ mod tests {
             .unwrap();
         assert!(matches!(
             plan(&advanced_base, &composition, &advanced_master, &racks),
-            Err(CompositionPlanError::TemporalBypassUnsupportedTopology { layers })
+            Err(CompositionPlanError::TemporalBypassUnsupportedTopology { layers, blockers })
                 if layers == vec![layer_id(1)]
+                    && blockers == vec![TemporalBypassBlocker::CustomMasterRack]
         ));
 
         let mut garden_temporal = TemporalParams::default();
@@ -7356,8 +7774,9 @@ mod tests {
                 &master,
                 &racks
             ),
-            Err(CompositionPlanError::TemporalBypassUnsupportedTopology { layers })
+            Err(CompositionPlanError::TemporalBypassUnsupportedTopology { layers, blockers })
                 if layers == vec![layer_id(1)]
+                    && blockers == vec![TemporalBypassBlocker::RoutedRefreshGarden]
         ));
     }
 

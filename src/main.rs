@@ -98,6 +98,121 @@ use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 use input::{apply_action, map_key, ControlFlow};
 use layers::{is_still_image_file, is_supported_visual_file, Layer};
 use renderer::{LiveFrameResources, Renderer};
+
+#[derive(Clone, Copy)]
+enum TemporalOverlayTarget {
+    Engine,
+    Audience,
+}
+
+/// Resolve the executor's retained Advanced dry payload against the immutable
+/// evaluated layer table. This is both the preflight and render resolver: one
+/// count/order/identity/base-index law means the pre-Mosh slot-2 write cannot
+/// race ahead of a later, stricter interpretation of the same plan.
+fn resolve_advanced_temporal_bypass_overlays<'a>(
+    executor: &'a renderer::composition::CompositionGpuExecutor,
+    advanced: &evaluated_frame::evaluated_composition::AdvancedCompositionPlan,
+) -> Result<Vec<renderer::state::PrecomposedTemporalBypassLayer<'a>>, String> {
+    let retained = executor
+        .temporal_bypass_overlays(advanced)
+        .map_err(|error| error.to_string())?;
+    let expected = advanced.temporal_dry_layers();
+    if retained.len() != expected.len() {
+        return Err(format!(
+            "Advanced Temporal bypass retained {} overlays for {} planned dry layers",
+            retained.len(),
+            expected.len()
+        ));
+    }
+    let mut overlays = Vec::with_capacity(retained.len());
+    for (index, retained) in retained.iter().enumerate() {
+        if expected.get(index).copied() != Some(retained.stable_id) {
+            return Err(format!(
+                "Advanced Temporal bypass retained layer {} out of planned order at slot {index}",
+                retained.stable_id.get()
+            ));
+        }
+        let layer_plan = advanced
+            .layers()
+            .iter()
+            .find(|layer| layer.stable_id == retained.stable_id)
+            .ok_or_else(|| {
+                format!(
+                    "Advanced Temporal bypass retained unknown layer {}",
+                    retained.stable_id.get()
+                )
+            })?;
+        let layer = advanced
+            .base()
+            .layers()
+            .get(layer_plan.base_layer_index)
+            .ok_or_else(|| {
+                format!(
+                    "Advanced Temporal bypass layer {} has invalid base index {}",
+                    retained.stable_id.get(),
+                    layer_plan.base_layer_index
+                )
+            })?;
+        if layer.visible && (layer.opacity > 0.0 || !layer.opacity.is_finite()) {
+            overlays.push(renderer::state::PrecomposedTemporalBypassLayer {
+                view: retained.view,
+                opacity: layer.opacity,
+                blend_mode: layer.blend_mode,
+                bypass_master_fx: layer.bypass_master_fx,
+            });
+        }
+    }
+    if overlays.is_empty() {
+        return Err("Advanced Temporal bypass has no contributing retained dry layer".to_string());
+    }
+    Ok(overlays)
+}
+
+/// Route both composition kinds through their exact dry payload. Advanced
+/// must use executor-retained post-rack/post-layer-Motion surfaces; falling
+/// back to the legacy raw-source renderer would silently erase the very
+/// effects whose support this route promises.
+fn render_planned_temporal_bypass_overlay(
+    renderer: &Renderer,
+    executor: Option<&renderer::composition::CompositionGpuExecutor>,
+    plan: &evaluated_frame::evaluated_composition::EvaluatedCompositionPlan,
+    encoder: &mut wgpu::CommandEncoder,
+    resources: &LiveFrameResources,
+    evaluated: &EvaluatedFramePlan,
+    target: TemporalOverlayTarget,
+) -> Result<bool, String> {
+    use evaluated_frame::evaluated_composition::EvaluatedCompositionPlan;
+    match plan {
+        EvaluatedCompositionPlan::LegacyExact(_) => match target {
+            TemporalOverlayTarget::Engine => {
+                renderer.render_temporal_bypass_overlay_engine(encoder, resources, evaluated)
+            }
+            TemporalOverlayTarget::Audience => {
+                renderer.render_temporal_bypass_overlay_audience(encoder, resources, evaluated)
+            }
+        },
+        EvaluatedCompositionPlan::Advanced(advanced) => {
+            let executor = executor.ok_or_else(|| {
+                "Advanced Temporal bypass has no prepared composition executor".to_string()
+            })?;
+            let overlays = resolve_advanced_temporal_bypass_overlays(executor, advanced)?;
+            match target {
+                TemporalOverlayTarget::Engine => renderer
+                    .render_precomposed_temporal_bypass_overlay_engine(
+                        encoder,
+                        &overlays,
+                        advanced.base().master_pass(),
+                    ),
+                TemporalOverlayTarget::Audience => renderer
+                    .render_precomposed_temporal_bypass_overlay_audience(
+                        encoder,
+                        &overlays,
+                        advanced.base().master_pass(),
+                    ),
+            }
+        }
+    }
+}
 use visual_rack::{LegacyRackScope, RuntimeVisualRack};
 use web::state::{ControlServerInfo, ControlServerStatus, WebState};
 
@@ -24999,6 +25114,32 @@ impl ApplicationHandler for App {
                                     renderer::composition::COMPOSITION_PRESENT_FORMAT,
                                 )
                                 .map_err(|error| error.to_string())?;
+                            if temporal_bypass_overlay_active {
+                                // Full dry-payload preflight precedes every
+                                // possible write to accepted audience slot 2.
+                                // The later renderer call reuses this resolver,
+                                // so no partial StableId/base-index mapping can
+                                // turn the first Mosh frame into a bare wet plate.
+                                let _ = resolve_advanced_temporal_bypass_overlays(
+                                    &*executor,
+                                    advanced,
+                                )?;
+                            }
+                            // Advanced does not enter Renderer::render_evaluated_frame,
+                            // so it must arm the same transactional Codec-Mosh
+                            // candidate explicitly. This happens once at the frame
+                            // preflight/encode seam: the later post-Mosh overlay may
+                            // then consume a CPU upload without resetting its
+                            // `uploaded_base` proof.
+                            renderer
+                                .configure_temporal_bypass_audience_candidate(
+                                    temporal_bypass_overlay_active && mosh_active,
+                                )
+                                .map_err(|error| {
+                                    format!(
+                                        "Advanced Temporal-bypass audience preflight failed: {error}"
+                                    )
+                                })?;
                             Ok(())
                         })();
                         match advanced_result {
@@ -25241,9 +25382,103 @@ impl ApplicationHandler for App {
                                         &mod_temporal.display,
                                         temporal_input.program_advancing_delta(),
                                     );
-                                    renderer.render_opaque_output(&mut encoder);
-                                    advanced_audience_rendered = true;
-                                    temporal_frame_accepted = true;
+                                    let audience_result = if temporal_bypass_overlay_active {
+                                        if mosh_active {
+                                            // Codec Mosh receives only the wet Advanced plate;
+                                            // the executor-retained post-rack dry surfaces are
+                                            // restored transactionally afterwards.
+                                            renderer.render_opaque_output(&mut encoder);
+                                            let metadata = codec_mosh::MoshFrameMetadata {
+                                                params: mod_temporal.mosh.sanitized(),
+                                                ordinal: ntsc::reference_frame_for_time(
+                                                    elapsed_duration.as_secs_f64(),
+                                                )
+                                                    as u64,
+                                                seed: self.master_effects.random_seed,
+                                                generation: self.mosh_interval_generation,
+                                                ntsc: None,
+                                            };
+                                            match renderer.begin_readback(
+                                                &mut encoder,
+                                                self.visual_epoch,
+                                                None,
+                                                Some(metadata),
+                                            ) {
+                                                Ok(slot) => {
+                                                    temporal_bypass_mosh_readback_to_map = slot;
+                                                }
+                                                Err(error) => {
+                                                    self.mosh_live_metrics.record_admission(
+                                                        ntsc::NtscSubmitOutcome::Unavailable,
+                                                    );
+                                                    self.output_error = format!(
+                                                        "Advanced Temporal-bypass wet Codec Mosh readback unavailable: {error}"
+                                                    );
+                                                    log::error!("{}", self.output_error);
+                                                }
+                                            }
+                                            render_planned_temporal_bypass_overlay(
+                                                renderer,
+                                                self.composition_gpu.as_ref(),
+                                                evaluated_creative.as_ref().expect(
+                                                    "Temporal bypass requires an evaluated plan",
+                                                ),
+                                                &mut encoder,
+                                                &frame_resources,
+                                                &evaluated_frame,
+                                                TemporalOverlayTarget::Audience,
+                                            )
+                                            .and_then(|rendered| {
+                                                rendered.then_some(()).ok_or_else(|| {
+                                                    "Advanced Temporal bypass rendered no dry layers"
+                                                        .to_string()
+                                                })
+                                            })
+                                        } else {
+                                            render_planned_temporal_bypass_overlay(
+                                                renderer,
+                                                self.composition_gpu.as_ref(),
+                                                evaluated_creative.as_ref().expect(
+                                                    "Temporal bypass requires an evaluated plan",
+                                                ),
+                                                &mut encoder,
+                                                &frame_resources,
+                                                &evaluated_frame,
+                                                TemporalOverlayTarget::Engine,
+                                            )
+                                            .and_then(|rendered| {
+                                                rendered.then_some(()).ok_or_else(|| {
+                                                    "Advanced Temporal bypass rendered no dry layers"
+                                                        .to_string()
+                                                })
+                                            })
+                                            .map(|()| renderer.render_opaque_output(&mut encoder))
+                                        }
+                                    } else {
+                                        renderer.render_opaque_output(&mut encoder);
+                                        Ok(())
+                                    };
+                                    if let Err(error) = audience_result {
+                                        if temporal_bypass_mosh_readback_to_map.is_some() {
+                                            self.mosh_interval_generation = self
+                                                .mosh_interval_generation
+                                                .wrapping_add(1)
+                                                .max(1);
+                                            self.mosh_presented = None;
+                                        }
+                                        self.output_error = format!(
+                                            "Advanced Temporal bypass audience failed: {error}"
+                                        );
+                                        log::error!("{}", self.output_error);
+                                        let _ = renderer
+                                            .configure_temporal_bypass_audience_candidate(false);
+                                        if let Some(executor) = self.composition_gpu.as_mut() {
+                                            executor.discard_frame_history();
+                                        }
+                                    } else {
+                                        advanced_audience_rendered = true;
+                                        temporal_frame_accepted = true;
+                                    }
                                 } else {
                                     let legacy_scope_armed = if capture_frame_intent.is_some_and(
                                         |intent| {
@@ -25346,12 +25581,17 @@ impl ApplicationHandler for App {
                                                         log::error!("{}", self.output_error);
                                                     }
                                                 }
-                                                renderer
-                                                    .render_temporal_bypass_overlay_audience(
-                                                        &mut encoder,
-                                                        &frame_resources,
-                                                        &evaluated_frame,
-                                                    )
+                                                render_planned_temporal_bypass_overlay(
+                                                    renderer,
+                                                    self.composition_gpu.as_ref(),
+                                                    evaluated_creative.as_ref().expect(
+                                                        "Temporal bypass requires an evaluated plan",
+                                                    ),
+                                                    &mut encoder,
+                                                    &frame_resources,
+                                                    &evaluated_frame,
+                                                    TemporalOverlayTarget::Audience,
+                                                )
                                                     .and_then(|rendered| {
                                                         rendered.then_some(()).ok_or_else(|| {
                                                             "Temporal bypass overlay was planned but rendered no layers"
@@ -25359,12 +25599,17 @@ impl ApplicationHandler for App {
                                                         })
                                                     })
                                             } else {
-                                                renderer
-                                                    .render_temporal_bypass_overlay_engine(
-                                                        &mut encoder,
-                                                        &frame_resources,
-                                                        &evaluated_frame,
-                                                    )
+                                                render_planned_temporal_bypass_overlay(
+                                                    renderer,
+                                                    self.composition_gpu.as_ref(),
+                                                    evaluated_creative.as_ref().expect(
+                                                        "Temporal bypass requires an evaluated plan",
+                                                    ),
+                                                    &mut encoder,
+                                                    &frame_resources,
+                                                    &evaluated_frame,
+                                                    TemporalOverlayTarget::Engine,
+                                                )
                                                     .and_then(|rendered| {
                                                         rendered.then_some(()).ok_or_else(|| {
                                                             "Temporal bypass overlay was planned but rendered no layers"
@@ -26338,10 +26583,16 @@ impl ApplicationHandler for App {
                         let mut temporal_overlay_audience_ready = temporal_frame_accepted;
                         if temporal_bypass_overlay_active && mosh_active && mosh_replacement_written
                         {
-                            match renderer.render_temporal_bypass_overlay_audience(
+                            match render_planned_temporal_bypass_overlay(
+                                renderer,
+                                self.composition_gpu.as_ref(),
+                                evaluated_creative
+                                    .as_ref()
+                                    .expect("Temporal bypass requires an evaluated plan"),
                                 &mut encoder,
                                 &frame_resources,
                                 &evaluated_frame,
+                                TemporalOverlayTarget::Audience,
                             ) {
                                 Ok(true) => {}
                                 Ok(false) => {

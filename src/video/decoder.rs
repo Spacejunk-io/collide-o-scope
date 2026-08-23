@@ -42,6 +42,33 @@ const MEDIA_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// A hostile keyframe table cannot make one absolute selection decode an
 /// unbounded number of frames before returning control to the command worker.
 const MAX_SEEK_DECODE_FRAMES: u32 = 4_096;
+/// Source-pixel work that may begin immediately while a keyframe index is
+/// still being built. This is deliberately resolution-aware: the old
+/// frame-only admission called a 900-picture 1080p walk "near" even though it
+/// had to inspect almost two billion source pixels. Existing long-GOP evidence
+/// establishes that 240 decoded 1080p pictures already exceed one second; the
+/// 128-picture half-budget leaves scheduling/scaling margin while keeping
+/// short live advances nonblocking.
+const MAX_PROMPT_SEEK_PIXEL_WORK: u64 = 128 * 1920 * 1080;
+/// Materialize only this small time window immediately behind a selected
+/// target into the already-ledgered RGBA reverse cache. A reverse request may
+/// itself be up to 1.5 frame periods behind and selects a cached picture up to
+/// another 1.5 periods old, so four periods preserve that contract with one
+/// period of timestamp/reorder margin.
+const SEEK_REVERSE_TAIL_PERIODS: f64 = 4.0;
+
+/// Admission class for one absolute decode walk with the index and live
+/// stream position currently available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SeekWorkload {
+    /// Small enough to start immediately without waiting for indexing.
+    Prompt,
+    /// Reachable inside the hard cap, but expensive enough that prepared
+    /// source staging should cooperatively adopt its pending index first.
+    Costly,
+    /// Cannot be reached inside [`MAX_SEEK_DECODE_FRAMES`].
+    Hard,
+}
 
 /// FFmpeg only attaches `AV_FRAME_DATA_MOTION_VECTORS` when this flag is set
 /// before `avcodec_open2`. Keep the narrow unsafe ABI write in one place and
@@ -64,6 +91,25 @@ struct StreamPosition {
     pts: Option<i64>,
 }
 
+/// One codec output retained during an absolute walk before the caller knows
+/// whether it is merely an intermediate reference picture or the selected
+/// output that merits RGBA materialization and cache admission.
+struct RawSeekFrame {
+    frame: VideoFrame,
+    presentation_ordinal: u64,
+}
+
+/// Exact depth-one EOF fallback. Its metadata/reference effects have already
+/// been committed before storage, so supersession may drop it without leaving
+/// Rust behind FFmpeg. It retains one format-native decoder image (plus one
+/// bounded codec product), never RGBA; the admitted video working-set plan
+/// already budgets decoder/scaler image lifetimes.
+struct TerminalSeekCandidate {
+    raw: RawSeekFrame,
+    metadata: FrameMetadata,
+    codec_motion: Option<CodecMotionProduct>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DecoderSeekStats {
     pub index_builds: u64,
@@ -73,6 +119,20 @@ pub struct DecoderSeekStats {
     /// Kept explicit as a regression seam: indexed selection must never fall
     /// back to reopening and scanning from frame zero.
     pub scans_from_zero: u64,
+    /// Codec outputs traversed without being selected. Nearly all avoid RGBA;
+    /// `reverse_tail_materializations` identifies the small ledgered subset.
+    pub skipped_seek_outputs: u64,
+    /// Selected seek outputs that were actually converted to RGBA.
+    pub selected_materializations: u64,
+    /// Near-target skipped outputs scaled solely to preserve bounded reverse
+    /// selection. These enter the existing globally ledgered RGBA cache.
+    pub reverse_tail_materializations: u64,
+    /// Number of raw terminal candidates installed at depth one.
+    pub terminal_candidate_updates: u64,
+    /// EOF fallbacks actually converted from their final raw candidate.
+    pub terminal_candidate_materializations: u64,
+    /// Skipped outputs for which vector side data was actually copied.
+    pub skipped_codec_motion_extractions: u64,
 }
 
 pub(super) struct KeyframeIndexBuildRequest {
@@ -447,18 +507,17 @@ impl VideoDecoder {
         self.seek_stats.index_builds = self.seek_stats.index_builds.saturating_add(1);
     }
 
-    /// Whether the exact selection would have to decode more pictures than
-    /// [`MAX_SEEK_DECODE_FRAMES`] permits with the index and live position
-    /// currently available. The threaded wrapper uses this only to decide
-    /// whether a first, distant request must wait for its asynchronous
-    /// keyframe index; ordinary nearby playback never waits on indexing.
-    pub(super) fn selection_exceeds_bounded_walk(
+    /// Classify the exact selection using both the inviolable frame bound and
+    /// saturating source-pixel work. The threaded wrapper uses the middle
+    /// class only for prepared saved-playhead staging; ordinary live work
+    /// remains opportunistic unless it is genuinely unreachable.
+    pub(super) fn selection_workload(
         &self,
         target_seconds: f64,
         previous_accepted_identity: Option<CodecFrameIdentity>,
-    ) -> bool {
+    ) -> SeekWorkload {
         if !target_seconds.is_finite() {
-            return false;
+            return SeekWorkload::Prompt;
         }
         let target_seconds = if self.duration_seconds > 0.0 {
             target_seconds.clamp(0.0, self.duration_seconds)
@@ -480,11 +539,13 @@ impl VideoDecoder {
         } else {
             keyframe.source_seconds
         };
-        bounded_walk_exceeds_limit(
+        classify_seek_workload(
             walk_start_seconds,
             target_seconds,
             frame_period,
             continue_forward,
+            self.width,
+            self.height,
         )
     }
 
@@ -662,40 +723,132 @@ impl VideoDecoder {
     {
         let mut motion_sequence = None;
         let mut motion_sequence_rejected = false;
-        let mut newest = None;
+        // Terminal selection is the sole case that may need the last picture
+        // after EOF proves no later one exists. Keep exactly one already-
+        // observed native candidate and do not allocate its RGBA image unless
+        // EOF actually selects it.
+        let terminal_target =
+            self.duration_seconds > 0.0 && target_seconds + frame_period >= self.duration_seconds;
+        let mut newest_terminal = None;
         let mut reached_eof = false;
+        let collect_motion_chain = compose_skipped_motion && previous_accepted_identity.is_some();
         for _ in 0..MAX_SEEK_DECODE_FRAMES {
             self.check_work_current(is_current)?;
-            let Some(mut frame) =
-                self.next_frame_without_loop_interruptible(source_generation, is_current)?
-            else {
+            let Some(raw) = self.next_raw_frame_without_loop_interruptible(is_current)? else {
                 reached_eof = true;
                 break;
             };
-            if compose_skipped_motion {
-                append_codec_motion_after(
-                    &mut motion_sequence,
-                    &mut motion_sequence_rejected,
-                    &frame,
-                    previous_accepted_identity,
-                );
-            }
-            let reached = frame.metadata.source_seconds + frame_period * 0.5 >= target_seconds;
+            let metadata = self.decoded_frame_metadata(
+                &raw.frame,
+                source_generation,
+                raw.presentation_ordinal,
+            );
+            let reached = metadata.source_seconds + frame_period * 0.5 >= target_seconds;
             if reached {
+                let capture_selected_motion = should_capture_seek_codec_motion(
+                    compose_skipped_motion,
+                    previous_accepted_identity.is_some(),
+                    motion_sequence_rejected,
+                );
+                let mut frame = self
+                    .materialize_selected_seek_frame(
+                        &raw,
+                        source_generation,
+                        capture_selected_motion,
+                    )
+                    .map_err(DecodeWorkError::Failed)?;
                 if compose_skipped_motion {
+                    if collect_motion_chain && !motion_sequence_rejected {
+                        append_codec_motion_parts(
+                            &mut motion_sequence,
+                            &mut motion_sequence_rejected,
+                            frame.metadata,
+                            frame.codec_motion.as_ref(),
+                            previous_accepted_identity,
+                        );
+                    }
                     frame.codec_motion =
                         accepted_codec_motion_sequence(motion_sequence, motion_sequence_rejected);
                 }
                 return Ok(frame);
             }
-            newest = Some(frame);
-        }
-        if compose_skipped_motion {
-            if let Some(frame) = newest.as_mut() {
-                frame.codec_motion =
-                    accepted_codec_motion_sequence(motion_sequence, motion_sequence_rejected);
+            let capture_skipped_motion = should_capture_seek_codec_motion(
+                compose_skipped_motion,
+                previous_accepted_identity.is_some(),
+                motion_sequence_rejected,
+            );
+            let (metadata, codec_motion) =
+                self.observe_skipped_seek_frame(&raw, source_generation, capture_skipped_motion);
+            if collect_motion_chain && !motion_sequence_rejected {
+                append_codec_motion_parts(
+                    &mut motion_sequence,
+                    &mut motion_sequence_rejected,
+                    metadata,
+                    codec_motion.as_ref(),
+                    previous_accepted_identity,
+                );
+            }
+            if terminal_target {
+                // Replacing the candidate drops the previous native buffer;
+                // no RGBA image is created here. Observation above happens
+                // first, so a superseding command always sees aligned state.
+                newest_terminal = Some(TerminalSeekCandidate {
+                    raw,
+                    metadata,
+                    codec_motion,
+                });
+                self.seek_stats.terminal_candidate_updates =
+                    self.seek_stats.terminal_candidate_updates.saturating_add(1);
+            } else if metadata.source_seconds + SEEK_REVERSE_TAIL_PERIODS * frame_period
+                >= target_seconds
+            {
+                // Preserve nearby reverse selection through the existing
+                // per-decoder/global RGBA ledger, while hundreds of earlier
+                // pictures remain metadata/reference-only.
+                if let Err(error) = self.cache_observed_reverse_tail_frame(&raw, metadata) {
+                    self.reverse_cache.clear();
+                    log::warn!(
+                        "could not retain near-target reverse frame in {}: {error}",
+                        self.path
+                    );
+                }
             }
         }
+
+        let terminal_selection = reached_eof
+            && self.duration_seconds > 0.0
+            && target_seconds + frame_period >= self.duration_seconds;
+        let newest = if terminal_selection {
+            match newest_terminal {
+                Some(candidate) => {
+                    self.check_work_current(is_current)?;
+                    let TerminalSeekCandidate {
+                        raw,
+                        metadata,
+                        codec_motion,
+                    } = candidate;
+                    let mut frame = self
+                        .materialize_observed_without_commit(&raw, metadata, codec_motion)
+                        .map_err(DecodeWorkError::Failed)?;
+                    self.seek_stats.terminal_candidate_materializations = self
+                        .seek_stats
+                        .terminal_candidate_materializations
+                        .saturating_add(1);
+                    if compose_skipped_motion {
+                        frame.codec_motion = accepted_codec_motion_sequence(
+                            motion_sequence,
+                            motion_sequence_rejected,
+                        );
+                    }
+                    self.seek_stats.selected_materializations =
+                        self.seek_stats.selected_materializations.saturating_add(1);
+                    Some(self.commit_materialized_frame(frame))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         finish_unreached_seek(
             newest,
             reached_eof,
@@ -741,11 +894,10 @@ impl VideoDecoder {
         (self.reverse_cache.len(), self.reverse_cache.bytes())
     }
 
-    fn next_frame_without_loop_interruptible<F>(
+    fn next_raw_frame_without_loop_interruptible<F>(
         &mut self,
-        source_generation: u64,
         is_current: &mut F,
-    ) -> Result<Option<DecodedVideoFrame>, DecodeWorkError>
+    ) -> Result<Option<RawSeekFrame>, DecodeWorkError>
     where
         F: FnMut() -> bool,
     {
@@ -755,10 +907,10 @@ impl VideoDecoder {
             let mut decoded = VideoFrame::empty();
             if self.decoder.receive_frame(&mut decoded).is_ok() {
                 self.frame_count = self.frame_count.saturating_add(1);
-                return self
-                    .finish_decoded_frame(&decoded, source_generation)
-                    .map(Some)
-                    .map_err(DecodeWorkError::Failed);
+                return Ok(Some(RawSeekFrame {
+                    frame: decoded,
+                    presentation_ordinal: self.frame_count.saturating_sub(1),
+                }));
             }
             match self.next_video_packet_interruptible(&mut packets_without_frame, is_current)? {
                 Some(packet) => {
@@ -774,10 +926,10 @@ impl VideoDecoder {
                     let mut drained = VideoFrame::empty();
                     if self.decoder.receive_frame(&mut drained).is_ok() {
                         self.frame_count = self.frame_count.saturating_add(1);
-                        return self
-                            .finish_decoded_frame(&drained, source_generation)
-                            .map(Some)
-                            .map_err(DecodeWorkError::Failed);
+                        return Ok(Some(RawSeekFrame {
+                            frame: drained,
+                            presentation_ordinal: self.frame_count.saturating_sub(1),
+                        }));
                     }
                     return Ok(None);
                 }
@@ -824,8 +976,133 @@ impl VideoDecoder {
         frame: &VideoFrame,
         source_generation: u64,
     ) -> Result<DecodedVideoFrame, String> {
+        self.materialize_decoded_frame(
+            frame,
+            source_generation,
+            self.frame_count.saturating_sub(1),
+            true,
+        )
+    }
+
+    fn materialize_selected_seek_frame(
+        &mut self,
+        raw: &RawSeekFrame,
+        source_generation: u64,
+        capture_codec_motion: bool,
+    ) -> Result<DecodedVideoFrame, String> {
+        let decoded = self.materialize_decoded_frame(
+            &raw.frame,
+            source_generation,
+            raw.presentation_ordinal,
+            capture_codec_motion,
+        )?;
+        self.seek_stats.selected_materializations =
+            self.seek_stats.selected_materializations.saturating_add(1);
+        Ok(decoded)
+    }
+
+    fn materialize_observed_without_commit(
+        &mut self,
+        raw: &RawSeekFrame,
+        metadata: FrameMetadata,
+        codec_motion: Option<CodecMotionProduct>,
+    ) -> Result<DecodedVideoFrame, String> {
+        Ok(DecodedVideoFrame {
+            rgba: self.scale_frame(&raw.frame)?,
+            metadata,
+            codec_motion,
+        })
+    }
+
+    fn cache_observed_reverse_tail_frame(
+        &mut self,
+        raw: &RawSeekFrame,
+        metadata: FrameMetadata,
+    ) -> Result<(), String> {
+        let decoded = self.materialize_observed_without_commit(raw, metadata, None)?;
+        self.reverse_cache.insert(&decoded)?;
+        self.seek_stats.reverse_tail_materializations = self
+            .seek_stats
+            .reverse_tail_materializations
+            .saturating_add(1);
+        Ok(())
+    }
+
+    fn materialize_decoded_frame(
+        &mut self,
+        frame: &VideoFrame,
+        source_generation: u64,
+        presentation_ordinal: u64,
+        capture_codec_motion: bool,
+    ) -> Result<DecodedVideoFrame, String> {
+        // Scaling is intentionally paid only for an image the caller can
+        // receive. Intermediate codec outputs still advance reference state
+        // below, but never allocate RGBA or enter the reverse cache.
+        let rgba = self.scale_frame(frame)?;
+        let (metadata, codec_motion) = self.observe_decoded_frame(
+            frame,
+            source_generation,
+            presentation_ordinal,
+            capture_codec_motion,
+        );
+        Ok(self.finish_materialized_frame(rgba, metadata, codec_motion))
+    }
+
+    fn finish_materialized_frame(
+        &mut self,
+        rgba: Vec<u8>,
+        metadata: FrameMetadata,
+        codec_motion: Option<CodecMotionProduct>,
+    ) -> DecodedVideoFrame {
+        self.commit_materialized_frame(DecodedVideoFrame {
+            rgba,
+            metadata,
+            codec_motion,
+        })
+    }
+
+    fn commit_materialized_frame(&mut self, decoded: DecodedVideoFrame) -> DecodedVideoFrame {
+        self.adopt_selected_metadata(decoded.metadata);
+        if let Err(error) = self.reverse_cache.insert(&decoded) {
+            // Reverse acceleration is optional. A cache allocation failure
+            // cannot poison forward playback or source selection.
+            self.reverse_cache.clear();
+            log::warn!("{error}");
+        }
+        decoded
+    }
+
+    fn observe_skipped_seek_frame(
+        &mut self,
+        raw: &RawSeekFrame,
+        source_generation: u64,
+        capture_codec_motion: bool,
+    ) -> (FrameMetadata, Option<CodecMotionProduct>) {
+        if capture_codec_motion {
+            self.seek_stats.skipped_codec_motion_extractions = self
+                .seek_stats
+                .skipped_codec_motion_extractions
+                .saturating_add(1);
+        }
+        let observed = self.observe_decoded_frame(
+            &raw.frame,
+            source_generation,
+            raw.presentation_ordinal,
+            capture_codec_motion,
+        );
+        self.seek_stats.skipped_seek_outputs =
+            self.seek_stats.skipped_seek_outputs.saturating_add(1);
+        observed
+    }
+
+    fn decoded_frame_metadata(
+        &self,
+        frame: &VideoFrame,
+        source_generation: u64,
+        presentation_ordinal: u64,
+    ) -> FrameMetadata {
         let pts = frame.timestamp().or_else(|| frame.pts());
-        let fallback_seconds = self.frame_count.saturating_sub(1) as f64 / f64::from(self.fps);
+        let fallback_seconds = presentation_ordinal as f64 / f64::from(self.fps);
         let source_seconds = pts.map_or(fallback_seconds, |timestamp| {
             timestamp_to_source_seconds(
                 timestamp,
@@ -836,16 +1113,30 @@ impl VideoDecoder {
         let identity = pts.map(|pts| CodecFrameIdentity {
             source_generation,
             pts,
-            presentation_ordinal: self.frame_count.saturating_sub(1),
+            presentation_ordinal,
         });
-        let metadata = FrameMetadata::sanitized(
+        FrameMetadata::sanitized(
             source_generation,
             pts,
             source_seconds,
             self.duration_seconds,
         )
-        .with_codec_identity(identity);
-        let rgba = self.scale_frame(frame)?;
+        .with_codec_identity(identity)
+    }
+
+    /// Advance the Rust-side identity/reference model for a codec output.
+    /// This is separate from RGBA materialization so skipped pictures preserve
+    /// FFmpeg/reference correctness without paying scaler, cache, or (when no
+    /// exact accepted-image motion chain is requested) vector extraction.
+    fn observe_decoded_frame(
+        &mut self,
+        frame: &VideoFrame,
+        source_generation: u64,
+        presentation_ordinal: u64,
+        capture_codec_motion: bool,
+    ) -> (FrameMetadata, Option<CodecMotionProduct>) {
+        let metadata = self.decoded_frame_metadata(frame, source_generation, presentation_ordinal);
+        let identity = metadata.codec_identity;
         if self.codec_motion_generation != Some(source_generation) {
             self.reset_codec_motion_reference_state();
             self.codec_motion_generation = Some(source_generation);
@@ -871,17 +1162,17 @@ impl VideoDecoder {
         } else {
             None
         };
-        let codec_motion = Some(
+        let codec_motion = capture_codec_motion.then(|| {
             CodecMotionFrame::from_decoded_frame(
                 frame,
                 [self.width, self.height],
                 frame_delta_seconds,
                 past_reference_proof,
                 source_generation,
-                self.frame_count.saturating_sub(1),
+                presentation_ordinal,
             )
-            .into(),
-        );
+            .into()
+        });
         self.codec_previous_output = identity;
         if !frame.is_interlaced()
             && !frame.is_corrupt()
@@ -897,25 +1188,13 @@ impl VideoDecoder {
             // the immediately preceding presentation slot.
             self.codec_previous_anchor = None;
         }
-        let decoded = DecodedVideoFrame {
-            rgba,
-            metadata,
-            codec_motion,
-        };
-        self.adopt_selected_metadata(metadata);
         // A real decode is the only thing that moves the live decoder, so this
         // is the one place the stream position may advance.
         self.stream_position = Some(StreamPosition {
             source_seconds: metadata.source_seconds,
             pts: metadata.pts,
         });
-        if let Err(error) = self.reverse_cache.insert(&decoded) {
-            // Reverse acceleration is optional. A cache allocation failure
-            // cannot poison forward playback or source selection.
-            self.reverse_cache.clear();
-            log::warn!("{error}");
-        }
-        Ok(decoded)
+        (metadata, codec_motion)
     }
 
     fn adopt_selected_metadata(&mut self, metadata: FrameMetadata) {
@@ -1196,10 +1475,98 @@ fn bounded_walk_exceeds_limit(
     target_seconds > maximum_reachable_seconds
 }
 
+/// Estimate how many decoded pictures the walk must inspect. The hard-bound
+/// decision remains delegated to `bounded_walk_exceeds_limit`, whose formula
+/// is aligned with the decoder's exact inclusive loop. This estimate exists
+/// only to price reachable work and therefore saturates instead of wrapping
+/// for hostile dimensions or time values.
+fn estimated_seek_decode_frames(
+    start_seconds: f64,
+    target_seconds: f64,
+    frame_period: f64,
+    continue_forward: bool,
+) -> u64 {
+    if !start_seconds.is_finite()
+        || !target_seconds.is_finite()
+        || !frame_period.is_finite()
+        || frame_period <= 0.0
+    {
+        return 0;
+    }
+    let offsets = ((target_seconds - start_seconds).max(0.0) / frame_period - 0.5)
+        .ceil()
+        .max(0.0) as u64;
+    if continue_forward {
+        offsets.max(1)
+    } else {
+        offsets.saturating_add(1).max(1)
+    }
+}
+
+fn classify_seek_workload(
+    start_seconds: f64,
+    target_seconds: f64,
+    frame_period: f64,
+    continue_forward: bool,
+    width: u32,
+    height: u32,
+) -> SeekWorkload {
+    if bounded_walk_exceeds_limit(
+        start_seconds,
+        target_seconds,
+        frame_period,
+        continue_forward,
+    ) {
+        return SeekWorkload::Hard;
+    }
+    let pixels_per_frame = u64::from(width).saturating_mul(u64::from(height));
+    let pixel_work = pixels_per_frame.saturating_mul(estimated_seek_decode_frames(
+        start_seconds,
+        target_seconds,
+        frame_period,
+        continue_forward,
+    ));
+    if pixel_work > MAX_PROMPT_SEEK_PIXEL_WORK {
+        SeekWorkload::Costly
+    } else {
+        SeekWorkload::Prompt
+    }
+}
+
+/// A normal absolute selection publishes the selected frame's direct codec
+/// product. A composed selection needs products only while it has an accepted
+/// predecessor and its exact chain remains valid. Once rejected, later vector
+/// copies cannot make the result valid again, but frame observation must still
+/// advance identity/reference state.
+fn should_capture_seek_codec_motion(
+    compose_skipped_motion: bool,
+    has_previous_accepted_identity: bool,
+    motion_sequence_rejected: bool,
+) -> bool {
+    !compose_skipped_motion || (has_previous_accepted_identity && !motion_sequence_rejected)
+}
+
+#[cfg(test)]
 fn append_codec_motion_after(
     sequence: &mut Option<CodecMotionSequence>,
     rejected: &mut bool,
     frame: &DecodedVideoFrame,
+    previous_accepted_identity: Option<CodecFrameIdentity>,
+) {
+    append_codec_motion_parts(
+        sequence,
+        rejected,
+        frame.metadata,
+        frame.codec_motion.as_ref(),
+        previous_accepted_identity,
+    );
+}
+
+fn append_codec_motion_parts(
+    sequence: &mut Option<CodecMotionSequence>,
+    rejected: &mut bool,
+    metadata: FrameMetadata,
+    codec_motion: Option<&CodecMotionProduct>,
     previous_accepted_identity: Option<CodecFrameIdentity>,
 ) {
     let Some(previous_identity) = previous_accepted_identity else {
@@ -1208,13 +1575,15 @@ fn append_codec_motion_after(
     if *rejected {
         return;
     }
-    let Some(product) = frame.codec_motion.as_ref() else {
+    let Some(product) = codec_motion else {
         *sequence = None;
         *rejected = true;
         return;
     };
     let transition = product.latest().clone();
-    if transition.frame_ordinal <= previous_identity.presentation_ordinal {
+    if metadata.source_generation != previous_identity.source_generation
+        || transition.frame_ordinal <= previous_identity.presentation_ordinal
+    {
         return;
     }
     if sequence.is_none() {
@@ -1437,11 +1806,12 @@ fn reserve_packed_rgba(output_len: usize) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_walk_exceeds_limit, can_continue_forward, count_packet_without_frame,
-        enable_export_motion_vectors, next_loop_generation, repack_rgba_plane,
-        require_decoded_frame_before_loop, reserve_packed_rgba, should_interrupt_input,
-        validate_media_dimensions, StreamPosition, VideoDecoder, MAX_PACKETS_WITHOUT_FRAME,
-        MAX_SEEK_DECODE_FRAMES,
+        bounded_walk_exceeds_limit, can_continue_forward, classify_seek_workload,
+        count_packet_without_frame, enable_export_motion_vectors, estimated_seek_decode_frames,
+        next_loop_generation, repack_rgba_plane, require_decoded_frame_before_loop,
+        reserve_packed_rgba, should_capture_seek_codec_motion, should_interrupt_input,
+        validate_media_dimensions, SeekWorkload, StreamPosition, VideoDecoder,
+        MAX_PACKETS_WITHOUT_FRAME, MAX_SEEK_DECODE_FRAMES,
     };
     use crate::video::{CodecFrameIdentity, CodecTimeBase};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1505,6 +1875,52 @@ mod tests {
             FRAME_PERIOD,
             false
         ));
+    }
+
+    #[test]
+    fn resolution_aware_seek_workload_separates_prompt_costly_and_hard_walks() {
+        assert_eq!(
+            classify_seek_workload(0.0, 1.0, FRAME_PERIOD, false, 1920, 1080),
+            SeekWorkload::Prompt
+        );
+
+        // Ars-Longa's saved playhead is about 30.03s from the fallback seed:
+        // reachable under 4,096 frames, but roughly 902 full-HD pictures.
+        assert_eq!(
+            estimated_seek_decode_frames(0.0, 30.029_765, FRAME_PERIOD, false),
+            902
+        );
+        assert_eq!(
+            classify_seek_workload(0.0, 30.029_765, FRAME_PERIOD, false, 1920, 1080),
+            SeekWorkload::Costly
+        );
+
+        let beyond_hard_bound = (f64::from(MAX_SEEK_DECODE_FRAMES) + 1.0) * FRAME_PERIOD;
+        assert_eq!(
+            classify_seek_workload(0.0, beyond_hard_bound, FRAME_PERIOD, false, 1, 1,),
+            SeekWorkload::Hard
+        );
+    }
+
+    #[test]
+    fn resolution_aware_seek_pixel_work_saturates_instead_of_wrapping() {
+        assert_eq!(
+            classify_seek_workload(0.0, 1.0, FRAME_PERIOD, false, u32::MAX, u32::MAX,),
+            SeekWorkload::Costly
+        );
+        assert_eq!(
+            estimated_seek_decode_frames(0.0, f64::MAX, FRAME_PERIOD, false),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn rejected_composed_motion_stops_vector_extraction_but_direct_selection_does_not() {
+        assert!(should_capture_seek_codec_motion(false, false, false));
+        assert!(should_capture_seek_codec_motion(false, false, true));
+        assert!(!should_capture_seek_codec_motion(true, false, false));
+        assert!(should_capture_seek_codec_motion(true, true, false));
+        assert!(!should_capture_seek_codec_motion(true, true, true));
     }
 
     fn accepted(pts: i64) -> Option<CodecFrameIdentity> {
@@ -1851,6 +2267,20 @@ mod tests {
         assert_eq!(after_forward.seek_calls, 1);
         assert_eq!(after_forward.reopen_calls, 0);
         assert_eq!(after_forward.scans_from_zero, 0);
+        assert_eq!(after_forward.selected_materializations, 1);
+        assert!(
+            after_forward.skipped_seek_outputs > 1,
+            "the forward walk did not exercise unmaterialized reference outputs"
+        );
+        assert!(after_forward.reverse_tail_materializations > 0);
+        assert!(
+            after_forward.reverse_tail_materializations <= 6,
+            "near-target reverse preservation scaled an unbounded tail"
+        );
+        assert!(
+            after_forward.skipped_seek_outputs > after_forward.reverse_tail_materializations,
+            "every skipped output was still materialized"
+        );
 
         let earlier = decoder.seek_decode_for_generation(1.52, 77).unwrap();
         assert!((earlier.metadata.source_seconds - 1.52).abs() <= 1.0 / 15.0);
@@ -1869,6 +2299,16 @@ mod tests {
         assert_eq!(after_reverse.reopen_calls, 0);
         assert_eq!(after_reverse.scans_from_zero, 0);
 
+        let mut direct = VideoDecoder::open(&fixture.to_string_lossy()).unwrap();
+        direct.build_keyframe_index().unwrap();
+        let direct_earlier = direct.seek_decode_for_generation(1.52, 77).unwrap();
+        assert_eq!(earlier.metadata.pts, direct_earlier.metadata.pts);
+        assert_eq!(
+            earlier.metadata.source_seconds,
+            direct_earlier.metadata.source_seconds
+        );
+        assert_eq!(earlier.rgba, direct_earlier.rgba);
+
         // The cache already contains the later frame, but a forward request
         // must decode from the index so it can reconstruct current codec
         // proof state instead of returning an RGBA-only cache hit.
@@ -1882,6 +2322,104 @@ mod tests {
         );
         let (_, cache_bytes) = decoder.reverse_cache_usage();
         assert!(cache_bytes <= super::super::indexed::MAX_REVERSE_CACHE_BYTES);
+    }
+
+    #[test]
+    fn terminal_target_replaces_one_raw_candidate_and_materializes_only_the_selection() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("loop-72f.mp4");
+        // Keep the fallback zero index so this test traverses the whole clip
+        // and cannot pass vacuously on a terminal keyframe. Inflate reported
+        // duration by one frame to exercise the historical EOF fallback used
+        // for containers whose duration extends past their final timestamp.
+        let mut decoder = VideoDecoder::open(&fixture.to_string_lossy()).unwrap();
+        decoder.duration_seconds += 1.0 / f64::from(decoder.fps.max(1.0));
+        let terminal = decoder.duration_seconds();
+        let selected = decoder.seek_decode(terminal).unwrap();
+        let stats = decoder.seek_stats();
+
+        assert!(stats.terminal_candidate_updates > 8);
+        assert_eq!(stats.terminal_candidate_materializations, 1);
+        assert_eq!(stats.selected_materializations, 1);
+        assert!(
+            stats.terminal_candidate_updates > stats.terminal_candidate_materializations,
+            "terminal candidates were materialized while being replaced"
+        );
+        let (cache_frames, cache_bytes) = decoder.reverse_cache_usage();
+        assert_eq!(
+            cache_frames, 1,
+            "only the selected terminal frame is cached"
+        );
+        assert_eq!(cache_bytes, selected.rgba.len());
+    }
+
+    #[test]
+    fn supersession_after_a_raw_skip_keeps_stream_and_codec_identity_aligned() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("loop-72f.mp4");
+        let mut decoder = VideoDecoder::open(&fixture.to_string_lossy()).unwrap();
+        let start_pts = decoder.keyframe_index.preceding(0.0).pts;
+        decoder.seek_to_preceding_keyframe(start_pts).unwrap();
+        let raw = decoder
+            .next_raw_frame_without_loop_interruptible(&mut || true)
+            .unwrap()
+            .expect("fixture emits a decoded frame");
+        let (metadata, _) = decoder.observe_skipped_seek_frame(&raw, 41, false);
+
+        assert!(matches!(
+            decoder.next_raw_frame_without_loop_interruptible(&mut || false),
+            Err(crate::video::DecodeWorkError::Superseded)
+        ));
+        assert_eq!(
+            decoder.stream_position,
+            Some(StreamPosition {
+                source_seconds: metadata.source_seconds,
+                pts: metadata.pts,
+            })
+        );
+        assert_eq!(decoder.codec_previous_output, metadata.codec_identity);
+    }
+
+    #[test]
+    fn rejected_motion_chain_observes_later_frames_without_copying_their_vectors() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("loop-72f.mp4");
+        let mut decoder = VideoDecoder::open(&fixture.to_string_lossy()).unwrap();
+        decoder.build_keyframe_index().unwrap();
+        let generation = 73;
+        let previous = decoder.seek_decode_for_generation(0.2, generation).unwrap();
+        let before = decoder.seek_stats();
+        let selected = decoder
+            .seek_decode_after_for_generation(2.0, generation, previous.metadata.codec_identity)
+            .unwrap();
+        let after = decoder.seek_stats();
+        let skipped = after
+            .skipped_seek_outputs
+            .saturating_sub(before.skipped_seek_outputs);
+        let extracted = after
+            .skipped_codec_motion_extractions
+            .saturating_sub(before.skipped_codec_motion_extractions);
+
+        assert!(skipped > 8, "fixture did not exercise a long skipped walk");
+        assert!(
+            extracted < skipped,
+            "rejected chain continued copying motion for all {skipped} skipped outputs"
+        );
+        assert!(selected.codec_motion.is_none());
+        assert_eq!(
+            decoder.codec_previous_output,
+            selected.metadata.codec_identity
+        );
+        assert_eq!(
+            decoder.stream_position.and_then(|position| position.pts),
+            selected.metadata.pts
+        );
     }
 
     #[test]
