@@ -757,6 +757,21 @@ pub static CONTROL_HELP: &[HelpEntry] = &[
         "mosh_key_removal",
         "How often whole keyframes are thrown away. The first key after any reset always passes, because the decoder needs one complete picture to damage, and at full removal the picture never recovers.",
     ),
+    entry(
+        Temporal,
+        "mosh_wipe",
+        "Restricts the damaged codec picture to motion. At zero Mosh keeps its original full-program blend; toward one, moving objects wipe open corridors of stale pixels while still using the same codec round trip.",
+    ),
+    entry(
+        Temporal,
+        "mosh_smear",
+        "Pulls damaged pixels backward along the MPEG motion vectors already exported by the mosh decoder. It adds no codec pass or frame of latency; the displaced sample is folded into the existing wet/dry blend.",
+    ),
+    entry(
+        Temporal,
+        "mosh_trail",
+        "Retains the motion corridor on the fixed 30 Hz program clock, so an object leaves a fading pixel wake after it moves. At zero only the current motion wake remains.",
+    ),
     entry(Temporal, "mosh_hold", "Re-applies the same delta several times under fresh timestamps, so motion keeps smearing in one direction."),
     entry(Temporal, "mosh_drop", "Starves the decoder of chunks. The last decoded picture is held, so a dropped chunk smears rather than flashing."),
     entry(Temporal, "mosh_shuffle", "Re-injects an older chunk out of order. Only chunks at least six deep are eligible, so the result is stale motion rather than a stutter."),
@@ -793,7 +808,7 @@ pub static CONTROL_HELP: &[HelpEntry] = &[
     entry(
         Ntsc,
         "enabled",
-        "Runs the composite VHS emulation over the finished programme. It is real CPU work on bounded workers, so it costs a frame of latency rather than being free.",
+        "Runs composite VHS once over the finished programme, independently of per-layer Master bypass. It follows Codec Mosh in their shared bounded worker hop (Mosh then VHS), so it costs one frame of latency rather than adding another hop.",
     ),
     entry(Ntsc, "tape_speed", "Which tape speed is being emulated. Slower speeds carry less bandwidth and degrade more."),
     entry(Ntsc, "composite_noise_intensity", "How much noise rides on the composite signal as a whole."),

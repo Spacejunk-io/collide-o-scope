@@ -103,7 +103,7 @@ Measurements on this host (same adapter):
 
 - No cross-adapter portability claim beyond hosted three-platform CI.
 - No new modulation source, no Symmetry-side change, no change to the M4
-  velocity contract, byte ledger, or selective-VHS budgets.
+  velocity contract, byte ledger, or final-program VHS worker budget.
 - The trash event clock (8 Hz) and shove amplitude (16 UV/s) are fixed law,
   not authored controls; a future authored rate would need its own address,
   Morph law, and Dice domain.

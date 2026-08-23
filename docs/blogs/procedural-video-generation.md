@@ -26,9 +26,9 @@ and what still needs evidence.
 | clip luminance/color/motion statistics | deferred | motion statistics require bounded multi-frame decoding and a persistent cache; they are not “almost free” |
 | second-order markov names from two-word phrases | replaced | two-word examples cannot train a genuine second-order model; a weighted finite grammar is honest and deterministic |
 | visual-parameter-driven audio DSP | research gate | the current exporter promises explicit 1x media-audio muxing; pitch shift, convolution, dynamics, smoothing, and loudness need a real DSP contract |
-| content-aware source identity and preflight | implemented in generator v7 / manifest schema v2 | bounded SHA-256 fingerprinting removes host paths from canonical identity and produces a reviewable receipt before commit |
-| bounded spatial mutation | implemented in generator v7 | independent deterministic domains vary continuous position/scale/anchor/rotation/skew/crop while preserving discrete framing and sampling choices |
-| automatic batch video rendering | still deferred | v7 prepares reviewable patches, manifests, and receipts but does not yet own a cancellable budgeted GPU render session |
+| content-aware source identity and preflight | implemented since generator v7 / manifest schema v2; retained in v14 | bounded SHA-256 fingerprinting removes host paths from canonical identity and produces a reviewable receipt before commit |
+| bounded spatial mutation | implemented since generator v7; retained in v14 | independent deterministic domains vary continuous position/scale/anchor/rotation/skew/crop while preserving discrete framing and sampling choices |
+| automatic batch video rendering | still deferred | generator v14 prepares reviewable patches, manifests, and receipts but does not yet own a cancellable budgeted GPU render session |
 
 ---
 
@@ -81,6 +81,18 @@ amount, density, and speed use bounded linear steps, block size uses the
 reflected log-space walk, and the existing pattern seed determines each band's
 arrangement. amount zero remains the exact pre-Shift shader path.
 
+generator v14 likewise gives the v1.5 Codec Mosh motion-wake controls fresh,
+field-isolated streams: Motion Wipe (`wipe` in the patch, `mosh_wipe` on the
+control wire), Vector Smear (`smear` / `mosh_smear`), and Motion Trail (`trail`
+/ `mosh_trail`). all three are continuous unit values and default to zero.
+temperature zero therefore retains the exact pre-v1.5 codec path, including no
+motion-side-data request, luma analysis, wake allocation, displaced read, or
+changed blend arithmetic. nonzero generation remains bounded to the capped
+codec image's 16×16 macroblocks—at most 40×40 / 1,600 cells. per-layer
+`mosh_send` is deliberately outside generator v14's patch-level mutation: it
+is an authored performance/morph/modulation control over one shared Codec
+Mosh history, not a second random codec domain.
+
 the walk is sequential and mean-reverting: siblings have local continuity but
 do not drift without bound. temperature is finite and constrained to 0–2. at
 temperature zero, output is a canonical anchor: defaults are resolved and
@@ -100,9 +112,10 @@ change a patch.
 
 ### command-line generation and source preflight
 
-generator v7 is deliberately patch-only. Versions 4–7 add isolated domains for
-the Collision Rack/composition graph, Temporal Originals, and Motion while
-preserving the projected random streams of older manifests:
+generator v14 is deliberately patch-only. earlier versions added isolated
+domains for the Collision Rack/composition graph, Temporal Originals, and
+Motion; v14 appends the three Codec Mosh motion-wake domains while preserving
+the projected random streams of established fields:
 
 ```powershell
 target\release\collide-o-scope.exe generate `
@@ -206,11 +219,12 @@ coordinates are aspect-correct, UV displacement is capped, and `F2-F1` supplies
 a restrained ridge at cellular boundaries. the disabled branch skips every hash
 and distance operation. the gap controls convert that ridge into straight-alpha
 coverage. layer gaps expose the existing stack below. the master exposes the
-same three controls: an ordinary post-stack master gap resolves over black; in
-the selective master-bypass path, direct master cellular and VHS run only on
-inherited slices, so inherited gaps can reveal lower or bypassed content before
-the stack is recomposited. temporal processing remains program-wide, and the
-final program is composited over black once for opaque preview, Spout, and MP4.
+same three controls: an ordinary post-stack master gap resolves over black;
+Master-bypass layers skip that inherited cellular pass while retaining their
+local coverage. temporal processing remains program-wide, the final program is
+composited over black once, and the audience order remains creative composition
+/ temporal → Codec Mosh → final-program VHS → blackout, independently of
+Master bypass for preview, Spout, and MP4.
 
 this is bounded interpolation between independently hashed stochastic feature
 targets, not literal Brownian motion or a random walk. that deviation is intentional:
@@ -233,8 +247,10 @@ modulation result then supplies the master and every layer's offsets. morph
 captures are layer-topology-revision guarded; removal/reorder remaps stored
 slots, a newly appended layer stays outside existing slots, and hue/slit angles
 use their shortest wrapped arcs. offline replay uses the same frame-indexed
-ordering. selective VHS is asynchronous live and synchronous in export, so this
-is a semantic/order guarantee rather than a claim of bit-identical live pixels.
+ordering: creative composition / temporal → Codec Mosh → final-program VHS →
+blackout. final-program VHS is asynchronous live and synchronous in export, so
+this is a semantic/order guarantee rather than a claim of bit-identical live
+pixels.
 
 the graphics basis is inspired by Steven Worley’s cellular texture function,
 which defines fields from distances to scattered feature points
@@ -316,7 +332,7 @@ pad when short, trim when long, and remain independent of visual speed/pause.
 ### next build order
 
 1. **implemented:** bounded atomic patch capture.
-2. **implemented:** deterministic typed generator v7, weighted titles,
+2. **implemented:** deterministic typed generator v14, weighted titles,
    schema-v2 manifests, bounded spatial mutation, and content-aware preflight
    receipts.
 3. **implemented:** bounded cellular/Worley effect across live and offline paths.

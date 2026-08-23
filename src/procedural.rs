@@ -56,7 +56,9 @@ use crate::visual_rack::{
 // per-layer Master and Temporal bypass values after a YAML round trip. The
 // PRNG streams and mutation laws are unchanged; the version names the new
 // inspectable evidence carried beside every generated piece.
-pub const GENERATOR_VERSION: &str = "13";
+// "14": B5 adds motion wipe, vector smear, and motion-trail controls in
+// fresh field-isolated domains. Earlier domains retain their exact streams.
+pub const GENERATOR_VERSION: &str = "14";
 pub const MAX_GENERATED_COUNT: usize = 256;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub const PREFLIGHT_SCHEMA_VERSION: u32 = 2;
@@ -854,6 +856,9 @@ const PROCEDURAL_MOSH_SHUFFLE: u64 = 0x4d4f_5348_5348_5501;
 const PROCEDURAL_MOSH_RATE: u64 = 0x4d4f_5348_5241_5401;
 const PROCEDURAL_MOSH_BITRATE: u64 = 0x4d4f_5348_4249_5401;
 const PROCEDURAL_MOSH_RESYNC: u64 = 0x4d4f_5348_5253_5901;
+const PROCEDURAL_MOSH_WIPE: u64 = 0x4d4f_5348_5749_5001;
+const PROCEDURAL_MOSH_SMEAR: u64 = 0x4d4f_5348_534d_5201;
+const PROCEDURAL_MOSH_TRAIL: u64 = 0x4d4f_5348_5452_4c01;
 
 /// Vary only the display stage's seventeen bounded continuous values.
 /// B8 master melting edge: mutate the six continuous values in fresh
@@ -892,7 +897,7 @@ fn mutate_master_melt(
     *value = value.sanitized();
 }
 
-/// B5 codec mosh: mutate the eight continuous values in fresh
+/// B5 codec mosh: mutate every continuous codec and motion-wake value in fresh
 /// field-isolated domains. The recycle law is discrete and never rerolls.
 fn mutate_codec_mosh(
     anchor: &crate::codec_mosh::CodecMoshParams,
@@ -926,6 +931,9 @@ fn mutate_codec_mosh(
     linear!(rate, 0.1, PROCEDURAL_MOSH_RATE);
     linear!(bitrate_starve, 0.1, PROCEDURAL_MOSH_BITRATE);
     linear!(resync, 0.08, PROCEDURAL_MOSH_RESYNC);
+    linear!(wipe, 0.1, PROCEDURAL_MOSH_WIPE);
+    linear!(smear, 0.1, PROCEDURAL_MOSH_SMEAR);
+    linear!(trail, 0.1, PROCEDURAL_MOSH_TRAIL);
     *value = value.sanitized();
 }
 
@@ -4136,6 +4144,7 @@ mod tests {
                 filename: "clip.mp4".to_string(),
                 source_path: String::new(),
                 opacity: 1.0,
+                mosh_send: 1.0,
                 blend_mode: "normal".to_string(),
                 speed: 1.0,
                 fps: 30.0,
@@ -4465,6 +4474,9 @@ mod tests {
             key_removal: 0.9,
             hold: 0.3,
             resync: 0.2,
+            wipe: 0.35,
+            smear: 0.55,
+            trail: 0.7,
             recycle: true,
             ..CodecMoshParams::default()
         };
@@ -4486,6 +4498,9 @@ mod tests {
             left.rate,
             left.bitrate_starve,
             left.resync,
+            left.wipe,
+            left.smear,
+            left.trail,
         ] {
             assert!((0.0..=1.0).contains(&value));
         }
@@ -4793,7 +4808,7 @@ layers:
         .unwrap()
         .remove(0);
 
-        assert_eq!(piece.manifest.generator_version, "13");
+        assert_eq!(piece.manifest.generator_version, "14");
         assert_eq!(piece.preflight.schema_version, 2);
         assert_eq!(
             piece.preflight.layer_bypass_states,

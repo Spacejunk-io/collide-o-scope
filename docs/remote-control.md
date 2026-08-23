@@ -128,9 +128,9 @@ Media is also released.
   Morph automation so those defaults stay in force. It preserves layers and
   their effects, visibility and transport,
   BPM, and audio/MIDI/device choices. A layer card's **Reset FX** remains local:
-  it resets that layer's direct effects and Motion, but deliberately leaves its
-  rack, transform, opacity, and transport unchanged; Transform and Rack have
-  their own controls. The
+  it resets that layer's direct effects, Motion, and Mosh Send, but deliberately
+  leaves its rack, transform, opacity, and transport unchanged; Transform and
+  Rack have their own controls. The
   bundled panel sends `reset_visual_program` for this broad operation. The
   legacy `reset_fx` protocol action remains accepted but resets only direct
   master effect uniforms, matching the original remote-control contract. It
@@ -138,23 +138,23 @@ Media is also released.
   Morph, and queued automation
   live, so those systems may continue changing the rendered master afterward.
 - **Bypass Master FX** on a layer skips inherited Digital, Analog, Cellular,
-  Motion, and VHS processing for that layer. Its own Layer FX, opacity, key,
-  and blend remain active. This switch retains the v1.2 LinkedDry contract: a
+  and Motion processing for that layer. Its own Layer FX, opacity, key, and
+  blend remain active. VHS remains one final-program pass over the complete
+  audience, independent of this switch. This retains the v1.2 LinkedDry contract: a
   visible, positive-opacity bypass layer links the complete shared Temporal
   family dry for the whole program when no explicit **Bypass Temporal FX**
   route is active. Feedback, Slit-Scan, Temporal Originals, Melt, Sync Latch,
   Display Physics, and Codec Mosh receive neutral frame parameters. The clean
   program still warms Temporal history, and the authored/modulated controls
-  resume unchanged when no contributing bypass remains. With VHS enabled,
-  direct master effects and VHS run only on inherited layer slices; the engine
-  then recomposites the stack before that linked Temporal boundary. Offline
-  render follows the same law. Hidden or non-positive-opacity layers neither
-  link Temporal dry nor create selective work. Live selective processing has
-  a 320 MiB safety budget and no silent
-  global-VHS fallback: if the current output size and contributing stack exceed
-  it, the prior exact audience frame is held and the VHS panel reports how to
-  reduce the load. Layer **Reset FX** and master **Revert** preserve this
-  non-destructive switch.
+  resume unchanged when no contributing bypass remains. The audience order is
+  creative composition / Temporal → Codec Mosh → final-program VHS →
+  blackout. Hidden or non-positive-opacity layers neither link Temporal dry nor
+  change that route.
+  One bounded latest-only worker pass avoids per-layer readbacks, allocations,
+  and CPU kernels for mixed stacks. Layer **Reset FX** and master **Revert**
+  preserve this non-destructive switch. Explicit **Bypass Temporal FX** plus VHS
+  is rejected transactionally because a correct dry-overlay finish would add a
+  second readback and frame of latency.
 - **Bypass Temporal FX** is the independent, exact Temporal route. It defaults
   off and is controlled remotely with `set_layer_param` parameter
   `bypass_temporal_fx`. Every enabled layer must form one contiguous prefix at
@@ -331,7 +331,7 @@ reservation.
 Expert affects future allocations only. Returning to Safe does not destroy an
 already accepted source, and patches cannot enable Expert on another host. It
 does not raise the live renderer, fullscreen-output, or export-output UHD-area
-caps, and it does not raise the separate 320 MiB selective-VHS budget. The
+caps. The
 bundled panel sends the idempotent action
 `{"action":"set_media_safety_mode","mode":"safe"}` (or `"expert"`). The additive
 `media_safety` snapshot defaults to Safe when absent, so older snapshots and
@@ -346,14 +346,62 @@ reserved capacity. This prevents a fast slider, sensor, or disconnected client
 from building an unbounded render-thread backlog. Beat latch adds the separate
 downbeat behavior below.
 
+### Codec Mosh
+
+Codec Mosh is the real in-process mpeg4 encode→break→decode stage over the
+finished program, not a shader approximation. v1.5 adds three continuous,
+unit-range controls to its established codec-fault controls:
+
+- **Motion Wipe** is patch field `wipe` and `set_temporal` / modulation target
+  `mosh_wipe`. It changes the damaged-picture mix from uniform to a reveal over
+  moving macroblocks.
+- **Vector Smear** is patch field `smear` and wire target `mosh_smear`. It pulls
+  damaged pixels backward along the decoder's forward motion displacement.
+- **Motion Trail** is patch field `trail` and wire target `mosh_trail`. It
+  retains the observed motion wake on the fixed 30 Hz reference clock.
+
+All three default to zero and persist in patches, interpolate through Morph,
+accept modulation, and mutate in isolated deterministic generator-v14 domains.
+With all three at zero the pre-v1.5 path is exact: the engine requests no motion
+side data, performs no luma analysis, allocates no wake, performs no displaced
+read, and uses the old blend arithmetic. When Motion Wipe or Vector Smear is
+armed, analysis stays on the codec image, whose longest edge is already capped
+at 640 pixels. Native 16×16 macroblocks bound even a square maximum image to
+40×40 / 1,600 cells; the one clamped smear read is fused into the existing
+output blend, with no extra full-frame pass or readback. Motion Trail shapes
+that bounded wake and does not allocate invisible history by itself.
+
+Each layer also exposes **Mosh Send**, patch and `set_layer_param` field
+`mosh_send`, with modulation address `layerN_mosh_send`. It is a finite unit
+value, defaults to one, persists through patches, and interpolates through
+Morph. The value controls that layer's covered pixels in a programme-space
+matte: zero is dry, one is full send, and intermediate values blend the one
+shared Codec Mosh result. It does not create an independent codec, trail, or
+history for each layer.
+
+The all-one default is the exact old path. A matte is built only when Codec
+Mosh is armed and a visible positive-opacity wet layer resolves below one;
+then two R8 masks and one RGBA alpha-pack target cost six nominal texel bytes
+per output pixel; backend alignment and metadata may add overhead. The pack
+reuses the existing RGBA readback, codec, latest-only worker, and upload, so it
+adds no readback, worker hop, or frame of latency. After source-cache warmup,
+dynamic uniform arenas and cached bindings create no per-layer GPU resources;
+ordinary unkeyed/unwarped layers also skip the duplicate RGBA coverage pass.
+Coverage
+follows the evaluated base layer transform/effects before support-changing
+Advanced racks, groups, master effects, and Temporal; those later operations
+can displace pixels beyond the control field. A **Bypass Temporal FX** layer
+is in the dry prefix and never enters Codec Mosh, so Mosh Send does not act on
+it. The audience position remains creative composition / Temporal → Codec
+Mosh → final-program VHS → blackout.
+
 ### Live VHS admission metrics
 
-The VHS panel labels the current live path as global or selective and exposes
-separate saturating counters for each path. `attempted` counts bounded admission
-attempts and `accepted` counts work admitted by that path. `skipped` is reserved
-for healthy bounded backpressure when a worker or selective staging slot is
-busy; `unavailable` separately counts a disconnected or failed worker so a
-fault cannot look like ordinary load shedding. `stale` is orthogonal: it counts
+The VHS panel labels the final-program live path and exposes saturating counters
+for its bounded worker. `attempted` counts admission attempts and `accepted`
+counts work admitted by that path. `skipped` is reserved for healthy bounded
+backpressure while the worker is busy; `unavailable` separately counts a
+failed worker so a fault cannot look like ordinary load shedding. `stale` is orthogonal: it counts
 work that was accepted but whose asynchronous result was later rejected at a
 visual-generation, topology, or path-compatibility boundary. A disabled path
 generates no attempts. `busy` is current presentation context for the selected
@@ -365,6 +413,11 @@ are not an export metric, a count of every presentation drop, or proof that an
 accepted frame reached an audience surface. Worker errors remain in the VHS
 error status. The additive metric snapshot defaults to zero with the active path
 off when absent, preserving older-client compatibility.
+
+When both stages are active, Codec Mosh and VHS share the bounded latest-only
+worker hop in Mosh→VHS order. This retains one asynchronous frame of live
+latency rather than chaining a second worker; blackout remains the absolute
+operation after the completed replacement.
 
 ### Random / Dice
 
@@ -607,7 +660,7 @@ is rejected and corrected by the next snapshot.
 Manual fader and blend-law edits are accepted and materialize their bases while
 Freeze Program holds automatic glide/clock motion. If Blackout is engaged while
 the program is frozen, the cut remains absolute and releasing it restores the
-exact pre-cut audience. A frozen selective-VHS audience frame stays held until
+exact pre-cut audience. A frozen final-program VHS audience frame stays held until
 the program resumes and can process the complete replacement. Adding a layer
 leaves it outside existing A/B slots; reorder and removal remap the slots to
 their surviving layers. The slots, law, position, and exact remaining glide are
@@ -673,8 +726,8 @@ returns to zero, and the error remains visible.
 
 **RECORDER** is separate from offline **Render**. **Record program…** opens a
 native final-file picker and starts a video-only capture of the exact final
-Program image after NTSC and absolute blackout. The render thread only submits
-to fixed readback/pool/queue capacity; it never waits for FFmpeg. Readback,
+Program image after final-program VHS and absolute blackout. The render thread
+only submits to fixed readback/pool/queue capacity; it never waits for FFmpeg. Readback,
 pool, queue, source, and worker drops are counted, and a cadence gap repeats the
 last admitted frame in the video instead of falsifying its duration. **Finish**
 stops admission, drains in-flight work, then publishes. **Cancel** removes the
@@ -716,20 +769,18 @@ offscreen. Test cards, identification, and calibration affect that endpoint
 only, after the completed creative Program, and never alter the artwork saved
 in a patch.
 
-Selective VHS export is synchronous but follows the live **Bypass Master FX**
-law: bypassed layers retain only their direct effects, inherited layers receive
-master effects and VHS, and the stack is recomposited. If any Bypass Master FX
-layer contributes, the complete shared Temporal family then runs neutral while
-accepting the clean program into warm history. A selective-processing failure
-stops the export with an error instead of silently applying VHS to a bypassed
-layer.
+VHS export is synchronous and follows the live final-program law: per-layer
+**Bypass Master FX** is resolved during creative composition, the complete
+Temporal family runs next, Codec Mosh runs when armed, and one VHS kernel
+finishes the composed program before blackout. In compact form: creative
+composition / Temporal → Codec Mosh → final-program VHS → blackout. Mixed
+and all-bypass stacks use the same pass.
 
 An admitted **Bypass Temporal FX** top prefix also follows its live law during
 offline render: the inherited background receives the complete Temporal family,
 including Codec Mosh, before the dry prefix is recomposited in authored order.
 
-**VHS quality** affects both the ordinary global path and those inherited
-selective slices:
+**VHS quality** affects that final-program pass:
 
 - **Live parity (half)** is the default, including for older clients. It
   downsamples to half width and height, runs VHS, and upscales, matching the
@@ -738,7 +789,7 @@ selective slices:
   avoids the half-resolution downscale/upscale but is slower and more
   memory-intensive; live rendering remains half-resolution.
 
-Both modes preserve keyed alpha and the same global/selective routing and
+Both modes preserve keyed alpha and the same final-program routing and
 composition order; quality changes only VHS spatial resolution. When VHS is
 off, the choice has no effect.
 
@@ -754,8 +805,7 @@ Arbitrary counts and unknown strings are rejected.
 
 Expert media mode may admit a larger source while reconstructing an offline
 patch, but it does not enlarge the selected export output. Export-output
-dimensions retain the established UHD-area validation, and selective export
-retains its independent bounded working-set validation.
+dimensions retain the established UHD-area validation.
 
 The optional **Audio (1× independent)** selector muxes the chosen video
 layer's first audio stream. Audio starts at source time zero, ignores visual
@@ -764,14 +814,17 @@ duration. Live Spout layers cannot be selected for audio and render as black
 offline because an external live sender is not reproducible.
 
 After the MP4 succeeds, offline Render atomically publishes
-`<video>.motion.json`. The bounded schema-v3 provenance report records source
+`<video>.motion.json`. The bounded schema-v7 provenance report records source
 fingerprints when available; requested shutter policy and exact count;
 separate authored and effective motion scope/algorithm/quality/donor/carrier
 values; the final planner source, actual rendered source, and field-attachment
 truth (including planned-but-unprimed fields); codec transition count, elapsed
 source time, and exact proof/vector digest only when a proven codec field was
 attached; diagnostics and dynamic-state changes; the last accepted
-frame; and warnings. It explicitly does not guarantee cross-GPU pixel identity.
+frame; and warnings. Its Codec-Mosh section includes encoder identity, authored
+recipe, accepted-frame min/max recipe values, observed Recycle states, and
+per-layer authored/observed Mosh Send plus wet-partition admission. It
+explicitly does not guarantee cross-GPU pixel identity.
 Cancel/failure removes partial video/sidecar work, and unavailable codec vectors
 or fingerprints remain warnings rather than being rewritten as proof.
 
@@ -834,7 +887,7 @@ layout synthesized with frozen markers. Unknown future visual topology versions
 are rejected rather than guessed. Omitted prepared-performance, Temporal
 Originals, Motion, and Scene fields take their exact inactive/legacy defaults.
 The generator's schema-v2 `manifest.json` is a different document; current
-procedural output is generator v7. StageMap, controller/OSC configuration,
+procedural output is generator v14. StageMap, controller/OSC configuration,
 preset library, recovery journal, recorder state, runtime pixels, and GPU
 resources are intentionally not PatchState.
 
@@ -1024,7 +1077,7 @@ proof of any deferred backend.
 | **Panel server is unavailable** | Read the native RECOVERY status and concrete bind error. Stop any earlier process holding ports 3030/3031, then restart. Browser count alone is not listener health. |
 | **Library is empty or points at the wrong folder** | Check the active path in RECOVERY, choose the intended folder, and use Rescan. Choosing or rescanning does not add a layer automatically. |
 | **A large source is rejected in Safe or Expert mode** | Safe intentionally stops above UHD area. Expert still enforces DCI-8K area, absolute/device edge, per-buffer, and aggregate host-planning limits; it is not a guarantee of available VRAM. Reduce the source or close other above-Safe sources. |
-| **Selective VHS reports a memory budget error** | The requested output size and number of visible, positive-opacity layers exceed the bounded live working set. Hide unneeded layers, set their opacity to zero, or lower the output resolution. The engine holds the prior exact audience frame and does not violate Bypass Master FX. |
+| **VHS reports unavailable or skipped work** | Unavailable means the bounded worker/readback path failed; skipped means healthy latest-only backpressure while a prior frame is processing. Lower the output resolution or other load if skips are frequent, and inspect the reported worker error for unavailable work. |
 | **Bypass Temporal FX is rejected** | Put every dry layer in one contiguous prefix beginning at Layer 1/top and use a flat LegacyExact Program stack. Remove groups, A/B or non-Program bus routing, mattes, advanced racks or advanced Motion, authored Master/layer Motion modulation routes (including zero-depth routes), and routed Refresh Garden; disable VHS. The rejected transaction leaves the previous switch state and audience frame intact. |
 | **Audio meters remain zero** | Select/enable a real input, grant OS access, and inspect the panel error. Software-only tests do not prove venue hardware. |
 | **QR contains 127.0.0.1** | No LAN address was found at launch. Connect networking and restart. |

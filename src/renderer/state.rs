@@ -243,12 +243,968 @@ impl TemporalBypassAudienceCandidate {
     }
 }
 
+/// One layer's scalar contribution to the programme-space Codec-Mosh send
+/// matte. The colour compositor keeps its full straight-alpha contract; this
+/// compact companion therefore never overloads a creative colour channel.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MoshInfluenceUniforms {
+    send: f32,
+    opacity: f32,
+    blend_mode: u32,
+    _pad: u32,
+}
+
+const MOSH_INFLUENCE_TEXTURE_BYTES_PER_PIXEL: u64 = 6;
+
+/// Nominal full-frame texture ceiling for the optional layer-send path under
+/// the renderer's ordinary Safe media-area contract. The two R8 masks and one
+/// RGBA8 packing target are the only output-sized allocations it owns.
+pub(crate) const MAX_MOSH_INFLUENCE_GPU_BYTES: u64 = crate::media_safety::SAFE_MEDIA_MAX_PIXELS
+    .checked_mul(MOSH_INFLUENCE_TEXTURE_BYTES_PER_PIXEL)
+    .expect("Safe Codec-Mosh influence texture ceiling fits u64");
+
+#[derive(Debug, Clone, Copy)]
+struct MoshInfluenceLayerState {
+    visible: bool,
+    bypass_temporal_fx: bool,
+    opacity: f32,
+    send: f32,
+    alpha_cut: bool,
+}
+
+impl MoshInfluenceLayerState {
+    fn contributes(self) -> bool {
+        self.visible && !self.bypass_temporal_fx && self.opacity.is_finite() && self.opacity > 0.0
+    }
+
+    fn authors_send_reduction(self) -> bool {
+        self.contributes() && !self.alpha_cut && self.send.is_finite() && self.send < 1.0
+    }
+
+    fn affects_active_field(self) -> bool {
+        self.contributes() && (self.alpha_cut || (self.send.is_finite() && self.send < 1.0))
+    }
+}
+
+fn mosh_influence_stack_start_by(
+    layer_count: usize,
+    mosh_active: bool,
+    mut state_at: impl FnMut(usize) -> MoshInfluenceLayerState,
+) -> Option<usize> {
+    if !mosh_active
+        || !(0..layer_count)
+            .rev()
+            .any(|index| state_at(index).authors_send_reduction())
+    {
+        return None;
+    }
+    // Once any colour-owning layer reduces its send, retain the bottommost
+    // relevant AlphaCut too: destination-out can alter the control field even
+    // though its own send is semantically inert.
+    (0..layer_count)
+        .rev()
+        .find(|&index| state_at(index).affects_active_field())
+}
+
+pub(crate) fn mosh_influence_stack_start(
+    layers: &[crate::evaluated_frame::EvaluatedLayer],
+    mosh_active: bool,
+) -> Option<usize> {
+    mosh_influence_stack_start_by(layers.len(), mosh_active, |index| {
+        let layer = &layers[index];
+        MoshInfluenceLayerState {
+            visible: layer.visible,
+            bypass_temporal_fx: layer.bypass_temporal_fx,
+            opacity: layer.opacity,
+            send: layer.mosh_send,
+            alpha_cut: layer.blend_mode == crate::layers::BlendMode::AlphaCut,
+        }
+    })
+}
+
+/// Immutable optional kernels precompiled with the renderer/export device so
+/// the first authored send never compiles WGSL on a presentation frame.
+#[derive(Clone)]
+pub(crate) struct MoshInfluencePipelines {
+    coverage_pipeline: wgpu::RenderPipeline,
+    coverage_texture_layout: wgpu::BindGroupLayout,
+    coverage_uniform_layout: wgpu::BindGroupLayout,
+    mask_pipeline: wgpu::RenderPipeline,
+    mask_texture_layout: wgpu::BindGroupLayout,
+    mask_uniform_layout: wgpu::BindGroupLayout,
+    pack_pipeline: wgpu::RenderPipeline,
+    pack_layout: wgpu::BindGroupLayout,
+}
+
+struct MoshInfluenceUniformArena {
+    capacity: usize,
+    coverage_stride: u64,
+    mask_stride: u64,
+    coverage_buffer: wgpu::Buffer,
+    coverage_group: wgpu::BindGroup,
+    mask_buffer: wgpu::Buffer,
+    mask_group: wgpu::BindGroup,
+}
+
+struct MoshInfluenceLayerBindings {
+    source: SourceTap,
+    texture: wgpu::Texture,
+    coverage_group: wgpu::BindGroup,
+    direct_mask_groups: [wgpu::BindGroup; 2],
+}
+
+/// Lazy GPU state for per-layer Codec-Mosh sends. Two R8 ping-pong masks plus
+/// one RGBA8 packing target cost six bytes per output pixel, but only after a
+/// contributing layer actually authors a send below one. The pack target is
+/// copied into the ordinary staging buffer, so readback count and size stay
+/// unchanged.
+pub(crate) struct MoshInfluenceGpu {
+    dimensions: [u32; 2],
+    /// Views/bind groups borrow these allocations conceptually; retaining the
+    /// handles also makes the six-byte-per-pixel ownership explicit.
+    _masks: [wgpu::Texture; 2],
+    mask_views: [wgpu::TextureView; 2],
+    packed: wgpu::Texture,
+    packed_view: wgpu::TextureView,
+    pipelines: MoshInfluencePipelines,
+    sampler: wgpu::Sampler,
+    nearest_sampler: wgpu::Sampler,
+    coverage_view: wgpu::TextureView,
+    scratch_mask_groups: [wgpu::BindGroup; 2],
+    layer_bindings: Vec<Option<MoshInfluenceLayerBindings>>,
+    uniforms: MoshInfluenceUniformArena,
+    pack_groups: [wgpu::BindGroup; 2],
+    parity: usize,
+    uniform_cursor: usize,
+    valid: bool,
+}
+
+impl MoshInfluencePipelines {
+    /// Compile the optional kernels outside the presentation loop. Keeping
+    /// this result separate from mandatory renderer setup preserves the
+    /// full-program fallback if an unusual adapter rejects R8 rendering.
+    pub(crate) fn build(device: &wgpu::Device) -> Result<Self, String> {
+        create_gpu_resources_checked(device, "Codec-Mosh influence pipelines", || {
+            let coverage_vertex = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Codec-Mosh Influence Coverage Vertex"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/fullscreen.wgsl").into()),
+            });
+            let coverage_fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Codec-Mosh Influence Coverage Fragment"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/effects.wgsl").into()),
+            });
+            let mask_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Codec-Mosh Influence Shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/mosh_influence.wgsl").into(),
+                ),
+            });
+            let pack_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Codec-Mosh Influence Pack Shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/mosh_influence_pack.wgsl").into(),
+                ),
+            });
+            let coverage_texture_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Codec-Mosh Influence Coverage Texture BGL"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+            let coverage_uniform_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Codec-Mosh Influence Coverage Uniform BGL"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: true,
+                            min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<
+                                EffectPassUniforms,
+                            >(
+                            )
+                                as u64),
+                        },
+                        count: None,
+                    }],
+                });
+            let coverage_pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Codec-Mosh Influence Coverage Pipeline Layout"),
+                    bind_group_layouts: &[
+                        Some(&coverage_texture_layout),
+                        Some(&coverage_uniform_layout),
+                    ],
+                    immediate_size: 0,
+                });
+            let coverage_pipeline =
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("Codec-Mosh Influence Coverage Pipeline"),
+                    layout: Some(&coverage_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &coverage_vertex,
+                        entry_point: Some("vs_main"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &coverage_fragment,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: COMPOSITE_FORMAT,
+                            blend: Some(wgpu::BlendState::REPLACE),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                });
+            let mask_texture_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Codec-Mosh Influence Texture BGL"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+            let mask_uniform_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Codec-Mosh Influence Uniform BGL"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: true,
+                            min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<
+                                MoshInfluenceUniforms,
+                            >(
+                            )
+                                as u64),
+                        },
+                        count: None,
+                    }],
+                });
+            let mask_pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Codec-Mosh Influence Pipeline Layout"),
+                    bind_group_layouts: &[Some(&mask_texture_layout), Some(&mask_uniform_layout)],
+                    immediate_size: 0,
+                });
+            let mask_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Codec-Mosh Influence Pipeline"),
+                layout: Some(&mask_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &mask_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &mask_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::R8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::RED,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            let pack_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Codec-Mosh Influence Pack BGL"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+            let pack_pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Codec-Mosh Influence Pack Pipeline Layout"),
+                    bind_group_layouts: &[Some(&pack_layout)],
+                    immediate_size: 0,
+                });
+            let pack_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Codec-Mosh Influence Alpha Pack Pipeline"),
+                layout: Some(&pack_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &pack_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &pack_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: COMPOSITE_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALPHA,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            Self {
+                coverage_pipeline,
+                coverage_texture_layout,
+                coverage_uniform_layout,
+                mask_pipeline,
+                mask_texture_layout,
+                mask_uniform_layout,
+                pack_pipeline,
+                pack_layout,
+            }
+        })
+    }
+}
+
+fn aligned_uniform_stride<T>(alignment: u64) -> Option<u64> {
+    let size = std::mem::size_of::<T>() as u64;
+    let alignment = alignment.max(1);
+    size.checked_add(alignment - 1)
+        .map(|value| value / alignment * alignment)
+}
+
+impl MoshInfluenceUniformArena {
+    fn build(
+        device: &wgpu::Device,
+        pipelines: &MoshInfluencePipelines,
+        required_capacity: usize,
+    ) -> Result<Self, String> {
+        let capacity = required_capacity.max(1);
+        let capacity_u64 = u64::try_from(capacity)
+            .map_err(|_| "Codec-Mosh influence layer count overflow".to_string())?;
+        let alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment.max(1));
+        let coverage_stride = aligned_uniform_stride::<EffectPassUniforms>(alignment)
+            .ok_or_else(|| "Codec-Mosh coverage uniform stride overflow".to_string())?;
+        let mask_stride = aligned_uniform_stride::<MoshInfluenceUniforms>(alignment)
+            .ok_or_else(|| "Codec-Mosh send uniform stride overflow".to_string())?;
+        let coverage_size = coverage_stride
+            .checked_mul(capacity_u64)
+            .ok_or_else(|| "Codec-Mosh coverage uniform arena overflow".to_string())?;
+        let mask_size = mask_stride
+            .checked_mul(capacity_u64)
+            .ok_or_else(|| "Codec-Mosh send uniform arena overflow".to_string())?;
+        let max_buffer_size = device.limits().max_buffer_size;
+        if coverage_size > max_buffer_size || mask_size > max_buffer_size {
+            return Err(format!(
+                "Codec-Mosh influence needs uniform arenas of {coverage_size} and {mask_size} bytes, exceeding this GPU's {max_buffer_size}-byte buffer limit"
+            ));
+        }
+        for (label, stride) in [("coverage", coverage_stride), ("send", mask_stride)] {
+            let last_offset = stride
+                .checked_mul(capacity_u64.saturating_sub(1))
+                .ok_or_else(|| format!("Codec-Mosh {label} dynamic offset overflow"))?;
+            u32::try_from(last_offset).map_err(|_| {
+                format!("Codec-Mosh {label} dynamic offset {last_offset} exceeds the GPU API limit")
+            })?;
+        }
+
+        create_gpu_resources_checked(device, "Codec-Mosh influence uniform arenas", || {
+            let coverage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Codec-Mosh Influence Coverage Uniform Arena"),
+                size: coverage_size,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let coverage_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Codec-Mosh Influence Coverage Uniform BG"),
+                layout: &pipelines.coverage_uniform_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &coverage_buffer,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<EffectPassUniforms>() as u64
+                        ),
+                    }),
+                }],
+            });
+            let mask_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Codec-Mosh Influence Send Uniform Arena"),
+                size: mask_size,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mask_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Codec-Mosh Influence Send Uniform BG"),
+                layout: &pipelines.mask_uniform_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &mask_buffer,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<MoshInfluenceUniforms>() as u64,
+                        ),
+                    }),
+                }],
+            });
+            Self {
+                capacity,
+                coverage_stride,
+                mask_stride,
+                coverage_buffer,
+                coverage_group,
+                mask_buffer,
+                mask_group,
+            }
+        })
+    }
+
+    fn dynamic_offset(stride: u64, index: usize) -> Result<(u64, u32), String> {
+        let index = u64::try_from(index)
+            .map_err(|_| "Codec-Mosh influence uniform index overflow".to_string())?;
+        let offset = stride
+            .checked_mul(index)
+            .ok_or_else(|| "Codec-Mosh influence uniform offset overflow".to_string())?;
+        let dynamic = u32::try_from(offset)
+            .map_err(|_| "Codec-Mosh influence dynamic offset exceeds u32".to_string())?;
+        Ok((offset, dynamic))
+    }
+}
+
+fn mosh_influence_needs_coverage_pass(uniforms: &EffectPassUniforms) -> bool {
+    let effects = &uniforms.effects;
+    uniforms.spatial.is_spatially_active()
+        || effects.multi_grid_x >= 1.5
+        || effects.multi_grid_y >= 1.5
+        || effects.breathe_scale > 0.0
+        || effects.breathe_rotation > 0.0
+        || effects.breathe_position > 0.0
+        || effects.cellular_amount > 0.0001
+        || effects.shift_amount > 0.0001
+        || effects.barrel.abs() > 0.0001
+        || effects.row_smear > 0.0001
+        || effects.downsample < 0.99
+        || effects.pixelate_size > 1.0
+        || effects.key_mode > 0.5
+}
+
+impl MoshInfluenceGpu {
+    pub(crate) fn new(
+        device: &wgpu::Device,
+        sampler: &wgpu::Sampler,
+        nearest_sampler: &wgpu::Sampler,
+        coverage_view: &wgpu::TextureView,
+        dimensions: [u32; 2],
+        layer_capacity: usize,
+        prepared: &MoshInfluencePipelines,
+    ) -> Result<Self, String> {
+        if dimensions[0] == 0 || dimensions[1] == 0 {
+            return Err("Codec-Mosh influence dimensions are empty".to_string());
+        }
+        mosh_influence_allocation_bytes(dimensions).ok_or_else(|| {
+            format!(
+                "Codec-Mosh influence dimensions {}x{} overflow their allocation bound",
+                dimensions[0], dimensions[1]
+            )
+        })?;
+        let uniforms = MoshInfluenceUniformArena::build(device, prepared, layer_capacity)?;
+        create_gpu_resources_checked(device, "Codec-Mosh layer influence textures", || {
+            let masks = std::array::from_fn(|index| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(if index == 0 {
+                        "Codec-Mosh Influence Mask A"
+                    } else {
+                        "Codec-Mosh Influence Mask B"
+                    }),
+                    size: wgpu::Extent3d {
+                        width: dimensions[0],
+                        height: dimensions[1],
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::R8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+            });
+            let mask_views = std::array::from_fn(|index| {
+                masks[index].create_view(&wgpu::TextureViewDescriptor::default())
+            });
+            let packed = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Codec-Mosh Influence Packed Readback"),
+                size: wgpu::Extent3d {
+                    width: dimensions[0],
+                    height: dimensions[1],
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: COMPOSITE_FORMAT,
+                usage: wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let packed_view = packed.create_view(&wgpu::TextureViewDescriptor::default());
+            let scratch_mask_groups = std::array::from_fn(|index| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Codec-Mosh Influence Scratch Mask BG"),
+                    layout: &prepared.mask_texture_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&mask_views[index]),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(coverage_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                    ],
+                })
+            });
+            let pack_groups = std::array::from_fn(|index| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Codec-Mosh Influence Pack BG"),
+                    layout: &prepared.pack_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&mask_views[index]),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                    ],
+                })
+            });
+            Self {
+                dimensions,
+                _masks: masks,
+                mask_views,
+                packed,
+                packed_view,
+                pipelines: prepared.clone(),
+                sampler: sampler.clone(),
+                nearest_sampler: nearest_sampler.clone(),
+                coverage_view: coverage_view.clone(),
+                scratch_mask_groups,
+                layer_bindings: Vec::new(),
+                uniforms,
+                pack_groups,
+                parity: 0,
+                uniform_cursor: 0,
+                valid: false,
+            }
+        })
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.valid = false;
+    }
+
+    fn ensure_uniform_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        required_capacity: usize,
+    ) -> Result<(), String> {
+        if required_capacity <= self.uniforms.capacity {
+            return Ok(());
+        }
+        let grown_capacity = self
+            .uniforms
+            .capacity
+            .checked_mul(2)
+            .unwrap_or(required_capacity)
+            .max(required_capacity);
+        self.uniforms = MoshInfluenceUniformArena::build(device, &self.pipelines, grown_capacity)?;
+        Ok(())
+    }
+
+    pub(crate) fn begin_frame(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        layer_capacity: usize,
+    ) -> Result<(), String> {
+        self.parity = 0;
+        self.uniform_cursor = 0;
+        // Publication is transactional: a missing layer resource or any
+        // other mid-build error must make the caller fall back to the exact
+        // full-program path, never consume a partially composed matte.
+        self.valid = false;
+        self.ensure_uniform_capacity(device, layer_capacity)?;
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Clear Codec-Mosh Influence Matte"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.mask_views[0],
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        Ok(())
+    }
+
+    pub(crate) fn finish_frame(&mut self) {
+        self.valid = true;
+    }
+
+    fn ensure_layer_bindings(
+        &mut self,
+        device: &wgpu::Device,
+        source: SourceTap,
+        source_view: &wgpu::TextureView,
+    ) {
+        if self.layer_bindings.len() <= source.slot {
+            self.layer_bindings.resize_with(source.slot + 1, || None);
+        }
+        let source_texture = source_view.texture();
+        let current = self.layer_bindings[source.slot].as_ref();
+        if current
+            .is_some_and(|binding| binding.source == source && &binding.texture == source_texture)
+        {
+            return;
+        }
+
+        let coverage_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Codec-Mosh Influence Cached Coverage Input"),
+            layout: &self.pipelines.coverage_texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(source_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
+                },
+            ],
+        });
+        let direct_mask_groups = std::array::from_fn(|index| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Codec-Mosh Influence Cached Direct Mask Input"),
+                layout: &self.pipelines.mask_texture_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.mask_views[index]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(source_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            })
+        });
+        self.layer_bindings[source.slot] = Some(MoshInfluenceLayerBindings {
+            source,
+            texture: source_texture.clone(),
+            coverage_group,
+            direct_mask_groups,
+        });
+    }
+
+    fn encode_mask(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        texture_groups: &[wgpu::BindGroup; 2],
+        send: f32,
+        opacity: f32,
+        blend_mode: crate::layers::BlendMode,
+    ) -> Result<(), String> {
+        if self.uniform_cursor >= self.uniforms.capacity {
+            return Err(format!(
+                "Codec-Mosh influence encoded more than {} admitted layers",
+                self.uniforms.capacity
+            ));
+        }
+        let write = self.parity ^ 1;
+        let uniforms = MoshInfluenceUniforms {
+            send: if send.is_finite() {
+                send.clamp(0.0, 1.0)
+            } else {
+                1.0
+            },
+            opacity: if opacity.is_finite() {
+                opacity.clamp(0.0, 1.0)
+            } else {
+                1.0
+            },
+            blend_mode: blend_mode.as_u32(),
+            _pad: 0,
+        };
+        let (uniform_offset, dynamic_offset) = MoshInfluenceUniformArena::dynamic_offset(
+            self.uniforms.mask_stride,
+            self.uniform_cursor,
+        )?;
+        queue.write_buffer(
+            &self.uniforms.mask_buffer,
+            uniform_offset,
+            bytemuck::bytes_of(&uniforms),
+        );
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Composite Codec-Mosh Layer Influence"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.mask_views[write],
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        pass.set_pipeline(&self.pipelines.mask_pipeline);
+        pass.set_bind_group(0, &texture_groups[self.parity], &[]);
+        pass.set_bind_group(1, &self.uniforms.mask_group, &[dynamic_offset]);
+        pass.draw(0..3, 0..1);
+        drop(pass);
+        self.parity = write;
+        self.uniform_cursor += 1;
+        Ok(())
+    }
+
+    /// Encode one production layer without creating a buffer or bind group on
+    /// the steady-state path. Straight, unkeyed layers sample source alpha
+    /// directly; only support-changing local effects materialize the RGBA
+    /// coverage scratch before the one-channel send composite.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one encoded layer needs its immutable source/pass identity plus three send-compositor scalars"
+    )]
+    pub(crate) fn encode_source_layer(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        source: SourceTap,
+        source_view: &wgpu::TextureView,
+        pass_uniforms: &EffectPassUniforms,
+        send: f32,
+        opacity: f32,
+        blend_mode: crate::layers::BlendMode,
+    ) -> Result<(), String> {
+        self.ensure_layer_bindings(device, source, source_view);
+        let binding = self.layer_bindings[source.slot]
+            .as_ref()
+            .expect("Codec-Mosh source binding was cached above");
+
+        let texture_groups = if mosh_influence_needs_coverage_pass(pass_uniforms) {
+            let (uniform_offset, dynamic_offset) = MoshInfluenceUniformArena::dynamic_offset(
+                self.uniforms.coverage_stride,
+                self.uniform_cursor,
+            )?;
+            queue.write_buffer(
+                &self.uniforms.coverage_buffer,
+                uniform_offset,
+                bytemuck::bytes_of(pass_uniforms),
+            );
+            let coverage_group = binding.coverage_group.clone();
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Codec-Mosh Influence Layer Coverage"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.coverage_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.pipelines.coverage_pipeline);
+                pass.set_bind_group(0, &coverage_group, &[]);
+                pass.set_bind_group(1, &self.uniforms.coverage_group, &[dynamic_offset]);
+                pass.draw(0..3, 0..1);
+            }
+            self.scratch_mask_groups.clone()
+        } else {
+            binding.direct_mask_groups.clone()
+        };
+        self.encode_mask(queue, encoder, &texture_groups, send, opacity, blend_mode)
+    }
+
+    #[cfg(test)]
+    fn encode_precomputed_layer(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        send: f32,
+        opacity: f32,
+        blend_mode: crate::layers::BlendMode,
+    ) -> Result<(), String> {
+        let texture_groups = self.scratch_mask_groups.clone();
+        self.encode_mask(queue, encoder, &texture_groups, send, opacity, blend_mode)
+    }
+
+    pub(crate) fn encode_pack(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        opaque: &wgpu::Texture,
+    ) -> &wgpu::Texture {
+        debug_assert!(self.valid);
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: opaque,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.packed,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.dimensions[0],
+                height: self.dimensions[1],
+                depth_or_array_layers: 1,
+            },
+        );
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Pack Codec-Mosh Influence Into Readback Alpha"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.packed_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        pass.set_pipeline(&self.pipelines.pack_pipeline);
+        pass.set_bind_group(0, &self.pack_groups[self.parity], &[]);
+        pass.draw(0..3, 0..1);
+        drop(pass);
+        &self.packed
+    }
+
+    pub(crate) fn valid(&self) -> bool {
+        self.valid
+    }
+
+    fn texture_bytes(&self) -> u64 {
+        mosh_influence_allocation_bytes(self.dimensions)
+            .expect("validated Codec-Mosh influence dimensions")
+    }
+}
+
+fn mosh_influence_allocation_bytes(dimensions: [u32; 2]) -> Option<u64> {
+    u64::from(dimensions[0])
+        .checked_mul(u64::from(dimensions[1]))?
+        .checked_mul(MOSH_INFLUENCE_TEXTURE_BYTES_PER_PIXEL)
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SelectiveNtscAllocationSnapshot {
     pub scratch_bytes: u64,
     pub staging_bytes: u64,
 }
 
+#[cfg(test)]
 impl SelectiveNtscAllocationSnapshot {
     pub const fn total_bytes(self) -> u64 {
         self.scratch_bytes.saturating_add(self.staging_bytes)
@@ -259,6 +1215,7 @@ impl SelectiveNtscAllocationSnapshot {
 /// and its current mapped staging capacity. Renderer dimensions have already
 /// passed the device edge limits; saturating arithmetic keeps operator
 /// telemetry truthful even for hostile synthetic dimensions.
+#[cfg(test)]
 const fn selective_ntsc_allocation_snapshot_for(
     width: u32,
     height: u32,
@@ -390,6 +1347,218 @@ mod temporal_state_tests {
         assert_eq!(
             renderer_owned_full_frame_texture_floor_bytes(u32::MAX, u32::MAX),
             None
+        );
+    }
+
+    #[test]
+    fn layer_mosh_influence_budget_is_six_bytes_per_output_pixel() {
+        assert_eq!(MOSH_INFLUENCE_TEXTURE_BYTES_PER_PIXEL, 6);
+        assert_eq!(MAX_MOSH_INFLUENCE_GPU_BYTES, 49_766_400);
+        assert_eq!(
+            mosh_influence_allocation_bytes([1_920, 1_080]),
+            Some(12_441_600)
+        );
+        assert_eq!(
+            mosh_influence_allocation_bytes([3_840, 2_160]),
+            Some(49_766_400)
+        );
+        assert_eq!(mosh_influence_allocation_bytes([u32::MAX; 2]), None);
+    }
+
+    #[test]
+    fn layer_mosh_direct_alpha_fast_path_is_exactly_gated() {
+        use crate::effects::EffectUniforms;
+        use crate::spatial::{EdgeMode, FitMode, SamplingMode, SpatialTransform};
+
+        let pass = |effects, transform| {
+            EffectPassUniforms::for_target(effects, transform, (320, 180), (640, 480))
+        };
+        let defaults = EffectUniforms::default();
+        assert!(!mosh_influence_needs_coverage_pass(&pass(
+            defaults,
+            SpatialTransform::default()
+        )));
+
+        let mut effects = defaults;
+        effects.multi_grid_x = 2.0;
+        assert!(mosh_influence_needs_coverage_pass(&pass(
+            effects,
+            SpatialTransform::default()
+        )));
+        effects = defaults;
+        effects.multi_grid_y = 2.0;
+        assert!(mosh_influence_needs_coverage_pass(&pass(
+            effects,
+            SpatialTransform::default()
+        )));
+        let support_changes: [fn(&mut EffectUniforms); 13] = [
+            |effects: &mut EffectUniforms| effects.breathe_scale = 0.01,
+            |effects: &mut EffectUniforms| effects.breathe_rotation = 0.01,
+            |effects: &mut EffectUniforms| effects.breathe_position = 0.01,
+            |effects: &mut EffectUniforms| effects.cellular_amount = 0.01,
+            |effects: &mut EffectUniforms| effects.shift_amount = 0.01,
+            |effects: &mut EffectUniforms| effects.barrel = -0.01,
+            |effects: &mut EffectUniforms| effects.row_smear = 0.01,
+            |effects: &mut EffectUniforms| effects.downsample = 0.98,
+            |effects: &mut EffectUniforms| effects.pixelate_size = 2.0,
+            |effects: &mut EffectUniforms| effects.key_mode = 1.0,
+            |effects: &mut EffectUniforms| effects.key_mode = 2.0,
+            |effects: &mut EffectUniforms| effects.key_mode = 3.0,
+            |effects: &mut EffectUniforms| effects.key_mode = 4.0,
+        ];
+        for mutate in support_changes {
+            let mut changed = defaults;
+            mutate(&mut changed);
+            assert!(mosh_influence_needs_coverage_pass(&pass(
+                changed,
+                SpatialTransform::default()
+            )));
+        }
+
+        // These fields cannot change support until their owning key/cellular
+        // switch is active, so they retain the source-alpha fast path alone.
+        effects = defaults;
+        effects.key_threshold = 0.1;
+        effects.key_softness = 0.4;
+        effects.key_border = 1.0;
+        effects.key_shadow = 1.0;
+        effects.cellular_gap_amount = 1.0;
+        assert!(!mosh_influence_needs_coverage_pass(&pass(
+            effects,
+            SpatialTransform::default()
+        )));
+        effects.key_mode = 3.0;
+        assert!(mosh_influence_needs_coverage_pass(&pass(
+            effects,
+            SpatialTransform::default()
+        )));
+
+        let spatial_variants = [
+            SpatialTransform {
+                position: [0.1, 0.0],
+                ..SpatialTransform::default()
+            },
+            SpatialTransform {
+                scale: [1.1, 1.0],
+                ..SpatialTransform::default()
+            },
+            SpatialTransform {
+                anchor: [0.4, 0.5],
+                ..SpatialTransform::default()
+            },
+            SpatialTransform {
+                rotation_deg: 1.0,
+                ..SpatialTransform::default()
+            },
+            SpatialTransform {
+                skew_deg: 1.0,
+                ..SpatialTransform::default()
+            },
+            SpatialTransform {
+                skew_axis_deg: 1.0,
+                ..SpatialTransform::default()
+            },
+            SpatialTransform {
+                crop: [0.1, 0.0, 0.0, 0.0],
+                ..SpatialTransform::default()
+            },
+            SpatialTransform {
+                fit: FitMode::Fit,
+                ..SpatialTransform::default()
+            },
+            SpatialTransform {
+                fit: FitMode::Fill,
+                ..SpatialTransform::default()
+            },
+            SpatialTransform {
+                fit: FitMode::Native,
+                ..SpatialTransform::default()
+            },
+            SpatialTransform {
+                edge: EdgeMode::Clamp,
+                ..SpatialTransform::default()
+            },
+            SpatialTransform {
+                edge: EdgeMode::Repeat,
+                ..SpatialTransform::default()
+            },
+            SpatialTransform {
+                edge: EdgeMode::Mirror,
+                ..SpatialTransform::default()
+            },
+            SpatialTransform {
+                sampling: SamplingMode::Nearest,
+                ..SpatialTransform::default()
+            },
+        ];
+        for transform in spatial_variants {
+            assert!(
+                mosh_influence_needs_coverage_pass(&pass(defaults, transform)),
+                "spatial variant did not force exact coverage: {transform:?}"
+            );
+        }
+
+        // Colour-only work keeps the centre sample's alpha unchanged.
+        effects = defaults;
+        effects.rgb_split = 12.0;
+        effects.hue_shift = 90.0;
+        effects.grain_intensity = 0.2;
+        effects.edge_amount = 1.0;
+        assert!(!mosh_influence_needs_coverage_pass(&pass(
+            effects,
+            SpatialTransform::default()
+        )));
+    }
+
+    #[test]
+    fn layer_mosh_influence_stack_keeps_alpha_cut_below_partial_send() {
+        let normal = |send| MoshInfluenceLayerState {
+            visible: true,
+            bypass_temporal_fx: false,
+            opacity: 1.0,
+            send,
+            alpha_cut: false,
+        };
+        let alpha_cut = MoshInfluenceLayerState {
+            alpha_cut: true,
+            ..normal(1.0)
+        };
+        // Stored top-to-bottom. The full-send layer at index 4 is an identity
+        // and is culled, but destination-out at index 3 must precede the
+        // partial colour-owning layer at index 1.
+        let layers = [
+            normal(1.0),
+            normal(0.25),
+            normal(1.0),
+            alpha_cut,
+            normal(1.0),
+        ];
+        assert_eq!(
+            mosh_influence_stack_start_by(layers.len(), true, |index| layers[index]),
+            Some(3)
+        );
+        assert_eq!(
+            mosh_influence_stack_start_by(layers.len(), false, |index| layers[index]),
+            None
+        );
+
+        let no_colour_reduction = [normal(1.0), alpha_cut];
+        assert_eq!(
+            mosh_influence_stack_start_by(no_colour_reduction.len(), true, |index| {
+                no_colour_reduction[index]
+            }),
+            None,
+            "AlphaCut alone owns no colour and must not allocate the optional matte"
+        );
+
+        let bypassed = MoshInfluenceLayerState {
+            bypass_temporal_fx: true,
+            ..normal(0.0)
+        };
+        assert_eq!(
+            mosh_influence_stack_start_by(1, true, |_| bypassed),
+            None,
+            "the exact dry prefix never enters Codec Mosh"
         );
     }
 
@@ -1231,6 +2400,509 @@ mod temporal_state_tests {
             );
         }
         assert_eq!(actual[3], 255);
+        drop(data);
+        staging.unmap();
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn gpu_layer_mosh_influence_preserves_rgb_and_composites_send_and_alpha_cut() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("GPU adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Codec-Mosh influence regression device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .expect("GPU device");
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let size = wgpu::Extent3d {
+            width: 2,
+            height: 2,
+            depth_or_array_layers: 1,
+        };
+        let texture = |label, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: COMPOSITE_FORMAT,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let coverage = texture(
+            "Codec-Mosh influence shared coverage scratch",
+            wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        );
+        let coverage_view = coverage.create_view(&wgpu::TextureViewDescriptor::default());
+        let prepared = MoshInfluencePipelines::build(&device).expect("influence pipelines");
+        let mut influence = MoshInfluenceGpu::new(
+            &device,
+            &sampler,
+            &sampler,
+            &coverage_view,
+            [2, 2],
+            3,
+            &prepared,
+        )
+        .expect("influence GPU");
+        let opaque = texture(
+            "Codec-Mosh influence RGB source",
+            wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+        );
+        let opaque_pixels = [
+            11_u8, 22, 33, 255, 44, 55, 66, 255, 77, 88, 99, 255, 111, 122, 133, 255,
+        ];
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &opaque,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &opaque_pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(8),
+                rows_per_image: Some(2),
+            },
+            size,
+        );
+
+        let overlay = |label: &'static str, pixels: &[u8; 16]| {
+            let texture = texture(
+                label,
+                wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+            );
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(8),
+                    rows_per_image: Some(2),
+                },
+                size,
+            );
+            texture
+        };
+        let partial = overlay(
+            "Codec-Mosh influence partial coverage",
+            &[0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255],
+        );
+        let restore = overlay(
+            "Codec-Mosh influence full-send restore",
+            &[0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0],
+        );
+        let cut = overlay(
+            "Codec-Mosh influence alpha cut",
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 0, 0],
+        );
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Codec-Mosh influence regression readback"),
+            size: 512,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Codec-Mosh influence regression encoder"),
+        });
+        influence
+            .begin_frame(&device, &mut encoder, 3)
+            .expect("begin influence frame");
+        let copy_overlay = |encoder: &mut wgpu::CommandEncoder, source: &wgpu::Texture| {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: source,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &coverage,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                size,
+            );
+        };
+        copy_overlay(&mut encoder, &partial);
+        influence
+            .encode_precomputed_layer(
+                &queue,
+                &mut encoder,
+                0.25,
+                1.0,
+                crate::layers::BlendMode::Normal,
+            )
+            .expect("partial influence");
+        copy_overlay(&mut encoder, &restore);
+        influence
+            .encode_precomputed_layer(
+                &queue,
+                &mut encoder,
+                1.0,
+                1.0,
+                crate::layers::BlendMode::Normal,
+            )
+            .expect("restore influence");
+        copy_overlay(&mut encoder, &cut);
+        influence
+            .encode_precomputed_layer(
+                &queue,
+                &mut encoder,
+                1.0,
+                1.0,
+                crate::layers::BlendMode::AlphaCut,
+            )
+            .expect("cut influence");
+        influence.finish_frame();
+        let packed = influence.encode_pack(&mut encoder, &opaque);
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: packed,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(2),
+                },
+            },
+            size,
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (send, receive) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = send.send(result);
+        });
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU wait");
+        receive.recv().expect("map callback").expect("map result");
+        let data = slice.get_mapped_range();
+        let actual = [
+            [data[0], data[1], data[2], data[3]],
+            [data[4], data[5], data[6], data[7]],
+            [data[256], data[257], data[258], data[259]],
+            [data[260], data[261], data[262], data[263]],
+        ];
+        assert_eq!(
+            actual.map(|pixel| [pixel[0], pixel[1], pixel[2]]),
+            [[11, 22, 33], [44, 55, 66], [77, 88, 99], [111, 122, 133]],
+            "alpha-only packing must preserve opaque programme RGB byte-for-byte"
+        );
+        assert_eq!(
+            actual.map(|pixel| pixel[3]),
+            [64, 255, 0, 64],
+            "partial send, later full-send restore, and AlphaCut must compose in stack order"
+        );
+        drop(data);
+        staging.unmap();
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn gpu_layer_mosh_direct_alpha_matches_default_coverage_and_rebinds_on_texture_change() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("GPU adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Codec-Mosh direct-alpha A/B device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .expect("GPU device");
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let size = wgpu::Extent3d {
+            width: 2,
+            height: 2,
+            depth_or_array_layers: 1,
+        };
+        let texture = |label, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: COMPOSITE_FORMAT,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let source = texture(
+            "Codec-Mosh direct-alpha source",
+            wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        queue.write_texture(
+            source.as_image_copy(),
+            &[
+                9, 19, 29, 0, 39, 49, 59, 64, 69, 79, 89, 128, 99, 109, 119, 255,
+            ],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(8),
+                rows_per_image: Some(2),
+            },
+            size,
+        );
+        let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
+        let coverage = texture(
+            "Codec-Mosh direct-alpha materialized coverage",
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let coverage_view = coverage.create_view(&wgpu::TextureViewDescriptor::default());
+        let opaque = texture(
+            "Codec-Mosh direct-alpha opaque programme",
+            wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+        );
+        queue.write_texture(
+            opaque.as_image_copy(),
+            &[1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(8),
+                rows_per_image: Some(2),
+            },
+            size,
+        );
+
+        let prepared = MoshInfluencePipelines::build(&device).expect("influence pipelines");
+        let make_influence = || {
+            MoshInfluenceGpu::new(
+                &device,
+                &sampler,
+                &nearest_sampler,
+                &coverage_view,
+                [2, 2],
+                1,
+                &prepared,
+            )
+            .expect("influence GPU")
+        };
+        let mut direct = make_influence();
+        let mut materialized = make_influence();
+        let uniforms = EffectPassUniforms::for_target(
+            crate::effects::EffectUniforms::default(),
+            crate::spatial::SpatialTransform::default(),
+            (2, 2),
+            (2, 2),
+        );
+        assert!(!mosh_influence_needs_coverage_pass(&uniforms));
+        let source_tap = SourceTap::new(41, 0, 2, 2);
+
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Codec-Mosh direct-alpha A/B readback"),
+            size: 1_024,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Codec-Mosh direct-alpha A/B encoder"),
+        });
+        direct
+            .begin_frame(&device, &mut encoder, 1)
+            .expect("begin direct frame");
+        direct
+            .encode_source_layer(
+                &device,
+                &queue,
+                &mut encoder,
+                source_tap,
+                &source_view,
+                &uniforms,
+                0.25,
+                1.0,
+                crate::layers::BlendMode::Normal,
+            )
+            .expect("direct source-alpha layer");
+        direct.finish_frame();
+        let direct_packed = direct.encode_pack(&mut encoder, &opaque);
+        encoder.copy_texture_to_buffer(
+            direct_packed.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(2),
+                },
+            },
+            size,
+        );
+
+        let cached_group = direct.layer_bindings[0]
+            .as_ref()
+            .expect("cached direct binding")
+            .coverage_group
+            .clone();
+        let fresh_view = source.create_view(&wgpu::TextureViewDescriptor::default());
+        direct.ensure_layer_bindings(&device, source_tap, &fresh_view);
+        assert_eq!(
+            direct.layer_bindings[0]
+                .as_ref()
+                .expect("reused direct binding")
+                .coverage_group,
+            cached_group,
+            "a fresh default view of the same texture must reuse cached groups"
+        );
+        let replacement = texture(
+            "Codec-Mosh direct-alpha replacement source",
+            wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let replacement_view = replacement.create_view(&wgpu::TextureViewDescriptor::default());
+        direct.ensure_layer_bindings(&device, source_tap, &replacement_view);
+        assert_ne!(
+            direct.layer_bindings[0]
+                .as_ref()
+                .expect("replacement direct binding")
+                .coverage_group,
+            cached_group,
+            "replacing the underlying texture must invalidate cached groups"
+        );
+
+        let (effects_pipeline, texture_layout, uniform_layout, _) = build_effects_pipeline(&device);
+        let effects_buffer = create_uploaded_uniform(
+            &device,
+            &queue,
+            "Codec-Mosh direct-alpha A/B effects uniforms",
+            &uniforms,
+        );
+        let effects_textures = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Codec-Mosh direct-alpha A/B effects input"),
+            layout: &texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&source_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&nearest_sampler),
+                },
+            ],
+        });
+        let effects_uniforms = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Codec-Mosh direct-alpha A/B effects uniform BG"),
+            layout: &uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: effects_buffer.as_entire_binding(),
+            }],
+        });
+        materialized
+            .begin_frame(&device, &mut encoder, 1)
+            .expect("begin materialized frame");
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Codec-Mosh direct-alpha A/B legacy coverage"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &coverage_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&effects_pipeline);
+            pass.set_bind_group(0, &effects_textures, &[]);
+            pass.set_bind_group(1, &effects_uniforms, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        materialized
+            .encode_precomputed_layer(
+                &queue,
+                &mut encoder,
+                0.25,
+                1.0,
+                crate::layers::BlendMode::Normal,
+            )
+            .expect("materialized source-alpha layer");
+        materialized.finish_frame();
+        let materialized_packed = materialized.encode_pack(&mut encoder, &opaque);
+        encoder.copy_texture_to_buffer(
+            materialized_packed.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 512,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(2),
+                },
+            },
+            size,
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (send, receive) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = send.send(result);
+        });
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU wait");
+        receive.recv().expect("map callback").expect("map result");
+        let data = slice.get_mapped_range();
+        for row in 0..2 {
+            let direct_row = row * 256;
+            let materialized_row = 512 + row * 256;
+            assert_eq!(
+                &data[direct_row..direct_row + 8],
+                &data[materialized_row..materialized_row + 8],
+                "direct source alpha diverged from the prior default effects-overlay path on row {row}"
+            );
+        }
         drop(data);
         staging.unmap();
     }
@@ -3437,6 +5109,12 @@ pub struct Renderer {
     // One lazy full-frame candidate for the isolated dry-overlay + Codec-Mosh
     // transaction. It is never allocated by an inherited/Master-only frame.
     temporal_bypass_audience_candidate: RefCell<Option<TemporalBypassAudienceCandidate>>,
+    // Lazy programme-space per-layer Mosh send matte. Default/inherited
+    // patches allocate nothing and keep the exact prior readback source.
+    // Immutable kernels are precompiled at renderer setup so the first slider
+    // move allocates textures only, never compiles WGSL on the frame thread.
+    mosh_influence_pipelines: Result<MoshInfluencePipelines, String>,
+    mosh_influence: Option<MoshInfluenceGpu>,
     selective_ntsc_gpu: Option<SelectiveNtscGpuState>,
 
     // Recorder/capture readback is a separate fixed two-slot pipeline. It is
@@ -3839,6 +5517,15 @@ impl Renderer {
             ));
         }
 
+        // Optional-feature isolation: compile outside the mandatory resource
+        // scopes. A rare R8/shader refusal is retained and surfaced only when
+        // a real partial layer send asks for the feature; default rendering
+        // remains available.
+        let mosh_influence_pipelines = MoshInfluencePipelines::build(&device);
+        if let Err(error) = &mosh_influence_pipelines {
+            log::warn!("optional Codec-Mosh layer influence unavailable: {error}");
+        }
+
         Ok(Self {
             surface,
             device,
@@ -3876,6 +5563,8 @@ impl Renderer {
             last_harvested_readback_sequence: 0,
             post_mosh_overlay_readback: None,
             temporal_bypass_audience_candidate: RefCell::new(None),
+            mosh_influence_pipelines,
+            mosh_influence: None,
             selective_ntsc_gpu: None,
             program_recorder_readback: RefCell::new(None),
             temporal_pipeline,
@@ -4329,6 +6018,106 @@ impl Renderer {
         stage.encode(&self.device, &self.queue, encoder, jobs);
     }
 
+    /// Nominal bytes owned by the three lazy output-sized Codec-Mosh
+    /// influence textures. Uniform arenas and cached handles are deliberately
+    /// excluded from this texture-budget metric.
+    pub(crate) fn mosh_influence_texture_bytes(&self) -> Option<u64> {
+        self.mosh_influence
+            .as_ref()
+            .map(MoshInfluenceGpu::texture_bytes)
+    }
+
+    /// Build the programme-space per-layer Codec-Mosh send matte from the
+    /// exact frame sample used by creative rendering. It intentionally follows
+    /// each layer's post-local coverage before support-changing group/master/
+    /// Temporal operations: one shared codec cannot retain independent layer
+    /// histories, and this control-field contract remains valid for every
+    /// creative topology without multiplying codec/readback work.
+    ///
+    /// Default sends are the exact old frame path: no texture, pass, or
+    /// alternate readback source is created until a visible contributing layer
+    /// resolves below one while Codec Mosh is armed. The optional kernels are
+    /// cold-precompiled with the renderer to avoid a first-use hitch.
+    pub fn encode_mosh_influence_frame(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        resources: &LiveFrameResources,
+        evaluated: &EvaluatedFramePlan,
+        mosh_active: bool,
+    ) -> Result<bool, String> {
+        // Preserve the literal zero-work default before even constructing a
+        // stack iterator. This entry is on every presented frame.
+        if !mosh_active {
+            if let Some(influence) = self.mosh_influence.as_mut() {
+                influence.invalidate();
+            }
+            return Ok(false);
+        }
+        let first_authored = mosh_influence_stack_start(evaluated.layers(), true);
+        let Some(first_authored) = first_authored else {
+            if let Some(influence) = self.mosh_influence.as_mut() {
+                influence.invalidate();
+            }
+            return Ok(false);
+        };
+        if self.mosh_influence.is_none() {
+            let prepared = self
+                .mosh_influence_pipelines
+                .as_ref()
+                .map_err(Clone::clone)?;
+            self.mosh_influence = Some(MoshInfluenceGpu::new(
+                &self.device,
+                &self.sampler,
+                &self.nearest_sampler,
+                &self.composite_views[1],
+                [self.output_width, self.output_height],
+                evaluated.layers().len(),
+                prepared,
+            )?);
+        }
+        self.mosh_influence
+            .as_mut()
+            .expect("Codec-Mosh influence was initialized above")
+            .begin_frame(&self.device, encoder, evaluated.layers().len())?;
+
+        // Render from bottom to top, matching the colour compositor. A
+        // full-send layer above a dry one must be visited because its covered
+        // pixels restore the matte to one.
+        // Full-send layers beneath the first authored reduction cannot change
+        // the white base field. Skipping that prefix is an Amdahl win for the
+        // common case of one selectively dry layer near the top of the stack.
+        for layer_index in (0..=first_authored).rev().filter(|&index| {
+            let layer = &evaluated.layers()[index];
+            layer.visible && !layer.bypass_temporal_fx
+        }) {
+            let layer = &evaluated.layers()[layer_index];
+            if !layer.opacity.is_finite() || layer.opacity <= 0.0 {
+                continue;
+            }
+            let pass_uniforms = &evaluated.layer_passes()[layer_index];
+            let texture_view = resources.texture_view(layer.source)?;
+            self.mosh_influence
+                .as_mut()
+                .expect("Codec-Mosh influence stays alive for the frame")
+                .encode_source_layer(
+                    &self.device,
+                    &self.queue,
+                    encoder,
+                    layer.source,
+                    texture_view,
+                    pass_uniforms,
+                    layer.mosh_send,
+                    layer.opacity,
+                    layer.blend_mode,
+                )?;
+        }
+        self.mosh_influence
+            .as_mut()
+            .expect("Codec-Mosh influence stays alive through publication")
+            .finish_frame();
+        Ok(true)
+    }
+
     /// B10: schedule one video-analysis reduction of the pre-blackout opaque
     /// audience image (slot 2, the program-tap seam) into its own encoder.
     /// The stage is lazily constructed on the first armed sample and a busy
@@ -4682,26 +6471,6 @@ impl Renderer {
     )]
     pub(crate) fn temporal_state_metrics(&self) -> TemporalStateMetrics {
         self.temporal_state.metrics()
-    }
-
-    /// `None` means the lazy selective-NTSC resources have never been
-    /// allocated. `Some(0)` is therefore never used to disguise an unknown
-    /// state as a measured zero.
-    pub(crate) fn selective_ntsc_allocation_bytes(&self) -> Option<u64> {
-        self.selective_ntsc_allocation_snapshot()
-            .map(SelectiveNtscAllocationSnapshot::total_bytes)
-    }
-
-    pub(crate) fn selective_ntsc_allocation_snapshot(
-        &self,
-    ) -> Option<SelectiveNtscAllocationSnapshot> {
-        self.selective_ntsc_gpu.as_ref().map(|state| {
-            selective_ntsc_allocation_snapshot_for(
-                self.output_width,
-                self.output_height,
-                state.slot.capacity,
-            )
-        })
     }
 
     /// The B4 display-physics stage — fields, phosphor, display model — on
@@ -7671,7 +9440,7 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         epoch: u64,
         ntsc_metadata: Option<NtscFrameMetadata>,
-        mosh_metadata: Option<crate::codec_mosh::MoshFrameMetadata>,
+        mut mosh_metadata: Option<crate::codec_mosh::MoshFrameMetadata>,
         selective_sample: Option<SelectiveNtscGeneration>,
         held_audience: bool,
     ) -> Result<Option<usize>, String> {
@@ -7729,6 +9498,14 @@ impl Renderer {
 
         let sequence = self.next_readback_sequence;
         self.next_readback_sequence = self.next_readback_sequence.saturating_add(1);
+        let use_influence_alpha = mosh_metadata.is_some()
+            && self
+                .mosh_influence
+                .as_ref()
+                .is_some_and(MoshInfluenceGpu::valid);
+        if let Some(metadata) = mosh_metadata.as_mut() {
+            metadata.use_influence_alpha = use_influence_alpha;
+        }
         self.readback_slots[idx].sequence = sequence;
         self.readback_slots[idx].epoch = epoch;
         self.readback_slots[idx].ntsc_metadata = ntsc_metadata;
@@ -7736,9 +9513,17 @@ impl Renderer {
         self.readback_slots[idx].selective_sample = selective_sample;
         self.readback_slots[idx].held_audience = held_audience;
         let slot = &self.readback_slots[idx];
+        let readback_source = if use_influence_alpha {
+            self.mosh_influence
+                .as_ref()
+                .expect("validated Codec-Mosh influence source")
+                .encode_pack(encoder, &self.composite_textures[2])
+        } else {
+            &self.composite_textures[2]
+        };
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.composite_textures[2],
+                texture: readback_source,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,

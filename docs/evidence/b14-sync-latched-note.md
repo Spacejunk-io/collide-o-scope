@@ -42,8 +42,8 @@ temporal → melting edge → sync latch → display physics → opaque resolve
 
 That ordering is the law, not a preference: **a sync fault happens in the
 signal, and the screen model downstream then shows it.** Live LegacyExact,
-live Advanced, the selective-VHS path, and export all converge on this
-adjacency, so one implementation and one shader serve all four — the
+live Advanced, and export all converge on this adjacency before the
+final-program VHS finish, so one implementation and one shader serve them — the
 `encode_opaque_output` precedent, exactly the B4 and B8 shape. Five
 production call sites: three live (`main.rs`) and two offline
 (`render_export.rs`).

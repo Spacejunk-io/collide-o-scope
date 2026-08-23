@@ -795,7 +795,7 @@ pub struct MorphTemporalSnapshot {
     #[serde(default)]
     pub melt: crate::mixing_boundary::MeltParams,
     /// B5 codec mosh, captured whole: the params struct is its own
-    /// sanitizing serde block. The eight continuous controls blend; the
+    /// sanitizing serde block. The eleven continuous controls blend; the
     /// discrete recycle law recalls an endpoint at the midpoint.
     #[serde(default)]
     pub mosh: crate::codec_mosh::CodecMoshParams,
@@ -938,8 +938,8 @@ fn interpolate_sync_latch(
     .sanitized()
 }
 
-/// B5 codec-mosh morphing: the eight continuous controls blend, and the
-/// discrete recycle law recalls an endpoint at the midpoint.
+/// B5 codec-mosh morphing: every continuous codec and motion-wake control
+/// blends, and the discrete recycle law recalls an endpoint at the midpoint.
 fn interpolate_codec_mosh(
     a: crate::codec_mosh::CodecMoshParams,
     b: crate::codec_mosh::CodecMoshParams,
@@ -957,6 +957,9 @@ fn interpolate_codec_mosh(
         rate: blend_finite(a.rate, b.rate, weights),
         bitrate_starve: blend_finite(a.bitrate_starve, b.bitrate_starve, weights),
         resync: blend_finite(a.resync, b.resync, weights),
+        wipe: blend_finite(a.wipe, b.wipe, weights),
+        smear: blend_finite(a.smear, b.smear, weights),
+        trail: blend_finite(a.trail, b.trail, weights),
         recycle: if choose_b { b.recycle } else { a.recycle },
     }
     .sanitized()
@@ -1320,6 +1323,10 @@ impl MorphLayerBlendMode {
 pub struct LayerMorphSnapshot {
     pub position: usize,
     pub opacity: f32,
+    /// Optional for schema evolution: legacy slots predate the per-layer
+    /// spatial send and therefore must not seize ownership from the live layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mosh_send: Option<f32>,
     pub speed: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fps: Option<f32>,
@@ -1365,6 +1372,7 @@ pub struct LayerMorphSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LayerMorphControl {
     Opacity,
+    MoshSend,
     Speed,
     Fps,
     Effects,
@@ -1385,6 +1393,7 @@ impl Default for LayerMorphSnapshot {
         Self {
             position: 0,
             opacity: 1.0,
+            mosh_send: None,
             speed: 1.0,
             fps: None,
             effects: None,
@@ -1410,6 +1419,7 @@ impl LayerMorphSnapshot {
         Self {
             position,
             opacity: layer.opacity,
+            mosh_send: Some(layer.mosh_send),
             speed: layer.speed,
             fps: Some(layer.fps),
             effects: Some(MorphMasterSnapshot::capture(&layer.effects)),
@@ -1443,6 +1453,9 @@ impl LayerMorphSnapshot {
         Self {
             position: self.position,
             opacity: finite_clamp(self.opacity, 1.0, 0.0, 1.0),
+            mosh_send: self
+                .mosh_send
+                .map(|value| finite_clamp(value, 1.0, 0.0, 1.0)),
             speed: finite_clamp(self.speed, 1.0, 0.25, 4.0),
             fps: self.fps.map(|value| finite_clamp(value, 30.0, 1.0, 240.0)),
             effects,
@@ -1485,6 +1498,12 @@ impl LayerMorphSnapshot {
         Self {
             position: a.position,
             opacity: finite_clamp(blend_finite(a.opacity, b.opacity, weights), 1.0, 0.0, 1.0),
+            mosh_send: match (a.mosh_send, b.mosh_send) {
+                (Some(a), Some(b)) => {
+                    Some(finite_clamp(blend_finite(a, b, weights), 1.0, 0.0, 1.0))
+                }
+                _ => None,
+            },
             speed: finite_clamp(blend_finite(a.speed, b.speed, weights), 1.0, 0.25, 4.0),
             fps: match (a.fps, b.fps) {
                 (Some(a), Some(b)) => {
@@ -1532,6 +1551,9 @@ impl LayerMorphSnapshot {
     fn apply_to(&self, layer: &mut Layer) {
         let clean = self.sanitized();
         layer.opacity = clean.opacity;
+        if let Some(mosh_send) = clean.mosh_send {
+            layer.mosh_send = mosh_send;
+        }
         layer.speed = clean.speed;
         if let Some(fps) = clean.fps {
             layer.fps = fps;
@@ -2819,6 +2841,7 @@ impl Morph {
         };
         match control {
             LayerMorphControl::Opacity | LayerMorphControl::Speed => true,
+            LayerMorphControl::MoshSend => a.mosh_send.is_some() && b.mosh_send.is_some(),
             LayerMorphControl::Fps => a.fps.is_some() && b.fps.is_some(),
             LayerMorphControl::Effects => a.effects.is_some() && b.effects.is_some(),
             LayerMorphControl::AnyEffect => {
@@ -4777,6 +4800,7 @@ mod tests {
         LayerMorphSnapshot {
             position,
             opacity: if high { 1.0 } else { 0.0 },
+            mosh_send: Some(if high { 1.0 } else { 0.0 }),
             speed: if high { 4.0 } else { 0.25 },
             fps: Some(if high { 240.0 } else { 1.0 }),
             effects: Some(effects),
@@ -5167,6 +5191,9 @@ mod tests {
                 amount: 0.2,
                 hold: 0.4,
                 bitrate_starve: 0.2,
+                wipe: 0.1,
+                smear: 0.3,
+                trail: 0.2,
                 recycle: false,
                 ..CodecMoshParams::default()
             },
@@ -5177,6 +5204,9 @@ mod tests {
                 amount: 0.8,
                 hold: 0.8,
                 bitrate_starve: 0.6,
+                wipe: 0.9,
+                smear: 0.7,
+                trail: 1.0,
                 recycle: true,
                 ..CodecMoshParams::default()
             },
@@ -5187,6 +5217,9 @@ mod tests {
         assert!((quarter.mosh.amount - 0.35).abs() < 1.0e-6);
         assert!((quarter.mosh.hold - 0.5).abs() < 1.0e-6);
         assert!((quarter.mosh.bitrate_starve - 0.3).abs() < 1.0e-6);
+        assert!((quarter.mosh.wipe - 0.3).abs() < 1.0e-6);
+        assert!((quarter.mosh.smear - 0.4).abs() < 1.0e-6);
+        assert!((quarter.mosh.trail - 0.4).abs() < 1.0e-6);
         // The discrete recycle law recalls an endpoint, never a blend.
         assert!(!quarter.mosh.recycle);
         let past = MorphTemporalSnapshot::interpolate(&a, &b, [0.25, 0.75], true);
@@ -6002,6 +6035,7 @@ key_threshold: 0.2
 "#;
         let legacy: LayerMorphSnapshot = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(legacy.fps, None);
+        assert_eq!(legacy.mosh_send, None);
         assert_eq!(legacy.effects, None);
         assert_eq!(legacy.blend_mode, None);
         assert_eq!(legacy.visible, None);
@@ -6028,8 +6062,37 @@ key_threshold: 0.2
         let sampled = morph.sample(0.5).unwrap().layers.remove(0);
         close(sampled.opacity, 0.5);
         close(sampled.key_threshold.unwrap(), 0.5);
+        assert_eq!(sampled.mosh_send, None);
         assert!(sampled.effects.is_none());
         assert!(sampled.blend_mode.is_none());
+        assert!(!morph.controls_layer_field(4, LayerMorphControl::MoshSend));
+    }
+
+    #[test]
+    fn authored_layer_mosh_send_morphs_continuously_and_is_range_sanitized() {
+        let morph = Morph {
+            a: Some(MorphSlot {
+                layers: vec![LayerMorphSnapshot {
+                    position: 2,
+                    mosh_send: Some(-1.0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            b: Some(MorphSlot {
+                layers: vec![LayerMorphSnapshot {
+                    position: 2,
+                    mosh_send: Some(0.8),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(morph.controls_layer_field(2, LayerMorphControl::MoshSend));
+        assert_eq!(morph.sample(0.0).unwrap().layers[0].mosh_send, Some(0.0));
+        assert_eq!(morph.sample(0.5).unwrap().layers[0].mosh_send, Some(0.4));
+        assert_eq!(morph.sample(1.0).unwrap().layers[0].mosh_send, Some(0.8));
     }
 
     #[test]
