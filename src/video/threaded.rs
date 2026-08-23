@@ -5,7 +5,7 @@
 //! latest-only.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,7 @@ use crate::media_safety::{
 use super::decoder::validate_media_dimensions;
 use super::decoder::validate_media_dimensions_with_policy as plan_media_dimensions;
 use super::decoder::KeyframeIndexBuildRequest;
-use super::indexed::KeyframeIndex;
+use super::indexed::{KeyframeIndex, MAX_INDEX_BUILD_TIME};
 #[cfg(test)]
 use super::CodecMotionFrame;
 use super::{
@@ -27,6 +27,12 @@ use super::{
 };
 
 const DECODER_OPEN_TIMEOUT: Duration = Duration::from_secs(7);
+/// First-distant-select admission budget. It matches the packet scanner's work
+/// cap but deliberately does not absorb arbitrary helper-queue or input-open
+/// delay; failure remains early enough for the callers' five-second deadline
+/// to report it rather than starting an unreachable fallback decode.
+const DISTANT_SELECT_INDEX_WAIT: Duration = MAX_INDEX_BUILD_TIME;
+const DISTANT_SELECT_INDEX_POLL: Duration = Duration::from_millis(2);
 pub const DECODER_TELEMETRY_WINDOW_SAMPLES: usize = 64;
 
 #[derive(Debug, Clone)]
@@ -161,6 +167,123 @@ fn install_ready_keyframe_index(
         }
         Some(Err(TryRecvError::Empty)) | None => {}
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KeyframeIndexWaitError {
+    Superseded,
+    Timeout,
+    Build(String),
+    Disconnected,
+}
+
+/// Wait for one already-submitted index build without weakening newest-only
+/// selection. The short receive timeout is also the cancellation polling
+/// interval, so a newer command never has to wait for the index deadline.
+fn wait_for_keyframe_index<I>(
+    receiver: &Receiver<Result<KeyframeIndex, String>>,
+    timeout: Duration,
+    poll: Duration,
+    mut is_current: I,
+) -> Result<KeyframeIndex, KeyframeIndexWaitError>
+where
+    I: FnMut() -> bool,
+{
+    let started = Instant::now();
+    loop {
+        if !is_current() {
+            return Err(KeyframeIndexWaitError::Superseded);
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return Err(KeyframeIndexWaitError::Timeout);
+        }
+        let remaining = timeout.saturating_sub(elapsed);
+        match receiver.recv_timeout(poll.min(remaining)) {
+            Ok(Ok(index)) => return Ok(index),
+            Ok(Err(error)) => return Err(KeyframeIndexWaitError::Build(error)),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(KeyframeIndexWaitError::Disconnected);
+            }
+        }
+    }
+}
+
+/// Install an index opportunistically for ordinary work, but never start a
+/// decode walk that is provably longer than the decoder's hard frame bound.
+/// Only that distant case waits, preserving low-latency startup and playback
+/// while removing the first-request race for saved playheads.
+fn prepare_keyframe_index_for_select<I>(
+    decoder: &std::cell::RefCell<VideoDecoder>,
+    pending: &std::cell::RefCell<Option<Receiver<Result<KeyframeIndex, String>>>>,
+    path: &str,
+    target_seconds: f64,
+    previous_accepted_identity: Option<CodecFrameIdentity>,
+    is_current: I,
+) -> Result<(), DecodeWorkError>
+where
+    I: FnMut() -> bool,
+{
+    if !decoder
+        .borrow()
+        .selection_exceeds_bounded_walk(target_seconds, previous_accepted_identity)
+    {
+        install_ready_keyframe_index(decoder, pending, path);
+        return Ok(());
+    }
+
+    let result = {
+        let pending = pending.borrow();
+        let Some(receiver) = pending.as_ref() else {
+            return Err(DecodeWorkError::Failed(format!(
+                "cannot select distant source time {target_seconds:.6}s in {path}: no usable keyframe index is available and the bounded decode walk cannot reach it"
+            )));
+        };
+        wait_for_keyframe_index(
+            receiver,
+            DISTANT_SELECT_INDEX_WAIT,
+            DISTANT_SELECT_INDEX_POLL,
+            is_current,
+        )
+    };
+    let index = match result {
+        Ok(index) => {
+            *pending.borrow_mut() = None;
+            index
+        }
+        Err(KeyframeIndexWaitError::Superseded) => return Err(DecodeWorkError::Superseded),
+        Err(KeyframeIndexWaitError::Timeout) => {
+            // Retain the receiver: a later selection may adopt the bounded
+            // build if it completes after this command's wait budget.
+            return Err(DecodeWorkError::Failed(format!(
+                "keyframe index for {path} did not become ready within {:.1}s; refusing unreachable distant selection at {target_seconds:.6}s",
+                DISTANT_SELECT_INDEX_WAIT.as_secs_f64()
+            )));
+        }
+        Err(KeyframeIndexWaitError::Build(error)) => {
+            *pending.borrow_mut() = None;
+            return Err(DecodeWorkError::Failed(format!(
+                "keyframe index unavailable for distant selection at {target_seconds:.6}s in {path}: {error}"
+            )));
+        }
+        Err(KeyframeIndexWaitError::Disconnected) => {
+            *pending.borrow_mut() = None;
+            return Err(DecodeWorkError::Failed(format!(
+                "keyframe index worker disconnected before distant selection at {target_seconds:.6}s in {path}"
+            )));
+        }
+    };
+    decoder.borrow_mut().install_keyframe_index(index);
+    if decoder
+        .borrow()
+        .selection_exceeds_bounded_walk(target_seconds, previous_accepted_identity)
+    {
+        return Err(DecodeWorkError::Failed(format!(
+            "cannot select distant source time {target_seconds:.6}s in {path}: the indexed preceding keyframe still exceeds the bounded decode walk"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -665,9 +788,9 @@ impl ThreadedDecoder {
                     }
 
                     // A bounded helper pool scans a second demuxer. Ordinary
-                    // Select commands continue immediately against the safe
-                    // fallback entry and install the result only
-                    // when it is already ready.
+                    // nearby Select commands continue immediately; only a
+                    // request that cannot fit inside the fallback decode walk
+                    // waits for its pending index below.
                     let index_result =
                         match submit_keyframe_index(decoder.keyframe_index_build_request()) {
                             Ok(receiver) => Some(receiver),
@@ -685,7 +808,14 @@ impl ThreadedDecoder {
                         worker_mailbox,
                         worker_shared,
                         |generation, target_seconds, previous_accepted_source_seconds, epoch| {
-                            install_ready_keyframe_index(&decoder, &index_result, &path_owned);
+                            prepare_keyframe_index_for_select(
+                                &decoder,
+                                &index_result,
+                                &path_owned,
+                                target_seconds,
+                                previous_accepted_source_seconds,
+                                || select_mailbox.is_current(epoch),
+                            )?;
                             let mut decoder = decoder.borrow_mut();
                             let frame = decoder.seek_decode_after_interruptible(
                                 target_seconds,
@@ -1209,6 +1339,84 @@ mod tests {
             last_consumed_at: None,
             consumed_frames: 0,
         }
+    }
+
+    #[test]
+    fn distant_selection_wait_accepts_a_delayed_keyframe_index() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(15));
+            sender
+                .send(Ok(KeyframeIndex::fallback(0).unwrap()))
+                .unwrap();
+        });
+
+        let index = wait_for_keyframe_index(
+            &receiver,
+            Duration::from_millis(250),
+            Duration::from_millis(1),
+            || true,
+        )
+        .expect("the delayed index should be installed before distant decode");
+        assert_eq!(index.len(), 1);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn distant_selection_wait_is_superseded_while_the_index_is_pending() {
+        let (_sender, receiver) = std::sync::mpsc::sync_channel::<Result<KeyframeIndex, String>>(1);
+        let current = Arc::new(AtomicBool::new(true));
+        let superseding = current.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(15));
+            superseding.store(false, Ordering::Release);
+        });
+
+        assert!(matches!(
+            wait_for_keyframe_index(
+                &receiver,
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+                || current.load(Ordering::Acquire),
+            ),
+            Err(KeyframeIndexWaitError::Superseded)
+        ));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires COLLIDEOSCOPE_DISTANT_VIDEO_FIXTURE pointing to a seekable long video"]
+    fn real_immediate_distant_seed_selection_reaches_the_requested_generation() {
+        let path = std::env::var("COLLIDEOSCOPE_DISTANT_VIDEO_FIXTURE")
+            .expect("set COLLIDEOSCOPE_DISTANT_VIDEO_FIXTURE to a long seekable video");
+        let start_position = std::env::var("COLLIDEOSCOPE_DISTANT_VIDEO_POSITION")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(0.596_448_694_580_675_2);
+        let mut decoder = ThreadedDecoder::open_with_media_policy(
+            &path,
+            &MediaSafetyPolicy::safe(),
+            MediaDeviceLimits::none(),
+        )
+        .unwrap();
+        let target_seconds = start_position * decoder.duration_seconds;
+        let started = Instant::now();
+        let frame = decoder
+            .select_seed_frame_at(
+                start_position,
+                Duration::from_secs(5),
+                Duration::from_millis(2),
+                &|| true,
+            )
+            .unwrap();
+
+        assert_eq!(frame.source_generation, 1);
+        assert!(
+            (frame.source_seconds - target_seconds).abs() <= 1.0 / f64::from(decoder.fps.max(1.0)),
+            "selected {:.6}s instead of requested {target_seconds:.6}s",
+            frame.source_seconds
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
