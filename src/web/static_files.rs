@@ -53,3 +53,29 @@ pub async fn serve(uri: axum::http::Uri) -> Response {
 
     ([(header::CONTENT_TYPE, mime)], content).into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::STYLE_CSS;
+
+    #[test]
+    fn panel_columns_share_the_scroll_contract_without_magnifying_range_thumbs() {
+        assert!(
+            STYLE_CSS.contains("min-height: 0;\n  overflow-y: auto;"),
+            "the first desktop column must own its vertical scroll"
+        );
+        assert!(
+            STYLE_CSS.contains("overflow: visible;\n  padding: 6px;\n  flex: 0 0 auto;"),
+            "the library grid must participate in the column scroll"
+        );
+        let thumb_hover = STYLE_CSS
+            .split_once("input[type=\"range\"]::-webkit-slider-thumb:hover {")
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(rule, _)| rule)
+            .expect("missing range-thumb hover rule");
+        assert!(
+            !thumb_hover.contains("transform"),
+            "hovering a range cursor must not change its size"
+        );
+    }
+}

@@ -55,7 +55,10 @@ body {
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  /* Match the Layers and Effects columns: one scroll owner keeps every
+     library tool reachable instead of pinning everything above the tiles. */
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .col-left .panel-title {
@@ -69,9 +72,11 @@ body {
 }
 
 .library-grid {
-  overflow-y: auto;
+  /* The complete left column scrolls; a nested tile scroller would trap the
+     wheel and leave Media Safety, Scenes, and import controls unreachable. */
+  overflow: visible;
   padding: 6px;
-  flex: 1;
+  flex: 0 0 auto;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
   grid-auto-rows: min-content;
@@ -1289,11 +1294,10 @@ input[type="range"]::-webkit-slider-thumb {
   border-radius: 50%;
   background: var(--accent);
   cursor: pointer;
-  transition: transform 0.1s;
+  transition: background 0.1s;
 }
 
 input[type="range"]::-webkit-slider-thumb:hover {
-  transform: scale(1.3);
   background: var(--accent-hover);
 }
 

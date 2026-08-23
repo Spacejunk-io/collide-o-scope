@@ -4795,6 +4795,65 @@ fn apply_offset(
 mod tests {
     use super::*;
 
+    fn browser_target_keys<'a>(javascript: &'a str, declaration: &str) -> Vec<&'a str> {
+        let body = javascript
+            .split_once(declaration)
+            .and_then(|(_, rest)| rest.split_once("];"))
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("missing browser target declaration {declaration}"));
+        body.split("['")
+            .skip(1)
+            .filter_map(|entry| entry.split_once('\'').map(|(key, _)| key))
+            .collect()
+    }
+
+    #[test]
+    fn browser_target_catalogs_exact_cover_the_engine_vocabulary() {
+        let javascript = include_str!("../../static/app.js");
+        let master = browser_target_keys(javascript, "const MOD_TARGETS = [");
+        let layer = browser_target_keys(javascript, "const LAYER_FX_TARGETS = [");
+
+        assert_eq!(master.len(), TARGETS.len());
+        for &(target, _, _) in TARGETS {
+            assert_eq!(
+                master
+                    .iter()
+                    .filter(|candidate| **candidate == target)
+                    .count(),
+                1,
+                "browser master target catalog must expose {target} exactly once"
+            );
+        }
+        assert_eq!(layer.len(), LAYER_TARGET_SUFFIXES.len());
+        for suffix in LAYER_TARGET_SUFFIXES {
+            assert_eq!(
+                layer
+                    .iter()
+                    .filter(|candidate| *candidate == suffix)
+                    .count(),
+                1,
+                "browser layer target catalog must expose {suffix} exactly once"
+            );
+        }
+        for target in master {
+            assert!(
+                is_valid_target(target),
+                "browser master target {target} is not an engine target"
+            );
+        }
+        for suffix in layer {
+            assert!(
+                is_valid_target(&format!("layer1_{suffix}")),
+                "browser layer target {suffix} is not an engine suffix"
+            );
+        }
+
+        // The persisted vocabulary is `hold`, not the descriptive past-tense
+        // word sometimes used when speaking about held delta frames.
+        assert!(is_valid_target("mosh_hold"));
+        assert!(!is_valid_target("mosh_held"));
+    }
+
     fn approx(actual: f32, expected: f32) {
         assert!(
             (actual - expected).abs() < 1e-5,
@@ -5906,7 +5965,11 @@ mod tests {
         // authored base.
         let mut matrix = ModMatrix::new();
         matrix.midi[0] = 1.0;
-        matrix.routings = vec![Routing::new(ModSource::Midi(0), "mosh_amount", 1.0)];
+        matrix.midi[1] = 1.0;
+        matrix.routings = vec![
+            Routing::new(ModSource::Midi(0), "mosh_amount", 1.0),
+            Routing::new(ModSource::Midi(1), "mosh_hold", 1.0),
+        ];
         matrix.update_at_beat(0.0, 0.0);
         let frame = matrix.frame(0);
         let base = crate::effects::params::TemporalParams::default();
@@ -5917,7 +5980,9 @@ mod tests {
             &base,
         );
         approx(tp.mosh.amount, 0.5);
+        approx(tp.mosh.hold, 0.75);
         assert_eq!(base.mosh.amount, 0.0, "the authored base is immutable");
+        assert_eq!(base.mosh.hold, 0.25, "the authored base is immutable");
         // Discrete mosh state never moves under modulation.
         assert!(!tp.mosh.recycle);
     }
