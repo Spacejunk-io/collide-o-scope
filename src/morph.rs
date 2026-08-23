@@ -74,9 +74,23 @@ impl MorphBlendLaw {
             Self::Linear => [1.0 - t, t],
             Self::EqualPower => {
                 let angle = t * std::f32::consts::FRAC_PI_2;
-                let a = angle.cos();
-                let b = angle.sin();
-                [a * a, b * b]
+                let (b_gain, a_gain) = angle.sin_cos();
+                // Mathematically cos²(theta) and sin²(theta) are exact
+                // complements. Computing both squares independently in f32
+                // can nevertheless leave their sum one ulp either side of
+                // one. Derive the larger contribution from the smaller one:
+                // this retains the intended equal-power law, gives the
+                // midpoint its exact representation, and keeps the returned
+                // pair complementary for downstream interpolation.
+                if t < 0.5 {
+                    let b = b_gain * b_gain;
+                    [1.0 - b, b]
+                } else if t > 0.5 {
+                    let a = a_gain * a_gain;
+                    [a, 1.0 - a]
+                } else {
+                    [0.5, 0.5]
+                }
             }
         }
     }
@@ -3203,10 +3217,23 @@ fn interpolate_rack(
         let node = sampled
             .get_mut(node_a.stable_id)
             .expect("topology-compatible rack contains every sampled node");
-        node.enabled = pick(node_a.enabled, node_b.enabled, choose_b);
-        node.wet = finite_clamp(blend_finite(node_a.wet, node_b.wet, weights), 1.0, 0.0, 1.0);
-        node.blend = pick(node_a.blend, node_b.blend, choose_b);
         node.kind = interpolate_node_kind(node_a.kind, node_b.kind, weights, choose_b)?;
+        if matches!(
+            node.kind,
+            VisualNodeKind::LegacyCanonical | VisualNodeKind::LegacyTemporal
+        ) {
+            // These nodes are immutable host-boundary markers, not authored
+            // effects. In particular, equal-power cos² + sin² rounding
+            // must never turn their exactly-wet envelope into 0.99999994 and
+            // make a sampled rack fail the creative-graph preflight.
+            node.enabled = true;
+            node.wet = 1.0;
+            node.blend = crate::visual_rack::NodeBlend::Normal;
+        } else {
+            node.enabled = pick(node_a.enabled, node_b.enabled, choose_b);
+            node.wet = finite_clamp(blend_finite(node_a.wet, node_b.wet, weights), 1.0, 0.0, 1.0);
+            node.blend = pick(node_a.blend, node_b.blend, choose_b);
+        }
     }
     Some(sampled)
 }
@@ -4411,6 +4438,12 @@ fn rebase_glide_from_position(
 }
 
 fn lerp(a: f32, b: f32, weights: [f32; 2]) -> f32 {
+    // A morph between identical authored values is an identity operation.
+    // Preserve its exact f32 representation instead of multiplying twice and
+    // relying on rounded complementary weights to reconstruct it.
+    if a == b {
+        return a;
+    }
     a * weights[0] + b * weights[1]
 }
 
@@ -5701,10 +5734,17 @@ mod tests {
 
     #[test]
     fn equal_power_weights_are_complementary_and_preserve_equal_values() {
-        for t in [0.0, 0.1, 0.5, 0.9, 1.0] {
+        const DENSE_STEPS: u32 = 16_384;
+        for step in 0..=DENSE_STEPS {
+            let t = step as f32 / DENSE_STEPS as f32;
             let [a, b] = MorphBlendLaw::EqualPower.weights(t);
-            close(a + b, 1.0);
+            assert_eq!(a + b, 1.0, "weights at step {step}: [{a}, {b}]");
+            assert!((0.0..=1.0).contains(&a));
+            assert!((0.0..=1.0).contains(&b));
         }
+        assert_eq!(MorphBlendLaw::EqualPower.weights(0.0), [1.0, 0.0]);
+        assert_eq!(MorphBlendLaw::EqualPower.weights(0.5), [0.5, 0.5]);
+        assert_eq!(MorphBlendLaw::EqualPower.weights(1.0), [0.0, 1.0]);
 
         let morph = Morph {
             a: Some(slot(7.0, 0.0, 0.4)),
@@ -5712,10 +5752,129 @@ mod tests {
             blend_law: MorphBlendLaw::EqualPower,
             ..Default::default()
         };
-        for t in [0.0, 0.2, 0.5, 0.8, 1.0] {
+        for step in 0..=DENSE_STEPS {
+            let t = step as f32 / DENSE_STEPS as f32;
             let sample = morph.sample(t).unwrap();
-            close(sample.master.pixelate_size, 7.0);
-            close(sample.layers[0].opacity, 0.4);
+            assert_eq!(
+                sample.master.pixelate_size.to_bits(),
+                7.0_f32.to_bits(),
+                "identical master value drifted at step {step}"
+            );
+            assert_eq!(
+                sample.layers[0].opacity.to_bits(),
+                0.4_f32.to_bits(),
+                "identical layer value drifted at step {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_equal_power_rack_morph_keeps_host_markers_exact_and_preflight_compatible() {
+        use crate::visual_rack::{LegacyRackScope, NodeBlend, NodeId};
+
+        fn layer_rack(amount: f32, wet: f32, blend: NodeBlend) -> VisualRack {
+            let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+            let authored = rack
+                .push(VisualNodeKind::Shift(ShiftParams {
+                    amount,
+                    ..ShiftParams::default()
+                }))
+                .unwrap();
+            let node = rack.get_mut(authored).unwrap();
+            node.wet = wet;
+            node.blend = blend;
+            rack
+        }
+
+        fn master_rack(intensity: f32, wet: f32, blend: NodeBlend) -> VisualRack {
+            let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Master);
+            let authored = rack
+                .push(VisualNodeKind::Grain(GrainParams {
+                    intensity,
+                    ..GrainParams::default()
+                }))
+                .unwrap();
+            let node = rack.get_mut(authored).unwrap();
+            node.wet = wet;
+            node.blend = blend;
+            rack
+        }
+
+        fn assert_marker(rack: &VisualRack, id: NodeId, expected_kind: VisualNodeKind, step: u32) {
+            let marker = rack.get(id).expect("reserved marker remains present");
+            assert!(marker.enabled, "marker {id:?} disabled at step {step}");
+            assert_eq!(
+                marker.wet.to_bits(),
+                1.0_f32.to_bits(),
+                "marker {id:?} wet drifted at step {step}"
+            );
+            assert_eq!(marker.blend, NodeBlend::Normal, "step {step}");
+            assert_eq!(marker.kind, expected_kind, "step {step}");
+        }
+
+        fn assert_preflight_entry(rack: &VisualRack, scope: LegacyRackScope, step: u32) {
+            // Rebuild through the exact validator used when a captured runtime
+            // rack enters creative resource preflight. This is the production
+            // boundary that rejected Sfumato's interior Morph samples.
+            let rebuilt = VisualRack::try_from_parts(
+                rack.iter().copied().collect(),
+                Some(rack.next_node_id_raw()),
+            )
+            .unwrap_or_else(|error| panic!("sample {step} cannot enter preflight: {error}"));
+            rebuilt
+                .validate_for_scope(scope)
+                .unwrap_or_else(|error| panic!("sample {step} has invalid scope: {error}"));
+
+            let recaptured = rebuilt
+                .resolve_routes(|_| None, |_| false)
+                .capture_routes(|_| None)
+                .unwrap_or_else(|error| panic!("sample {step} cannot be recaptured: {error}"));
+            assert_eq!(recaptured, rebuilt, "sample {step} changed on capture");
+        }
+
+        let a = MorphSlot {
+            master_rack: Some(master_rack(0.02, 0.25, NodeBlend::Screen)),
+            layer_racks: Some(vec![layer_rack(0.1, 0.2, NodeBlend::Multiply)]),
+            ..MorphSlot::default()
+        };
+        let b = MorphSlot {
+            master_rack: Some(master_rack(0.28, 0.9, NodeBlend::Difference)),
+            layer_racks: Some(vec![layer_rack(0.9, 0.8, NodeBlend::Add)]),
+            ..MorphSlot::default()
+        };
+        let morph = Morph {
+            a: Some(a),
+            b: Some(b),
+            blend_law: MorphBlendLaw::EqualPower,
+            ..Morph::default()
+        };
+
+        const DENSE_STEPS: u32 = 4_096;
+        for step in 1..DENSE_STEPS {
+            let sample = morph.sample(step as f32 / DENSE_STEPS as f32).unwrap();
+            let master = sample.master_rack.as_ref().expect("master rack morphs");
+            let layer = &sample.layer_racks.as_ref().expect("layer rack morphs")[0];
+
+            assert_marker(
+                master,
+                NodeId::LEGACY_CANONICAL,
+                VisualNodeKind::LegacyCanonical,
+                step,
+            );
+            assert_marker(
+                master,
+                NodeId::LEGACY_TEMPORAL,
+                VisualNodeKind::LegacyTemporal,
+                step,
+            );
+            assert_marker(
+                layer,
+                NodeId::LEGACY_CANONICAL,
+                VisualNodeKind::LegacyCanonical,
+                step,
+            );
+            assert_preflight_entry(master, LegacyRackScope::Master, step);
+            assert_preflight_entry(layer, LegacyRackScope::Layer, step);
         }
     }
 

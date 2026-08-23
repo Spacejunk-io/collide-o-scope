@@ -17,7 +17,7 @@ use crate::media_safety::{
 #[cfg(test)]
 use super::decoder::validate_media_dimensions;
 use super::decoder::validate_media_dimensions_with_policy as plan_media_dimensions;
-use super::decoder::KeyframeIndexBuildRequest;
+use super::decoder::{KeyframeIndexBuildRequest, SeekWorkload};
 use super::indexed::{KeyframeIndex, MAX_INDEX_BUILD_TIME};
 #[cfg(test)]
 use super::CodecMotionFrame;
@@ -210,25 +210,64 @@ where
     }
 }
 
-/// Install an index opportunistically for ordinary work, but never start a
-/// decode walk that is provably longer than the decoder's hard frame bound.
-/// Only that distant case waits, preserving low-latency startup and playback
-/// while removing the first-request race for saved playheads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingIndexWait {
+    None,
+    /// The fallback is valid but too expensive for prepared-source latency.
+    CostAcceleration,
+    /// The fallback cannot reach the target inside the hard frame cap.
+    HardCorrectness,
+}
+
+fn pending_index_wait(workload: SeekWorkload, prepared_seed: bool) -> PendingIndexWait {
+    match (workload, prepared_seed) {
+        (SeekWorkload::Hard, _) => PendingIndexWait::HardCorrectness,
+        (SeekWorkload::Costly, true) => PendingIndexWait::CostAcceleration,
+        (SeekWorkload::Prompt | SeekWorkload::Costly, _) => PendingIndexWait::None,
+    }
+}
+
+fn index_failure_allows_bounded_fallback(wait: PendingIndexWait) -> bool {
+    matches!(wait, PendingIndexWait::CostAcceleration)
+}
+
+fn index_wait_timeout_message(wait: PendingIndexWait, path: &str, target_seconds: f64) -> String {
+    match wait {
+        PendingIndexWait::CostAcceleration => format!(
+            "keyframe index for {path} did not become ready within {:.1}s before costly prepared selection at {target_seconds:.6}s; the reachable bounded fallback was not started after the wait so the caller retains its response deadline",
+            DISTANT_SELECT_INDEX_WAIT.as_secs_f64()
+        ),
+        PendingIndexWait::HardCorrectness => format!(
+            "keyframe index for {path} did not become ready within {:.1}s; refusing unreachable distant selection at {target_seconds:.6}s",
+            DISTANT_SELECT_INDEX_WAIT.as_secs_f64()
+        ),
+        PendingIndexWait::None => {
+            unreachable!("a non-waiting selection cannot have an index wait timeout")
+        }
+    }
+}
+
+/// Install an index opportunistically for ordinary work. Unreachable work
+/// always waits; a prepared saved-playhead selection also waits when its
+/// resolution-aware fallback cost is high. Prompt preparation and reachable
+/// live selections remain nonblocking.
 fn prepare_keyframe_index_for_select<I>(
     decoder: &std::cell::RefCell<VideoDecoder>,
     pending: &std::cell::RefCell<Option<Receiver<Result<KeyframeIndex, String>>>>,
     path: &str,
     target_seconds: f64,
     previous_accepted_identity: Option<CodecFrameIdentity>,
+    prepared_seed: bool,
     is_current: I,
 ) -> Result<(), DecodeWorkError>
 where
     I: FnMut() -> bool,
 {
-    if !decoder
+    let workload = decoder
         .borrow()
-        .selection_exceeds_bounded_walk(target_seconds, previous_accepted_identity)
-    {
+        .selection_workload(target_seconds, previous_accepted_identity);
+    let wait = pending_index_wait(workload, prepared_seed);
+    if matches!(wait, PendingIndexWait::None) {
         install_ready_keyframe_index(decoder, pending, path);
         return Ok(());
     }
@@ -236,6 +275,12 @@ where
     let result = {
         let pending = pending.borrow();
         let Some(receiver) = pending.as_ref() else {
+            if index_failure_allows_bounded_fallback(wait) {
+                // Cost-aware waiting is an acceleration policy, not a second
+                // correctness cap. If staging was saturated or unavailable,
+                // the reachable bounded walk remains a valid fallback.
+                return Ok(());
+            }
             return Err(DecodeWorkError::Failed(format!(
                 "cannot select distant source time {target_seconds:.6}s in {path}: no usable keyframe index is available and the bounded decode walk cannot reach it"
             )));
@@ -256,29 +301,44 @@ where
         Err(KeyframeIndexWaitError::Timeout) => {
             // Retain the receiver: a later selection may adopt the bounded
             // build if it completes after this command's wait budget.
-            return Err(DecodeWorkError::Failed(format!(
-                "keyframe index for {path} did not become ready within {:.1}s; refusing unreachable distant selection at {target_seconds:.6}s",
-                DISTANT_SELECT_INDEX_WAIT.as_secs_f64()
+            return Err(DecodeWorkError::Failed(index_wait_timeout_message(
+                wait,
+                path,
+                target_seconds,
             )));
         }
         Err(KeyframeIndexWaitError::Build(error)) => {
             *pending.borrow_mut() = None;
+            if index_failure_allows_bounded_fallback(wait) {
+                log::warn!(
+                    "keyframe index unavailable for costly prepared selection at {target_seconds:.6}s in {path}; using bounded fallback: {error}"
+                );
+                return Ok(());
+            }
             return Err(DecodeWorkError::Failed(format!(
                 "keyframe index unavailable for distant selection at {target_seconds:.6}s in {path}: {error}"
             )));
         }
         Err(KeyframeIndexWaitError::Disconnected) => {
             *pending.borrow_mut() = None;
+            if index_failure_allows_bounded_fallback(wait) {
+                log::warn!(
+                    "keyframe index worker disconnected before costly prepared selection at {target_seconds:.6}s in {path}; using reachable bounded fallback"
+                );
+                return Ok(());
+            }
             return Err(DecodeWorkError::Failed(format!(
                 "keyframe index worker disconnected before distant selection at {target_seconds:.6}s in {path}"
             )));
         }
     };
     decoder.borrow_mut().install_keyframe_index(index);
-    if decoder
-        .borrow()
-        .selection_exceeds_bounded_walk(target_seconds, previous_accepted_identity)
-    {
+    if matches!(
+        decoder
+            .borrow()
+            .selection_workload(target_seconds, previous_accepted_identity),
+        SeekWorkload::Hard
+    ) {
         return Err(DecodeWorkError::Failed(format!(
             "cannot select distant source time {target_seconds:.6}s in {path}: the indexed preceding keyframe still exceeds the bounded decode walk"
         )));
@@ -526,6 +586,7 @@ struct QueuedCommand {
     command: DecodeCommand,
     epoch: u64,
     previous_accepted_codec_identity: Option<CodecFrameIdentity>,
+    prepared_seed: bool,
 }
 
 #[derive(Debug)]
@@ -576,6 +637,25 @@ impl DecodeCommandMailbox {
         target_seconds: f64,
         previous_accepted_codec_identity: Option<CodecFrameIdentity>,
     ) -> Result<bool, String> {
+        self.select_after_with_kind(
+            generation,
+            target_seconds,
+            previous_accepted_codec_identity,
+            false,
+        )
+    }
+
+    fn select_prepared_seed(&self, generation: u64, target_seconds: f64) -> Result<bool, String> {
+        self.select_after_with_kind(generation, target_seconds, None, true)
+    }
+
+    fn select_after_with_kind(
+        &self,
+        generation: u64,
+        target_seconds: f64,
+        previous_accepted_codec_identity: Option<CodecFrameIdentity>,
+        prepared_seed: bool,
+    ) -> Result<bool, String> {
         if !target_seconds.is_finite() {
             return Err(format!(
                 "source-time selection must be finite, got {target_seconds}"
@@ -600,6 +680,7 @@ impl DecodeCommandMailbox {
             epoch,
             previous_accepted_codec_identity: previous_accepted_codec_identity
                 .filter(|identity| identity.source_generation == generation),
+            prepared_seed,
         });
         if replaced.is_some() {
             self.command_overwrites.fetch_add(1, Ordering::Relaxed);
@@ -623,6 +704,7 @@ impl DecodeCommandMailbox {
             command: DecodeCommand::Stop,
             epoch,
             previous_accepted_codec_identity: None,
+            prepared_seed: false,
         });
         if replaced.is_some() {
             self.command_overwrites.fetch_add(1, Ordering::Relaxed);
@@ -788,9 +870,9 @@ impl ThreadedDecoder {
                     }
 
                     // A bounded helper pool scans a second demuxer. Ordinary
-                    // nearby Select commands continue immediately; only a
-                    // request that cannot fit inside the fallback decode walk
-                    // waits for its pending index below.
+                    // nearby/live Select commands continue immediately;
+                    // unreachable work and costly prepared saved playheads
+                    // cooperatively wait for their pending index below.
                     let index_result =
                         match submit_keyframe_index(decoder.keyframe_index_build_request()) {
                             Ok(receiver) => Some(receiver),
@@ -807,20 +889,25 @@ impl ThreadedDecoder {
                     run_decode_commands(
                         worker_mailbox,
                         worker_shared,
-                        |generation, target_seconds, previous_accepted_source_seconds, epoch| {
+                        |generation,
+                         target_seconds,
+                         previous_accepted_codec_identity,
+                         prepared_seed,
+                         epoch| {
                             prepare_keyframe_index_for_select(
                                 &decoder,
                                 &index_result,
                                 &path_owned,
                                 target_seconds,
-                                previous_accepted_source_seconds,
+                                previous_accepted_codec_identity,
+                                prepared_seed,
                                 || select_mailbox.is_current(epoch),
                             )?;
                             let mut decoder = decoder.borrow_mut();
                             let frame = decoder.seek_decode_after_interruptible(
                                 target_seconds,
                                 generation,
-                                previous_accepted_source_seconds,
+                                previous_accepted_codec_identity,
                                 || select_mailbox.is_current(epoch),
                             )?;
                             Ok(DecodedFrame::from_video(
@@ -942,7 +1029,8 @@ impl ThreadedDecoder {
             SeedSelectError::Decode("prepared video source generation exhausted".to_string())
         })?;
         let target_seconds = start_position * self.duration_seconds;
-        self.request_source_time(generation, target_seconds)
+        self.mailbox
+            .select_prepared_seed(generation, target_seconds)
             .map_err(SeedSelectError::Decode)?;
         let started = Instant::now();
         loop {
@@ -1190,7 +1278,13 @@ fn run_decode_commands<S>(
     shared: Arc<Mutex<SharedState>>,
     mut select_frame: S,
 ) where
-    S: FnMut(u64, f64, Option<CodecFrameIdentity>, u64) -> Result<DecodedFrame, DecodeWorkError>,
+    S: FnMut(
+        u64,
+        f64,
+        Option<CodecFrameIdentity>,
+        bool,
+        u64,
+    ) -> Result<DecodedFrame, DecodeWorkError>,
 {
     loop {
         let queued = mailbox.recv();
@@ -1212,6 +1306,7 @@ fn run_decode_commands<S>(
                     generation,
                     target_seconds,
                     queued.previous_accepted_codec_identity,
+                    queued.prepared_seed,
                     queued.epoch,
                 );
                 (generation, result, decode_started.elapsed())
@@ -1385,6 +1480,82 @@ mod tests {
     }
 
     #[test]
+    fn bounded_index_timeout_does_not_consume_the_receiver() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        assert!(matches!(
+            wait_for_keyframe_index(
+                &receiver,
+                Duration::from_millis(2),
+                Duration::from_millis(1),
+                || true,
+            ),
+            Err(KeyframeIndexWaitError::Timeout)
+        ));
+        sender
+            .send(Ok(KeyframeIndex::fallback(0).unwrap()))
+            .unwrap();
+        assert_eq!(
+            wait_for_keyframe_index(
+                &receiver,
+                Duration::from_millis(20),
+                Duration::from_millis(1),
+                || true,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn pending_index_policy_waits_only_for_costly_preparation_or_hard_correctness() {
+        assert_eq!(
+            pending_index_wait(SeekWorkload::Prompt, true),
+            PendingIndexWait::None
+        );
+        assert_eq!(
+            pending_index_wait(SeekWorkload::Costly, false),
+            PendingIndexWait::None,
+            "reachable live selections must remain nonblocking"
+        );
+        assert_eq!(
+            pending_index_wait(SeekWorkload::Costly, true),
+            PendingIndexWait::CostAcceleration
+        );
+        assert_eq!(
+            pending_index_wait(SeekWorkload::Hard, false),
+            PendingIndexWait::HardCorrectness
+        );
+        assert_eq!(
+            pending_index_wait(SeekWorkload::Hard, true),
+            PendingIndexWait::HardCorrectness
+        );
+    }
+
+    #[test]
+    fn costly_index_failures_remain_reachable_and_timeout_wording_is_exact() {
+        assert!(index_failure_allows_bounded_fallback(
+            PendingIndexWait::CostAcceleration
+        ));
+        assert!(!index_failure_allows_bounded_fallback(
+            PendingIndexWait::HardCorrectness
+        ));
+
+        let costly = index_wait_timeout_message(
+            PendingIndexWait::CostAcceleration,
+            "ars-longa.mp4",
+            30.029_765,
+        );
+        assert!(costly.contains("costly prepared selection"));
+        assert!(costly.contains("reachable bounded fallback"));
+        assert!(!costly.contains("unreachable"));
+
+        let hard =
+            index_wait_timeout_message(PendingIndexWait::HardCorrectness, "distant.mp4", 409.0);
+        assert!(hard.contains("unreachable distant selection"));
+    }
+
+    #[test]
     #[ignore = "requires COLLIDEOSCOPE_DISTANT_VIDEO_FIXTURE pointing to a seekable long video"]
     fn real_immediate_distant_seed_selection_reaches_the_requested_generation() {
         let path = std::env::var("COLLIDEOSCOPE_DISTANT_VIDEO_FIXTURE")
@@ -1393,6 +1564,43 @@ mod tests {
             .ok()
             .and_then(|value| value.parse::<f64>().ok())
             .unwrap_or(0.596_448_694_580_675_2);
+        let mut decoder = ThreadedDecoder::open_with_media_policy(
+            &path,
+            &MediaSafetyPolicy::safe(),
+            MediaDeviceLimits::none(),
+        )
+        .unwrap();
+        let target_seconds = start_position * decoder.duration_seconds;
+        let started = Instant::now();
+        let frame = decoder
+            .select_seed_frame_at(
+                start_position,
+                Duration::from_secs(5),
+                Duration::from_millis(2),
+                &|| true,
+            )
+            .unwrap();
+
+        assert_eq!(frame.source_generation, 1);
+        assert!(
+            (frame.source_seconds - target_seconds).abs() <= 1.0 / f64::from(decoder.fps.max(1.0)),
+            "selected {:.6}s instead of requested {target_seconds:.6}s",
+            frame.source_seconds
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    #[ignore = "requires COLLIDEOSCOPE_ARS_LONGA_VIDEO_FIXTURE pointing to the exact 445343423-byte source"]
+    fn real_ars_longa_saved_playhead_completes_inside_patch_deadline() {
+        let path = std::env::var("COLLIDEOSCOPE_ARS_LONGA_VIDEO_FIXTURE")
+            .expect("set COLLIDEOSCOPE_ARS_LONGA_VIDEO_FIXTURE to Ars-Longa's long video");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            445_343_423,
+            "fixture is not Ars-Longa's exact source"
+        );
+        let start_position = 0.167_920_403_325_936_1;
         let mut decoder = ThreadedDecoder::open_with_media_policy(
             &path,
             &MediaSafetyPolicy::safe(),
@@ -1443,6 +1651,24 @@ mod tests {
             }
         );
         assert_eq!(queued.previous_accepted_codec_identity, Some(newest));
+        assert!(!queued.prepared_seed);
+        assert_eq!(mailbox.command_overwrites.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn prepared_seed_marker_is_overwritten_with_the_newest_live_selection() {
+        let mailbox = DecodeCommandMailbox::new();
+        assert!(mailbox.select_prepared_seed(1, 30.0).unwrap());
+        assert!(mailbox.select_after(1, 0.5, None).unwrap());
+        let queued = mailbox.recv();
+        assert_eq!(
+            queued.command,
+            DecodeCommand::Select {
+                generation: 1,
+                target_seconds: 0.5,
+            }
+        );
+        assert!(!queued.prepared_seed);
         assert_eq!(mailbox.command_overwrites.load(Ordering::Relaxed), 1);
     }
 
@@ -1791,7 +2017,7 @@ mod tests {
         let worker_started = started.clone();
         let worker_release = release.clone();
         let worker = std::thread::spawn(move || {
-            run_decode_commands(worker_mailbox, worker_shared, |generation, _, _, _| {
+            run_decode_commands(worker_mailbox, worker_shared, |generation, _, _, _, _| {
                 if generation == 0 {
                     *lock_recover(&worker_started.0) = true;
                     worker_started.1.notify_one();
@@ -1867,7 +2093,7 @@ mod tests {
         let worker_started = started.clone();
         let worker_release = release.clone();
         let worker = std::thread::spawn(move || {
-            run_decode_commands(worker_mailbox, worker_shared, |generation, _, _, _| {
+            run_decode_commands(worker_mailbox, worker_shared, |generation, _, _, _, _| {
                 if generation == 10 {
                     *lock_recover(&worker_started.0) = true;
                     worker_started.1.notify_one();
