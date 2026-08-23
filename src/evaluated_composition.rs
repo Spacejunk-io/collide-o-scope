@@ -79,17 +79,17 @@ pub struct CompositionPlanInput<'a> {
     /// master-scope singleton, so this is a bare admission fact rather than an
     /// identity — there is nothing to name and no position to preserve.
     pub gesture_canvas_admitted: bool,
-    /// Whether the programme tap holds a committed frame.
+    /// Whether the host can back the programme-tap singleton.
     ///
-    /// `false` is the pre-first-frame default: a route to the tap resolves to
-    /// a transparent field with a named diagnostic, exactly as an unadmitted
-    /// gesture canvas does, and never silently rebinds to a layer or a group.
-    /// The tap is a master-scope singleton, so this is a bare admission fact
-    /// rather than an identity — there is nothing to name and no position to
-    /// preserve. Live answers from the renderer's published-tap validity;
-    /// export admits unconditionally because its tap surface exists for the
-    /// whole job and frame zero reads its defined-transparent contents (the
-    /// `with_gesture_canvas(true)` precedent).
+    /// This is a resource-capability fact, not the frame-local readiness of its
+    /// contents. A capable live or export host admits the route for the whole
+    /// renderer/job lifetime; before the first committed frame its executor
+    /// binds the defined-transparent fallback and reports `donor_valid=false`.
+    /// Keeping readiness out of this immutable plan prevents a patch recall
+    /// from temporarily deleting a rack route and changing its topology.
+    /// `false` is reserved for an embedder with no tap resource at all: the
+    /// route resolves transparent with a named diagnostic and is never silently
+    /// rebound to a layer or group.
     pub program_tap_admitted: bool,
     /// The host Study library. A Study node's digest resolves here at plan
     /// time; `None` (the default) or an absent digest plans an inert pass
@@ -137,9 +137,9 @@ impl<'a> CompositionPlanInput<'a> {
         self
     }
 
-    /// Declare whether the programme tap holds a committed frame. Live and
-    /// export must supply the same admission law so a routed tap plans
-    /// identically on both sides once the first frame commits.
+    /// Declare whether the host owns a programme-tap resource. Content
+    /// readiness remains an executor binding fact so live and export keep one
+    /// stable route topology across their cold and committed frames.
     pub const fn with_program_tap(mut self, admitted: bool) -> Self {
         self.program_tap_admitted = admitted;
         self
@@ -733,9 +733,9 @@ pub enum CompositionPlanDiagnostic {
     GestureCanvasUnavailable {
         consumer: ImageTapConsumer,
     },
-    /// A route named the programme tap before the first committed frame. The
-    /// tap resolves transparent and stays visible as this diagnostic; it is
-    /// never repointed at some other producer.
+    /// A route named the programme tap on a host that cannot back that
+    /// singleton. The tap resolves transparent and stays visible as this
+    /// diagnostic; it is never repointed at some other producer.
     ProgramTapUnavailable {
         consumer: ImageTapConsumer,
     },
@@ -8469,7 +8469,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unavailable_program_tap_route_is_transparent_and_named_rather_than_rebound() {
+    fn an_unsupported_program_tap_route_is_transparent_and_named_rather_than_rebound() {
         let base = base(&[1, 2], &[]);
         let composition = legacy_composition(&[1, 2]);
         let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
@@ -8481,16 +8481,16 @@ mod tests {
             0.5,
         );
 
-        // Before the first committed frame the tap holds nothing, and the
-        // route must say so by name rather than borrowing another producer.
+        // An embedder without a programme-tap resource must say so by name
+        // rather than borrowing another producer.
         let compiled =
             advanced(plan_with_program_tap(&base, &composition, &master, &racks, false).unwrap());
         let tap = displace_tap_for(&compiled, node)
-            .expect("an unavailable tap still reports a diagnostic tap");
+            .expect("an unsupported tap still reports a diagnostic tap");
         assert_eq!(
             tap.resolved,
             PlannedImageSource::Transparent,
-            "an uncommitted tap resolves transparent, exactly as a missing donor does"
+            "an unsupported tap resolves transparent, exactly as a missing donor does"
         );
         assert!(compiled.diagnostics().iter().any(|diagnostic| matches!(
             diagnostic,
@@ -8502,8 +8502,9 @@ mod tests {
         assert_eq!(compiled.graph().current_taps, 0);
         assert_eq!(compiled.graph().previous_taps, 0);
 
-        // Admission is the only difference. The identical rack, planned after
-        // the first committed frame, resolves to the tap.
+        // Host capability is the only difference. The identical rack on a host
+        // that owns the persistent resource resolves to the tap; its executor
+        // separately decides whether committed contents are ready.
         let admitted =
             advanced(plan_with_program_tap(&base, &composition, &master, &racks, true).unwrap());
         assert_eq!(

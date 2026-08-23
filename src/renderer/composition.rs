@@ -6295,15 +6295,16 @@ mod tests {
     /// three ways over a real carrier, and each claim is a leg of the tranche:
     ///
     /// (a) an unbound tap and a bound-but-never-published (all-zero) tap are
-    ///     byte identical — live's pre-first-commit diagnostic transparency
+    ///     byte identical — live's unbound pre-first-commit transparency
     ///     and export's zero-initialized job-lifetime surface are the same
     ///     pixels, by arithmetic (the frozen donor decode yields exactly zero
     ///     for a fully transparent donor);
     /// (b) a published programme copy reaches the pixels through the routed
     ///     donor — the re-entry loop's read half demonstrably works;
-    /// (c) rebinding a different tap under a new epoch on an unchanged
-    ///     topology re-prepares rather than keeping the stale view — the
-    ///     renderer-rebuild law the binding identity exists for.
+    /// (c) invalidating a previously bound tap and then publishing a different
+    ///     tap on an unchanged topology both re-prepare, rather than retaining
+    ///     the stale view — the patch-generation and renderer-rebuild laws the
+    ///     binding identity exists for.
     ///
     /// The N-1 publication half (the copy at the acceptance decision, the
     /// blackout hold, and the byte-identical offline ordering) is pinned by
@@ -6383,9 +6384,10 @@ mod tests {
             "the published programme copy displaced nothing; the tap never reached the node"
         );
 
-        // (c) One executor, one topology, two different taps. Without the tap
-        // identity in the reuse test this second prepare would keep the
-        // never-published surface's view and the image would not move at all.
+        // (c) One executor, one topology, the exact patch lifecycle. It begins
+        // bound, invalidates to the default binding without sampling the old
+        // patch, then binds the newly published image. Each identity transition
+        // must rebuild even though the immutable plan never changes.
         let mut reused = CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
         reused.bind_program_tap(ProgramTapBinding::bound(
             never_published.create_view(&wgpu::TextureViewDescriptor::default()),
@@ -6396,7 +6398,19 @@ mod tests {
             .unwrap();
         let reused_zeroed = gpu.render(&mut reused, &plan, 1.0 / 30.0, true);
         assert_eq!(reused_zeroed, zeroed);
-        reused.bind_program_tap(ProgramTapBinding::bound(previous.view.clone(), 2));
+
+        reused.bind_program_tap(ProgramTapBinding::default());
+        reused
+            .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+            .unwrap();
+        assert!(!reused.program_tap_bound());
+        let reused_invalidated = gpu.render(&mut reused, &plan, 1.0 / 30.0, true);
+        assert_eq!(
+            reused_invalidated, unbound,
+            "tap invalidation retained pixels from the previous patch"
+        );
+
+        reused.bind_program_tap(ProgramTapBinding::bound(previous.view.clone(), 1));
         reused
             .prepare(&gpu.device, &gpu.queue, &plan, &sources)
             .unwrap();
