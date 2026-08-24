@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "receipt_kind": "post_v1_6_improvement_baseline",
+  "recorded_at_utc": "2026-08-24T03:42:32Z",
+  "source": {
+    "commit": "000411d383205596b46feb09de32f7eaa5aeb0c6",
+    "tag": "v1.6.0",
+    "version": "1.6.0",
+    "tracked_diff_clean_before_measurement": true,
+    "audit_sha256": "8AA8B84BD86E91AE4B88A2D0955494B1E88D0CFA66AFB971E7181ED36285CD5B",
+    "declared_rust_test_attributes": 1897
+  },
+  "host": {
+    "os": "Microsoft Windows 11 Pro",
+    "os_version": "10.0.26200",
+    "architecture": "x86_64",
+    "cpu": "13th Gen Intel(R) Core(TM) i9-13900K",
+    "physical_cores": 24,
+    "logical_processors": 32,
+    "visible_memory_kib": 33289112,
+    "gpu": "AMD Radeon RX 6950 XT",
+    "gpu_driver": "32.0.21045.1000",
+    "display_mode": "3840 x 2160"
+  },
+  "toolchain": {
+    "rustc": "1.98.0 (88d9e12ae 2026-08-18)",
+    "cargo": "1.98.0 (797e8a9bc 2026-08-05)",
+    "llvm": "22.1.8",
+    "git": "2.55.0.windows.5",
+    "ffmpeg": "8.1.2-full_build-www.gyan.dev",
+    "ffmpeg_binary_sha256": "9BE30133EDCC5786F16E632D57E2DAB5B259FEA9A5243BA99758CA3ADC110BD9",
+    "libavutil": "60.26.102",
+    "libavcodec": "62.28.102",
+    "libavformat": "62.12.102"
+  },
+  "baseline_gates": {
+    "cargo_fmt_all_check": "pass",
+    "static_app_js_syntax": "pass",
+    "wireframe_js_syntax": "pass",
+    "cargo_check_locked_all_targets": "pass",
+    "cargo_clippy_locked_all_targets_all_features_deny_warnings": "pass",
+    "cargo_test_locked_all_targets_single_thread": {
+      "status": "pass",
+      "passed": 1753,
+      "failed": 0,
+      "ignored_unit": 142,
+      "ignored_gpu_integration": 2
+    }
+  },
+  "measurement_boundary": {
+    "gpu_stage_timestamps": "unavailable_before_P1",
+    "engine_action_correlation": "unavailable_before_P1",
+    "physical_action_to_photon_fixture": "not_connected",
+    "claim": "This receipt freezes correctness and toolchain identity only; it makes no pre-P1 GPU or photon-latency claim."
+  }
+}
