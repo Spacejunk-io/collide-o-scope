@@ -1568,6 +1568,71 @@ def self_test_reproducible_checkout_attributes(attributes: str) -> None:
             fail("checkout-attribute self-test accepted a byte-unstable release input")
 
 
+def validate_required_workflow_transport(workflow_gate: str) -> None:
+    exact_contract = {
+        'MAX_RECEIPT_BYTES = 128 * 1024': 1,
+        'request.add_unredirected_header("Authorization", f"Bearer {token}")': 1,
+        'request = github_request(url, token)': 2,
+        'require_https_url(response.geturl()': 2,
+        'class SecureGitHubRedirectHandler(urllib.request.HTTPRedirectHandler)': 1,
+        'max_repeats = 2': 1,
+        'max_redirections = 5': 1,
+        'with github_opener().open(request, timeout=': 2,
+        'sensitive_headers = {': 1,
+        'redirected.remove_header(header)': 1,
+        'redirected.add_unredirected_header("Authorization", authorization)': 1,
+        'assert "Authorization" not in authenticated_request.headers': 1,
+        'assert cross_origin.full_url == signed_url': 1,
+        'assert cross_origin.get_header("Authorization") is None': 1,
+        'assert same_origin.get_header("Authorization") == "Bearer secret"': 1,
+        'assert cross_origin_back_to_api.get_header("Authorization") is None': 1,
+        'ordinary_sensitive_request = urllib.request.Request(': 1,
+        '"Proxy-Authorization": "Basic ordinary"': 1,
+        'GitHub token was accepted for an unsafe API origin': 1,
+        'required-run receipt accepted one byte beyond its limit': 1,
+    }
+    if (
+        any(workflow_gate.count(value) != count for value, count in exact_contract.items())
+        or '"Authorization": f"Bearer {token}"' in workflow_gate
+    ):
+        fail("required-workflow transport can leak credentials or exceed its evidence bound")
+    helper = workflow_gate.split("def github_request(", 1)
+    if len(helper) != 2:
+        fail("required-workflow authenticated request helper is absent")
+    helper_body = helper[1].split("\n\nclass ", 1)[0]
+    if (
+        helper_body.find('require_https_url(url, expected_host="api.github.com")') < 0
+        or helper_body.find('require_https_url(url, expected_host="api.github.com")')
+        > helper_body.find('request.add_unredirected_header("Authorization"')
+    ):
+        fail("required-workflow token can be attached before API-origin validation")
+
+
+def self_test_required_workflow_transport(workflow_gate: str) -> None:
+    validate_required_workflow_transport(workflow_gate)
+    mutations = [
+        workflow_gate.replace("add_unredirected_header", "add_header", 1),
+        workflow_gate.replace("max_redirections = 5", "max_redirections = 10", 1),
+        workflow_gate.replace("github_opener().open", "urllib.request.urlopen", 1),
+        workflow_gate.replace("redirected.remove_header(header)", "", 1),
+        workflow_gate.replace(
+            'require_https_url(url, expected_host="api.github.com")', "", 1
+        ),
+        workflow_gate.replace(
+            "MAX_RECEIPT_BYTES = 128 * 1024",
+            "MAX_RECEIPT_BYTES = 64 * 1024",
+            1,
+        ),
+    ]
+    for mutation in mutations:
+        try:
+            validate_required_workflow_transport(mutation)
+        except ValueError:
+            pass
+        else:
+            fail("required-workflow transport mutation escaped the policy gate")
+
+
 def main() -> int:
     try:
         self_test_create_only_publication_policy()
@@ -1596,6 +1661,7 @@ def main() -> int:
         workflow_gate = (ROOT / "scripts/wait-required-workflows.py").read_text(
             encoding="utf-8"
         )
+        self_test_required_workflow_transport(workflow_gate)
         workflows = "\n".join(
             path.read_text(encoding="utf-8")
             for path in sorted((ROOT / ".github/workflows").glob("*.yml"))
@@ -1704,6 +1770,7 @@ def main() -> int:
             "tag_object: ${{ steps.source.outputs.tag_object }}",
             "required_runs: ${{ steps.required.outputs.required_runs }}",
             '--target "${{ needs.verification-gate.outputs.commit }}"',
+            "python scripts/wait-required-workflows.py --self-test",
             "python scripts/verify-release.py self-test",
             "python scripts/finalize-release-receipt.py self-test",
         ]

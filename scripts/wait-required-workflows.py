@@ -44,13 +44,84 @@ REQUIRED_STEP_GROUPS = {
     },
 }
 REQUIRED_JOB_NAMES = set(PLATFORM_TEST_STEPS) | {DEPENDENCY_JOB}
-MAX_RECEIPT_BYTES = 64 * 1024
+# Retain the independently cross-checked ignored-test names for all three platforms.
+MAX_RECEIPT_BYTES = 128 * 1024
 MAX_LOG_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_LOG_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 
 
 class GateError(RuntimeError):
     pass
+
+
+def require_https_url(
+    url: str, *, expected_host: str | None = None
+) -> tuple[str, int]:
+    parsed = urllib.parse.urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise GateError("GitHub response URL has an invalid port") from error
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or (
+            expected_host is not None
+            and (parsed.hostname.lower() != expected_host or port not in (None, 443))
+        )
+    ):
+        raise GateError("GitHub response URL is not an allowed credential-free HTTPS URL")
+    return parsed.hostname.lower(), port or 443
+
+
+def github_request(url: str, token: str) -> urllib.request.Request:
+    require_https_url(url, expected_host="api.github.com")
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "collide-o-scope-release-gate/1",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    request.add_unredirected_header("Authorization", f"Bearer {token}")
+    return request
+
+
+class SecureGitHubRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep every hop on HTTPS and never resurrect cross-origin credentials."""
+
+    max_repeats = 2
+    max_redirections = 5
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        source_origin = require_https_url(req.full_url)
+        target_origin = require_https_url(newurl)
+        authorization = req.get_header("Authorization")
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+        sensitive_headers = {
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "cookie2",
+        }
+        for header, _value in tuple(redirected.header_items()):
+            if header.lower() in sensitive_headers:
+                redirected.remove_header(header)
+        if (
+            authorization is not None
+            and source_origin == target_origin
+        ):
+            redirected.add_unredirected_header("Authorization", authorization)
+        return redirected
+
+
+def github_opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(SecureGitHubRedirectHandler())
 
 
 def newest_exact_run(payload: object, commit: str) -> dict | None:
@@ -83,17 +154,10 @@ def run_state(run: dict | None) -> str:
 
 
 def github_json(url: str, token: str) -> object:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "collide-o-scope-release-gate/1",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
+    request = github_request(url, token)
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with github_opener().open(request, timeout=30) as response:
+            require_https_url(response.geturl(), expected_host="api.github.com")
             payload = response.read(4 * 1024 * 1024 + 1)
         if len(payload) > 4 * 1024 * 1024:
             raise GateError("GitHub workflow response is unexpectedly large")
@@ -103,17 +167,10 @@ def github_json(url: str, token: str) -> object:
 
 
 def github_bytes(url: str, token: str) -> bytes:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "collide-o-scope-release-gate/1",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
+    request = github_request(url, token)
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with github_opener().open(request, timeout=60) as response:
+            require_https_url(response.geturl())
             payload = response.read(MAX_LOG_ARCHIVE_BYTES + 1)
     except (OSError, urllib.error.HTTPError) as error:
         raise GateError(f"download GitHub workflow logs: {error}") from error
@@ -517,6 +574,108 @@ def collect_final_candidate_evidence(
 
 
 def self_test() -> None:
+    authenticated_request = github_request(
+        "https://api.github.com/repos/acme/project/actions/jobs/1/logs", "secret"
+    )
+    assert authenticated_request.get_header("Authorization") == "Bearer secret"
+    assert "Authorization" not in authenticated_request.headers
+    redirect_handler = SecureGitHubRedirectHandler()
+    signed_url = (
+        "https://results.example.test/actions/job-logs.txt?signature=fixture"
+    )
+    cross_origin = redirect_handler.redirect_request(
+        authenticated_request,
+        None,
+        302,
+        "Found",
+        {},
+        signed_url,
+    )
+    assert cross_origin is not None
+    assert cross_origin.full_url == signed_url
+    assert cross_origin.get_header("Authorization") is None
+    assert cross_origin.get_header("User-agent") == "collide-o-scope-release-gate/1"
+    ordinary_sensitive_request = urllib.request.Request(
+        authenticated_request.full_url,
+        headers={
+            "Authorization": "Bearer ordinary",
+            "Proxy-Authorization": "Basic ordinary",
+            "Cookie": "session=ordinary",
+        },
+    )
+    ordinary_cross_origin = redirect_handler.redirect_request(
+        ordinary_sensitive_request,
+        None,
+        302,
+        "Found",
+        {},
+        signed_url,
+    )
+    assert ordinary_cross_origin is not None
+    assert all(
+        ordinary_cross_origin.get_header(header) is None
+        for header in ("Authorization", "Proxy-authorization", "Cookie")
+    )
+    same_origin = redirect_handler.redirect_request(
+        authenticated_request,
+        None,
+        302,
+        "Found",
+        {},
+        "https://api.github.com/repos/acme/project/actions/jobs/1/logs?attempt=2",
+    )
+    assert same_origin is not None
+    assert same_origin.get_header("Authorization") == "Bearer secret"
+    cross_origin_back_to_api = redirect_handler.redirect_request(
+        cross_origin,
+        None,
+        302,
+        "Found",
+        {},
+        "https://api.github.com/repos/acme/project/actions/jobs/1/logs",
+    )
+    assert cross_origin_back_to_api is not None
+    assert cross_origin_back_to_api.get_header("Authorization") is None
+    try:
+        redirect_handler.redirect_request(
+            authenticated_request,
+            None,
+            302,
+            "Found",
+            {},
+            "http://results.example.test/actions/job-logs.txt",
+        )
+    except GateError:
+        pass
+    else:
+        raise AssertionError("workflow log redirect accepted an HTTPS downgrade")
+    for unsafe_api_url in (
+        "https://api.github.com:444/repos/acme/project/actions/jobs/1/logs",
+        "https://user@api.github.com/repos/acme/project/actions/jobs/1/logs",
+    ):
+        try:
+            github_request(unsafe_api_url, "secret")
+        except GateError:
+            pass
+        else:
+            raise AssertionError("GitHub token was accepted for an unsafe API origin")
+    assert redirect_handler.max_redirections == 5
+    assert redirect_handler.max_repeats == 2
+    assert any(
+        isinstance(handler, SecureGitHubRedirectHandler)
+        for handler in github_opener().handlers
+    )
+    empty_payload_bytes = len(canonical_json({"payload": ""}).encode("utf-8"))
+    exact_limit = {"payload": "x" * (MAX_RECEIPT_BYTES - empty_payload_bytes)}
+    assert len(canonical_json(exact_limit).encode("utf-8")) == MAX_RECEIPT_BYTES
+    exact_limit["payload"] += "x"
+    try:
+        canonical_json(exact_limit)
+    except GateError:
+        pass
+    else:
+        raise AssertionError("required-run receipt accepted one byte beyond its limit")
+
     commit = "a" * 40
     payload = {
         "workflow_runs": [
