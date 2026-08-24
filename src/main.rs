@@ -90,7 +90,7 @@ use evaluated_frame::SourceTap;
 use evaluated_frame::{EvaluatedFramePlan, FramePlanContext, LayerFrameInput, MasterFrameInput};
 use winit::application::ApplicationHandler;
 use winit::event::{KeyEvent, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow as WinitControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::monitor::MonitorHandle;
 use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
@@ -217,11 +217,10 @@ use visual_rack::{LegacyRackScope, RuntimeVisualRack};
 use web::state::{ControlServerInfo, ControlServerStatus, WebState};
 
 const TARGET_FPS: u64 = 30;
-// Microseconds, not milliseconds: `1000 / 30` truncates to 33 ms, which paces
-// the program at 30.30 fps and — because this same value is the stage-health
-// deadline and the proxy assessment's frame budget — marked very nearly every
-// frame as a missed deadline against a target the loop was actually meeting.
-const FRAME_DURATION: Duration = Duration::from_micros(1_000_000 / TARGET_FPS);
+// Conservative one-frame budget for assessment only. The event loop itself is
+// governed by `RationalFramePacer`, whose exact 30 Hz deadlines carry the
+// fractional nanosecond remainder without accumulating phase drift.
+const FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000_u64.div_ceil(TARGET_FPS));
 const STILL_CAPTURE_SOURCE_TIMEOUT: Duration = Duration::from_secs(5);
 const FALLBACK_OUTPUT_WIDTH: u32 = 1280;
 const FALLBACK_OUTPUT_HEIGHT: u32 = 720;
@@ -902,9 +901,12 @@ fn proxy_playback_observation(
     if sampled_frames == 0 {
         return None;
     }
+    // Proxy advice is based on frames lost after decode, not cancelled work or
+    // stale seeks. Those causes have separate telemetry and are not evidence
+    // that a lower-resolution proxy would improve steady-state delivery.
     let dropped_frames = telemetry
         .frame_overwrites
-        .saturating_add(telemetry.frame_drops)
+        .saturating_add(telemetry.stale_completed_frames)
         .min(u64::from(sampled_frames)) as u32;
     let (hardware_decode_active, zero_copy_active) = decode_activity_claims();
     Some(proxy::ProxyPlaybackObservation {
@@ -917,6 +919,10 @@ fn proxy_playback_observation(
         decode_p95_micros: duration_micros_u32(telemetry.decode_p95_duration),
         upload_p95_micros: duration_micros_u32(telemetry.upload_p95_duration),
         frame_age_p95_micros: duration_micros_u32(telemetry.frame_age_p95_duration),
+        delivery_hold_p95_micros: duration_micros_u32(telemetry.decoder_delivery_hold_p95_duration),
+        delivery_hold_peak_micros: duration_micros_u32(
+            telemetry.peak_decoder_delivery_hold_duration,
+        ),
         dropped_frames,
         pending_frames_peak: u16::from(telemetry.pending_frames_peak),
         hardware_decode_active,
@@ -963,7 +969,12 @@ fn proxy_assessment_status_from_observation(
                         proxy::ProxyRecommendationReason::DecodeExceedsFrameBudget => "decode p95",
                         proxy::ProxyRecommendationReason::UploadExceedsFrameBudget => "upload p95",
                         proxy::ProxyRecommendationReason::FrameAgeExceedsFrameBudget => "frame age",
-                        proxy::ProxyRecommendationReason::DroppedFramesObserved => "frame drops",
+                        proxy::ProxyRecommendationReason::DeliveryHoldExceedsFrameBudget => {
+                            "decoder delivery hold"
+                        }
+                        proxy::ProxyRecommendationReason::DroppedFramesObserved => {
+                            "sustained delivery loss"
+                        }
                         proxy::ProxyRecommendationReason::DecoderQueuePressure => "queue pressure",
                         proxy::ProxyRecommendationReason::MultiLayerPressure => "layer pressure",
                     })
@@ -4744,7 +4755,7 @@ struct App {
     master_transform: spatial::SpatialTransform,
     master_paused: bool,
     media_frozen: bool,
-    last_frame_time: Instant,
+    frame_pacer: stage_health::RationalFramePacer,
     program_clock: ProgramClock,
     modifiers: ModifiersState,
     // Library
@@ -5328,7 +5339,7 @@ impl App {
             master_transform: spatial::SpatialTransform::default(),
             master_paused: false,
             media_frozen: false,
-            last_frame_time: Instant::now(),
+            frame_pacer: stage_health::RationalFramePacer::new(Instant::now(), TARGET_FPS),
             program_clock: ProgramClock::default(),
             modifiers: ModifiersState::empty(),
             library_folder,
@@ -8958,7 +8969,7 @@ impl App {
         for layer in &mut self.layers {
             layer.reset_transport_timing_at(now);
         }
-        self.last_frame_time = now;
+        self.frame_pacer.reset(now);
     }
 
     fn resolve_audio_clip_path_near(
@@ -21493,21 +21504,42 @@ impl App {
                     format!("{} ready", layer.source_kind())
                 };
                 telemetry.as_ref().map_or(base.clone(), |telemetry| {
-                    let last_upload_us = telemetry
-                        .last_upload_duration
-                        .map_or(0, |duration| duration.as_micros().min(u128::from(u64::MAX)) as u64);
                     let decode_p95_us = duration_micros_u32(telemetry.decode_p95_duration);
+                    let attempt_p95_us =
+                        duration_micros_u32(telemetry.decode_attempt_p95_duration);
                     let upload_p95_us = duration_micros_u32(telemetry.upload_p95_duration);
                     let frame_age_p95_us = duration_micros_u32(telemetry.frame_age_p95_duration);
+                    let accepted_age_ms = telemetry
+                        .last_accepted_upload_age
+                        .map_or(0, |duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+                    let hold_p95_ms = telemetry
+                        .accepted_upload_interval_p95_duration
+                        .map_or(0, |duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+                    let hold_p99_ms = telemetry
+                        .accepted_upload_interval_p99_duration
+                        .map_or(0, |duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+                    let hold_max_ms = telemetry
+                        .peak_accepted_upload_interval_duration
+                        .map_or(0, |duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+                    let delivery_hold_p95_ms = telemetry
+                        .decoder_delivery_hold_p95_duration
+                        .map_or(0, |duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+                    let delivery_hold_max_ms = telemetry
+                        .peak_decoder_delivery_hold_duration
+                        .map_or(0, |duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
                     let proxy_status = self.proxy_layer_status(layer, telemetry, visible_layers);
                     format!(
-                        "{base}; decoded {}/{} frames, command queue {}, command drops {}, upload {} us ({} samples), p95 decode/upload/age {decode_p95_us}/{upload_p95_us}/{frame_age_p95_us} us; {proxy_status}",
+                        "{base}; frames c/p/a {}/{}/{}; req c/d {}/{} (coal {}); loss stale/cancel/fail {}/{}/{}; q {}; p95 all/ok/up/age {attempt_p95_us}/{decode_p95_us}/{upload_p95_us}/{frame_age_p95_us} us; accepted age/hold95/99/max {accepted_age_ms}/{hold_p95_ms}/{hold_p99_ms}/{hold_max_ms} ms; decoder hold95/max {delivery_hold_p95_ms}/{delivery_hold_max_ms} ms; {proxy_status}",
                         telemetry.consumed_frames,
                         telemetry.published_frames,
+                        telemetry.accepted_uploads,
+                        telemetry.continuous_requests,
+                        telemetry.discontinuity_requests,
+                        telemetry.continuous_overwrites,
+                        telemetry.stale_commands,
+                        telemetry.superseded_decode_attempts,
+                        telemetry.failed_decode_attempts,
                         telemetry.pending_command_depth,
-                        telemetry.command_drops.saturating_add(telemetry.command_overwrites),
-                        last_upload_us,
-                        telemetry.upload_samples,
                     )
                 })
             })
@@ -21521,7 +21553,7 @@ impl App {
                 let dropped_frames = telemetry.as_ref().map_or(0, |telemetry| {
                     telemetry
                         .frame_overwrites
-                        .saturating_add(telemetry.frame_drops)
+                        .saturating_add(telemetry.stale_completed_frames)
                 });
                 stage_health::LayerStageHealthInput {
                     layer_id: layer.stable_layer_id(),
@@ -22996,7 +23028,7 @@ impl ApplicationHandler for App {
 
         let mut egui_renderer = egui_wgpu::Renderer::new(
             &renderer.device,
-            renderer.config.format,
+            renderer::state::egui_surface_view_format(renderer.config.format),
             egui_wgpu::RendererOptions::default(),
         );
 
@@ -23436,11 +23468,13 @@ impl ApplicationHandler for App {
                 }
 
                 let now = Instant::now();
-                if now - self.last_frame_time >= FRAME_DURATION {
-                    let wall_frame_delta = now.saturating_duration_since(self.last_frame_time);
-                    self.last_frame_time = now;
-                    self.stage_health_monitor
-                        .observe_frame(wall_frame_delta, FRAME_DURATION);
+                if let Some(frame_tick) = self.frame_pacer.accept_due(now) {
+                    let wall_frame_delta = frame_tick.wall_interval;
+                    self.stage_health_monitor.observe_frame(
+                        wall_frame_delta,
+                        frame_tick.schedule_lateness,
+                        frame_tick.skipped_program_ticks,
+                    );
 
                     // Drive only nonblocking GPU-map/worker completion before
                     // accepting another control action. A terminal success may
@@ -27192,9 +27226,16 @@ impl ApplicationHandler for App {
                             return;
                         }
                     };
-                    let surface_view = surface_texture
-                        .texture
-                        .create_view(&wgpu::TextureViewDescriptor::default());
+                    let surface_view =
+                        surface_texture
+                            .texture
+                            .create_view(&wgpu::TextureViewDescriptor {
+                                label: Some("egui raw main-surface view"),
+                                format: Some(renderer::state::egui_surface_view_format(
+                                    renderer.config.format,
+                                )),
+                                ..Default::default()
+                            });
 
                     {
                         let mut render_pass = encoder
@@ -27258,18 +27299,26 @@ impl ApplicationHandler for App {
                         t.present();
                     }
                     present_stage_monitor_surfaces(stage_surface_frames);
-                    if exit_on_renderer_device_loss(renderer, &mut self.output_error, event_loop) {
-                        return;
-                    }
-                }
-
-                if let Some(window) = &self.window {
-                    window.request_redraw();
+                    exit_on_renderer_device_loss(renderer, &mut self.output_error, event_loop);
                 }
             }
 
             _ => {}
         }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let deadline = self.frame_pacer.next_deadline();
+        if Instant::now() >= deadline {
+            window.request_redraw();
+        }
+        // Input and window events still wake the loop immediately. In the
+        // absence of work, WaitUntil replaces the former redraw busy-spin with
+        // one bounded wake at the next exact rational program deadline.
+        event_loop.set_control_flow(WinitControlFlow::WaitUntil(deadline));
     }
 }
 
@@ -30619,7 +30668,7 @@ mod app_state_tests {
             decode_p95_duration: Some(FRAME_DURATION + Duration::from_millis(1)),
             upload_p95_duration: Some(FRAME_DURATION),
             frame_age_p95_duration: Some(FRAME_DURATION.saturating_mul(3)),
-            frame_drops: 2,
+            stale_completed_frames: 2,
             pending_frames_peak: 3,
             ..Default::default()
         };
@@ -32908,7 +32957,7 @@ mod app_state_tests {
 
         assert!(!app.master_paused);
         assert!(!app.mod_matrix.clock.is_paused());
-        assert_eq!(app.last_frame_time, modal_finished);
+        assert_eq!(app.frame_pacer.last_accepted_at(), modal_finished);
         assert!((app.mod_matrix.clock.beat(modal_finished) - beat_before).abs() < 1.0e-9);
         assert!(
             app.mod_matrix

@@ -1,8 +1,11 @@
 //! Generation-safe, request-driven wrapper around [`VideoDecoder`].
 //!
-//! Commands occupy one overwrite slot. Absolute source-time selection always
-//! supersedes queued or in-flight work. The completed-frame mailbox is also
-//! latest-only.
+//! Commands occupy one overwrite slot. A source-generation change (seek, cue,
+//! loop/reflection, source replacement, or stop) supersedes queued and
+//! in-flight work. A newer continuous selection in the same generation only
+//! replaces the queued desire: the running decode may finish and publish
+//! before the worker advances directly to the newest target. The
+//! completed-frame mailbox is also latest-only.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
@@ -83,14 +86,26 @@ impl DurationWindow {
         self.peak_nanoseconds.map(Duration::from_nanos)
     }
 
-    fn p95(&self) -> Option<Duration> {
+    fn percentile(&self, percentile: usize) -> Option<Duration> {
         if self.len == 0 {
             return None;
         }
         let mut sorted = self.nanoseconds;
         sorted[..self.len].sort_unstable();
-        let nearest_rank = (95 * self.len).div_ceil(100);
+        let nearest_rank = (percentile.clamp(1, 100) * self.len).div_ceil(100);
         Some(Duration::from_nanos(sorted[nearest_rank - 1]))
+    }
+
+    fn p50(&self) -> Option<Duration> {
+        self.percentile(50)
+    }
+
+    fn p95(&self) -> Option<Duration> {
+        self.percentile(95)
+    }
+
+    fn p99(&self) -> Option<Duration> {
+        self.percentile(99)
     }
 }
 
@@ -486,6 +501,10 @@ pub enum DecoderHealth {
 pub struct DecoderTelemetry {
     pub last_publish_age: Option<Duration>,
     pub last_consume_age: Option<Duration>,
+    /// Time since the latest decoded source image was successfully accepted by
+    /// the GPU upload seam. Unlike publish-to-consume age, this keeps growing
+    /// through a visible source hold.
+    pub last_accepted_upload_age: Option<Duration>,
     pub pending_command_depth: u8,
     pub pending_frames: u8,
     pub pending_frames_peak: u8,
@@ -493,27 +512,76 @@ pub struct DecoderTelemetry {
     pub consumed_frames: u64,
     pub command_overwrites: u64,
     pub command_drops: u64,
+    /// Accepted selections whose generation matched the prior accepted
+    /// selection. These are ordinary continuous playback desires, not
+    /// cancellation tokens.
+    pub continuous_requests: u64,
+    /// Accepted selections that advanced the source discontinuity token.
+    pub discontinuity_requests: u64,
+    /// Same-generation desires replaced before the worker received them.
+    pub continuous_overwrites: u64,
+    /// Queued work replaced by a different generation before receipt.
+    pub discontinuity_overwrites: u64,
     pub frame_overwrites: u64,
     pub frame_drops: u64,
+    /// Queued commands retired before decode because their generation was no
+    /// longer current.
+    pub stale_commands: u64,
+    /// Decode attempts cooperatively retired by a discontinuity or Stop.
+    pub superseded_decode_attempts: u64,
+    /// Completed mailbox frames rejected at consume because their generation
+    /// was no longer current.
+    pub stale_completed_frames: u64,
+    pub failed_decode_attempts: u64,
+    /// All attempts, including failures and superseded work. The existing
+    /// `decode_*` fields remain successful-publication timings.
+    pub decode_attempt_samples: u64,
+    pub last_decode_attempt_duration: Option<Duration>,
+    pub peak_decode_attempt_duration: Option<Duration>,
+    pub decode_attempt_p95_duration: Option<Duration>,
     pub decode_samples: u64,
     pub last_decode_duration: Option<Duration>,
     pub peak_decode_duration: Option<Duration>,
     pub decode_p95_duration: Option<Duration>,
+    pub publish_interval_p95_duration: Option<Duration>,
+    pub publish_interval_p99_duration: Option<Duration>,
+    pub peak_publish_interval_duration: Option<Duration>,
     pub frame_age_p95_duration: Option<Duration>,
     pub upload_samples: u64,
     pub last_upload_duration: Option<Duration>,
     pub peak_upload_duration: Option<Duration>,
     pub upload_p95_duration: Option<Duration>,
+    pub accepted_uploads: u64,
+    pub accepted_upload_interval_p50_duration: Option<Duration>,
+    pub accepted_upload_interval_p95_duration: Option<Duration>,
+    pub accepted_upload_interval_p99_duration: Option<Duration>,
+    pub peak_accepted_upload_interval_duration: Option<Duration>,
+    /// Intervals in which more than one continuous playback request elapsed
+    /// between accepted images. Authored holds and discontinuities are not
+    /// admitted, so this measures decoder delivery starvation rather than
+    /// merely time between uploads.
+    pub decoder_delivery_hold_p95_duration: Option<Duration>,
+    pub peak_decoder_delivery_hold_duration: Option<Duration>,
 }
 
 #[derive(Debug)]
 struct SharedState {
     latest: Option<DecodedFrame>,
     last_published_at: Option<Instant>,
+    publish_interval_durations: DurationWindow,
+    last_accepted_upload_at: Option<Instant>,
+    accepted_upload_interval_durations: DurationWindow,
+    decoder_delivery_hold_durations: DurationWindow,
+    accepted_uploads: u64,
     frame_overwrites: u64,
     frame_drops: u64,
+    stale_commands: u64,
+    superseded_decode_attempts: u64,
+    stale_completed_frames: u64,
+    failed_decode_attempts: u64,
     published_frames: u64,
     pending_frames_peak: u8,
+    decode_attempt_durations: DurationWindow,
     decode_durations: DurationWindow,
     frame_age_durations: DurationWindow,
     upload_durations: DurationWindow,
@@ -531,10 +599,20 @@ impl SharedState {
         Self {
             latest: Some(seed),
             last_published_at: Some(published_at),
+            publish_interval_durations: DurationWindow::default(),
+            last_accepted_upload_at: None,
+            accepted_upload_interval_durations: DurationWindow::default(),
+            decoder_delivery_hold_durations: DurationWindow::default(),
+            accepted_uploads: 0,
             frame_overwrites: 0,
             frame_drops: 0,
+            stale_commands: 0,
+            superseded_decode_attempts: 0,
+            stale_completed_frames: 0,
+            failed_decode_attempts: 0,
             published_frames: 1,
             pending_frames_peak: 1,
+            decode_attempt_durations: DurationWindow::default(),
             decode_durations: DurationWindow::default(),
             frame_age_durations: DurationWindow::default(),
             upload_durations: DurationWindow::default(),
@@ -548,6 +626,10 @@ impl SharedState {
         if self.latest.replace(frame).is_some() {
             self.frame_overwrites = self.frame_overwrites.saturating_add(1);
         }
+        if let Some(previous) = self.last_published_at {
+            self.publish_interval_durations
+                .record(duration_since_or_zero(published_at, previous));
+        }
         self.last_published_at = Some(published_at);
         self.published_frames = self.published_frames.saturating_add(1);
         self.pending_frames_peak = 1;
@@ -556,11 +638,47 @@ impl SharedState {
     }
 
     fn record_seed_decode(&mut self, decode_duration: Duration) {
+        self.decode_attempt_durations.record(decode_duration);
         self.decode_durations.record(decode_duration);
     }
 
-    fn drop_frame(&mut self) {
+    fn record_decode_attempt(&mut self, decode_duration: Duration) {
+        self.decode_attempt_durations.record(decode_duration);
+    }
+
+    fn drop_stale_command(&mut self) {
+        self.stale_commands = self.stale_commands.saturating_add(1);
         self.frame_drops = self.frame_drops.saturating_add(1);
+    }
+
+    fn drop_superseded_decode_attempt(&mut self) {
+        self.superseded_decode_attempts = self.superseded_decode_attempts.saturating_add(1);
+        self.frame_drops = self.frame_drops.saturating_add(1);
+    }
+
+    fn drop_stale_completed_frame(&mut self) {
+        self.stale_completed_frames = self.stale_completed_frames.saturating_add(1);
+        self.frame_drops = self.frame_drops.saturating_add(1);
+    }
+
+    fn record_failed_decode_attempt(&mut self) {
+        self.failed_decode_attempts = self.failed_decode_attempts.saturating_add(1);
+    }
+
+    fn record_accepted_upload(
+        &mut self,
+        accepted_at: Instant,
+        continuous_requests_since_previous: u64,
+    ) {
+        if let Some(previous) = self.last_accepted_upload_at {
+            let interval = duration_since_or_zero(accepted_at, previous);
+            self.accepted_upload_interval_durations.record(interval);
+            if continuous_requests_since_previous > 1 {
+                self.decoder_delivery_hold_durations.record(interval);
+            }
+        }
+        self.last_accepted_upload_at = Some(accepted_at);
+        self.accepted_uploads = self.accepted_uploads.saturating_add(1);
     }
 
     fn set_failed(&mut self, error: String) {
@@ -587,6 +705,7 @@ struct QueuedCommand {
     epoch: u64,
     previous_accepted_codec_identity: Option<CodecFrameIdentity>,
     prepared_seed: bool,
+    continuous: bool,
 }
 
 #[derive(Debug)]
@@ -606,6 +725,10 @@ struct DecodeCommandMailbox {
     stopped: AtomicBool,
     command_overwrites: AtomicU64,
     command_drops: AtomicU64,
+    continuous_requests: AtomicU64,
+    discontinuity_requests: AtomicU64,
+    continuous_overwrites: AtomicU64,
+    discontinuity_overwrites: AtomicU64,
 }
 
 impl DecodeCommandMailbox {
@@ -623,6 +746,10 @@ impl DecodeCommandMailbox {
             stopped: AtomicBool::new(false),
             command_overwrites: AtomicU64::new(0),
             command_drops: AtomicU64::new(0),
+            continuous_requests: AtomicU64::new(0),
+            discontinuity_requests: AtomicU64::new(0),
+            continuous_overwrites: AtomicU64::new(0),
+            discontinuity_overwrites: AtomicU64::new(0),
         })
     }
 
@@ -666,6 +793,7 @@ impl DecodeCommandMailbox {
             self.command_drops.fetch_add(1, Ordering::Relaxed);
             return Ok(false);
         }
+        let continuous = generation == state.generation;
         let epoch = state
             .epoch
             .checked_add(1)
@@ -681,9 +809,27 @@ impl DecodeCommandMailbox {
             previous_accepted_codec_identity: previous_accepted_codec_identity
                 .filter(|identity| identity.source_generation == generation),
             prepared_seed,
+            continuous,
         });
+        if continuous {
+            self.continuous_requests.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.discontinuity_requests.fetch_add(1, Ordering::Relaxed);
+        }
         if replaced.is_some() {
             self.command_overwrites.fetch_add(1, Ordering::Relaxed);
+            if replaced.is_some_and(|queued| match queued.command {
+                DecodeCommand::Select {
+                    generation: replaced_generation,
+                    ..
+                } => replaced_generation == generation,
+                DecodeCommand::Stop => false,
+            }) {
+                self.continuous_overwrites.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.discontinuity_overwrites
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         self.current_generation.store(generation, Ordering::Release);
         self.current_epoch.store(epoch, Ordering::Release);
@@ -705,6 +851,7 @@ impl DecodeCommandMailbox {
             epoch,
             previous_accepted_codec_identity: None,
             prepared_seed: false,
+            continuous: false,
         });
         if replaced.is_some() {
             self.command_overwrites.fetch_add(1, Ordering::Relaxed);
@@ -730,6 +877,14 @@ impl DecodeCommandMailbox {
 
     fn is_current(&self, epoch: u64) -> bool {
         !self.stopped.load(Ordering::Acquire) && self.current_epoch.load(Ordering::Acquire) == epoch
+    }
+
+    /// A source generation, unlike a command epoch, is a true cancellation
+    /// boundary. Continuous playback may advance the epoch every program tick
+    /// while a valid same-generation decode is still running.
+    fn is_generation_current(&self, generation: u64) -> bool {
+        !self.stopped.load(Ordering::Acquire)
+            && self.current_generation.load(Ordering::Acquire) == generation
     }
 
     fn generation(&self) -> u64 {
@@ -761,6 +916,7 @@ pub struct ThreadedDecoder {
     accepted_source_generation: Option<u64>,
     accepted_source_seconds: Option<f64>,
     accepted_codec_identity: Option<CodecFrameIdentity>,
+    last_accepted_continuous_requests: Option<u64>,
     last_consumed_upload_token: Option<ConsumedUploadToken>,
     failure_revision_reported: u64,
     last_consumed_at: Option<Instant>,
@@ -809,10 +965,20 @@ impl ThreadedDecoder {
         let shared = Arc::new(Mutex::new(SharedState {
             latest: None,
             last_published_at: None,
+            publish_interval_durations: DurationWindow::default(),
+            last_accepted_upload_at: None,
+            accepted_upload_interval_durations: DurationWindow::default(),
+            decoder_delivery_hold_durations: DurationWindow::default(),
+            accepted_uploads: 0,
             frame_overwrites: 0,
             frame_drops: 0,
+            stale_commands: 0,
+            superseded_decode_attempts: 0,
+            stale_completed_frames: 0,
+            failed_decode_attempts: 0,
             published_frames: 0,
             pending_frames_peak: 0,
+            decode_attempt_durations: DurationWindow::default(),
             decode_durations: DurationWindow::default(),
             frame_age_durations: DurationWindow::default(),
             upload_durations: DurationWindow::default(),
@@ -893,7 +1059,8 @@ impl ThreadedDecoder {
                          target_seconds,
                          previous_accepted_codec_identity,
                          prepared_seed,
-                         epoch| {
+                         _epoch,
+                         continuous| {
                             prepare_keyframe_index_for_select(
                                 &decoder,
                                 &index_result,
@@ -901,15 +1068,25 @@ impl ThreadedDecoder {
                                 target_seconds,
                                 previous_accepted_codec_identity,
                                 prepared_seed,
-                                || select_mailbox.is_current(epoch),
+                                || select_mailbox.is_generation_current(generation),
                             )?;
                             let mut decoder = decoder.borrow_mut();
-                            let frame = decoder.seek_decode_after_interruptible(
-                                target_seconds,
-                                generation,
-                                previous_accepted_codec_identity,
-                                || select_mailbox.is_current(epoch),
-                            )?;
+                            let frame = if continuous && !prepared_seed {
+                                decoder.seek_decode_after_interruptible_bounded(
+                                    target_seconds,
+                                    generation,
+                                    previous_accepted_codec_identity,
+                                    super::decoder::LIVE_FORWARD_PROGRESS_PERIODS,
+                                    || select_mailbox.is_generation_current(generation),
+                                )?
+                            } else {
+                                decoder.seek_decode_after_interruptible(
+                                    target_seconds,
+                                    generation,
+                                    previous_accepted_codec_identity,
+                                    || select_mailbox.is_generation_current(generation),
+                                )?
+                            };
                             Ok(DecodedFrame::from_video(
                                 frame,
                                 decoder.progress(),
@@ -958,6 +1135,7 @@ impl ThreadedDecoder {
             accepted_source_generation: None,
             accepted_source_seconds: None,
             accepted_codec_identity: None,
+            last_accepted_continuous_requests: None,
             last_consumed_upload_token: None,
             failure_revision_reported: 0,
             last_consumed_at: None,
@@ -974,6 +1152,20 @@ impl ThreadedDecoder {
     ) -> Result<bool, String> {
         if let Some(error) = self.terminal_error_once() {
             return Err(error);
+        }
+        if accepted_frame_remains_selected(
+            generation,
+            target_seconds,
+            self.accepted_source_generation,
+            self.accepted_source_seconds,
+            self.fps,
+        ) {
+            // The caller asks whether the selection was accepted, not whether
+            // a command was enqueued. Holding the already-uploaded exact
+            // selection avoids decoding a lower-rate source at the program
+            // rate, which otherwise runs the codec ahead and eventually
+            // forces an expensive corrective reverse selection.
+            return Ok(true);
         }
         let forward_tolerance = 0.25 / f64::from(self.fps.max(1.0));
         let previous_accepted_codec_identity = (Some(generation)
@@ -1082,7 +1274,7 @@ impl ThreadedDecoder {
             .is_some_and(|frame| frame.source_generation != current_generation)
         {
             state.latest = None;
-            state.drop_frame();
+            state.drop_stale_completed_frame();
         }
         if state
             .command_error
@@ -1167,6 +1359,13 @@ impl ThreadedDecoder {
         let pending_command_depth = u8::try_from(self.mailbox.pending_depth()).unwrap_or(u8::MAX);
         let command_overwrites = self.mailbox.command_overwrites.load(Ordering::Relaxed);
         let command_drops = self.mailbox.command_drops.load(Ordering::Relaxed);
+        let continuous_requests = self.mailbox.continuous_requests.load(Ordering::Relaxed);
+        let discontinuity_requests = self.mailbox.discontinuity_requests.load(Ordering::Relaxed);
+        let continuous_overwrites = self.mailbox.continuous_overwrites.load(Ordering::Relaxed);
+        let discontinuity_overwrites = self
+            .mailbox
+            .discontinuity_overwrites
+            .load(Ordering::Relaxed);
         let state = lock_state(&self.shared);
         DecoderTelemetry {
             last_publish_age: state
@@ -1175,6 +1374,9 @@ impl ThreadedDecoder {
             last_consume_age: self
                 .last_consumed_at
                 .map(|consumed_at| duration_since_or_zero(sampled_at, consumed_at)),
+            last_accepted_upload_age: state
+                .last_accepted_upload_at
+                .map(|accepted_at| duration_since_or_zero(sampled_at, accepted_at)),
             pending_command_depth,
             pending_frames: u8::from(state.latest.is_some()),
             pending_frames_peak: state.pending_frames_peak,
@@ -1182,17 +1384,39 @@ impl ThreadedDecoder {
             consumed_frames: self.consumed_frames,
             command_overwrites,
             command_drops,
+            continuous_requests,
+            discontinuity_requests,
+            continuous_overwrites,
+            discontinuity_overwrites,
             frame_overwrites: state.frame_overwrites,
             frame_drops: state.frame_drops,
+            stale_commands: state.stale_commands,
+            superseded_decode_attempts: state.superseded_decode_attempts,
+            stale_completed_frames: state.stale_completed_frames,
+            failed_decode_attempts: state.failed_decode_attempts,
+            decode_attempt_samples: state.decode_attempt_durations.total_samples,
+            last_decode_attempt_duration: state.decode_attempt_durations.last(),
+            peak_decode_attempt_duration: state.decode_attempt_durations.peak(),
+            decode_attempt_p95_duration: state.decode_attempt_durations.p95(),
             decode_samples: state.decode_durations.total_samples,
             last_decode_duration: state.decode_durations.last(),
             peak_decode_duration: state.decode_durations.peak(),
             decode_p95_duration: state.decode_durations.p95(),
+            publish_interval_p95_duration: state.publish_interval_durations.p95(),
+            publish_interval_p99_duration: state.publish_interval_durations.p99(),
+            peak_publish_interval_duration: state.publish_interval_durations.peak(),
             frame_age_p95_duration: state.frame_age_durations.p95(),
             upload_samples: state.upload_durations.total_samples,
             last_upload_duration: state.upload_durations.last(),
             peak_upload_duration: state.upload_durations.peak(),
             upload_p95_duration: state.upload_durations.p95(),
+            accepted_uploads: state.accepted_uploads,
+            accepted_upload_interval_p50_duration: state.accepted_upload_interval_durations.p50(),
+            accepted_upload_interval_p95_duration: state.accepted_upload_interval_durations.p95(),
+            accepted_upload_interval_p99_duration: state.accepted_upload_interval_durations.p99(),
+            peak_accepted_upload_interval_duration: state.accepted_upload_interval_durations.peak(),
+            decoder_delivery_hold_p95_duration: state.decoder_delivery_hold_durations.p95(),
+            peak_decoder_delivery_hold_duration: state.decoder_delivery_hold_durations.peak(),
         }
     }
 
@@ -1209,21 +1433,35 @@ impl ThreadedDecoder {
         codec_identity: Option<CodecFrameIdentity>,
         duration: Duration,
     ) {
-        lock_state(&self.shared).upload_durations.record(duration);
         let upload_matches_consumed_frame = self.last_consumed_upload_token.is_some_and(|token| {
             token.source_generation == source_generation
                 && token.source_seconds_bits == source_seconds.to_bits()
                 && token.codec_identity == codec_identity
         });
+        let mut state = lock_state(&self.shared);
+        state.upload_durations.record(duration);
         if source_seconds.is_finite() && source_seconds >= 0.0 && upload_matches_consumed_frame {
+            let continuous_requests = self.mailbox.continuous_requests.load(Ordering::Relaxed);
+            let continuous_requests_since_previous =
+                if self.accepted_source_generation == Some(source_generation) {
+                    self.last_accepted_continuous_requests
+                        .map_or(0, |previous| continuous_requests.saturating_sub(previous))
+                } else {
+                    0
+                };
+            state.record_accepted_upload(Instant::now(), continuous_requests_since_previous);
+            drop(state);
             self.accepted_source_generation = Some(source_generation);
             self.accepted_source_seconds = Some(source_seconds);
             self.accepted_codec_identity =
                 codec_identity.filter(|identity| identity.source_generation == source_generation);
+            self.last_accepted_continuous_requests = Some(continuous_requests);
         } else {
+            drop(state);
             self.accepted_source_generation = None;
             self.accepted_source_seconds = None;
             self.accepted_codec_identity = None;
+            self.last_accepted_continuous_requests = None;
         }
     }
 
@@ -1238,6 +1476,28 @@ impl ThreadedDecoder {
         self.failure_revision_reported = state.health_revision;
         Some(error.clone())
     }
+}
+
+fn accepted_frame_remains_selected(
+    requested_generation: u64,
+    target_seconds: f64,
+    accepted_generation: Option<u64>,
+    accepted_source_seconds: Option<f64>,
+    source_fps: f32,
+) -> bool {
+    let Some(accepted_source_seconds) = accepted_source_seconds else {
+        return false;
+    };
+    if accepted_generation != Some(requested_generation)
+        || !target_seconds.is_finite()
+        || !accepted_source_seconds.is_finite()
+        || !source_fps.is_finite()
+        || source_fps <= 0.0
+        || target_seconds + 0.5 / f64::from(source_fps) < accepted_source_seconds
+    {
+        return false;
+    }
+    target_seconds <= accepted_source_seconds + 0.5 / f64::from(source_fps)
 }
 
 impl Drop for ThreadedDecoder {
@@ -1284,6 +1544,7 @@ fn run_decode_commands<S>(
         Option<CodecFrameIdentity>,
         bool,
         u64,
+        bool,
     ) -> Result<DecodedFrame, DecodeWorkError>,
 {
     loop {
@@ -1291,34 +1552,37 @@ fn run_decode_commands<S>(
         if matches!(queued.command, DecodeCommand::Stop) {
             return;
         }
-        if !mailbox.is_current(queued.epoch) {
-            lock_state(&shared).drop_frame();
-            continue;
-        }
-
-        let (generation, result, decode_duration) = match queued.command {
+        let (generation, target_seconds) = match queued.command {
             DecodeCommand::Select {
                 generation,
                 target_seconds,
-            } => {
-                let decode_started = Instant::now();
-                let result = select_frame(
-                    generation,
-                    target_seconds,
-                    queued.previous_accepted_codec_identity,
-                    queued.prepared_seed,
-                    queued.epoch,
-                );
-                (generation, result, decode_started.elapsed())
-            }
+            } => (generation, target_seconds),
             DecodeCommand::Stop => unreachable!("stop returned above"),
         };
-
-        if !mailbox.is_current(queued.epoch) {
-            lock_state(&shared).drop_frame();
+        if !mailbox.is_generation_current(generation) {
+            lock_state(&shared).drop_stale_command();
             continue;
         }
+
+        let decode_started = Instant::now();
+        let result = select_frame(
+            generation,
+            target_seconds,
+            queued.previous_accepted_codec_identity,
+            queued.prepared_seed,
+            queued.epoch,
+            queued.continuous,
+        );
+        let decode_duration = decode_started.elapsed();
+
+        let generation_is_current = mailbox.is_generation_current(generation);
+        let epoch_is_latest = mailbox.is_current(queued.epoch);
         let mut state = lock_state(&shared);
+        state.record_decode_attempt(decode_duration);
+        if !generation_is_current {
+            state.drop_superseded_decode_attempt();
+            continue;
+        }
         match result {
             Ok(mut frame) => {
                 frame.source_generation = generation;
@@ -1343,9 +1607,16 @@ fn run_decode_commands<S>(
                 state.publish(frame, Instant::now(), decode_duration);
             }
             Err(DecodeWorkError::Failed(error)) => {
-                state.command_error = Some((generation, queued.epoch, error));
+                state.record_failed_decode_attempt();
+                // A newer same-generation desire makes this failure obsolete;
+                // the worker will immediately try that newest target. Exposing
+                // the older error would turn healthy coalescing into a visible
+                // false failure.
+                if epoch_is_latest {
+                    state.command_error = Some((generation, queued.epoch, error));
+                }
             }
-            Err(DecodeWorkError::Superseded) => state.drop_frame(),
+            Err(DecodeWorkError::Superseded) => state.drop_superseded_decode_attempt(),
         }
     }
 }
@@ -1429,6 +1700,7 @@ mod tests {
             accepted_source_generation: None,
             accepted_source_seconds: None,
             accepted_codec_identity: None,
+            last_accepted_continuous_requests: None,
             last_consumed_upload_token: None,
             failure_revision_reported: 0,
             last_consumed_at: None,
@@ -1656,6 +1928,46 @@ mod tests {
     }
 
     #[test]
+    fn an_already_uploaded_lower_rate_frame_satisfies_its_selection_window() {
+        let mut decoder = synthetic_decoder(DecodedFrame::synthetic(3, 0, 0));
+        decoder.fps = 24.0;
+        let seed = decoder
+            .try_next_ready_frame_result()
+            .unwrap()
+            .expect("seed frame");
+        decoder.record_accepted_upload(
+            seed.source_generation,
+            seed.source_seconds,
+            seed.codec_identity,
+            Duration::ZERO,
+        );
+
+        assert!(decoder
+            .request_source_time(0, seed.source_seconds + 0.020)
+            .unwrap());
+        assert_eq!(decoder.mailbox.pending_depth(), 0);
+
+        assert!(decoder
+            .request_source_time(0, seed.source_seconds + 0.021)
+            .unwrap());
+        assert_eq!(decoder.mailbox.pending_depth(), 1);
+        assert!(!accepted_frame_remains_selected(
+            1,
+            seed.source_seconds,
+            Some(0),
+            Some(seed.source_seconds),
+            24.0,
+        ));
+        assert!(!accepted_frame_remains_selected(
+            0,
+            seed.source_seconds - 0.030,
+            Some(0),
+            Some(seed.source_seconds),
+            24.0,
+        ));
+    }
+
+    #[test]
     fn prepared_seed_marker_is_overwritten_with_the_newest_live_selection() {
         let mailbox = DecodeCommandMailbox::new();
         assert!(mailbox.select_prepared_seed(1, 30.0).unwrap());
@@ -1833,6 +2145,26 @@ mod tests {
     }
 
     #[test]
+    fn decoder_delivery_holds_require_multiple_continuous_desires() {
+        let started = Instant::now();
+        let mut state =
+            SharedState::healthy_with_seed_at(DecodedFrame::synthetic(1, 0, 0), started);
+        state.record_accepted_upload(started, 0);
+        state.record_accepted_upload(started + Duration::from_secs(2), 1);
+        assert_eq!(
+            state.accepted_upload_interval_durations.peak(),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(state.decoder_delivery_hold_durations.peak(), None);
+
+        state.record_accepted_upload(started + Duration::from_millis(2_400), 12);
+        assert_eq!(
+            state.decoder_delivery_hold_durations.peak(),
+            Some(Duration::from_millis(400))
+        );
+    }
+
+    #[test]
     fn telemetry_reports_pending_overwrite_stale_drop_and_upload_samples() {
         let published_at = Instant::now();
         let mut decoder = synthetic_decoder_at(DecodedFrame::synthetic(1, 0, 0), published_at);
@@ -1931,6 +2263,128 @@ mod tests {
     }
 
     #[test]
+    fn newer_same_generation_desire_does_not_cancel_the_running_decode() {
+        let mailbox = DecodeCommandMailbox::new();
+        let shared = Arc::new(Mutex::new(SharedState {
+            latest: None,
+            last_published_at: None,
+            publish_interval_durations: DurationWindow::default(),
+            last_accepted_upload_at: None,
+            accepted_upload_interval_durations: DurationWindow::default(),
+            decoder_delivery_hold_durations: DurationWindow::default(),
+            accepted_uploads: 0,
+            frame_overwrites: 0,
+            frame_drops: 0,
+            stale_commands: 0,
+            superseded_decode_attempts: 0,
+            stale_completed_frames: 0,
+            failed_decode_attempts: 0,
+            published_frames: 0,
+            pending_frames_peak: 0,
+            decode_attempt_durations: DurationWindow::default(),
+            decode_durations: DurationWindow::default(),
+            frame_age_durations: DurationWindow::default(),
+            upload_durations: DurationWindow::default(),
+            command_error: None,
+            health: DecoderHealth::Healthy,
+            health_revision: 1,
+        }));
+        let first_started = Arc::new((Mutex::new(false), Condvar::new()));
+        let first_release = Arc::new((Mutex::new(false), Condvar::new()));
+        let second_started = Arc::new((Mutex::new(false), Condvar::new()));
+        let second_release = Arc::new((Mutex::new(false), Condvar::new()));
+
+        assert!(mailbox.select(4, 1.0).unwrap());
+        let worker_mailbox = mailbox.clone();
+        let worker_shared = shared.clone();
+        let worker_first_started = first_started.clone();
+        let worker_first_release = first_release.clone();
+        let worker_second_started = second_started.clone();
+        let worker_second_release = second_release.clone();
+        let worker = std::thread::spawn(move || {
+            run_decode_commands(
+                worker_mailbox,
+                worker_shared,
+                |generation, target_seconds, _, _, _, _| {
+                    let (started, release, value) = if target_seconds < 1.5 {
+                        (&worker_first_started, &worker_first_release, 10)
+                    } else {
+                        (&worker_second_started, &worker_second_release, 20)
+                    };
+                    *lock_recover(&started.0) = true;
+                    started.1.notify_one();
+                    let mut released = lock_recover(&release.0);
+                    while !*released {
+                        released = release
+                            .1
+                            .wait(released)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    Ok(DecodedFrame::synthetic(value, generation, 0))
+                },
+            );
+        });
+
+        let mut did_start = lock_recover(&first_started.0);
+        while !*did_start {
+            did_start = first_started
+                .1
+                .wait(did_start)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        drop(did_start);
+
+        let first_epoch = mailbox.epoch();
+        assert!(mailbox.select(4, 2.0).unwrap());
+        assert!(!mailbox.is_current(first_epoch));
+        assert!(mailbox.is_generation_current(4));
+        *lock_recover(&first_release.0) = true;
+        first_release.1.notify_one();
+
+        let mut second_did_start = lock_recover(&second_started.0);
+        while !*second_did_start {
+            second_did_start = second_started
+                .1
+                .wait(second_did_start)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        drop(second_did_start);
+        {
+            let state = lock_state(&shared);
+            assert_eq!(
+                state.latest.as_ref().map(|frame| frame.rgba.as_slice()),
+                Some(&[10][..])
+            );
+            assert_eq!(state.published_frames, 1);
+            assert_eq!(state.frame_drops, 0);
+            assert_eq!(state.decode_attempt_durations.total_samples, 1);
+        }
+
+        *lock_recover(&second_release.0) = true;
+        second_release.1.notify_one();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let state = lock_state(&shared);
+            if state.published_frames == 2 {
+                assert_eq!(
+                    state.latest.as_ref().map(|frame| frame.rgba.as_slice()),
+                    Some(&[20][..])
+                );
+                assert_eq!(state.frame_drops, 0);
+                assert_eq!(state.decode_attempt_durations.total_samples, 2);
+                break;
+            }
+            drop(state);
+            assert!(Instant::now() < deadline, "second desire did not publish");
+            std::thread::yield_now();
+        }
+        assert_eq!(mailbox.continuous_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(mailbox.discontinuity_requests.load(Ordering::Relaxed), 1);
+        mailbox.stop();
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn completed_mailbox_overwrite_is_counted_without_growing_depth() {
         let published_at = Instant::now();
         let decoder = synthetic_decoder_at(DecodedFrame::synthetic(1, 0, 0), published_at);
@@ -1997,10 +2451,20 @@ mod tests {
         let shared = Arc::new(Mutex::new(SharedState {
             latest: None,
             last_published_at: None,
+            publish_interval_durations: DurationWindow::default(),
+            last_accepted_upload_at: None,
+            accepted_upload_interval_durations: DurationWindow::default(),
+            decoder_delivery_hold_durations: DurationWindow::default(),
+            accepted_uploads: 0,
             frame_overwrites: 0,
             frame_drops: 0,
+            stale_commands: 0,
+            superseded_decode_attempts: 0,
+            stale_completed_frames: 0,
+            failed_decode_attempts: 0,
             published_frames: 0,
             pending_frames_peak: 0,
+            decode_attempt_durations: DurationWindow::default(),
             decode_durations: DurationWindow::default(),
             frame_age_durations: DurationWindow::default(),
             upload_durations: DurationWindow::default(),
@@ -2017,24 +2481,28 @@ mod tests {
         let worker_started = started.clone();
         let worker_release = release.clone();
         let worker = std::thread::spawn(move || {
-            run_decode_commands(worker_mailbox, worker_shared, |generation, _, _, _, _| {
-                if generation == 0 {
-                    *lock_recover(&worker_started.0) = true;
-                    worker_started.1.notify_one();
-                    let mut released = lock_recover(&worker_release.0);
-                    while !*released {
-                        released = worker_release
-                            .1
-                            .wait(released)
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            run_decode_commands(
+                worker_mailbox,
+                worker_shared,
+                |generation, _, _, _, _, _| {
+                    if generation == 0 {
+                        *lock_recover(&worker_started.0) = true;
+                        worker_started.1.notify_one();
+                        let mut released = lock_recover(&worker_release.0);
+                        while !*released {
+                            released = worker_release
+                                .1
+                                .wait(released)
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        }
+                        Err(DecodeWorkError::Failed(
+                            "stale generation error".to_string(),
+                        ))
+                    } else {
+                        Ok(DecodedFrame::synthetic(7, generation, 0))
                     }
-                    Err(DecodeWorkError::Failed(
-                        "stale generation error".to_string(),
-                    ))
-                } else {
-                    Ok(DecodedFrame::synthetic(7, generation, 0))
-                }
-            });
+                },
+            );
         });
         let mut did_start = lock_recover(&started.0);
         while !*did_start {
@@ -2073,10 +2541,20 @@ mod tests {
         let shared = Arc::new(Mutex::new(SharedState {
             latest: None,
             last_published_at: None,
+            publish_interval_durations: DurationWindow::default(),
+            last_accepted_upload_at: None,
+            accepted_upload_interval_durations: DurationWindow::default(),
+            decoder_delivery_hold_durations: DurationWindow::default(),
+            accepted_uploads: 0,
             frame_overwrites: 0,
             frame_drops: 0,
+            stale_commands: 0,
+            superseded_decode_attempts: 0,
+            stale_completed_frames: 0,
+            failed_decode_attempts: 0,
             published_frames: 0,
             pending_frames_peak: 0,
+            decode_attempt_durations: DurationWindow::default(),
             decode_durations: DurationWindow::default(),
             frame_age_durations: DurationWindow::default(),
             upload_durations: DurationWindow::default(),
@@ -2093,24 +2571,28 @@ mod tests {
         let worker_started = started.clone();
         let worker_release = release.clone();
         let worker = std::thread::spawn(move || {
-            run_decode_commands(worker_mailbox, worker_shared, |generation, _, _, _, _| {
-                if generation == 10 {
-                    *lock_recover(&worker_started.0) = true;
-                    worker_started.1.notify_one();
-                    let mut released = lock_recover(&worker_release.0);
-                    while !*released {
-                        released = worker_release
-                            .1
-                            .wait(released)
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            run_decode_commands(
+                worker_mailbox,
+                worker_shared,
+                |generation, _, _, _, _, _| {
+                    if generation == 10 {
+                        *lock_recover(&worker_started.0) = true;
+                        worker_started.1.notify_one();
+                        let mut released = lock_recover(&worker_release.0);
+                        while !*released {
+                            released = worker_release
+                                .1
+                                .wait(released)
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        }
+                        Ok(synthetic_frame_with_motion(10, generation))
+                    } else {
+                        // Deliberately return mismatched adapter metadata. The
+                        // publication transaction must retag both it and pixels.
+                        Ok(synthetic_frame_with_motion(20, 0))
                     }
-                    Ok(synthetic_frame_with_motion(10, generation))
-                } else {
-                    // Deliberately return mismatched adapter metadata. The
-                    // publication transaction must retag both it and pixels.
-                    Ok(synthetic_frame_with_motion(20, 0))
-                }
-            });
+                },
+            );
         });
         let mut did_start = lock_recover(&started.0);
         while !*did_start {
@@ -2185,6 +2667,221 @@ mod tests {
             decoder.health(),
             DecoderHealth::Failed("synthetic decode failure".into())
         );
+    }
+
+    /// Real-media delivery receipt for the two corrected Cygnus controls. It
+    /// intentionally stays opt-in: the source files are operator-owned and a
+    /// useful run consumes real wall time. The fixture drives two independent
+    /// workers with the same rational 30 Hz, request-before-harvest order as
+    /// the live frame loop, while treating each harvested image as an accepted
+    /// upload so codec-motion predecessor semantics remain exercised.
+    #[test]
+    #[ignore = "requires COLLIDEOSCOPE_DELIVERY_SWAN_FIXTURE and COLLIDEOSCOPE_DELIVERY_NATURE_FIXTURE"]
+    fn real_two_source_thirty_hertz_delivery_receipt() {
+        let paths = [
+            std::env::var("COLLIDEOSCOPE_DELIVERY_SWAN_FIXTURE")
+                .expect("set COLLIDEOSCOPE_DELIVERY_SWAN_FIXTURE"),
+            std::env::var("COLLIDEOSCOPE_DELIVERY_NATURE_FIXTURE")
+                .expect("set COLLIDEOSCOPE_DELIVERY_NATURE_FIXTURE"),
+        ];
+        let seconds = std::env::var("COLLIDEOSCOPE_DELIVERY_RECEIPT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(60)
+            .clamp(1, 300);
+        let warmup_seconds = std::env::var("COLLIDEOSCOPE_DELIVERY_WARMUP_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(10)
+            .min(60);
+        let fps = 30_u64;
+        let ticks = seconds.saturating_mul(fps);
+        let warmup_ticks = warmup_seconds.saturating_mul(fps);
+        let total_ticks = warmup_ticks.saturating_add(ticks);
+        let mut decoders = paths
+            .iter()
+            .map(|path| {
+                ThreadedDecoder::open_with_media_policy(
+                    path,
+                    &MediaSafetyPolicy::safe(),
+                    MediaDeviceLimits::none(),
+                )
+                .unwrap_or_else(|error| panic!("could not open {path}: {error}"))
+            })
+            .collect::<Vec<_>>();
+        for (decoder, path) in decoders.iter().zip(&paths) {
+            assert!(
+                decoder.duration_seconds > (warmup_seconds + seconds) as f64 + 1.0,
+                "{path} is too short for an uninterrupted {warmup_seconds}s warm-up plus {seconds}s receipt"
+            );
+        }
+
+        let started = Instant::now();
+        let mut accepted_counts = vec![0_u64; decoders.len()];
+        let mut accepted_identities = vec![std::collections::HashSet::new(); decoders.len()];
+        let mut last_accepted_at = vec![started; decoders.len()];
+        let mut last_accepted_source_seconds = vec![0.0; decoders.len()];
+        let mut peak_holds = vec![Duration::ZERO; decoders.len()];
+        let mut telemetry_baselines = vec![DecoderTelemetry::default(); decoders.len()];
+
+        for (index, decoder) in decoders.iter_mut().enumerate() {
+            let seed = decoder
+                .try_next_ready_frame_result()
+                .unwrap_or_else(|error| panic!("seed failed for {}: {error}", paths[index]))
+                .unwrap_or_else(|| panic!("no seed frame for {}", paths[index]));
+            accepted_identities[index].insert(seed.source_seconds.to_bits());
+            decoder.record_accepted_upload(
+                seed.source_generation,
+                seed.source_seconds,
+                seed.codec_identity,
+                Duration::ZERO,
+            );
+            accepted_counts[index] = 1;
+            last_accepted_at[index] = Instant::now();
+            last_accepted_source_seconds[index] = seed.source_seconds;
+        }
+        if warmup_ticks == 0 {
+            for (index, decoder) in decoders.iter().enumerate() {
+                telemetry_baselines[index] = decoder.telemetry();
+                accepted_counts[index] = 0;
+                accepted_identities[index].clear();
+                last_accepted_at[index] = Instant::now();
+            }
+        }
+
+        for ordinal in 1..=total_ticks {
+            let deadline =
+                started + Duration::from_nanos(ordinal.saturating_mul(1_000_000_000) / fps);
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                if remaining > Duration::from_millis(2) {
+                    std::thread::sleep(remaining - Duration::from_millis(1));
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+
+            let measuring = ordinal > warmup_ticks;
+            for (index, decoder) in decoders.iter_mut().enumerate() {
+                let target_seconds = ordinal as f64 / fps as f64;
+                decoder
+                    .request_source_time(0, target_seconds)
+                    .unwrap_or_else(|error| {
+                        panic!("selection failed for {}: {error}", paths[index])
+                    });
+                if let Some(frame) = decoder
+                    .try_next_ready_frame_result()
+                    .unwrap_or_else(|error| panic!("harvest failed for {}: {error}", paths[index]))
+                {
+                    let accepted_at = Instant::now();
+                    if measuring {
+                        let hold = accepted_at.saturating_duration_since(last_accepted_at[index]);
+                        peak_holds[index] = peak_holds[index].max(hold);
+                        if hold > Duration::from_nanos(4_000_000_000 / fps) {
+                            eprintln!(
+                                "delivery hold {}: target={target_seconds:.6}s previous_source={:.6}s accepted_source={:.6}s hold_ms={}",
+                                paths[index],
+                                last_accepted_source_seconds[index],
+                                frame.source_seconds,
+                                hold.as_millis(),
+                            );
+                        }
+                        accepted_identities[index].insert(frame.source_seconds.to_bits());
+                        accepted_counts[index] = accepted_counts[index].saturating_add(1);
+                    }
+                    last_accepted_at[index] = accepted_at;
+                    last_accepted_source_seconds[index] = frame.source_seconds;
+                    decoder.record_accepted_upload(
+                        frame.source_generation,
+                        frame.source_seconds,
+                        frame.codec_identity,
+                        Duration::ZERO,
+                    );
+                }
+            }
+            if ordinal == warmup_ticks {
+                for (index, decoder) in decoders.iter().enumerate() {
+                    telemetry_baselines[index] = decoder.telemetry();
+                    accepted_counts[index] = 0;
+                    accepted_identities[index].clear();
+                    peak_holds[index] = Duration::ZERO;
+                    last_accepted_at[index] = Instant::now();
+                }
+            }
+        }
+
+        let mut failures = Vec::new();
+        for (index, decoder) in decoders.iter().enumerate() {
+            let telemetry = decoder.telemetry();
+            let baseline = telemetry_baselines[index];
+            let delivered = accepted_counts[index];
+            let distinct = accepted_identities[index].len() as u64;
+            let expected_distinct = (seconds as f64 * f64::from(decoder.fps.min(fps as f32)))
+                .floor()
+                .max(1.0) as u64;
+            let continuous_overwrites = telemetry
+                .continuous_overwrites
+                .saturating_sub(baseline.continuous_overwrites);
+            let stale_commands = telemetry
+                .stale_commands
+                .saturating_sub(baseline.stale_commands);
+            let cancelled = telemetry
+                .superseded_decode_attempts
+                .saturating_sub(baseline.superseded_decode_attempts);
+            let failed = telemetry
+                .failed_decode_attempts
+                .saturating_sub(baseline.failed_decode_attempts);
+            eprintln!(
+                "delivery receipt {}: warmup_s={} requested={} expected_distinct={} distinct={} accepted={} continuous_overwrites={} stale={} cancelled={} failed={} all_attempt_p95_us={} successful_p95_us={} hold_p95_ms={} hold_p99_ms={} hold_max_ms={} decoder_hold_p95_ms={} decoder_hold_max_ms={} current_hold_ms={}",
+                paths[index],
+                warmup_seconds,
+                ticks,
+                expected_distinct,
+                distinct,
+                delivered,
+                continuous_overwrites,
+                stale_commands,
+                cancelled,
+                failed,
+                telemetry.decode_attempt_p95_duration.map_or(0, |value| value.as_micros()),
+                telemetry.decode_p95_duration.map_or(0, |value| value.as_micros()),
+                telemetry.accepted_upload_interval_p95_duration.map_or(0, |value| value.as_millis()),
+                telemetry.accepted_upload_interval_p99_duration.map_or(0, |value| value.as_millis()),
+                peak_holds[index].as_millis(),
+                telemetry.decoder_delivery_hold_p95_duration.map_or(0, |value| value.as_millis()),
+                telemetry.peak_decoder_delivery_hold_duration.map_or(0, |value| value.as_millis()),
+                Instant::now().saturating_duration_since(last_accepted_at[index]).as_millis(),
+            );
+            if stale_commands != 0 || cancelled != 0 || failed != 0 {
+                failures.push(format!(
+                    "{} reported stale/cancelled/failed {stale_commands}/{cancelled}/{failed}",
+                    paths[index]
+                ));
+            }
+            if delivered.saturating_mul(100) < expected_distinct.saturating_mul(95) {
+                failures.push(format!(
+                    "{} accepted only {delivered}/{expected_distinct} expected due source identities",
+                    paths[index]
+                ));
+            }
+            if distinct.saturating_mul(100) < expected_distinct.saturating_mul(95) {
+                failures.push(format!(
+                    "{} delivered only {distinct}/{expected_distinct} distinct due source identities",
+                    paths[index]
+                ));
+            }
+            if peak_holds[index] > Duration::from_nanos(4_000_000_000 / fps) {
+                failures.push(format!(
+                    "{} held a source image for {:?}",
+                    paths[index], peak_holds[index]
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("; "));
     }
 
     #[test]

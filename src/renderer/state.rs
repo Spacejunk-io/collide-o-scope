@@ -2146,6 +2146,22 @@ mod temporal_state_tests {
     }
 
     #[test]
+    fn main_egui_surface_advertises_and_targets_only_the_compatible_raw_twin() {
+        assert_eq!(
+            egui_surface_view_format(wgpu::TextureFormat::Rgba8UnormSrgb),
+            wgpu::TextureFormat::Rgba8Unorm
+        );
+        assert_eq!(
+            egui_surface_view_formats(wgpu::TextureFormat::Bgra8UnormSrgb),
+            vec![wgpu::TextureFormat::Bgra8Unorm]
+        );
+        assert_eq!(
+            egui_surface_view_formats(wgpu::TextureFormat::Bgra8Unorm),
+            Vec::<wgpu::TextureFormat>::new()
+        );
+    }
+
+    #[test]
     fn live_layer_accumulation_starts_transparent() {
         let clear = transparent_accumulation_clear();
         assert_eq!([clear.r, clear.g, clear.b, clear.a], [0.0; 4]);
@@ -5175,6 +5191,18 @@ fn preferred_surface_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::Tex
         .or_else(|| formats.first().copied())
 }
 
+/// egui performs its own sRGB-aware blending and expects a raw render target.
+/// A surface's raw twin is view-compatible with its selected sRGB format; the
+/// audience/output surfaces retain their authored formats and are unaffected.
+pub(crate) fn egui_surface_view_format(surface_format: wgpu::TextureFormat) -> wgpu::TextureFormat {
+    surface_format.remove_srgb_suffix()
+}
+
+fn egui_surface_view_formats(surface_format: wgpu::TextureFormat) -> Vec<wgpu::TextureFormat> {
+    let raw = egui_surface_view_format(surface_format);
+    (raw != surface_format).then_some(raw).into_iter().collect()
+}
+
 fn preferred_present_mode(modes: &[wgpu::PresentMode]) -> Option<wgpu::PresentMode> {
     if modes.contains(&wgpu::PresentMode::Fifo) {
         Some(wgpu::PresentMode::Fifo)
@@ -5257,7 +5285,7 @@ impl Renderer {
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
+            view_formats: egui_surface_view_formats(surface_format),
             desired_maximum_frame_latency: 2,
         };
         configure_surface_checked(&device, &surface, &config, &gpu_health)?;

@@ -56,6 +56,16 @@ const MAX_PROMPT_SEEK_PIXEL_WORK: u64 = 128 * 1920 * 1080;
 /// another 1.5 periods old, so four periods preserve that contract with one
 /// period of timestamp/reorder margin.
 const SEEK_REVERSE_TAIL_PERIODS: f64 = 4.0;
+/// A continuous live selection may advance through at most this many newly due
+/// source periods before publishing its best exact decoded image. This bounds
+/// one worker turn so a moving target cannot turn into a progressively longer
+/// forward walk and a visible multi-hundred-millisecond hold.
+pub(super) const LIVE_FORWARD_PROGRESS_PERIODS: u32 = 1;
+/// VP9's costly pictures showed severe single-thread tail latency even though
+/// whole-file software decode was comfortably faster than realtime. Four
+/// bounded slice workers reached the local throughput plateau without adding
+/// frame-reorder delay or an unledgered decoder-frame working set.
+const VP9_MAX_SLICE_THREADS: usize = 4;
 
 /// Admission class for one absolute decode walk with the index and live
 /// stream position currently available.
@@ -71,14 +81,53 @@ pub(super) enum SeekWorkload {
 }
 
 /// FFmpeg only attaches `AV_FRAME_DATA_MOTION_VECTORS` when this flag is set
-/// before `avcodec_open2`. Keep the narrow unsafe ABI write in one place and
-/// call it for initial open, dimension probe, and every EOF reopen.
+/// before `avcodec_open2`. Keep the narrow unsafe ABI write in one place. It is
+/// enabled only for the codec family whose reference law the engine can prove;
+/// asking H.264/VP9 to export vectors that must later be rejected adds decode
+/// work without creating an admissible Codec Mosh product.
 fn enable_export_motion_vectors(context: &mut ffmpeg::codec::context::Context) {
     // SAFETY: `Context` owns a live, uniquely borrowed AVCodecContext. The
     // flag is part of FFmpeg's public ABI and is written before decoder open.
     unsafe {
         (*context.as_mut_ptr()).flags2 |= ffmpeg::ffi::AV_CODEC_FLAG2_EXPORT_MVS;
     }
+}
+
+fn codec_may_export_admissible_motion(codec_id: ffmpeg::codec::Id) -> bool {
+    codec_id == ffmpeg::codec::Id::MPEG4
+}
+
+fn enable_admissible_motion_vectors(context: &mut ffmpeg::codec::context::Context) {
+    if codec_may_export_admissible_motion(context.id()) {
+        enable_export_motion_vectors(context);
+    }
+}
+
+fn configure_low_latency_software_threads(context: &mut ffmpeg::codec::context::Context) -> usize {
+    let count = low_latency_software_thread_count(
+        context.id(),
+        std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+    );
+    if count > 1 {
+        let mut config = ffmpeg::threading::Config::count(count);
+        config.kind = ffmpeg::threading::Type::Slice;
+        context.set_threading(config);
+    }
+    count
+}
+
+fn low_latency_software_thread_count(codec_id: ffmpeg::codec::Id, available: usize) -> usize {
+    if codec_id == ffmpeg::codec::Id::VP9 {
+        available.clamp(1, VP9_MAX_SLICE_THREADS)
+    } else {
+        1
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WalkPolicy {
+    compose_skipped_motion: bool,
+    cache_reverse_tail: bool,
 }
 
 /// Where the live FFmpeg decoder actually sits, as opposed to which picture
@@ -237,9 +286,8 @@ impl VideoDecoder {
             .streams()
             .best(Type::Video)
             .ok_or("No video stream found")?;
-        let mut codec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+        let codec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|error| format!("Codec params: {error}"))?;
-        enable_export_motion_vectors(&mut codec_ctx);
         let decoder = codec_ctx
             .decoder()
             .video()
@@ -293,8 +341,9 @@ impl VideoDecoder {
 
         let mut codec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|e| format!("Codec params: {e}"))?;
-        enable_export_motion_vectors(&mut codec_ctx);
         let codec_id = codec_ctx.id();
+        enable_admissible_motion_vectors(&mut codec_ctx);
+        configure_low_latency_software_threads(&mut codec_ctx);
         let decoder = codec_ctx
             .decoder()
             .video()
@@ -577,7 +626,14 @@ impl VideoDecoder {
     where
         F: FnMut() -> bool,
     {
-        self.seek_decode_internal(target_seconds, source_generation, None, false, is_current)
+        self.seek_decode_internal(
+            target_seconds,
+            source_generation,
+            None,
+            false,
+            None,
+            is_current,
+        )
     }
 
     /// Select one absolute frame while retaining every adjacent codec-motion
@@ -614,6 +670,32 @@ impl VideoDecoder {
             source_generation,
             previous_accepted_identity,
             true,
+            None,
+            is_current,
+        )
+    }
+
+    /// Live continuous-playback form. A discontinuity continues to use the
+    /// exact method above; only a proven forward continuation may yield after
+    /// bounded progress, preserving exact pixels and decoder state while
+    /// preventing an always-moving target from starving publication.
+    pub(super) fn seek_decode_after_interruptible_bounded<F>(
+        &mut self,
+        target_seconds: f64,
+        source_generation: u64,
+        previous_accepted_identity: Option<CodecFrameIdentity>,
+        max_forward_periods: u32,
+        is_current: F,
+    ) -> Result<DecodedVideoFrame, DecodeWorkError>
+    where
+        F: FnMut() -> bool,
+    {
+        self.seek_decode_internal(
+            target_seconds,
+            source_generation,
+            previous_accepted_identity,
+            true,
+            Some(max_forward_periods.max(1)),
             is_current,
         )
     }
@@ -624,6 +706,7 @@ impl VideoDecoder {
         source_generation: u64,
         previous_accepted_identity: Option<CodecFrameIdentity>,
         compose_skipped_motion: bool,
+        max_forward_periods: Option<u32>,
         mut is_current: F,
     ) -> Result<DecodedVideoFrame, DecodeWorkError>
     where
@@ -682,11 +765,24 @@ impl VideoDecoder {
                     .floor()
                     .max(0.0) as u64;
             }
+            let walk_target_seconds = if continue_forward {
+                bounded_continuous_walk_target(
+                    self.stream_position,
+                    target_seconds,
+                    frame_period,
+                    max_forward_periods,
+                )
+            } else {
+                target_seconds
+            };
             match self.walk_to_target(
-                target_seconds,
+                walk_target_seconds,
                 source_generation,
                 previous_accepted_identity,
-                compose_skipped_motion,
+                WalkPolicy {
+                    compose_skipped_motion,
+                    cache_reverse_tail: max_forward_periods.is_none(),
+                },
                 frame_period,
                 &mut is_current,
             ) {
@@ -714,7 +810,7 @@ impl VideoDecoder {
         target_seconds: f64,
         source_generation: u64,
         previous_accepted_identity: Option<CodecFrameIdentity>,
-        compose_skipped_motion: bool,
+        policy: WalkPolicy,
         frame_period: f64,
         is_current: &mut F,
     ) -> Result<DecodedVideoFrame, DecodeWorkError>
@@ -731,7 +827,8 @@ impl VideoDecoder {
             self.duration_seconds > 0.0 && target_seconds + frame_period >= self.duration_seconds;
         let mut newest_terminal = None;
         let mut reached_eof = false;
-        let collect_motion_chain = compose_skipped_motion && previous_accepted_identity.is_some();
+        let collect_motion_chain =
+            policy.compose_skipped_motion && previous_accepted_identity.is_some();
         for _ in 0..MAX_SEEK_DECODE_FRAMES {
             self.check_work_current(is_current)?;
             let Some(raw) = self.next_raw_frame_without_loop_interruptible(is_current)? else {
@@ -746,7 +843,7 @@ impl VideoDecoder {
             let reached = metadata.source_seconds + frame_period * 0.5 >= target_seconds;
             if reached {
                 let capture_selected_motion = should_capture_seek_codec_motion(
-                    compose_skipped_motion,
+                    policy.compose_skipped_motion,
                     previous_accepted_identity.is_some(),
                     motion_sequence_rejected,
                 );
@@ -757,7 +854,7 @@ impl VideoDecoder {
                         capture_selected_motion,
                     )
                     .map_err(DecodeWorkError::Failed)?;
-                if compose_skipped_motion {
+                if policy.compose_skipped_motion {
                     if collect_motion_chain && !motion_sequence_rejected {
                         append_codec_motion_parts(
                             &mut motion_sequence,
@@ -773,7 +870,7 @@ impl VideoDecoder {
                 return Ok(frame);
             }
             let capture_skipped_motion = should_capture_seek_codec_motion(
-                compose_skipped_motion,
+                policy.compose_skipped_motion,
                 previous_accepted_identity.is_some(),
                 motion_sequence_rejected,
             );
@@ -799,8 +896,9 @@ impl VideoDecoder {
                 });
                 self.seek_stats.terminal_candidate_updates =
                     self.seek_stats.terminal_candidate_updates.saturating_add(1);
-            } else if metadata.source_seconds + SEEK_REVERSE_TAIL_PERIODS * frame_period
-                >= target_seconds
+            } else if policy.cache_reverse_tail
+                && metadata.source_seconds + SEEK_REVERSE_TAIL_PERIODS * frame_period
+                    >= target_seconds
             {
                 // Preserve nearby reverse selection through the existing
                 // per-decoder/global RGBA ledger, while hundreds of earlier
@@ -834,7 +932,7 @@ impl VideoDecoder {
                         .seek_stats
                         .terminal_candidate_materializations
                         .saturating_add(1);
-                    if compose_skipped_motion {
+                    if policy.compose_skipped_motion {
                         frame.codec_motion = accepted_codec_motion_sequence(
                             motion_sequence,
                             motion_sequence_rejected,
@@ -1268,8 +1366,9 @@ impl VideoDecoder {
         );
         let mut codec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|e| format!("Codec params on reopen: {e}"))?;
-        enable_export_motion_vectors(&mut codec_ctx);
         let codec_id = codec_ctx.id();
+        enable_admissible_motion_vectors(&mut codec_ctx);
+        configure_low_latency_software_threads(&mut codec_ctx);
         let decoder = codec_ctx
             .decoder()
             .video()
@@ -1448,6 +1547,29 @@ fn can_continue_forward(
         Some(identity) => position.pts.is_some_and(|pts| pts >= identity.pts),
         None => true,
     }
+}
+
+fn bounded_continuous_walk_target(
+    position: Option<StreamPosition>,
+    requested_target_seconds: f64,
+    frame_period: f64,
+    max_forward_periods: Option<u32>,
+) -> f64 {
+    let Some(max_forward_periods) = max_forward_periods else {
+        return requested_target_seconds;
+    };
+    let Some(position) = position else {
+        return requested_target_seconds;
+    };
+    if !position.source_seconds.is_finite()
+        || !requested_target_seconds.is_finite()
+        || !frame_period.is_finite()
+        || frame_period <= 0.0
+    {
+        return requested_target_seconds;
+    }
+    requested_target_seconds
+        .min(position.source_seconds + frame_period * f64::from(max_forward_periods.max(1)))
 }
 
 /// A continued walk decodes pictures after the current one; a post-seek walk
@@ -1806,12 +1928,13 @@ fn reserve_packed_rgba(output_len: usize) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_walk_exceeds_limit, can_continue_forward, classify_seek_workload,
-        count_packet_without_frame, enable_export_motion_vectors, estimated_seek_decode_frames,
-        next_loop_generation, repack_rgba_plane, require_decoded_frame_before_loop,
-        reserve_packed_rgba, should_capture_seek_codec_motion, should_interrupt_input,
-        validate_media_dimensions, SeekWorkload, StreamPosition, VideoDecoder,
-        MAX_PACKETS_WITHOUT_FRAME, MAX_SEEK_DECODE_FRAMES,
+        bounded_continuous_walk_target, bounded_walk_exceeds_limit, can_continue_forward,
+        classify_seek_workload, codec_may_export_admissible_motion, count_packet_without_frame,
+        enable_export_motion_vectors, estimated_seek_decode_frames,
+        low_latency_software_thread_count, next_loop_generation, repack_rgba_plane,
+        require_decoded_frame_before_loop, reserve_packed_rgba, should_capture_seek_codec_motion,
+        should_interrupt_input, validate_media_dimensions, SeekWorkload, StreamPosition,
+        VideoDecoder, MAX_PACKETS_WITHOUT_FRAME, MAX_SEEK_DECODE_FRAMES,
     };
     use crate::video::{CodecFrameIdentity, CodecTimeBase};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1831,6 +1954,25 @@ mod tests {
             source_seconds,
             pts: Some(pts),
         })
+    }
+
+    #[test]
+    fn continuous_walk_yields_after_two_source_periods_without_changing_exact_seeks() {
+        let position = position_at(1.0, 30);
+        assert!(
+            (bounded_continuous_walk_target(position, 3.0, FRAME_PERIOD, Some(2))
+                - (1.0 + 2.0 * FRAME_PERIOD))
+                .abs()
+                < 1.0e-9
+        );
+        assert_eq!(
+            bounded_continuous_walk_target(position, 3.0, FRAME_PERIOD, None),
+            3.0
+        );
+        assert_eq!(
+            bounded_continuous_walk_target(position, 1.04, FRAME_PERIOD, Some(2)),
+            1.04
+        );
     }
 
     #[test]
@@ -2080,6 +2222,39 @@ mod tests {
         // flags before it is consumed by a decoder open.
         let flags = unsafe { (*context.as_ptr()).flags2 };
         assert_ne!(flags & ffmpeg_next::ffi::AV_CODEC_FLAG2_EXPORT_MVS, 0);
+    }
+
+    #[test]
+    fn vector_export_is_skipped_for_codecs_without_an_admissible_reference_law() {
+        assert!(codec_may_export_admissible_motion(
+            ffmpeg_next::codec::Id::MPEG4
+        ));
+        assert!(!codec_may_export_admissible_motion(
+            ffmpeg_next::codec::Id::H264
+        ));
+        assert!(!codec_may_export_admissible_motion(
+            ffmpeg_next::codec::Id::VP9
+        ));
+    }
+
+    #[test]
+    fn vp9_software_parallelism_is_bounded_and_other_codecs_remain_unchanged() {
+        assert_eq!(
+            low_latency_software_thread_count(ffmpeg_next::codec::Id::VP9, 1),
+            1
+        );
+        assert_eq!(
+            low_latency_software_thread_count(ffmpeg_next::codec::Id::VP9, 3),
+            3
+        );
+        assert_eq!(
+            low_latency_software_thread_count(ffmpeg_next::codec::Id::VP9, 32),
+            4
+        );
+        assert_eq!(
+            low_latency_software_thread_count(ffmpeg_next::codec::Id::H264, 32),
+            1
+        );
     }
 
     #[test]

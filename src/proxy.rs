@@ -647,6 +647,11 @@ pub struct ProxyPlaybackObservation {
     pub decode_p95_micros: u32,
     pub upload_p95_micros: u32,
     pub frame_age_p95_micros: u32,
+    /// P95 and peak of intent-qualified delivery holds. These exclude an
+    /// authored pause or a discontinuity because the decoder records them
+    /// only when multiple continuous desires elapsed between accepted images.
+    pub delivery_hold_p95_micros: u32,
+    pub delivery_hold_peak_micros: u32,
     pub dropped_frames: u32,
     pub pending_frames_peak: u16,
     pub hardware_decode_active: bool,
@@ -666,6 +671,8 @@ impl ProxyPlaybackObservation {
             || self.decode_p95_micros > 60_000_000
             || self.upload_p95_micros > 60_000_000
             || self.frame_age_p95_micros > 60_000_000
+            || self.delivery_hold_p95_micros > 60_000_000
+            || self.delivery_hold_peak_micros > 60_000_000
             || self.dropped_frames > self.sampled_frames
             || self.pending_frames_peak > 4_096
             || (self.zero_copy_active && !self.hardware_decode_active)
@@ -690,6 +697,10 @@ impl<'de> Deserialize<'de> for ProxyPlaybackObservation {
             decode_p95_micros: u32,
             upload_p95_micros: u32,
             frame_age_p95_micros: u32,
+            #[serde(default)]
+            delivery_hold_p95_micros: u32,
+            #[serde(default)]
+            delivery_hold_peak_micros: u32,
             dropped_frames: u32,
             pending_frames_peak: u16,
             hardware_decode_active: bool,
@@ -704,6 +715,8 @@ impl<'de> Deserialize<'de> for ProxyPlaybackObservation {
             decode_p95_micros: raw.decode_p95_micros,
             upload_p95_micros: raw.upload_p95_micros,
             frame_age_p95_micros: raw.frame_age_p95_micros,
+            delivery_hold_p95_micros: raw.delivery_hold_p95_micros,
+            delivery_hold_peak_micros: raw.delivery_hold_peak_micros,
             dropped_frames: raw.dropped_frames,
             pending_frames_peak: raw.pending_frames_peak,
             hardware_decode_active: raw.hardware_decode_active,
@@ -720,6 +733,7 @@ pub enum ProxyRecommendationReason {
     DecodeExceedsFrameBudget,
     UploadExceedsFrameBudget,
     FrameAgeExceedsFrameBudget,
+    DeliveryHoldExceedsFrameBudget,
     DroppedFramesObserved,
     DecoderQueuePressure,
     MultiLayerPressure,
@@ -771,7 +785,18 @@ pub fn assess_proxy(observation: ProxyPlaybackObservation) -> Result<ProxyAssess
     if observation.frame_age_p95_micros > observation.frame_budget_micros * 2 {
         reasons.insert(ProxyRecommendationReason::FrameAgeExceedsFrameBudget);
     }
-    if observation.dropped_frames != 0 {
+    let frame_budget = u64::from(observation.frame_budget_micros);
+    if u64::from(observation.delivery_hold_p95_micros) > frame_budget.saturating_mul(3)
+        || u64::from(observation.delivery_hold_peak_micros) > frame_budget.saturating_mul(4)
+    {
+        reasons.insert(ProxyRecommendationReason::DeliveryHoldExceedsFrameBudget);
+    }
+    // One historical mailbox loss is not source-performance evidence. Require
+    // both a nontrivial count and at least a one-percent measured shortfall.
+    if observation.dropped_frames >= 3
+        && u64::from(observation.dropped_frames).saturating_mul(100)
+            >= u64::from(observation.sampled_frames)
+    {
         reasons.insert(ProxyRecommendationReason::DroppedFramesObserved);
     }
     if observation.pending_frames_peak > 2 {
@@ -1220,6 +1245,8 @@ mod tests {
             decode_p95_micros: 1,
             upload_p95_micros: 1,
             frame_age_p95_micros: 1,
+            delivery_hold_p95_micros: 0,
+            delivery_hold_peak_micros: 0,
             dropped_frames: 2,
             pending_frames_peak: 0,
             hardware_decode_active: false,
@@ -1236,6 +1263,21 @@ mod tests {
         let mut serialized = serde_json::to_value(hostile_budget).unwrap();
         serialized["frame_budget_micros"] = serde_json::json!(u32::MAX);
         assert!(serde_json::from_value::<ProxyPlaybackObservation>(serialized).is_err());
+
+        let mut compatible = observation;
+        compatible.dropped_frames = 0;
+        let mut legacy = serde_json::to_value(compatible).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("delivery_hold_p95_micros");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("delivery_hold_peak_micros");
+        let restored: ProxyPlaybackObservation = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.delivery_hold_p95_micros, 0);
+        assert_eq!(restored.delivery_hold_peak_micros, 0);
     }
 
     #[test]
@@ -1247,6 +1289,8 @@ mod tests {
             decode_p95_micros: 4_000,
             upload_p95_micros: 2_000,
             frame_age_p95_micros: 8_000,
+            delivery_hold_p95_micros: 0,
+            delivery_hold_peak_micros: 0,
             dropped_frames: 0,
             pending_frames_peak: 1,
             hardware_decode_active: false,
@@ -1262,7 +1306,7 @@ mod tests {
             ProxyAssessment::OriginalSufficient
         );
         observation.decode_p95_micros = 20_000;
-        observation.dropped_frames = 1;
+        observation.dropped_frames = 6;
         assert_eq!(
             assess_proxy(observation).unwrap(),
             ProxyAssessment::ProxyRecommended(
@@ -1271,6 +1315,15 @@ mod tests {
                     ProxyRecommendationReason::DroppedFramesObserved,
                 ]
                 .into_boxed_slice()
+            )
+        );
+        observation.decode_p95_micros = 4_000;
+        observation.dropped_frames = 0;
+        observation.delivery_hold_peak_micros = 70_000;
+        assert_eq!(
+            assess_proxy(observation).unwrap(),
+            ProxyAssessment::ProxyRecommended(
+                vec![ProxyRecommendationReason::DeliveryHoldExceedsFrameBudget].into_boxed_slice()
             )
         );
         let keyed = assess_content_addressed_proxy(

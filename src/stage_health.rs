@@ -5,7 +5,7 @@
 //! minted only for the editor preview. Test cards and output identification
 //! are pure decisions keyed to one exact physical output endpoint.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,93 @@ pub use crate::stage_map::{OutputEndpointId, StageSurface, StageToolState, TestC
 pub const STAGE_HEALTH_FRAME_WINDOW: usize = 512;
 pub const STAGE_HEALTH_MAX_LAYERS: usize = 256;
 pub const STAGE_HEALTH_MAX_TEXT_BYTES: usize = 256;
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
+
+/// One accepted program-frame deadline from a drift-free rational schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FramePacerTick {
+    pub wall_interval: Duration,
+    pub schedule_lateness: Duration,
+    /// Whole due program ticks intentionally skipped to resume at the newest
+    /// deadline. A fractional/ordinary scheduling overrun is not a skip.
+    pub skipped_program_ticks: u64,
+}
+
+/// Fixed-rate wall scheduler whose deadline `n` is
+/// `origin + floor(n * 1 second / fps)`. It never rebases a successful tick to
+/// `now`, so normal timer jitter cannot accumulate as permanent phase drift.
+#[derive(Debug, Clone)]
+pub struct RationalFramePacer {
+    fps: u64,
+    origin: Instant,
+    next_ordinal: u64,
+    last_accepted_at: Instant,
+}
+
+impl RationalFramePacer {
+    pub fn new(origin: Instant, fps: u64) -> Self {
+        assert!(fps > 0, "a frame pacer requires a nonzero rate");
+        Self {
+            fps,
+            origin,
+            next_ordinal: 1,
+            last_accepted_at: origin,
+        }
+    }
+
+    pub fn reset(&mut self, origin: Instant) {
+        self.origin = origin;
+        self.next_ordinal = 1;
+        self.last_accepted_at = origin;
+    }
+
+    #[cfg(test)]
+    pub fn last_accepted_at(&self) -> Instant {
+        self.last_accepted_at
+    }
+
+    pub fn next_deadline(&self) -> Instant {
+        let deadline_nanos =
+            u128::from(self.next_ordinal).saturating_mul(NANOS_PER_SECOND) / u128::from(self.fps);
+        self.origin
+            .checked_add(Duration::from_nanos(
+                u64::try_from(deadline_nanos).unwrap_or(u64::MAX),
+            ))
+            .unwrap_or(self.last_accepted_at)
+    }
+
+    /// Return the newest due tick, coalescing whole missed periods. The event
+    /// thread calls this nonblocking method on redraw; `None` means the next
+    /// rational deadline has not arrived.
+    pub fn accept_due(&mut self, now: Instant) -> Option<FramePacerTick> {
+        let elapsed_nanos = now.saturating_duration_since(self.origin).as_nanos();
+        // Largest ordinal whose floored rational deadline is <= elapsed.
+        // The +1/-1 form is the exact inverse of floor(n * second / fps).
+        let due_ordinal = elapsed_nanos
+            .saturating_add(1)
+            .saturating_mul(u128::from(self.fps))
+            .saturating_sub(1)
+            / NANOS_PER_SECOND;
+        if due_ordinal < u128::from(self.next_ordinal) {
+            return None;
+        }
+        let due_ordinal = u64::try_from(due_ordinal).unwrap_or(u64::MAX);
+        let skipped_program_ticks = due_ordinal.saturating_sub(self.next_ordinal);
+        let deadline_nanos =
+            u128::from(due_ordinal).saturating_mul(NANOS_PER_SECOND) / u128::from(self.fps);
+        let deadline_offset =
+            Duration::from_nanos(u64::try_from(deadline_nanos).unwrap_or(u64::MAX));
+        let deadline = self.origin.checked_add(deadline_offset).unwrap_or(now);
+        let tick = FramePacerTick {
+            wall_interval: now.saturating_duration_since(self.last_accepted_at),
+            schedule_lateness: now.saturating_duration_since(deadline),
+            skipped_program_ticks,
+        };
+        self.next_ordinal = due_ordinal.saturating_add(1);
+        self.last_accepted_at = now;
+        Some(tick)
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageToolsSnapshot {
@@ -120,6 +207,16 @@ pub struct StageHealthSnapshot {
     pub frame_time_p95_us: u32,
     pub frame_time_p99_us: u32,
     pub frame_samples: u16,
+    #[serde(default)]
+    pub schedule_lateness_p50_us: u32,
+    #[serde(default)]
+    pub schedule_lateness_p95_us: u32,
+    #[serde(default)]
+    pub schedule_lateness_p99_us: u32,
+    #[serde(default)]
+    pub skipped_program_ticks: u64,
+    /// Backwards-compatible alias for `skipped_program_ticks`. This no longer
+    /// increments for a sub-period scheduling overrun.
     pub missed_deadlines: u64,
     pub layers: Vec<LayerStageHealthSnapshot>,
     pub layers_truncated: bool,
@@ -137,6 +234,10 @@ impl Default for StageHealthSnapshot {
             frame_time_p95_us: 0,
             frame_time_p99_us: 0,
             frame_samples: 0,
+            schedule_lateness_p50_us: 0,
+            schedule_lateness_p95_us: 0,
+            schedule_lateness_p99_us: 0,
+            skipped_program_ticks: 0,
             missed_deadlines: 0,
             layers: Vec::new(),
             layers_truncated: false,
@@ -204,6 +305,7 @@ pub struct StageHealthPublishInput<'a> {
 
 pub struct StageHealthMonitor {
     frame_times_us: [u32; STAGE_HEALTH_FRAME_WINDOW],
+    schedule_lateness_us: [u32; STAGE_HEALTH_FRAME_WINDOW],
     next: usize,
     count: usize,
     total_frame_time_us: u64,
@@ -214,6 +316,7 @@ impl Default for StageHealthMonitor {
     fn default() -> Self {
         Self {
             frame_times_us: [0; STAGE_HEALTH_FRAME_WINDOW],
+            schedule_lateness_us: [0; STAGE_HEALTH_FRAME_WINDOW],
             next: 0,
             count: 0,
             total_frame_time_us: 0,
@@ -224,8 +327,14 @@ impl Default for StageHealthMonitor {
 
 impl StageHealthMonitor {
     /// Fixed-storage sample insertion. No allocation occurs on the frame path.
-    pub fn observe_frame(&mut self, elapsed: Duration, deadline: Duration) {
+    pub fn observe_frame(
+        &mut self,
+        elapsed: Duration,
+        schedule_lateness: Duration,
+        skipped_program_ticks: u64,
+    ) {
         let elapsed_us = elapsed.as_micros().min(u128::from(u32::MAX)) as u32;
+        let lateness_us = schedule_lateness.as_micros().min(u128::from(u32::MAX)) as u32;
         if self.count == STAGE_HEALTH_FRAME_WINDOW {
             self.total_frame_time_us = self
                 .total_frame_time_us
@@ -234,18 +343,19 @@ impl StageHealthMonitor {
             self.count += 1;
         }
         self.frame_times_us[self.next] = elapsed_us;
+        self.schedule_lateness_us[self.next] = lateness_us;
         self.total_frame_time_us = self
             .total_frame_time_us
             .saturating_add(u64::from(elapsed_us));
         self.next = (self.next + 1) % STAGE_HEALTH_FRAME_WINDOW;
-        if elapsed > deadline {
-            self.missed_deadlines = self.missed_deadlines.saturating_add(1);
-        }
+        self.missed_deadlines = self.missed_deadlines.saturating_add(skipped_program_ticks);
     }
 
     pub fn snapshot(&self, input: StageHealthPublishInput<'_>) -> StageHealthSnapshot {
         let mut sorted = self.frame_times_us;
         sorted[..self.count].sort_unstable();
+        let mut sorted_lateness = self.schedule_lateness_us;
+        sorted_lateness[..self.count].sort_unstable();
         let mean = if self.count == 0 {
             0.0
         } else {
@@ -277,6 +387,10 @@ impl StageHealthMonitor {
             frame_time_p95_us: percentile(&sorted[..self.count], 95),
             frame_time_p99_us: percentile(&sorted[..self.count], 99),
             frame_samples: self.count.min(usize::from(u16::MAX)) as u16,
+            schedule_lateness_p50_us: percentile(&sorted_lateness[..self.count], 50),
+            schedule_lateness_p95_us: percentile(&sorted_lateness[..self.count], 95),
+            schedule_lateness_p99_us: percentile(&sorted_lateness[..self.count], 99),
+            skipped_program_ticks: self.missed_deadlines,
             missed_deadlines: self.missed_deadlines,
             layers,
             layers_truncated: input.layers.len() > STAGE_HEALTH_MAX_LAYERS,
@@ -350,8 +464,11 @@ pub fn paint_editor_preview_health(
             f64::from(snapshot.frame_time_p99_us) / 1_000.0
         ));
         ui.label(format!(
-            "Missed deadlines {}  |  {}x{} @ {:.3} Hz  |  {}",
-            snapshot.missed_deadlines,
+            "Skipped ticks {}  |  lateness p50 {:.3} / p95 {:.3} / p99 {:.3} ms  |  {}x{} @ {:.3} Hz  |  {}",
+            snapshot.skipped_program_ticks,
+            f64::from(snapshot.schedule_lateness_p50_us) / 1_000.0,
+            f64::from(snapshot.schedule_lateness_p95_us) / 1_000.0,
+            f64::from(snapshot.schedule_lateness_p99_us) / 1_000.0,
             snapshot.output.width,
             snapshot.output.height,
             f64::from(snapshot.output.refresh_millihz) / 1_000.0,
@@ -426,10 +543,14 @@ mod tests {
     }
 
     #[test]
-    fn fixed_window_reports_exact_percentiles_fps_and_deadlines() {
+    fn fixed_window_reports_exact_percentiles_fps_lateness_and_skips() {
         let mut monitor = StageHealthMonitor::default();
         for millis in 1..=100 {
-            monitor.observe_frame(Duration::from_millis(millis), Duration::from_millis(16));
+            monitor.observe_frame(
+                Duration::from_millis(millis),
+                Duration::from_micros(millis),
+                u64::from(millis % 25 == 0),
+            );
         }
         let tools = StageToolState::default();
         let endpoint = OutputEndpointId::legacy();
@@ -439,7 +560,63 @@ mod tests {
         assert_eq!(snapshot.frame_time_p95_us, 95_000);
         assert_eq!(snapshot.frame_time_p99_us, 99_000);
         assert!((snapshot.fps - (1_000.0 / 50.5)).abs() < 0.01);
-        assert_eq!(snapshot.missed_deadlines, 84);
+        assert_eq!(snapshot.schedule_lateness_p50_us, 50);
+        assert_eq!(snapshot.schedule_lateness_p95_us, 95);
+        assert_eq!(snapshot.schedule_lateness_p99_us, 99);
+        assert_eq!(snapshot.skipped_program_ticks, 4);
+        assert_eq!(snapshot.missed_deadlines, 4);
+    }
+
+    #[test]
+    fn rational_pacer_honors_the_exact_thirty_hertz_boundary() {
+        let origin = Instant::now();
+        let mut pacer = RationalFramePacer::new(origin, 30);
+
+        assert_eq!(
+            pacer.accept_due(origin + Duration::from_nanos(33_333_332)),
+            None
+        );
+        let tick = pacer
+            .accept_due(origin + Duration::from_nanos(33_333_333))
+            .expect("the first rational deadline is due");
+        assert_eq!(tick.schedule_lateness, Duration::ZERO);
+        assert_eq!(tick.skipped_program_ticks, 0);
+        assert_eq!(
+            pacer.next_deadline(),
+            origin + Duration::from_nanos(66_666_666)
+        );
+    }
+
+    #[test]
+    fn rational_pacer_counts_only_whole_skipped_program_ticks() {
+        let origin = Instant::now();
+        let mut slightly_late = RationalFramePacer::new(origin, 30);
+        let tick = slightly_late
+            .accept_due(origin + Duration::from_nanos(33_340_333))
+            .expect("a slightly late first tick remains due");
+        assert_eq!(tick.schedule_lateness, Duration::from_micros(7));
+        assert_eq!(tick.skipped_program_ticks, 0);
+
+        let mut stalled = RationalFramePacer::new(origin, 30);
+        let tick = stalled
+            .accept_due(origin + Duration::from_millis(100))
+            .expect("the newest tick after a stall is due");
+        assert_eq!(tick.schedule_lateness, Duration::ZERO);
+        assert_eq!(tick.skipped_program_ticks, 2);
+    }
+
+    #[test]
+    fn rational_pacer_does_not_accumulate_integer_period_drift() {
+        let origin = Instant::now();
+        let mut pacer = RationalFramePacer::new(origin, 30);
+        for ordinal in 1_u64..=300 {
+            let deadline_nanos = ordinal.saturating_mul(1_000_000_000) / 30;
+            let tick = pacer
+                .accept_due(origin + Duration::from_nanos(deadline_nanos))
+                .expect("every exact rational deadline is accepted");
+            assert_eq!(tick.schedule_lateness, Duration::ZERO);
+            assert_eq!(tick.skipped_program_ticks, 0);
+        }
     }
 
     #[test]
