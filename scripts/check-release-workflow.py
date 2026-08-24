@@ -12,7 +12,19 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 REVIEWED_REPRODUCIBLE_BUILD_SHA256 = (
-    "1cb37cf4aaa949e7534baa3e6c8d3fc2a4570003a7f40c0134925daa10bb8d04"
+    "e22e2ef4daa0e997e36626d4d86df50fec7a2164e32ac7a276cff3d8475b58c5"
+)
+REVIEWED_PINNED_LLVM_STEP_SHA256 = (
+    "350df6cb05ff8a9ec6eb61963784afafb454a586314569c27961374880f61484"
+)
+REVIEWED_UNEQUAL_PREPARE_STEP_SHA256 = (
+    "4448f99dacab37f4314f561f7e5a667e12bc5b9ad463493f7b193e1decd31469"
+)
+REVIEWED_UNEQUAL_BUILD_STEP_SHA256 = (
+    "d4ab78f545f3eb0a23a93f303b7fc8b492c6d832904d0e305344eef997e335f7"
+)
+REVIEWED_UNEQUAL_CONTIGUOUS_REGION_SHA256 = (
+    "1898e012ed7d41c3a057872131789bc17b0448fa356c532684eb405eb4b8a4f2"
 )
 
 
@@ -601,853 +613,937 @@ def self_test_draft_publish_last(release: str) -> None:
             fail("draft publication self-test accepted partial or post-publish mutation")
 
 
-def reproducible_path_remapping_fragments() -> tuple[str, ...]:
-    path_resolution_contract = r"""$resolvedSource = (Resolve-Path -LiteralPath $SourceRoot).Path
-$source = [CollideReproducibleNativePaths]::GetLongPath($resolvedSource)
-$sourceShort = [CollideReproducibleNativePaths]::GetShortPath($source)
-$resolvedFfmpeg = (Resolve-Path -LiteralPath $FfmpegDir).Path
-$ffmpeg = [CollideReproducibleNativePaths]::GetLongPath($resolvedFfmpeg)
-$ffmpegShort = [CollideReproducibleNativePaths]::GetShortPath($ffmpeg)
-$target = [System.IO.Path]::GetFullPath($TargetDir)
-$userProfileCandidate = [Environment]::GetEnvironmentVariable("USERPROFILE", "Process")
-if (
-    [string]::IsNullOrWhiteSpace($userProfileCandidate) -or
-    -not (Test-Path -LiteralPath $userProfileCandidate -PathType Container)
-) {
-    throw "USERPROFILE must name an existing directory"
-}
-$resolvedUserProfile = (Resolve-Path -LiteralPath $userProfileCandidate).Path
-$userProfile = [CollideReproducibleNativePaths]::GetLongPath($resolvedUserProfile)
-$userProfileShort = [CollideReproducibleNativePaths]::GetShortPath($userProfile)
-$cargoHomeOverride = [Environment]::GetEnvironmentVariable("CARGO_HOME", "Process")
-if ([string]::IsNullOrEmpty($cargoHomeOverride)) {
-    $cargoHomeCandidate = Join-Path $userProfile ".cargo"
-} else {
-    if ([string]::IsNullOrWhiteSpace($cargoHomeOverride)) {
-        throw "CARGO_HOME must not be whitespace"
-    }
-    $cargoHomeCandidate = $cargoHomeOverride
-}
-if (-not (Test-Path -LiteralPath $cargoHomeCandidate -PathType Container)) {
-    throw "Cargo home directory is missing: $cargoHomeCandidate"
-}
-$resolvedCargoHome = (Resolve-Path -LiteralPath $cargoHomeCandidate).Path
-$cargoHome = [CollideReproducibleNativePaths]::GetLongPath($resolvedCargoHome)
-$cargoHomeShort = [CollideReproducibleNativePaths]::GetShortPath($cargoHome)
-foreach ($cargoHomePath in @($cargoHome, $cargoHomeShort)) {
-    if (
-        -not [System.IO.Path]::IsPathRooted($cargoHomePath) -or
-        -not (Test-Path -LiteralPath $cargoHomePath -PathType Container)
-    ) {
-        throw "Resolved Cargo home is not an existing absolute directory: $cargoHomePath"
-    }
-}
-if (-not (Test-Path -LiteralPath (Join-Path $source ".git"))) {
-    throw "SourceRoot is not a Git checkout: $source"
-}
-if (-not (Test-Path -LiteralPath (Join-Path $ffmpeg "bin"))) {
-    throw "FFmpeg bin directory is missing: $ffmpeg"
-}
-$dirty = @(git -C $source status --porcelain=v1 --untracked-files=all)
-if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) {
-    throw "Reproducible builds require an entirely clean source checkout"
-}
-$actualSha = (git -C $source rev-parse HEAD).Trim().ToLowerInvariant()
-if ($LASTEXITCODE -ne 0 -or $actualSha -ne $GitSha.ToLowerInvariant()) {
-    throw "Checkout SHA $actualSha does not match requested $GitSha"
-}
-if (Test-Path -LiteralPath $target) {
-    if (@(Get-ChildItem -LiteralPath $target -Force).Count -ne 0) {
-        throw "TargetDir must be absent or empty: $target"
-    }
-} else {
-    New-Item -ItemType Directory -Path $target | Out-Null
-}
-$resolvedTarget = (Resolve-Path -LiteralPath $target).Path
-$target = [CollideReproducibleNativePaths]::GetLongPath($resolvedTarget)
-$targetShort = [CollideReproducibleNativePaths]::GetShortPath($target)"""
-    cargo_build_target_rejection = """if (-not [string]::IsNullOrEmpty(
-    [Environment]::GetEnvironmentVariable("CARGO_BUILD_TARGET", "Process")
-)) {
-    throw "CARGO_BUILD_TARGET is not permitted for the reproducible Windows build"
-}"""
-    rust_host_derivation = """$rustcVersion = (rustc -vV) -join "`n"
-if ($LASTEXITCODE -ne 0) {
-    throw "rustc -vV failed while resolving the native target"
-}
-$rustHostMatch = [regex]::Match($rustcVersion, '(?m)^host: ([A-Za-z0-9_.-]+)$')
-if (-not $rustHostMatch.Success) {
-    throw "rustc -vV did not report exactly one canonical host target"
-}
-$nativeTarget = $rustHostMatch.Groups[1].Value
-$nativeTargetUnderscored = $nativeTarget.Replace('-', '_').Replace('.', '_')"""
-    higher_priority_native_flags = """$higherPriorityNativeFlagNames = @(
-    "HOST_CFLAGS", "TARGET_CFLAGS",
-    "CFLAGS_$nativeTarget", "CFLAGS_$nativeTargetUnderscored",
-    "HOST_CFLAGS_$nativeTargetUnderscored", "TARGET_CFLAGS_$nativeTargetUnderscored",
-    "HOST_CXXFLAGS", "TARGET_CXXFLAGS",
-    "CXXFLAGS_$nativeTarget", "CXXFLAGS_$nativeTargetUnderscored",
-    "HOST_CXXFLAGS_$nativeTargetUnderscored", "TARGET_CXXFLAGS_$nativeTargetUnderscored",
-    "AWS_LC_SYS_CFLAGS", "AWS_LC_SYS_CFLAGS_$nativeTargetUnderscored",
-    "AWS_LC_SYS_HOST_CFLAGS", "AWS_LC_SYS_HOST_CFLAGS_$nativeTargetUnderscored",
-    "AWS_LC_SYS_TARGET_CFLAGS", "AWS_LC_SYS_TARGET_CFLAGS_$nativeTargetUnderscored",
-    "AWS_LC_SYS_CXXFLAGS", "AWS_LC_SYS_CXXFLAGS_$nativeTargetUnderscored",
-    "AWS_LC_SYS_HOST_CXXFLAGS", "AWS_LC_SYS_HOST_CXXFLAGS_$nativeTargetUnderscored",
-    "AWS_LC_SYS_TARGET_CXXFLAGS", "AWS_LC_SYS_TARGET_CXXFLAGS_$nativeTargetUnderscored"
-)"""
-    native_flag_rejection = """foreach ($nativeFlagName in $higherPriorityNativeFlagNames) {
-    $nativeFlagValue = [Environment]::GetEnvironmentVariable($nativeFlagName, "Process")
-    if ($null -ne $nativeFlagValue) {
-        throw "higher-priority native compiler flags are not permitted: $nativeFlagName"
-    }
-}"""
-    cmake_environment_rejection = """$cmakeEnvironmentNames = @(
-    foreach ($cmakeVariable in @("CMAKE_GENERATOR", "CMAKE_TOOLCHAIN_FILE")) {
-        $cmakeVariable
-        "${cmakeVariable}_$nativeTarget"
-        "${cmakeVariable}_$nativeTargetUnderscored"
-        "HOST_$cmakeVariable"
-        "AWS_LC_SYS_$cmakeVariable"
-        "AWS_LC_SYS_${cmakeVariable}_$nativeTargetUnderscored"
-    }
-) | Select-Object -Unique
-foreach ($cmakeEnvironmentName in $cmakeEnvironmentNames) {
-    $cmakeEnvironmentValue = [Environment]::GetEnvironmentVariable($cmakeEnvironmentName, "Process")
-    if ($null -ne $cmakeEnvironmentValue) {
-        throw "ambient CMake configuration is not permitted: $cmakeEnvironmentName"
-    }
-}"""
-    saved_environment_contract = """$saved = @{}
-$names = @(
-    "CARGO_HOME", "CARGO_ENCODED_RUSTFLAGS", "CARGO_TARGET_DIR", "COLLIDE_BUILD_GIT_SHA",
-    "COLLIDE_BUILD_GIT_DIRTY", "COLLIDE_PUBLISHED_ARTIFACT", "FFMPEG_DIR",
-    "SOURCE_DATE_EPOCH", "CC_SHELL_ESCAPED_FLAGS", "CFLAGS", "CXXFLAGS", "CL", "_CL_", "PATH"
-)
-foreach ($name in $names) {
-    $saved[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
-}"""
-    native_environment_contract = (
-        "$resolvedTarget = (Resolve-Path -LiteralPath $target).Path\n"
-        "$target = [CollideReproducibleNativePaths]::GetLongPath($resolvedTarget)\n"
-        "$targetShort = [CollideReproducibleNativePaths]::GetShortPath($target)\n\n"
-        + "\n".join(
-            (
-                cargo_build_target_rejection,
-                rust_host_derivation,
-                higher_priority_native_flags,
-                native_flag_rejection,
-                cmake_environment_rejection,
-                "",
-                saved_environment_contract,
-                "",
-                "try {\n    $env:CARGO_HOME = $cargoHome",
-            )
-        )
-    )
-    native_trim_arguments = """    $nativeTrimArguments = @(
-        $nativeTrimSource,
-        $nativeTrimSourceShort,
-        $nativeTrimTarget,
-        $nativeTrimTargetShort,
-        $nativeTrimLong,
-        $nativeTrimShort,
-        $nativeTrimFfmpeg,
-        $nativeTrimFfmpegShort
-    )"""
-    compiler_controls = """    $env:CC_SHELL_ESCAPED_FLAGS = "1"
-    $env:CFLAGS = $nativeTrimFlags
-    $env:CXXFLAGS = $nativeTrimFlags
-    [Environment]::SetEnvironmentVariable("CL", $null, "Process")
-    [Environment]::SetEnvironmentVariable("_CL_", $null, "Process")"""
-    pre_build_execution_contract = r"""try {
-    $env:CARGO_HOME = $cargoHome
-    $installedCargoTools = (cargo install --list) -join "`n"
-    if (
-        $LASTEXITCODE -ne 0 -or
-        $installedCargoTools -notmatch '(?m)^cargo-auditable v0\.7\.5:$'
-    ) {
-        throw "cargo-auditable 0.7.5 is required"
-    }
-
-    $unitSeparator = [char]0x1f
-    $remappedSource = $source.Replace('\', '/')
-    $remappedTarget = $target.Replace('\', '/')
-    $remappedCargoHome = $cargoHome.Replace('\', '/')
-    $remappedFfmpeg = $ffmpeg.Replace('\', '/')
-    $remappedFfmpegShort = $ffmpegShort.Replace('\', '/')
-    $encodedFlags = @(
-        "-C", "link-arg=/Brepro",
-        "--remap-path-prefix=$remappedSource=/collide-o-scope",
-        "--remap-path-prefix=$remappedTarget=/collide-o-scope-target",
-        "--remap-path-prefix=$remappedCargoHome=/cargo-home",
-        "--remap-path-prefix=$remappedFfmpeg=/ffmpeg",
-        "--remap-path-prefix=$remappedFfmpegShort=/ffmpeg"
-    ) -join $unitSeparator
-    $env:CARGO_ENCODED_RUSTFLAGS = $encodedFlags
-    $env:CARGO_TARGET_DIR = $target
-    $env:COLLIDE_BUILD_GIT_SHA = $GitSha.ToLowerInvariant()
-    $env:COLLIDE_BUILD_GIT_DIRTY = "false"
-    $env:COLLIDE_PUBLISHED_ARTIFACT = "true"
-    $env:FFMPEG_DIR = $ffmpeg
-    $env:SOURCE_DATE_EPOCH = $SourceDateEpoch
-    $nativeTrimSource = "/d1trimfile:$source"
-    $nativeTrimSourceShort = "/d1trimfile:$sourceShort"
-    $nativeTrimTarget = "/d1trimfile:$target"
-    $nativeTrimTargetShort = "/d1trimfile:$targetShort"
-    $nativeTrimLong = "/d1trimfile:$cargoHome"
-    $nativeTrimShort = "/d1trimfile:$cargoHomeShort"
-    $nativeTrimFfmpeg = "/d1trimfile:$ffmpeg"
-    $nativeTrimFfmpegShort = "/d1trimfile:$ffmpegShort"
-    $nativeTrimArguments = @(
-        $nativeTrimSource,
-        $nativeTrimSourceShort,
-        $nativeTrimTarget,
-        $nativeTrimTargetShort,
-        $nativeTrimLong,
-        $nativeTrimShort,
-        $nativeTrimFfmpeg,
-        $nativeTrimFfmpegShort
-    )
-    $nativeTrimFlags = ($nativeTrimArguments | ForEach-Object { '"' + $_ + '"' }) -join ' '
-    $env:CC_SHELL_ESCAPED_FLAGS = "1"
-    $env:CFLAGS = $nativeTrimFlags
-    $env:CXXFLAGS = $nativeTrimFlags
-    [Environment]::SetEnvironmentVariable("CL", $null, "Process")
-    [Environment]::SetEnvironmentVariable("_CL_", $null, "Process")
-    $env:PATH = (Join-Path $ffmpeg "bin") + ";" + $env:PATH
-
-    Push-Location $source
-    try {
-        cargo auditable build --locked --release --bin collide-o-scope
-        if ($LASTEXITCODE -ne 0) { throw "cargo auditable build failed" }
-    } finally {
-        Pop-Location
-    }
-
-    $executable = Join-Path $target "release\collide-o-scope.exe"""
-    builder_specific_paths = """    $builderSpecificPaths = @(
-        $source,
-        $sourceShort,
-        $target,
-        $targetShort,
-        $cargoHome,
-        $cargoHomeShort,
-        $ffmpeg,
-        $ffmpegShort,
-        $userProfile,
-        $userProfileShort,
-        $profilesRoot,
-        'C:\\Users\\'
-    ) | Select-Object -Unique"""
-    leak_rejection = """                if ($binaryView.IndexOf($needleView, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                    throw "release executable contains a builder-specific path"
-                }"""
-    post_build_path_scan = r"""    $executableBytes = [System.IO.File]::ReadAllBytes($executable)
-    $latin1 = [Text.Encoding]::GetEncoding(28591)
-    $binaryView = $latin1.GetString($executableBytes)
-    $needleEncodings = @(
-        [Text.Encoding]::UTF8,
-        [Text.Encoding]::Unicode,
-        [Text.Encoding]::BigEndianUnicode
-    )
-    $profilesRoot = (Split-Path -Parent $userProfile).TrimEnd([char[]]@('\', '/')) + '\'
-    $builderSpecificPaths = @(
-        $source,
-        $sourceShort,
-        $target,
-        $targetShort,
-        $cargoHome,
-        $cargoHomeShort,
-        $ffmpeg,
-        $ffmpegShort,
-        $userProfile,
-        $userProfileShort,
-        $profilesRoot,
-        'C:\Users\'
-    ) | Select-Object -Unique
-    foreach ($builderSpecificPath in $builderSpecificPaths) {
-        $spellings = @(
-            $builderSpecificPath,
-            $builderSpecificPath.Replace('\', '/')
-        ) | Select-Object -Unique
-        foreach ($spelling in $spellings) {
-            foreach ($encoding in $needleEncodings) {
-                $needleView = $latin1.GetString($encoding.GetBytes($spelling))
-                if ($binaryView.IndexOf($needleView, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                    throw "release executable contains a builder-specific path"
-                }
-            }
-        }
-    }
-    $identityJson = & $executable --version-json"""
-    outer_try = """try {
-    $env:CARGO_HOME = $cargoHome"""
-    outer_finally = """} finally {
-    foreach ($name in $names) {
-        [Environment]::SetEnvironmentVariable($name, $saved[$name], "Process")
-    }
-}"""
+def canonical_reproducible_build_fragments() -> tuple[tuple[str, int], ...]:
     return (
-        "private static extern uint GetLongPathNameW(",
-        "private static extern uint GetShortPathNameW(",
-        path_resolution_contract,
-        "$source = [CollideReproducibleNativePaths]::GetLongPath($resolvedSource)",
-        "$sourceShort = [CollideReproducibleNativePaths]::GetShortPath($source)",
-        "$ffmpeg = [CollideReproducibleNativePaths]::GetLongPath($resolvedFfmpeg)",
-        "$ffmpegShort = [CollideReproducibleNativePaths]::GetShortPath($ffmpeg)",
-        '$userProfileCandidate = [Environment]::GetEnvironmentVariable("USERPROFILE", "Process")',
-        "$userProfile = [CollideReproducibleNativePaths]::GetLongPath($resolvedUserProfile)",
-        "$userProfileShort = [CollideReproducibleNativePaths]::GetShortPath($userProfile)",
-        '$cargoHomeOverride = [Environment]::GetEnvironmentVariable("CARGO_HOME", "Process")',
-        "if ([string]::IsNullOrEmpty($cargoHomeOverride)) {",
-        '$cargoHomeCandidate = Join-Path $userProfile ".cargo"',
-        "if (-not (Test-Path -LiteralPath $cargoHomeCandidate -PathType Container)) {",
-        "$resolvedCargoHome = (Resolve-Path -LiteralPath $cargoHomeCandidate).Path",
-        "$cargoHome = [CollideReproducibleNativePaths]::GetLongPath($resolvedCargoHome)",
-        "$cargoHomeShort = [CollideReproducibleNativePaths]::GetShortPath($cargoHome)",
-        "$target = [CollideReproducibleNativePaths]::GetLongPath($resolvedTarget)",
-        "$targetShort = [CollideReproducibleNativePaths]::GetShortPath($target)",
-        native_environment_contract,
-        saved_environment_contract,
-        '[Environment]::GetEnvironmentVariable("CARGO_BUILD_TARGET", "Process")',
-        "$rustHostMatch = [regex]::Match($rustcVersion, '(?m)^host: ([A-Za-z0-9_.-]+)$')",
-        "$nativeTargetUnderscored = $nativeTarget.Replace('-', '_').Replace('.', '_')",
-        higher_priority_native_flags,
-        native_flag_rejection,
-        cmake_environment_rejection,
-        '$nativeFlagValue = [Environment]::GetEnvironmentVariable($nativeFlagName, "Process")',
-        "if ($null -ne $nativeFlagValue) {",
-        'throw "higher-priority native compiler flags are not permitted: $nativeFlagName"',
-        '$cmakeEnvironmentValue = [Environment]::GetEnvironmentVariable($cmakeEnvironmentName, "Process")',
-        'throw "ambient CMake configuration is not permitted: $cmakeEnvironmentName"',
-        '"CARGO_HOME", "CARGO_ENCODED_RUSTFLAGS"',
-        '"SOURCE_DATE_EPOCH", "CC_SHELL_ESCAPED_FLAGS", "CFLAGS", "CXXFLAGS", "CL", "_CL_", "PATH"',
-        outer_try,
-        "$env:CARGO_HOME = $cargoHome",
-        "$remappedSource = $source.Replace('\\', '/')",
-        "$remappedTarget = $target.Replace('\\', '/')",
-        "$remappedCargoHome = $cargoHome.Replace('\\', '/')",
-        "$remappedFfmpeg = $ffmpeg.Replace('\\', '/')",
-        "$remappedFfmpegShort = $ffmpegShort.Replace('\\', '/')",
-        '"--remap-path-prefix=$remappedSource=/collide-o-scope"',
-        '"--remap-path-prefix=$remappedTarget=/collide-o-scope-target"',
-        '"--remap-path-prefix=$remappedCargoHome=/cargo-home"',
-        '"--remap-path-prefix=$remappedFfmpeg=/ffmpeg"',
-        '"--remap-path-prefix=$remappedFfmpegShort=/ffmpeg"',
-        '$nativeTrimSource = "/d1trimfile:$source"',
-        '$nativeTrimSourceShort = "/d1trimfile:$sourceShort"',
-        '$nativeTrimTarget = "/d1trimfile:$target"',
-        '$nativeTrimTargetShort = "/d1trimfile:$targetShort"',
-        '$nativeTrimLong = "/d1trimfile:$cargoHome"',
-        '$nativeTrimShort = "/d1trimfile:$cargoHomeShort"',
-        '$nativeTrimFfmpeg = "/d1trimfile:$ffmpeg"',
-        '$nativeTrimFfmpegShort = "/d1trimfile:$ffmpegShort"',
-        native_trim_arguments,
-        "$nativeTrimFlags = ($nativeTrimArguments | ForEach-Object { '\"' + $_ + '\"' }) -join ' '",
-        compiler_controls,
-        pre_build_execution_contract,
-        '$env:CC_SHELL_ESCAPED_FLAGS = "1"',
-        "$env:CFLAGS = $nativeTrimFlags",
-        "$env:CXXFLAGS = $nativeTrimFlags",
-        '[Environment]::SetEnvironmentVariable("CL", $null, "Process")',
-        '[Environment]::SetEnvironmentVariable("_CL_", $null, "Process")',
-        '[Environment]::SetEnvironmentVariable($name, $saved[$name], "Process")',
-        "$executableBytes = [System.IO.File]::ReadAllBytes($executable)",
-        "$latin1 = [Text.Encoding]::GetEncoding(28591)",
-        "[Text.Encoding]::UTF8,",
-        "[Text.Encoding]::Unicode,",
-        "[Text.Encoding]::BigEndianUnicode",
-        builder_specific_paths,
-        "$builderSpecificPath.Replace('\\', '/')",
-        "$needleView = $latin1.GetString($encoding.GetBytes($spelling))",
-        "$binaryView.IndexOf($needleView, [StringComparison]::OrdinalIgnoreCase) -ge 0",
-        leak_rejection,
-        post_build_path_scan,
-        outer_finally,
+        (r"$canonicalRoot = 'C:\cosrepro'", 1),
+        (r"$canonicalMutexName = 'Local\CollideOScope.Repro.Stage.v1'", 1),
+        ("canonical reproducible staging requires the fixed NTFS C: volume", 1),
+        ("Assert-NoReparsePoints -Path 'C:\\'", 1),
+        ("TargetDir must be absent", 1),
+        ("[CollideReproducibleNativePaths]::GetLongPath((Resolve-Path -LiteralPath $requestedOutputParent).Path)", 1),
+        ("function Assert-OnlyDefaultDataStream", 1),
+        ("alternate data streams are not permitted", 1),
+        ("ambient Cargo configuration or credentials are not permitted", 1),
+        ("caller FFmpeg binaries must not be on PATH during the reproducible build", 1),
+        ("Reproducible builds require an entirely clean source checkout", 1),
+        ("SOURCE_DATE_EPOCH must equal the exact source commit timestamp", 1),
+        ("tracked symlinks and gitlinks are not permitted", 1),
+        ("& rustup run 1.98.0 rustc -vV", 1),
+        ("& rustup run 1.98.0 cargo -Vv", 1),
+        ("88d9e12ae178fab0fb5cc050a94da85685d449ea", 2),
+        ("797e8a9bca276c1c9f9f738d2a20f484fa4eea9d", 2),
+        ("80934e8f208a0cc2a87a6057f871d0f492461952b8672464749a6c3dff34109c", 1),
+        ("51fed10c43c3d31c1fe5bfe76bac60150970961e9b9b23cf014dbfcb5398bbfc", 1),
+        ("'RUSTC', 'RUSTDOC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'", 1),
+        ("'CARGO_BUILD_RUSTC', 'CARGO_BUILD_RUSTC_WRAPPER', 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER'", 1),
+        ("'DOCS_RS', 'RING_PREGENERATE_ASM', 'COLLIDE_BUILD_FFMPEG_BINARY'", 1),
+        ("'SPOUT2_LIB_DIR', 'CC_FORCE_DISABLE'", 1),
+        ("unreviewed ambient Cargo configuration is not permitted", 1),
+        ("ambient CMake configuration is not permitted", 1),
+        ("ambient AWS-LC routing is not permitted", 1),
+        ("'GIT_DEFAULT_HASH', 'GIT_DEFAULT_REF_FORMAT', 'GIT_ALLOW_PROTOCOL'", 1),
+        ("core.fsmonitor=false", 1),
+        ("core.hooksPath=NUL", 1),
+        ("$mutexHeld = $mutex.WaitOne(0)", 1),
+        ("canonical reproducible staging root already exists and will not be auto-deleted", 1),
+        ("[CollideReproducibleNativePaths]::CreateNewDirectory($canonicalRoot)", 1),
+        ("[IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None", 1),
+        ("archive --format=tar --output=$sourceArchive", 1),
+        ("init --quiet --template=", 1),
+        ("canonical source checkout disagrees with the exact clean input tree", 1),
+        ("Copy-VerifiedTree -Source (Join-Path $inputCargoSeed 'registry\\cache')", 1),
+        ("Copy-VerifiedTree -Source (Join-Path $inputCargoSeed 'registry\\index')", 1),
+        ("Copy-VerifiedTree -Source (Join-Path $inputCargoSeed 'git\\db')", 1),
+        ("Copy-VerifiedFile -Source (Join-Path $inputCargoSeed 'bin\\cargo-auditable.exe')", 1),
+        ("expanded Cargo source/checkouts must be recreated offline", 1),
+        ("foreach ($component in @('bin', 'include', 'lib'))", 1),
+        ("Set-ProcessEnvironmentValue -Name 'CARGO_HOME' -Value $cargoHome", 1),
+        ("Set-ProcessEnvironmentValue -Name 'CARGO_TARGET_DIR' -Value $target", 1),
+        ("Set-ProcessEnvironmentValue -Name 'CARGO_NET_OFFLINE' -Value 'true'", 1),
+        ("Set-ProcessEnvironmentValue -Name 'RUSTUP_TOOLCHAIN' -Value '1.98.0'", 1),
+        ("Set-ProcessEnvironmentValue -Name $controlledArchiverName -Value $llvmAr", 1),
+        ("Set-ProcessEnvironmentValue -Name $controlledAwsCmakeName -Value '0'", 1),
+        ("Set-ProcessEnvironmentValue -Name $controlledAwsSystemName -Value '0'", 1),
+        ("rustup run 1.98.0 cargo fetch --locked --offline", 1),
+        (
+            "$cargoGitCheckoutReview = [ordered]@{\n"
+            "        'git/checkouts/ntsc-rs-5808ee35e7b6c97f/4b79500' = '4b79500dfac64efcfb393eebc89f5c75565ee5ae'\n"
+            "        'git/checkouts/ntsc-rs-5808ee35e7b6c97f/4b79500/crates/openfx-plugin/vendor/openfx' = '5aa788d5134f577c23eba158ded7592c4c471050'\n"
+            "    }",
+            1,
+        ),
+        (
+            "$checkoutCommit = (git @gitSafetyArguments -C $checkoutPath rev-parse --verify 'HEAD^{commit}').Trim().ToLowerInvariant()",
+            1,
+        ),
+        (
+            "if ($LASTEXITCODE -ne 0 -or $checkoutCommit -cne $cargoGitCheckoutReview[$relativeCheckout]) {\n"
+            "            throw \"Cargo Git checkout commit differs from Cargo.lock: $relativeCheckout\"\n"
+            "        }",
+            1,
+        ),
+        (
+            "git @gitSafetyArguments -C $checkoutPath diff-index --quiet HEAD --\n"
+            "        if ($LASTEXITCODE -ne 0) {\n"
+            "            throw \"Cargo Git checkout differs from its reviewed commit: $relativeCheckout\"\n"
+            "        }",
+            1,
+        ),
+        (
+            "$checkoutStatus = @(git @gitSafetyArguments -C $checkoutPath status --porcelain=v1 --untracked-files=all --ignore-submodules=dirty)",
+            1,
+        ),
+        (
+            "if ($LASTEXITCODE -ne 0 -or $checkoutStatus.Count -ne 1 -or $checkoutStatus[0] -cne '?? .cargo-ok') {",
+            1,
+        ),
+        ("Cargo Git checkout marker is not the expected empty file", 1),
+        ("Assert-OnlyDefaultDataStream -Path $cargoOk", 1),
+        (
+            "$relativeMetadataFiles = @(\n"
+            "            \"$relativeCheckout/.git/index\",\n"
+            "            \"$relativeCheckout/.git/logs/HEAD\",\n"
+            "            \"$relativeCheckout/.git/logs/refs/heads/master\"\n"
+            "        )",
+            1,
+        ),
+        ("Assert-OnlyDefaultDataStream -Path $metadataPath", 1),
+        ("$cargoCheckoutMetadataExclusions += $relativeMetadata", 1),
+        (
+            "$observedCargoCheckoutMetadata = @(\n"
+            "        Get-ChildItem -LiteralPath (Join-Path $cargoHome 'git\\checkouts') -Force -Recurse -File |\n"
+            "            ForEach-Object { $_.FullName.Substring($cargoHome.Length).TrimStart([char[]]@('\\', '/')).Replace('\\', '/') } |\n"
+            "            Where-Object { $_ -match '/\\.git/index$' -or $_ -match '/\\.git/logs/' } |\n"
+            "            Sort-Object\n"
+            "    )",
+            1,
+        ),
+        (
+            "if (@(Compare-Object @($cargoCheckoutMetadataExclusions) $observedCargoCheckoutMetadata -SyncWindow 0).Count -ne 0) {\n"
+            "        throw 'Cargo Git checkout metadata inventory differs from the reviewed nondeterministic bookkeeping set'\n"
+            "    }",
+            1,
+        ),
+        ("Cargo Git checkout metadata inventory differs from the reviewed nondeterministic bookkeeping set", 1),
+        (
+            "$cargoBookkeepingExclusions = @(\n"
+            "        '.global-cache', '.package-cache', '.package-cache-mutate'\n"
+            "    ) + @($cargoCheckoutMetadataExclusions)",
+            1,
+        ),
+        ("'-C', 'link-arg=/Brepro'", 1),
+        ("'-C', 'link-arg=/DEBUG:NONE'", 1),
+        ("--remap-path-prefix=$remappedSource=/collide-o-scope", 1),
+        ('"/d1trimfile:$source"', 1),
+        ("rustup run 1.98.0 cargo auditable build --locked --offline --release --bin collide-o-scope", 1),
+        ("canonical release directory contains a PDB despite /DEBUG:NONE", 1),
+        ("Assert-PortableExecutableHasNoCodeView -Executable $executable", 1),
+        ("release executable contains a builder-specific path", 1),
+        ("release executable embeds an incomplete or unexpected BuildIdentity", 1),
+        ("[Security.Cryptography.SHA256]::HashData($executableBytes)", 1),
+        ("reviewed LLVM inputs changed during the build", 1),
+        ("source identity changed during the canonical build", 1),
+        ("[Security.Cryptography.CryptographicOperations]::FixedTimeEquals($ownerBytes, $ownerCheckBytes)", 1),
+        ("contract = 'collide-windows-canonical-repro-v1'", 1),
+        ("cargo_manifest_exclusions = @($cargoBookkeepingExclusions)", 1),
+        ("cleanup_succeeded = $false", 1),
+        ("$restoreFailure = $null", 1),
+        ("Remove-Item -LiteralPath $canonicalRoot -Recurse -Force", 1),
+        ("canonical build did not complete its cleanup and restoration transaction", 1),
+        ("[CollideReproducibleNativePaths]::CreateNewDirectory($publishRoot)", 1),
+        ("publication staging bytes differ from the verified canonical executable", 1),
+        ("[IO.Directory]::Move($publishRoot, $outputTarget)", 1),
+        ("published executable differs from the verified canonical bytes", 1),
+        ("$result.cleanup_succeeded = $true", 1),
+        ("Assert-NoReparsePoints -Path $canonicalRoot -Recurse", 2),
     )
-
-
-def validate_reproducible_path_remapping(build_script: str) -> None:
-    required = reproducible_path_remapping_fragments()
-    if any(build_script.count(fragment) != 1 for fragment in required):
-        fail(
-            "reproducible build must control Rust and native path remapping, "
-            "native flag precedence, and post-build builder-path rejection"
-        )
-    allowed_process_environment_writes = (
-        "$env:CARGO_HOME = $cargoHome",
-        "$env:CARGO_ENCODED_RUSTFLAGS = $encodedFlags",
-        "$env:CARGO_TARGET_DIR = $target",
-        "$env:COLLIDE_BUILD_GIT_SHA = $GitSha.ToLowerInvariant()",
-        '$env:COLLIDE_BUILD_GIT_DIRTY = "false"',
-        '$env:COLLIDE_PUBLISHED_ARTIFACT = "true"',
-        "$env:FFMPEG_DIR = $ffmpeg",
-        "$env:SOURCE_DATE_EPOCH = $SourceDateEpoch",
-        '$env:CC_SHELL_ESCAPED_FLAGS = "1"',
-        "$env:CFLAGS = $nativeTrimFlags",
-        "$env:CXXFLAGS = $nativeTrimFlags",
-        '[Environment]::SetEnvironmentVariable("CL", $null, "Process")',
-        '[Environment]::SetEnvironmentVariable("_CL_", $null, "Process")',
-        '$env:PATH = (Join-Path $ffmpeg "bin") + ";" + $env:PATH',
-        '[Environment]::SetEnvironmentVariable($name, $saved[$name], "Process")',
-    )
-    environment_write_remainder = build_script
-    for statement in allowed_process_environment_writes:
-        if environment_write_remainder.count(statement) != 1:
-            fail("approved process-environment writes must occur exactly once")
-        environment_write_remainder = environment_write_remainder.replace(statement, "", 1)
-    if re.search(
-        r"(?i)(?:\bEnv\s*:|\bSetEnvironmentVariable\b)",
-        environment_write_remainder,
-    ):
-        fail("reproducible build contains an unreviewed process-environment write")
-    target_short = build_script.index(
-        "$targetShort = [CollideReproducibleNativePaths]::GetShortPath($target)"
-    )
-    cargo_target_guard = build_script.index(
-        'if (-not [string]::IsNullOrEmpty(\n'
-        '    [Environment]::GetEnvironmentVariable("CARGO_BUILD_TARGET", "Process")'
-    )
-    rustc_version = build_script.index('$rustcVersion = (rustc -vV) -join "`n"')
-    rust_host_match = build_script.index("$rustHostMatch = [regex]::Match($rustcVersion")
-    native_target = build_script.index("$nativeTarget = $rustHostMatch.Groups[1].Value")
-    native_target_underscored = build_script.index(
-        "$nativeTargetUnderscored = $nativeTarget.Replace('-', '_').Replace('.', '_')"
-    )
-    native_flag_names = build_script.index("$higherPriorityNativeFlagNames = @(")
-    native_flag_guard = build_script.index(
-        "foreach ($nativeFlagName in $higherPriorityNativeFlagNames) {"
-    )
-    cmake_environment_names = build_script.index("$cmakeEnvironmentNames = @(")
-    cmake_environment_guard = build_script.index(
-        "foreach ($cmakeEnvironmentName in $cmakeEnvironmentNames) {"
-    )
-    saved_environment = build_script.index("$saved = @{}")
-    save_loop = build_script.index("foreach ($name in $names) {")
-    outer_try = build_script.index("try {\n    $env:CARGO_HOME = $cargoHome")
-    cargo_home_write = build_script.index("$env:CARGO_HOME = $cargoHome")
-    cargo_tool_inventory = build_script.index(
-        "$installedCargoTools = (cargo install --list) -join"
-    )
-    encoded_rust_flags = build_script.index(
-        "$env:CARGO_ENCODED_RUSTFLAGS = $encodedFlags"
-    )
-    native_flags_assembled = build_script.index(
-        "$nativeTrimFlags = ($nativeTrimArguments | ForEach-Object"
-    )
-    compiler_controls = build_script.index(
-        '$env:CC_SHELL_ESCAPED_FLAGS = "1"'
-    )
-    cargo_build = build_script.index(
-        "cargo auditable build --locked --release --bin collide-o-scope"
-    )
-    build_environment_write_positions = tuple(
-        build_script.index(statement)
-        for statement in allowed_process_environment_writes[:-1]
-    )
-    build_finished = build_script.index(
-        '$executable = Join-Path $target "release\\collide-o-scope.exe"'
-    )
-    leak_guard = build_script.index(
-        "$executableBytes = [System.IO.File]::ReadAllBytes($executable)"
-    )
-    needle_encodings = build_script.index("$needleEncodings = @(")
-    builder_specific_paths = build_script.index("$builderSpecificPaths = @(")
-    builder_path_loop = build_script.index(
-        "foreach ($builderSpecificPath in $builderSpecificPaths) {"
-    )
-    spelling_loop = build_script.index("foreach ($spelling in $spellings) {")
-    encoding_loop = build_script.index("foreach ($encoding in $needleEncodings) {")
-    identity_probe = build_script.index(
-        "$identityJson = & $executable --version-json"
-    )
-    leak_rejection = build_script.index(
-        "if ($binaryView.IndexOf($needleView, [StringComparison]::OrdinalIgnoreCase) -ge 0) {"
-    )
-    artifact_hash = build_script.index(
-        "$hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $executable).Hash.ToLowerInvariant()"
-    )
-    outer_finally = build_script.index(
-        "} finally {\n    foreach ($name in $names) {"
-    )
-    restoration = build_script.index(
-        '[Environment]::SetEnvironmentVariable($name, $saved[$name], "Process")'
-    )
-    if not (
-        target_short
-        < cargo_target_guard
-        < rustc_version
-        < rust_host_match
-        < native_target
-        < native_target_underscored
-        < native_flag_names
-        < native_flag_guard
-        < cmake_environment_names
-        < cmake_environment_guard
-        < saved_environment
-        < save_loop
-        < outer_try
-        < cargo_home_write
-        < cargo_tool_inventory
-        < encoded_rust_flags
-        < native_flags_assembled
-        < compiler_controls
-        < cargo_build
-        < build_finished
-        < leak_guard
-        < needle_encodings
-        < builder_specific_paths
-        < builder_path_loop
-        < spelling_loop
-        < encoding_loop
-        < leak_rejection
-        < identity_probe
-        < artifact_hash
-        < outer_finally
-        < restoration
-    ) or any(
-        not (outer_try < position < cargo_build)
-        for position in build_environment_write_positions
-    ):
-        fail(
-            "native/CMake environment rejection, compiler controls, builder-path "
-            "rejection, identity probing, hashing, and restoration must guard "
-            "the complete build in fail-closed order"
-        )
 
 
 def validate_reviewed_reproducible_build_digest(build_script: str) -> None:
-    normalized_build_script = build_script.replace("\r\n", "\n").replace("\r", "\n")
-    observed_build_script_sha256 = hashlib.sha256(
-        normalized_build_script.encode("utf-8")
-    ).hexdigest()
-    if observed_build_script_sha256 != REVIEWED_REPRODUCIBLE_BUILD_SHA256:
+    normalized = build_script.replace("\r\n", "\n").replace("\r", "\n")
+    observed = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    if observed != REVIEWED_REPRODUCIBLE_BUILD_SHA256:
         fail("reproducible build wrapper differs from its reviewed semantic contract")
 
 
-def self_test_reproducible_path_remapping(build_script: str) -> None:
+def _unique_index(text: str, marker: str) -> int:
+    if text.count(marker) != 1:
+        fail(f"canonical reproducibility marker is not unique: {marker}")
+    return text.index(marker)
+
+
+def validate_canonical_reproducible_build(build_script: str) -> None:
+    for fragment, expected_count in canonical_reproducible_build_fragments():
+        if build_script.count(fragment) != expected_count:
+            fail(f"canonical reproducible build contract changed: {fragment}")
+
+    forbidden = (
+        r"(?i)RUNNER_TEMP|GITHUB_WORKSPACE",
+        r"(?i)\bsubst(?:\.exe)?\b|\bmklink\b|New-Item[^\n]*Junction",
+        r"(?i)--network",
+        r"(?i)\bif\s*\(\s*\$false\s*\)",
+        r"(?i)\b(?:Set|New|Remove|Clear)-Variable\b",
+        r"Copy-VerifiedTree\s+-Source\s+\$inputCargoSeed(?:\s|$)",
+        r"Copy-VerifiedTree[^\n]*(?:registry\\src|git\\checkouts)",
+        r"CARGO_TARGET_DIR'\s+-Value\s+\$outputTarget",
+        r"\$target\s*=\s*\$outputTarget",
+        r"(?i)\bMove-Item\b",
+    )
+    if any(re.search(pattern, build_script) for pattern in forbidden):
+        fail("reproducible build contains a caller-derived stage or unreviewed route")
+
+    helper_write = "[Environment]::SetEnvironmentVariable($Name, $Value, 'Process')"
+    if build_script.count(helper_write) != 1:
+        fail("process-environment helper is not singular")
+    outside_helper = build_script.replace(helper_write, "", 1)
+    approved_environment_read = "Get-ChildItem Env:"
+    if outside_helper.count(approved_environment_read) != 2:
+        fail("process-environment read inventory changed")
+    outside_helper = outside_helper.replace(approved_environment_read, "", 2)
+    if re.search(
+        r"(?i)\$env:|\bEnv\s*:|SetEnvironmentVariable\s*\(",
+        outside_helper,
+    ):
+        fail("reproducible build mutates process environment outside its checked helper")
+
+    approved_writes = sorted(
+        (
+            "Set-ProcessEnvironmentValue -Name 'GIT_CONFIG_NOSYSTEM' -Value '1'",
+            "Set-ProcessEnvironmentValue -Name 'GIT_CONFIG_NOSYSTEM' -Value '1'",
+            "Set-ProcessEnvironmentValue -Name 'GIT_CONFIG_GLOBAL' -Value 'NUL'",
+            "Set-ProcessEnvironmentValue -Name 'GIT_CONFIG_GLOBAL' -Value 'NUL'",
+            "Set-ProcessEnvironmentValue -Name 'GIT_CONFIG_COUNT' -Value '0'",
+            "Set-ProcessEnvironmentValue -Name 'GIT_CONFIG_COUNT' -Value '0'",
+            "Set-ProcessEnvironmentValue -Name 'GIT_ATTR_NOSYSTEM' -Value '1'",
+            "Set-ProcessEnvironmentValue -Name 'GIT_ATTR_NOSYSTEM' -Value '1'",
+            "Set-ProcessEnvironmentValue -Name $environmentName -Value $initialGitEnvironment[$environmentName]",
+            "Set-ProcessEnvironmentValue -Name 'CARGO_HOME' -Value $cargoHome",
+            "Set-ProcessEnvironmentValue -Name 'CARGO_TARGET_DIR' -Value $target",
+            "Set-ProcessEnvironmentValue -Name 'CARGO_NET_OFFLINE' -Value 'true'",
+            "Set-ProcessEnvironmentValue -Name 'CARGO_INCREMENTAL' -Value '0'",
+            "Set-ProcessEnvironmentValue -Name 'RUSTUP_TOOLCHAIN' -Value '1.98.0'",
+            "Set-ProcessEnvironmentValue -Name 'COLLIDE_BUILD_GIT_SHA' -Value $GitSha.ToLowerInvariant()",
+            "Set-ProcessEnvironmentValue -Name 'COLLIDE_BUILD_GIT_DIRTY' -Value 'false'",
+            "Set-ProcessEnvironmentValue -Name 'COLLIDE_PUBLISHED_ARTIFACT' -Value 'true'",
+            "Set-ProcessEnvironmentValue -Name 'FFMPEG_DIR' -Value $ffmpeg",
+            "Set-ProcessEnvironmentValue -Name 'FFMPEG_VERSION' -Value '8.1.2'",
+            "Set-ProcessEnvironmentValue -Name 'SOURCE_DATE_EPOCH' -Value $SourceDateEpoch",
+            "Set-ProcessEnvironmentValue -Name 'TEMP' -Value $canonicalTemp",
+            "Set-ProcessEnvironmentValue -Name 'TMP' -Value $canonicalTemp",
+            "Set-ProcessEnvironmentValue -Name 'TMPDIR' -Value $canonicalTemp",
+            "Set-ProcessEnvironmentValue -Name $controlledArchiverName -Value $llvmAr",
+            "Set-ProcessEnvironmentValue -Name $controlledAwsCmakeName -Value '0'",
+            "Set-ProcessEnvironmentValue -Name $controlledAwsSystemName -Value '0'",
+            "Set-ProcessEnvironmentValue -Name 'CL' -Value $null",
+            "Set-ProcessEnvironmentValue -Name '_CL_' -Value $null",
+            "Set-ProcessEnvironmentValue -Name 'LINK' -Value $null",
+            "Set-ProcessEnvironmentValue -Name '_LINK_' -Value $null",
+            "Set-ProcessEnvironmentValue -Name 'PATH' -Value $buildPath",
+            "Set-ProcessEnvironmentValue -Name 'PATH' -Value $buildPath",
+            "Set-ProcessEnvironmentValue -Name 'CARGO_ENCODED_RUSTFLAGS' -Value $encodedFlags",
+            "Set-ProcessEnvironmentValue -Name 'CC_SHELL_ESCAPED_FLAGS' -Value '1'",
+            "Set-ProcessEnvironmentValue -Name 'CFLAGS' -Value $nativeTrimFlags",
+            "Set-ProcessEnvironmentValue -Name 'CXXFLAGS' -Value $nativeTrimFlags",
+            "Set-ProcessEnvironmentValue -Name 'PATH' -Value ((Join-Path $ffmpeg 'bin') + ';' + $buildPath)",
+            "Set-ProcessEnvironmentValue -Name $environmentName -Value $saved[$environmentName]",
+        )
+    )
+    observed_writes = sorted(
+        line.strip()
+        for line in build_script.splitlines()
+        if "Set-ProcessEnvironmentValue -Name " in line
+    )
+    if observed_writes != approved_writes:
+        fail("reproducible build process-environment write inventory changed")
+
+    approved_metadata_exclusion_lines = sorted(
+        (
+            "$cargoCheckoutMetadataExclusions = @()",
+            "$cargoCheckoutMetadataExclusions += $relativeMetadata",
+            "if (@(Compare-Object @($cargoCheckoutMetadataExclusions) $observedCargoCheckoutMetadata -SyncWindow 0).Count -ne 0) {",
+            ") + @($cargoCheckoutMetadataExclusions)",
+        )
+    )
+    observed_metadata_exclusion_lines = sorted(
+        line.strip()
+        for line in build_script.splitlines()
+        if "$cargoCheckoutMetadataExclusions" in line
+    )
+    if observed_metadata_exclusion_lines != approved_metadata_exclusion_lines:
+        fail("Cargo checkout metadata exclusion inventory changed")
+
+    approved_bookkeeping_exclusion_lines = sorted(
+        (
+            "$cargoBookkeepingExclusions = @(",
+            "$cargoExpandedManifestSha256 = Get-TreeManifestDigest -Path $cargoHome -ExcludedRelativePaths $cargoBookkeepingExclusions",
+            "cargo_manifest_exclusions = @($cargoBookkeepingExclusions)",
+        )
+    )
+    observed_bookkeeping_exclusion_lines = sorted(
+        line.strip()
+        for line in build_script.splitlines()
+        if "$cargoBookkeepingExclusions" in line
+    )
+    if observed_bookkeeping_exclusion_lines != approved_bookkeeping_exclusion_lines:
+        fail("Cargo bookkeeping exclusion use inventory changed")
+
+    approved_checkout_review_lines = sorted(
+        (
+            "$cargoGitCheckoutReview = [ordered]@{",
+            "foreach ($relativeCheckout in $cargoGitCheckoutReview.Keys) {",
+            "if ($LASTEXITCODE -ne 0 -or $checkoutCommit -cne $cargoGitCheckoutReview[$relativeCheckout]) {",
+        )
+    )
+    observed_checkout_review_lines = sorted(
+        line.strip()
+        for line in build_script.splitlines()
+        if "$cargoGitCheckoutReview" in line
+    )
+    if observed_checkout_review_lines != approved_checkout_review_lines:
+        fail("Cargo Git checkout review-set use inventory changed")
+
+    approved_relative_metadata_lines = sorted(
+        (
+            "$relativeMetadataFiles = @(",
+            "foreach ($relativeMetadata in $relativeMetadataFiles) {",
+        )
+    )
+    observed_relative_metadata_lines = sorted(
+        line.strip()
+        for line in build_script.splitlines()
+        if "$relativeMetadataFiles" in line
+    )
+    if observed_relative_metadata_lines != approved_relative_metadata_lines:
+        fail("Cargo Git relative metadata-set use inventory changed")
+
+    approved_observed_metadata_lines = sorted(
+        (
+            "$observedCargoCheckoutMetadata = @(",
+            "if (@(Compare-Object @($cargoCheckoutMetadataExclusions) $observedCargoCheckoutMetadata -SyncWindow 0).Count -ne 0) {",
+        )
+    )
+    observed_observed_metadata_lines = sorted(
+        line.strip()
+        for line in build_script.splitlines()
+        if "$observedCargoCheckoutMetadata" in line
+    )
+    if observed_observed_metadata_lines != approved_observed_metadata_lines:
+        fail("observed Cargo Git metadata inventory use changed")
+
+    recursive_deletes = sorted(
+        line.strip()
+        for line in build_script.splitlines()
+        if "remove-item" in line.lower() and "-recurse" in line.lower()
+    )
+    if recursive_deletes != sorted(
+        (
+            "Remove-Item -LiteralPath $canonicalRoot -Recurse -Force",
+            "Remove-Item -LiteralPath $publishRoot -Recurse -Force",
+        )
+    ):
+        fail("reproducible build has an unreviewed recursive deletion")
+
+    order = (
+        "$resolvedSource = (Resolve-Path -LiteralPath $SourceRoot).Path",
+        "$gitOverrideEnvironmentNames = @(",
+        "$saved = @{}",
+        "$mutex = [Threading.Mutex]::new($false, $canonicalMutexName)",
+        "$mutexHeld = $mutex.WaitOne(0)",
+        "canonical reproducible staging root already exists and will not be auto-deleted",
+        "[CollideReproducibleNativePaths]::CreateNewDirectory($canonicalRoot)",
+        "$ownerStream = [IO.File]::Open($ownerPath",
+        "archive --format=tar --output=$sourceArchive",
+        "Copy-VerifiedTree -Source (Join-Path $inputCargoSeed 'registry\\cache')",
+        "foreach ($component in @('bin', 'include', 'lib'))",
+        "Set-ProcessEnvironmentValue -Name 'CARGO_HOME' -Value $cargoHome",
+        "rustup run 1.98.0 cargo fetch --locked --offline",
+        "$cargoGitCheckoutReview = [ordered]@{",
+        "$checkoutCommit = (git @gitSafetyArguments",
+        "git @gitSafetyArguments -C $checkoutPath diff-index --quiet HEAD --",
+        "$checkoutStatus = @(git @gitSafetyArguments",
+        "$relativeMetadataFiles = @(",
+        "$observedCargoCheckoutMetadata = @(",
+        "Cargo Git checkout metadata inventory differs from the reviewed nondeterministic bookkeeping set",
+        "$cargoBookkeepingExclusions = @(",
+        "$cargoExpandedManifestSha256 = Get-TreeManifestDigest",
+        "$encodedFlags = @(",
+        "rustup run 1.98.0 cargo auditable build --locked --offline --release --bin collide-o-scope",
+        "canonical release directory contains a PDB despite /DEBUG:NONE",
+        "Assert-PortableExecutableHasNoCodeView -Executable $executable",
+        "$builderSpecificPaths = @(",
+        "$identity = $identityJson | ConvertFrom-Json",
+        "$result = [ordered]@{",
+        "$restoreFailure = $null",
+        "Remove-Item -LiteralPath $canonicalRoot -Recurse -Force",
+        "canonical build did not complete its cleanup and restoration transaction",
+        "[CollideReproducibleNativePaths]::CreateNewDirectory($publishRoot)",
+        "publication staging bytes differ from the verified canonical executable",
+        "[IO.Directory]::Move($publishRoot, $outputTarget)",
+        "$finalHash = (Get-FileHash -LiteralPath $finalExecutable",
+        "$result.cleanup_succeeded = $true",
+    )
+    positions = [_unique_index(build_script, marker) for marker in order]
+    if positions != sorted(positions) or len(set(positions)) != len(positions):
+        fail("canonical build controls, cleanup, and publication are out of order")
+
+
+def _expect_semantic_rejection(build_script: str) -> None:
+    try:
+        validate_canonical_reproducible_build(build_script)
+    except ValueError:
+        return
+    fail("canonical reproducibility hostile mutation was not rejected")
+
+
+def self_test_canonical_reproducible_build(build_script: str) -> None:
     validate_reviewed_reproducible_build_digest(build_script)
-    validate_reproducible_path_remapping(build_script)
-    for fragment in reproducible_path_remapping_fragments():
-        mutation = build_script.replace(fragment, "", 1)
-        try:
-            validate_reproducible_path_remapping(mutation)
-        except ValueError:
-            pass
-        else:
-            fail("path-remap self-test accepted an omitted deterministic control")
+    validate_canonical_reproducible_build(build_script)
+    for fragment, _ in canonical_reproducible_build_fragments():
+        _expect_semantic_rejection(build_script.replace(fragment, "", 1))
 
     hostile_replacements = (
+        ("$canonicalRoot = 'C:\\cosrepro'", "$canonicalRoot = Join-Path $env:RUNNER_TEMP 'cosrepro'"),
         (
-            '"--remap-path-prefix=$remappedCargoHome=/cargo-home"',
-            '"--remap-path-prefix=$remappedCargoHome=/builder-cargo-home"',
+            "throw 'canonical reproducible staging root already exists and will not be auto-deleted'",
+            "Remove-Item -LiteralPath $canonicalRoot -Recurse -Force",
         ),
+        ("[CollideReproducibleNativePaths]::CreateNewDirectory($canonicalRoot)", "New-Item -ItemType Directory -Path $canonicalRoot"),
+        ("archive --format=tar --output=$sourceArchive", "Copy-VerifiedTree -Source $inputSource -Destination $canonicalSource"),
+        ("$target = $canonicalTarget", "$target = $outputTarget"),
+        ("'-C', 'link-arg=/DEBUG:NONE'", "'-C', 'link-arg=/DEBUG:FULL'"),
+        ("rustup run 1.98.0 cargo fetch --locked --offline", "rustup run 1.98.0 cargo fetch --locked"),
         (
-            '"--remap-path-prefix=$remappedCargoHome=/cargo-home"',
-            '"--remap-path-prefix=$remappedSource=/cargo-home"',
+            "rustup run 1.98.0 cargo auditable build --locked --offline --release --bin collide-o-scope",
+            "rustup run 1.98.0 cargo auditable build --locked --release --bin collide-o-scope",
         ),
-        (
-            '$nativeTrimLong = "/d1trimfile:$cargoHome"',
-            '$nativeTrimLong = "/d1trimfile:$cargoHomeShort"',
-        ),
-        (
-            '$nativeTrimShort = "/d1trimfile:$cargoHomeShort"',
-            '$nativeTrimShort = "/d1trimfile:$cargoHome"',
-        ),
-        (
-            '$nativeTrimSourceShort = "/d1trimfile:$sourceShort"',
-            '$nativeTrimSourceShort = "/d1trimfile:$source"',
-        ),
-        (
-            '$nativeTrimTargetShort = "/d1trimfile:$targetShort"',
-            '$nativeTrimTargetShort = "/d1trimfile:$target"',
-        ),
-        (
-            '$nativeTrimFfmpegShort = "/d1trimfile:$ffmpegShort"',
-            '$nativeTrimFfmpegShort = "/d1trimfile:$ffmpeg"',
-        ),
-        (
-            '"--remap-path-prefix=$remappedFfmpegShort=/ffmpeg"',
-            '"--remap-path-prefix=$remappedCargoHome=/ffmpeg"',
-        ),
-        ('$env:CC_SHELL_ESCAPED_FLAGS = "1"', '$env:CC_SHELL_ESCAPED_FLAGS = "0"'),
-        (
-            '[Environment]::SetEnvironmentVariable("CL", $null, "Process")',
-            '[Environment]::SetEnvironmentVariable("CL", "ambient", "Process")',
-        ),
-        ("[Text.Encoding]::BigEndianUnicode", "[Text.Encoding]::ASCII"),
-        (
-            "$binaryView.IndexOf($needleView, [StringComparison]::OrdinalIgnoreCase)",
-            "$binaryView.IndexOf($needleView, [StringComparison]::Ordinal)",
-        ),
-        (
-            'throw "release executable contains a builder-specific path"',
-            'Write-Warning "release executable contains a builder-specific path"',
-        ),
-        (
-            "foreach ($nativeFlagName in $higherPriorityNativeFlagNames) {",
-            "if ($false) {",
-        ),
-        (
-            "foreach ($cmakeEnvironmentName in $cmakeEnvironmentNames) {",
-            "if ($false) {",
-        ),
-        (
-            '    "CARGO_HOME", "CARGO_ENCODED_RUSTFLAGS", "CARGO_TARGET_DIR", '
-            '"COLLIDE_BUILD_GIT_SHA",',
-            '    "CARGO_HOME", "CARGO_ENCODED_RUSTFLAGS", "COLLIDE_BUILD_GIT_SHA",',
-        ),
-        (
-            '    "COLLIDE_BUILD_GIT_DIRTY", "COLLIDE_PUBLISHED_ARTIFACT", "FFMPEG_DIR",',
-            '    "COLLIDE_BUILD_GIT_DIRTY", "COLLIDE_PUBLISHED_ARTIFACT",',
-        ),
-        (
-            "foreach ($name in $names) {\n"
-            "    $saved[$name] = [Environment]::GetEnvironmentVariable($name, \"Process\")",
-            "if ($false) {\n"
-            "    $saved[$name] = [Environment]::GetEnvironmentVariable($name, \"Process\")",
-        ),
-        (
-            '        "${cmakeVariable}_$nativeTarget"',
-            '        "${cmakeVariable}_$nativeTargetUnderscored"',
-        ),
-        (
-            '        "${cmakeVariable}_$nativeTargetUnderscored"',
-            '        "${cmakeVariable}_$nativeTarget"',
-        ),
-        (
-            '        "HOST_$cmakeVariable"',
-            '        "AWS_LC_SYS_$cmakeVariable"',
-        ),
-        (
-            'foreach ($cmakeVariable in @("CMAKE_GENERATOR", "CMAKE_TOOLCHAIN_FILE")) {',
-            'foreach ($cmakeVariable in @("CMAKE_GENERATOR", "CMAKE_GENERATOR")) {',
-        ),
-        (
-            '        "AWS_LC_SYS_$cmakeVariable"',
-            '        "$cmakeVariable"',
-        ),
-        (
-            '        "AWS_LC_SYS_${cmakeVariable}_$nativeTargetUnderscored"',
-            '        "AWS_LC_SYS_$cmakeVariable"',
-        ),
-        (
-            "foreach ($builderSpecificPath in $builderSpecificPaths) {",
-            "if ($false) {",
-        ),
-        (
-            "try {\n    $env:CARGO_HOME = $cargoHome",
-            "if ($true) {\n    $env:CARGO_HOME = $cargoHome",
-        ),
-        (
-            "} finally {\n    foreach ($name in $names) {",
-            "} if ($false) {\n    foreach ($name in $names) {",
-        ),
+        ("[IO.Directory]::Move($publishRoot, $outputTarget)", "Move-Item -LiteralPath $publishRoot -Destination $outputTarget"),
     )
     for original, replacement in hostile_replacements:
-        if build_script.count(original) != 1:
-            fail("path-remap hostile self-test fixture is not unique")
-        mutation = build_script.replace(original, replacement, 1)
-        try:
-            validate_reproducible_path_remapping(mutation)
-        except ValueError:
-            pass
-        else:
-            fail("path-remap self-test accepted a corrupted deterministic control")
+        _expect_semantic_rejection(build_script.replace(original, replacement, 1))
 
-    compiler_controls = """    $env:CC_SHELL_ESCAPED_FLAGS = "1"
-    $env:CFLAGS = $nativeTrimFlags
-    $env:CXXFLAGS = $nativeTrimFlags
-    [Environment]::SetEnvironmentVariable("CL", $null, "Process")
-    [Environment]::SetEnvironmentVariable("_CL_", $null, "Process")
-"""
-    executable_marker = (
-        '    $executable = Join-Path $target "release\\collide-o-scope.exe"\n'
-    )
-    if build_script.count(compiler_controls) != 1 or build_script.count(executable_marker) != 1:
-        fail("compiler-control reorder self-test fixture is not unique")
-    late_compiler_controls = build_script.replace(compiler_controls, "", 1).replace(
-        executable_marker,
-        compiler_controls + executable_marker,
-        1,
-    )
-
-    scan_start = "    $latin1 = [Text.Encoding]::GetEncoding(28591)\n"
-    identity_marker = "    $identityJson = & $executable --version-json\n"
-    scan_start_index = build_script.index(scan_start)
-    identity_index = build_script.index(identity_marker)
-    if scan_start_index >= identity_index:
-        fail("path-scan reorder self-test fixture has invalid source order")
-    scan_block = build_script[scan_start_index:identity_index]
-    without_scan = build_script[:scan_start_index] + build_script[identity_index:]
-    late_path_scan = without_scan.replace(
-        identity_marker,
-        identity_marker + scan_block,
-        1,
-    )
-
-    cmake_start_marker = "$cmakeEnvironmentNames = @("
-    cmake_end_marker = "\n\n$saved = @{}"
-    cmake_start = build_script.index(cmake_start_marker)
-    cmake_end = build_script.index(cmake_end_marker, cmake_start)
-    cmake_environment_rejection = build_script[cmake_start:cmake_end]
-    native_underscore_line = (
-        "$nativeTargetUnderscored = "
-        "$nativeTarget.Replace('-', '_').Replace('.', '_')\n"
-    )
-    cargo_guard_start_marker = (
-        'if (-not [string]::IsNullOrEmpty(\n'
-        '    [Environment]::GetEnvironmentVariable("CARGO_BUILD_TARGET", "Process")\n'
-    )
-    cargo_guard_end_marker = '$rustcVersion = (rustc -vV) -join "`n"'
-    cargo_guard_start = build_script.index(cargo_guard_start_marker)
-    cargo_guard_end = build_script.index(cargo_guard_end_marker, cargo_guard_start)
-    cargo_build_target_rejection = build_script[cargo_guard_start:cargo_guard_end]
-    native_flags_start_marker = "$higherPriorityNativeFlagNames = @("
-    native_flags_end_marker = "foreach ($nativeFlagName in $higherPriorityNativeFlagNames) {"
-    native_flags_start = build_script.index(native_flags_start_marker)
-    native_flags_end = build_script.index(native_flags_end_marker, native_flags_start)
-    native_flags_assignment = build_script[native_flags_start:native_flags_end]
-    needle_encodings_start_marker = "    $needleEncodings = @(\n"
-    needle_encodings_end_marker = "    $profilesRoot = "
-    needle_encodings_start = build_script.index(needle_encodings_start_marker)
-    needle_encodings_end = build_script.index(
-        needle_encodings_end_marker, needle_encodings_start
-    )
-    needle_encodings_assignment = build_script[
-        needle_encodings_start:needle_encodings_end
-    ]
-    builder_paths_start_marker = "    $builderSpecificPaths = @(\n"
-    builder_paths_end_marker = (
-        "    foreach ($builderSpecificPath in $builderSpecificPaths) {\n"
-    )
-    builder_paths_start = build_script.index(builder_paths_start_marker)
-    builder_paths_end = build_script.index(builder_paths_end_marker, builder_paths_start)
-    builder_paths_assignment = build_script[builder_paths_start:builder_paths_end]
-
-    structured_hostile_mutations = (
-        build_script.replace(
-            cmake_environment_rejection,
-            "if ($false) {\n" + cmake_environment_rejection + "\n}",
-            1,
-        ),
-        build_script.replace(native_underscore_line, "", 1).replace(
-            cmake_environment_rejection,
-            cmake_environment_rejection + "\n" + native_underscore_line.rstrip(),
-            1,
-        ),
-        build_script.replace(
-            native_flags_start_marker,
-            '$nativeTarget = ""\n' + native_flags_start_marker,
-            1,
-        ),
-        build_script.replace(
-            "$saved = @{}",
-            '$env:CMAKE_TOOLCHAIN_FILE = "C:\\hostile.cmake"\n$saved = @{}',
-            1,
-        ),
-        build_script.replace(
-            "$saved = @{}",
-            '[System.Environment]::SetEnvironmentVariable(\n'
-            '    "CMAKE_GENERATOR", "hostile", "Process"\n'
-            ')\n$saved = @{}',
-            1,
-        ),
-        build_script.replace(
-            "$saved = @{}",
-            'Microsoft.PowerShell.Management\\Set-Item '
-            '-LiteralPath Env:CMAKE_TOOLCHAIN_FILE -Value hostile\n$saved = @{}',
-            1,
-        ),
-        build_script.replace(
-            "$saved = @{}",
-            '& Set-Item -LiteralPath Env:CMAKE_TOOLCHAIN_FILE '
-            '-Value hostile\n$saved = @{}',
-            1,
-        ),
-        build_script.replace(
-            "$saved = @{}",
-            'Set-Content -LiteralPath Env:CMAKE_TOOLCHAIN_FILE '
-            '-Value hostile\n$saved = @{}',
-            1,
-        ),
-        build_script.replace(
-            "$saved = @{}",
-            'Microsoft.PowerShell.Management\\Remove-Item Env:CFLAGS\n$saved = @{}',
-            1,
-        ),
-        build_script.replace(
-            "$saved = @{}",
-            '([System.Environment]).GetMethod("SetEnvironmentVariable").Invoke(\n'
-            '    $null, @("CMAKE_TOOLCHAIN_FILE", "hostile", "Process")\n'
-            ')\n$saved = @{}',
-            1,
-        ),
-        build_script.replace(cargo_build_target_rejection, "", 1).replace(
-            executable_marker,
-            cargo_build_target_rejection + executable_marker,
-            1,
-        ),
-        build_script.replace(native_flags_assignment, "", 1).replace(
-            cmake_start_marker,
-            native_flags_assignment + cmake_start_marker,
-            1,
-        ),
-        build_script.replace(needle_encodings_assignment, "", 1).replace(
-            identity_marker,
-            needle_encodings_assignment + identity_marker,
-            1,
-        ),
-        build_script.replace(builder_paths_assignment, "", 1).replace(
-            identity_marker,
-            builder_paths_assignment + identity_marker,
-            1,
-        ),
-    )
-    cargo_build_line = (
-        "        cargo auditable build --locked --release --bin collide-o-scope\n"
-    )
-    late_environment_statements = (
-        "$env:CARGO_TARGET_DIR = $target",
-        "$env:COLLIDE_BUILD_GIT_SHA = $GitSha.ToLowerInvariant()",
-        '$env:COLLIDE_BUILD_GIT_DIRTY = "false"',
-        '$env:COLLIDE_PUBLISHED_ARTIFACT = "true"',
-        "$env:FFMPEG_DIR = $ffmpeg",
-        "$env:SOURCE_DATE_EPOCH = $SourceDateEpoch",
-        '$env:PATH = (Join-Path $ffmpeg "bin") + ";" + $env:PATH',
-    )
-    late_environment_mutations = []
-    for statement in late_environment_statements:
-        original_line = "    " + statement + "\n"
-        if build_script.count(original_line) != 1:
-            fail("late environment-write self-test fixture is not unique")
-        late_environment_mutations.append(
-            build_script.replace(original_line, "", 1).replace(
-                cargo_build_line,
-                cargo_build_line + "        " + statement + "\n",
-                1,
-            )
-        )
-    source_epoch_line = "    $env:SOURCE_DATE_EPOCH = $SourceDateEpoch\n"
-    source_epoch_before_try = build_script.replace(source_epoch_line, "", 1).replace(
-        "try {\n    $env:CARGO_HOME = $cargoHome",
-        source_epoch_line + "try {\n    $env:CARGO_HOME = $cargoHome",
-        1,
-    )
-
-    for mutation in (
-        late_compiler_controls,
-        late_path_scan,
-        *structured_hostile_mutations,
-        *late_environment_mutations,
-        source_epoch_before_try,
+    build_marker = "rustup run 1.98.0 cargo auditable build --locked --offline --release --bin collide-o-scope"
+    for injected in (
+        "Set-Item Env:CL ambient",
+        "Set-Content -Path Env:LINK -Value ambient",
+        "Remove-Item Env:RUSTFLAGS",
+        "Clear-Item Env:CARGO_HOME",
+        "Copy-Item Env:RUST_LOG Env:RUSTFLAGS",
+        "[Environment]::setenvironmentvariable('CL', 'ambient', 'Process')",
+        "remove-item -LiteralPath C:\\unreviewed -recurse -Force",
     ):
+        _expect_semantic_rejection(
+            build_script.replace(build_marker, f"{injected}\n    {build_marker}", 1)
+        )
+
+    exclusion_marker = "$cargoBookkeepingExclusions = @("
+    _expect_semantic_rejection(
+        build_script.replace(
+            exclusion_marker,
+            "$cargoCheckoutMetadataExclusions += 'registry/src/unreviewed/Cargo.toml'\n"
+            f"    {exclusion_marker}",
+            1,
+        )
+    )
+    manifest_marker = (
+        "$cargoExpandedManifestSha256 = Get-TreeManifestDigest -Path $cargoHome "
+        "-ExcludedRelativePaths $cargoBookkeepingExclusions"
+    )
+    _expect_semantic_rejection(
+        build_script.replace(
+            manifest_marker,
+            "$cargoBookkeepingExclusions += 'registry/src/unreviewed/Cargo.toml'\n"
+            f"    {manifest_marker}",
+            1,
+        )
+    )
+    diff_marker = "git @gitSafetyArguments -C $checkoutPath diff-index --quiet HEAD --"
+    _expect_semantic_rejection(
+        build_script.replace(
+            diff_marker,
+            f"if ($false) {{\n            {diff_marker}\n        }}",
+            1,
+        )
+    )
+    relative_metadata_block = (
+        "$relativeMetadataFiles = @(\n"
+        "            \"$relativeCheckout/.git/index\",\n"
+        "            \"$relativeCheckout/.git/logs/HEAD\",\n"
+        "            \"$relativeCheckout/.git/logs/refs/heads/master\"\n"
+        "        )"
+    )
+    _expect_semantic_rejection(
+        build_script.replace(
+            relative_metadata_block,
+            relative_metadata_block
+            + '\n        $relativeMetadataFiles += "$relativeCheckout/vendor/extra/.git/index"',
+            1,
+        )
+    )
+    checkout_review_block = (
+        "$cargoGitCheckoutReview = [ordered]@{\n"
+        "        'git/checkouts/ntsc-rs-5808ee35e7b6c97f/4b79500' = '4b79500dfac64efcfb393eebc89f5c75565ee5ae'\n"
+        "        'git/checkouts/ntsc-rs-5808ee35e7b6c97f/4b79500/crates/openfx-plugin/vendor/openfx' = '5aa788d5134f577c23eba158ded7592c4c471050'\n"
+        "    }"
+    )
+    _expect_semantic_rejection(
+        build_script.replace(
+            checkout_review_block,
+            checkout_review_block
+            + "\n    $cargoGitCheckoutReview['git/checkouts/third/deadbee'] = '0000000000000000000000000000000000000000'",
+            1,
+        )
+    )
+    observed_metadata_marker = "$observedCargoCheckoutMetadata = @("
+    _expect_semantic_rejection(
+        build_script.replace(
+            observed_metadata_marker,
+            "Set-Variable -Name observedCargoCheckoutMetadata -Value @()\n    "
+            + observed_metadata_marker,
+            1,
+        )
+    )
+
+    env_marker = "Set-ProcessEnvironmentValue -Name 'CARGO_HOME' -Value $cargoHome"
+    mutation = build_script.replace(build_marker, "__BUILD__", 1).replace(env_marker, build_marker, 1).replace("__BUILD__", env_marker, 1)
+    _expect_semantic_rejection(mutation)
+
+    cleanup_marker = "Remove-Item -LiteralPath $canonicalRoot -Recurse -Force"
+    publish_marker = "[IO.Directory]::Move($publishRoot, $outputTarget)"
+    mutation = build_script.replace(cleanup_marker, "__CLEANUP__", 1).replace(publish_marker, cleanup_marker, 1).replace("__CLEANUP__", publish_marker, 1)
+    _expect_semantic_rejection(mutation)
+
+
+def pinned_llvm_workflow_fragments() -> tuple[tuple[str, int], ...]:
+    return (
+        ("LLVM_VERSION: 22.1.8", 1),
+        (
+            "LLVM_WINDOWS_INSTALLER_SHA256: 16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c",
+            1,
+        ),
+        ("LLVM_SOURCE_COMMIT: ca7933e47d3a3451d81e72ac174dcb5aa28b59d1", 1),
+        (
+            "LLVM_AR_SHA256: 80934e8f208a0cc2a87a6057f871d0f492461952b8672464749a6c3dff34109c",
+            1,
+        ),
+        (
+            "LIBCLANG_SHA256: 51fed10c43c3d31c1fe5bfe76bac60150970961e9b9b23cf014dbfcb5398bbfc",
+            1,
+        ),
+        (
+            "- name: Download and verify pinned LLVM toolchain\n"
+            "        shell: pwsh\n"
+            "        env:\n"
+            "          GH_TOKEN: ${{ github.token }}",
+            1,
+        ),
+        ('$destination = "C:\\collide-llvm-$env:LLVM_VERSION"', 1),
+        ("Pinned LLVM destination already exists", 1),
+        (
+            "if (Test-Path -LiteralPath $destination) {\n"
+            "            throw \"Pinned LLVM destination already exists\"\n"
+            "          }",
+            1,
+        ),
+        (
+            'https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-win64.exe',
+            1,
+        ),
+        ("$installerHash -cne $env:LLVM_WINDOWS_INSTALLER_SHA256", 1),
+        (
+            "if ($installerHash -cne $env:LLVM_WINDOWS_INSTALLER_SHA256) {\n"
+            "            throw \"LLVM installer checksum mismatch\"\n"
+            "          }",
+            1,
+        ),
+        ("gh attestation verify $installer `", 1),
+        ("--repo llvm/llvm-project `", 1),
+        (
+            "--signer-workflow llvm/llvm-project/.github/workflows/release-binaries.yml `",
+            1,
+        ),
+        ('--source-ref "refs/tags/llvmorg-$env:LLVM_VERSION" `', 1),
+        ("--source-digest $env:LLVM_SOURCE_COMMIT `", 1),
+        ("--deny-self-hosted-runners", 1),
+        (
+            "--deny-self-hosted-runners\n"
+            "          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n"
+            "          $sevenZip =",
+            1,
+        ),
+        ("Get-Command 7z.exe -CommandType Application -ErrorAction Stop", 1),
+        (
+            "& $sevenZip x $installer \"-o$destination\" 'bin\\llvm-ar.exe' 'bin\\libclang.dll' -y",
+            1,
+        ),
+        (
+            "'bin\\libclang.dll' -y\n"
+            "          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n"
+            "          $llvmBin =",
+            1,
+        ),
+        ("Pinned LLVM extraction contains unexpected files", 1),
+        (
+            "if ($actualFiles.Count -ne 2 -or (Compare-Object $expectedFiles $actualFiles)) {\n"
+            "            throw \"Pinned LLVM extraction contains unexpected files\"\n"
+            "          }",
+            1,
+        ),
+        ("$llvmArHash -cne $env:LLVM_AR_SHA256", 1),
+        (
+            'if ($llvmArHash -cne $env:LLVM_AR_SHA256) { throw "llvm-ar.exe checksum mismatch" }',
+            1,
+        ),
+        ("LLVM version $([regex]::Escape($env:LLVM_VERSION))", 1),
+        (
+            'if ($LASTEXITCODE -ne 0 -or $llvmArVersion -notmatch "(?m)^  LLVM version '
+            '$([regex]::Escape($env:LLVM_VERSION))$") {\n'
+            '            throw "llvm-ar.exe version mismatch"\n'
+            "          }",
+            1,
+        ),
+        ("$libclangHash -cne $env:LIBCLANG_SHA256", 1),
+        (
+            "if ($libclangHash -cne $env:LIBCLANG_SHA256 -or $libclangVersion -cne $env:LLVM_VERSION) {\n"
+            "            throw \"libclang.dll identity mismatch\"\n"
+            "          }",
+            1,
+        ),
+        ('"LIBCLANG_PATH=$llvmBin" >> $env:GITHUB_ENV', 1),
+    )
+
+
+def validate_pinned_llvm_workflow(release: str) -> None:
+    step_marker = "      - name: Download and verify pinned LLVM toolchain"
+    if release.count(step_marker) != 1:
+        fail("release workflow pinned LLVM step is absent or duplicated")
+    step_start = release.index(step_marker)
+    following_step = re.search(r"(?m)^      - name: ", release[step_start + len(step_marker) :])
+    if following_step is None:
+        fail("release workflow pinned LLVM step has no bounded successor")
+    step_end = step_start + len(step_marker) + following_step.start()
+    llvm_step = release[step_start:step_end]
+    observed_step_digest = hashlib.sha256(llvm_step.encode("utf-8")).hexdigest()
+    if observed_step_digest != REVIEWED_PINNED_LLVM_STEP_SHA256:
+        fail("release workflow pinned LLVM step differs from its reviewed bytes")
+
+    for fragment, expected_count in pinned_llvm_workflow_fragments():
+        if release.count(fragment) != expected_count:
+            fail(f"release workflow pinned LLVM contract changed: {fragment}")
+    forbidden = (
+        r"C:\\Program Files\\LLVM",
+        r"(?i)\b(?:winget|choco)\s+install\s+(?:llvm|llvm\.llvm)\b",
+        r"(?i)\bStart-Process\b|&\s*\$installer(?:\s|$)",
+        r"(?i)Invoke-Expression|\biex\b",
+    )
+    if any(re.search(pattern, release) for pattern in forbidden):
+        fail("release workflow executes or routes an unreviewed LLVM distribution")
+
+    approved_installer_lines = sorted(
+        (
+            '$installer = Join-Path $env:RUNNER_TEMP "LLVM-$env:LLVM_VERSION-win64.exe"',
+            "Invoke-WebRequest -Uri $url -OutFile $installer -MaximumRetryCount 3 -RetryIntervalSec 5",
+            "$installerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash.ToLowerInvariant()",
+            "gh attestation verify $installer `",
+            "& $sevenZip x $installer \"-o$destination\" 'bin\\llvm-ar.exe' 'bin\\libclang.dll' -y",
+        )
+    )
+    observed_installer_lines = sorted(
+        line.strip()
+        for line in release.splitlines()
+        if re.search(r"(?i)\$(?:\{installer\}|installer(?![A-Za-z0-9_]))", line)
+    )
+    if observed_installer_lines != approved_installer_lines:
+        fail("release workflow LLVM installer use inventory changed")
+
+    order = (
+        "- name: Download and verify pinned LLVM toolchain",
+        "Invoke-WebRequest -Uri $url -OutFile $installer",
+        "$installerHash = (Get-FileHash",
+        "$installerHash -cne $env:LLVM_WINDOWS_INSTALLER_SHA256",
+        "gh attestation verify $installer `",
+        "--deny-self-hosted-runners\n          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n          $sevenZip =",
+        "& $sevenZip x $installer",
+        "'bin\\libclang.dll' -y\n          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n          $llvmBin =",
+        "$extractedFiles = @(Get-ChildItem",
+        "$llvmArHash = (Get-FileHash",
+        "$llvmArHash -cne $env:LLVM_AR_SHA256",
+        "$llvmArVersion = (& $llvmAr --version)",
+        "$libclangHash = (Get-FileHash",
+        "$libclangHash -cne $env:LIBCLANG_SHA256",
+        '"LIBCLANG_PATH=$llvmBin" >> $env:GITHUB_ENV',
+        "- name: Download pinned FFmpeg shared runtime",
+        "- name: Build twice from clean independent unequal roots",
+    )
+    positions = [_unique_index(release, marker) for marker in order]
+    if positions != sorted(positions) or len(set(positions)) != len(positions):
+        fail("release workflow does not attest, hash, extract, and verify LLVM in order")
+
+
+def self_test_pinned_llvm_workflow(release: str) -> None:
+    validate_pinned_llvm_workflow(release)
+    for fragment, _ in pinned_llvm_workflow_fragments():
+        mutation = release.replace(fragment, "", 1)
         try:
-            validate_reproducible_path_remapping(mutation)
+            validate_pinned_llvm_workflow(mutation)
         except ValueError:
-            pass
-        else:
-            fail("path-remap self-test accepted a security control reordered too late")
+            continue
+        fail("pinned LLVM workflow fragment mutation was not rejected")
+
+    hostile = (
+        ("--repo llvm/llvm-project `", "--owner llvm `"),
+        (
+            "--signer-workflow llvm/llvm-project/.github/workflows/release-binaries.yml `",
+            "--signer-repo llvm/llvm-project `",
+        ),
+        ("--deny-self-hosted-runners", "--limit 1"),
+        (
+            "$installerHash -cne $env:LLVM_WINDOWS_INSTALLER_SHA256",
+            "$installerHash -eq $env:LLVM_WINDOWS_INSTALLER_SHA256",
+        ),
+        (
+            "& $sevenZip x $installer \"-o$destination\" 'bin\\llvm-ar.exe' 'bin\\libclang.dll' -y",
+            "& $installer /S",
+        ),
+        (
+            '"LIBCLANG_PATH=$llvmBin" >> $env:GITHUB_ENV',
+            '"LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> $env:GITHUB_ENV',
+        ),
+        (
+            'throw "LLVM installer checksum mismatch"',
+            'Write-Warning "LLVM installer checksum mismatch"',
+        ),
+        (
+            'throw "Pinned LLVM destination already exists"',
+            'Write-Warning "Pinned LLVM destination already exists"',
+        ),
+        (
+            'throw "Pinned LLVM extraction contains unexpected files"',
+            'Write-Warning "Pinned LLVM extraction contains unexpected files"',
+        ),
+        (
+            'throw "llvm-ar.exe checksum mismatch"',
+            'Write-Warning "llvm-ar.exe checksum mismatch"',
+        ),
+        (
+            'throw "libclang.dll identity mismatch"',
+            'Write-Warning "libclang.dll identity mismatch"',
+        ),
+    )
+    for original, replacement in hostile:
+        mutation = release.replace(original, replacement, 1)
+        try:
+            validate_pinned_llvm_workflow(mutation)
+        except ValueError:
+            continue
+        fail(f"pinned LLVM hostile mutation was not rejected: {original}")
+
+    execution_injection = release.replace(
+        "$sevenZip = (Get-Command 7z.exe",
+        "Start-Process $installer -Wait\n          $sevenZip = (Get-Command 7z.exe",
+        1,
+    )
+    try:
+        validate_pinned_llvm_workflow(execution_injection)
+    except ValueError:
+        pass
+    else:
+        fail("pinned LLVM checker accepted direct installer execution")
+
+    braced_execution_injection = release.replace(
+        "& $sevenZip x $installer",
+        "Start-Process ${installer} -Wait\n          & $sevenZip x $installer",
+        1,
+    )
+    try:
+        validate_pinned_llvm_workflow(braced_execution_injection)
+    except ValueError:
+        pass
+    else:
+        fail("pinned LLVM checker accepted braced-variable installer execution")
+
+
+def unequal_reproducibility_workflow_fragments() -> tuple[tuple[str, int], ...]:
+    return (
+        ("path: source-b-with-deliberately-different-path-length", 1),
+        ("source-b-with-deliberately-different-path-length", 3),
+        ("- name: Prepare unequal physical reproducibility roots", 1),
+        ("$cargoA = Join-Path $env:RUNNER_TEMP 'ca'", 1),
+        ("cargo-seed-b-with-deliberately-different-physical-path-length", 1),
+        ("$targetA = Join-Path $env:RUNNER_TEMP 'ta'", 1),
+        ("target-b-with-deliberately-different-physical-path-length", 1),
+        ("Copy-SeedTree (Join-Path $defaultCargoHome 'registry\\cache')", 1),
+        ("Copy-SeedTree (Join-Path $defaultCargoHome 'registry\\index')", 1),
+        ("Copy-SeedTree (Join-Path $defaultCargoHome 'git\\db')", 1),
+        ("Independent Cargo seed manifests differ", 1),
+        ("A/B path lengths must deliberately differ", 1),
+        ("REPRO_CARGO_SEED_SHA256=$manifestA", 1),
+        ("- name: Build twice from clean independent unequal roots", 1),
+        ("[Environment]::SetEnvironmentVariable('CARGO_HOME', $CargoSeed, 'Process')", 1),
+        ("[Environment]::SetEnvironmentVariable('CARGO_HOME', $priorCargoHome, 'Process')", 1),
+        ("Reproducible wrapper did not emit exactly one JSON receipt", 1),
+        (
+            "(($receipt.cargo_manifest_exclusions -join ',') -cne '.global-cache,.package-cache,.package-cache-mutate,"
+            "git/checkouts/ntsc-rs-5808ee35e7b6c97f/4b79500/.git/index,"
+            "git/checkouts/ntsc-rs-5808ee35e7b6c97f/4b79500/.git/logs/HEAD,"
+            "git/checkouts/ntsc-rs-5808ee35e7b6c97f/4b79500/.git/logs/refs/heads/master,"
+            "git/checkouts/ntsc-rs-5808ee35e7b6c97f/4b79500/crates/openfx-plugin/vendor/openfx/.git/index,"
+            "git/checkouts/ntsc-rs-5808ee35e7b6c97f/4b79500/crates/openfx-plugin/vendor/openfx/.git/logs/HEAD,"
+            "git/checkouts/ntsc-rs-5808ee35e7b6c97f/4b79500/crates/openfx-plugin/vendor/openfx/.git/logs/refs/heads/master')",
+            1,
+        ),
+        ("$receiptA = Invoke-ReproducibleBuild $env:REPRO_SOURCE_A $env:REPRO_TARGET_A $env:REPRO_CARGO_A", 1),
+        ("$receiptB = Invoke-ReproducibleBuild $env:REPRO_SOURCE_B $env:REPRO_TARGET_B $env:REPRO_CARGO_B", 1),
+        ("Independent build receipts differ at $property", 1),
+        ('--executable "$env:REPRO_TARGET_A\\release\\collide-o-scope.exe"', 1),
+        ('--second-executable "$env:REPRO_TARGET_B\\release\\collide-o-scope.exe"', 1),
+    )
+
+
+def validate_unequal_reproducibility_workflow(release: str) -> None:
+    reviewed_steps = (
+        (
+            "Prepare unequal physical reproducibility roots",
+            REVIEWED_UNEQUAL_PREPARE_STEP_SHA256,
+        ),
+        (
+            "Build twice from clean independent unequal roots",
+            REVIEWED_UNEQUAL_BUILD_STEP_SHA256,
+        ),
+    )
+    for step_name, expected_digest in reviewed_steps:
+        marker = f"      - name: {step_name}"
+        if release.count(marker) != 1:
+            fail(f"reviewed unequal-root workflow step is not unique: {step_name}")
+        step_start = release.index(marker)
+        step_end = release.find("\n      - name:", step_start + 1)
+        if step_end < 0:
+            step_end = len(release)
+        observed_digest = hashlib.sha256(
+            release[step_start:step_end].encode("utf-8")
+        ).hexdigest()
+        if observed_digest != expected_digest:
+            fail(f"reviewed unequal-root workflow step changed: {step_name}")
+
+    prepare_marker = "      - name: Prepare unequal physical reproducibility roots"
+    build_marker = "      - name: Build twice from clean independent unequal roots"
+    successor_marker = "      - name: Generate reproducible CycloneDX SBOM"
+    if release.count(successor_marker) != 1:
+        fail("reviewed unequal-root workflow successor is not unique")
+    region_start = release.index(prepare_marker)
+    build_start = release.index(build_marker, region_start + 1)
+    region_end = release.index(successor_marker, build_start + 1)
+    observed_region_digest = hashlib.sha256(
+        release[region_start:region_end].encode("utf-8")
+    ).hexdigest()
+    if observed_region_digest != REVIEWED_UNEQUAL_CONTIGUOUS_REGION_SHA256:
+        fail("reviewed unequal-root workflow region is not contiguous")
+
+    for fragment, expected_count in unequal_reproducibility_workflow_fragments():
+        if release.count(fragment) != expected_count:
+            fail(f"release workflow unequal-root contract changed: {fragment}")
+    if (
+        "GITHUB_PATH" in release
+        or "RUNNER_TEMP\\target-a" in release
+        or "RUNNER_TEMP\\target-b" in release
+        or re.search(r"(?m)^\s+path:\s+source-b\s*$", release)
+        or re.search(r"\$cargoB\s*=\s*\$cargoA|\$targetB\s*=\s*\$targetA", release)
+        or 'second-executable "$env:REPRO_TARGET_A' in release
+    ):
+        fail("release workflow can collapse or contaminate independent build roots")
+
+    order = (
+        "path: source-a",
+        "path: source-b-with-deliberately-different-path-length",
+        "- name: Prepare unequal physical reproducibility roots",
+        "$cargoA = Join-Path $env:RUNNER_TEMP 'ca'",
+        "$cargoB = Join-Path $env:RUNNER_TEMP",
+        "$manifestA = Get-ManifestDigest $cargoA",
+        "- name: Build twice from clean independent unequal roots",
+        "$receiptA = Invoke-ReproducibleBuild",
+        "Build A left the canonical root present",
+        "$receiptB = Invoke-ReproducibleBuild",
+        "Independent build receipts differ at $property",
+        '--executable "$env:REPRO_TARGET_A\\release\\collide-o-scope.exe"',
+        '--second-executable "$env:REPRO_TARGET_B\\release\\collide-o-scope.exe"',
+    )
+    positions = [_unique_index(release, marker) for marker in order]
+    if positions != sorted(positions) or len(set(positions)) != len(positions):
+        fail("release workflow does not create, build, compare, and package unequal roots in order")
+
+
+def self_test_unequal_reproducibility_workflow(release: str) -> None:
+    validate_unequal_reproducibility_workflow(release)
+    for fragment, _ in unequal_reproducibility_workflow_fragments():
+        mutation = release.replace(fragment, "", 1)
+        try:
+            validate_unequal_reproducibility_workflow(mutation)
+        except ValueError:
+            continue
+        fail("unequal-root workflow fragment mutation was not rejected")
+
+    hostile = (
+        ("source-b-with-deliberately-different-path-length", "source-b"),
+        ("$cargoB = Join-Path $env:RUNNER_TEMP", "$cargoB = $cargoA # "),
+        ("$targetB = Join-Path $env:RUNNER_TEMP", "$targetB = $targetA # "),
+        ("Independent Cargo seed manifests differ", "Cargo seed mismatch ignored"),
+        (
+            "if ($manifestA -cne $manifestB) { throw 'Independent Cargo seed manifests differ' }",
+            "if ($manifestA -cne $manifestB -and $false) { throw 'Independent Cargo seed manifests differ' }",
+        ),
+        (
+            "if ($left -cne $right) { throw \"Independent build receipts differ at $property\" }",
+            "if ($left -cne $right -and $false) { throw \"Independent build receipts differ at $property\" }",
+        ),
+        (
+            '--second-executable "$env:REPRO_TARGET_B\\release\\collide-o-scope.exe"',
+            '--second-executable "$env:REPRO_TARGET_A\\release\\collide-o-scope.exe"',
+        ),
+    )
+    for original, replacement in hostile:
+        mutation = release.replace(original, replacement, 1)
+        try:
+            validate_unequal_reproducibility_workflow(mutation)
+        except ValueError:
+            continue
+        fail(f"unequal-root workflow hostile mutation was not rejected: {original}")
+
+    receipt_exclusion_condition = next(
+        fragment
+        for fragment, _ in unequal_reproducibility_workflow_fragments()
+        if fragment.startswith("(($receipt.cargo_manifest_exclusions -join ',')")
+    )
+    mutation = release.replace(
+        receipt_exclusion_condition,
+        f"({receipt_exclusion_condition} -and $false)",
+        1,
+    )
+    try:
+        validate_unequal_reproducibility_workflow(mutation)
+    except ValueError:
+        pass
+    else:
+        fail("unequal-root workflow accepted a neutralized receipt exclusion guard")
+
+    prepare_to_build_injection = (
+        "      - name: Collapse independent Cargo roots\n"
+        "        shell: pwsh\n"
+        "        run: |\n"
+        '          "REPRO_CARGO_B=$env:REPRO_CARGO_A" >> $env:GITHUB_ENV\n\n'
+    )
+    for insertion_marker in (
+        "      - name: Build twice from clean independent unequal roots",
+        "      - name: Generate reproducible CycloneDX SBOM",
+    ):
+        mutation = release.replace(
+            insertion_marker,
+            prepare_to_build_injection + insertion_marker,
+            1,
+        )
+        try:
+            validate_unequal_reproducibility_workflow(mutation)
+        except ValueError:
+            continue
+        fail("unequal-root workflow accepted an interstitial root-collapse step")
 
 
 def validate_reproducible_checkout_attributes(attributes: str) -> None:
@@ -1478,6 +1574,8 @@ def main() -> int:
         release = (ROOT / ".github/workflows/release-trust.yml").read_text(encoding="utf-8")
         self_test_attestation_identity_policy(release)
         self_test_draft_publish_last(release)
+        self_test_pinned_llvm_workflow(release)
+        self_test_unequal_reproducibility_workflow(release)
         ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self_test_ci_gate_bodies(ci)
         adversarial = (ROOT / ".github/workflows/adversarial.yml").read_text(
@@ -1486,7 +1584,7 @@ def main() -> int:
         reproducible_build = (ROOT / "scripts/build-reproducible-windows.ps1").read_text(
             encoding="utf-8"
         )
-        self_test_reproducible_path_remapping(reproducible_build)
+        self_test_canonical_reproducible_build(reproducible_build)
         attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
         self_test_reproducible_checkout_attributes(attributes)
         release_verifier = (ROOT / "scripts/verify-release.py").read_text(
@@ -1521,16 +1619,23 @@ def main() -> int:
             'Install-PinnedCargoTool cargo-deny "cargo-deny 0.20.2" cargo-deny 0.20.2',
             'Install-PinnedCargoTool cargo-audit "cargo-audit 0.22.2" cargo-audit 0.22.2',
         ]
+        auditable_reinstall = (
+            "cargo install --locked --force cargo-auditable --version 0.7.5"
+        )
         if (
-            release.count(expected_tools[0]) != 2
-            or release.count(expected_tools[1]) != 2
+            release.count(expected_tools[0]) != 1
+            or release.count(expected_tools[1]) != 1
+            or release.count(auditable_reinstall) != 1
+            or release.index(auditable_reinstall) > release.index(expected_tools[1])
             or any(release.count(line) != 1 for line in expected_tools[2:])
         ):
             fail("release Cargo tools are not checked against the exact pinned binaries")
         if (
             "cargo auditable --version" in reproducible_build
             or reproducible_build.count(expected_tools[0]) != 1
-            or reproducible_build.count(expected_tools[1]) != 1
+            or reproducible_build.count(
+                '(& rustup run 1.98.0 cargo install --list) -join "`n"'
+            ) != 1
         ):
             fail("reproducible build does not probe the exact cargo-auditable package")
         ci_tools = [

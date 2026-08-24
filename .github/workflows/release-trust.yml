@@ -20,6 +20,11 @@ env:
   FFMPEG_VERSION: 8.1.2
   FFMPEG_WINDOWS_SHA256: 274923c68904a9b76c73b908f57923dafba81155856cd742138515ded570d066
   FFMPEG_SOURCE_COMMIT: 38b88335f99e76ed89ff3c93f877fdefce736c13
+  LLVM_VERSION: 22.1.8
+  LLVM_WINDOWS_INSTALLER_SHA256: 16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c
+  LLVM_SOURCE_COMMIT: ca7933e47d3a3451d81e72ac174dcb5aa28b59d1
+  LLVM_AR_SHA256: 80934e8f208a0cc2a87a6057f871d0f492461952b8672464749a6c3dff34109c
+  LIBCLANG_SHA256: 51fed10c43c3d31c1fe5bfe76bac60150970961e9b9b23cf014dbfcb5398bbfc
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
 jobs:
@@ -110,11 +115,21 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.verification-gate.outputs.commit }}
-          path: source-b
+          path: source-b-with-deliberately-different-path-length
           fetch-depth: 0
 
       - name: Install pinned Rust
-        run: rustup toolchain install 1.98.0 --profile minimal
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          rustup toolchain install 1.98.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default 1.98.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $rustcVersion = (rustc -Vv) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or $rustcVersion -notmatch '(?m)^release: 1\.98\.0$') {
+            throw "Rust 1.98.0 is not active"
+          }
 
       - name: Cache Cargo downloads and release tools
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -124,6 +139,58 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: release-tools-windows-auditable-0.7.5-cyclonedx-0.5.9-deny-0.20.2-audit-0.22.2-${{ hashFiles('source-a/Cargo.lock') }}
+
+      - name: Download and verify pinned LLVM toolchain
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Join-Path $env:RUNNER_TEMP "LLVM-$env:LLVM_VERSION-win64.exe"
+          $destination = "C:\collide-llvm-$env:LLVM_VERSION"
+          if (Test-Path -LiteralPath $destination) {
+            throw "Pinned LLVM destination already exists"
+          }
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-win64.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer -MaximumRetryCount 3 -RetryIntervalSec 5
+          $installerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash.ToLowerInvariant()
+          if ($installerHash -cne $env:LLVM_WINDOWS_INSTALLER_SHA256) {
+            throw "LLVM installer checksum mismatch"
+          }
+          gh attestation verify $installer `
+            --repo llvm/llvm-project `
+            --signer-workflow llvm/llvm-project/.github/workflows/release-binaries.yml `
+            --source-ref "refs/tags/llvmorg-$env:LLVM_VERSION" `
+            --source-digest $env:LLVM_SOURCE_COMMIT `
+            --deny-self-hosted-runners
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $sevenZip = (Get-Command 7z.exe -CommandType Application -ErrorAction Stop).Source
+          & $sevenZip x $installer "-o$destination" 'bin\llvm-ar.exe' 'bin\libclang.dll' -y
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $llvmBin = Join-Path $destination 'bin'
+          $llvmAr = Join-Path $llvmBin 'llvm-ar.exe'
+          $libclang = Join-Path $llvmBin 'libclang.dll'
+          if (-not (Test-Path -LiteralPath $llvmAr -PathType Leaf) -or -not (Test-Path -LiteralPath $libclang -PathType Leaf)) {
+            throw "Pinned LLVM extraction is incomplete"
+          }
+          $extractedFiles = @(Get-ChildItem -LiteralPath $destination -File -Recurse -Force)
+          $expectedFiles = @($llvmAr, $libclang) | Sort-Object
+          $actualFiles = @($extractedFiles.FullName) | Sort-Object
+          if ($actualFiles.Count -ne 2 -or (Compare-Object $expectedFiles $actualFiles)) {
+            throw "Pinned LLVM extraction contains unexpected files"
+          }
+          $llvmArHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $llvmAr).Hash.ToLowerInvariant()
+          if ($llvmArHash -cne $env:LLVM_AR_SHA256) { throw "llvm-ar.exe checksum mismatch" }
+          $llvmArVersion = (& $llvmAr --version) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or $llvmArVersion -notmatch "(?m)^  LLVM version $([regex]::Escape($env:LLVM_VERSION))$") {
+            throw "llvm-ar.exe version mismatch"
+          }
+          $libclangHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $libclang).Hash.ToLowerInvariant()
+          $libclangVersion = (Get-Item -LiteralPath $libclang -Force).VersionInfo.FileVersion
+          if ($libclangHash -cne $env:LIBCLANG_SHA256 -or $libclangVersion -cne $env:LLVM_VERSION) {
+            throw "libclang.dll identity mismatch"
+          }
+          "LIBCLANG_PATH=$llvmBin" >> $env:GITHUB_ENV
 
       - name: Download pinned FFmpeg shared runtime
         shell: pwsh
@@ -144,9 +211,7 @@ jobs:
           $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if ([string]::IsNullOrWhiteSpace($vsPath)) { throw "Visual Studio C++ tools were not found" }
           "FFMPEG_DIR=$($ffmpeg.FullName)" >> $env:GITHUB_ENV
-          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
           "VCVARS64=$(Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat')" >> $env:GITHUB_ENV
-          (Join-Path $ffmpeg.FullName "bin") >> $env:GITHUB_PATH
 
       - name: Install pinned release tools
         shell: pwsh
@@ -171,11 +236,8 @@ jobs:
               throw "$Binary version mismatch: expected '$Expected', got '$verified'"
             }
           }
-          $installed = (cargo install --list) -join "`n"
-          if ($installed -notmatch '(?m)^cargo-auditable v0\.7\.5:$') {
-            cmd /c "`"$env:VCVARS64`" >nul && cargo install --locked --force cargo-auditable --version 0.7.5"
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+          cmd /c "`"$env:VCVARS64`" >nul && cargo install --locked --force cargo-auditable --version 0.7.5"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $verifiedInstalled = (cargo install --list) -join "`n"
           if ($verifiedInstalled -notmatch '(?m)^cargo-auditable v0\.7\.5:$') {
             throw "cargo-auditable 0.7.5 is not the installed package"
@@ -214,7 +276,7 @@ jobs:
           if ($env:RELEASE_TAG -ne "v$version") { throw "Tag $env:RELEASE_TAG does not match Cargo version $version" }
           $commit = "${{ needs.verification-gate.outputs.commit }}".ToLowerInvariant()
           $sourceA = (git -C source-a rev-parse 'HEAD^{commit}').Trim().ToLowerInvariant()
-          $sourceB = (git -C source-b rev-parse 'HEAD^{commit}').Trim().ToLowerInvariant()
+          $sourceB = (git -C source-b-with-deliberately-different-path-length rev-parse 'HEAD^{commit}').Trim().ToLowerInvariant()
           if ($sourceA -ne $commit -or $sourceB -ne $commit) {
             throw "Independent sources and verified commit are not identical"
           }
@@ -228,13 +290,189 @@ jobs:
           "commit=$commit" >> $env:GITHUB_OUTPUT
           "epoch=$epoch" >> $env:GITHUB_OUTPUT
 
-      - name: Build twice from clean independent checkouts
+      - name: Prepare unequal physical reproducibility roots
         shell: pwsh
         run: |
-          cmd /c "`"$env:VCVARS64`" >nul && pwsh -NoProfile -File source-a\scripts\build-reproducible-windows.ps1 -SourceRoot source-a -TargetDir `"$env:RUNNER_TEMP\target-a`" -FfmpegDir `"$env:FFMPEG_DIR`" -GitSha ${{ steps.source.outputs.commit }} -SourceDateEpoch ${{ steps.source.outputs.epoch }}"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmd /c "`"$env:VCVARS64`" >nul && pwsh -NoProfile -File source-b\scripts\build-reproducible-windows.ps1 -SourceRoot source-b -TargetDir `"$env:RUNNER_TEMP\target-b`" -FfmpegDir `"$env:FFMPEG_DIR`" -GitSha ${{ steps.source.outputs.commit }} -SourceDateEpoch ${{ steps.source.outputs.epoch }}"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ErrorActionPreference = "Stop"
+          function Assert-NoReparsePathChain {
+            param([string]$Path)
+            $full = [IO.Path]::GetFullPath($Path)
+            $root = [IO.Path]::GetPathRoot($full)
+            $current = $root
+            foreach ($component in $full.Substring($root.Length).Split([char[]]@('\', '/'), [StringSplitOptions]::RemoveEmptyEntries)) {
+              $current = Join-Path $current $component
+              if (-not (Test-Path -LiteralPath $current)) { throw "Missing path component: $current" }
+              if (((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Reparse-point path is not an independent physical root: $current"
+              }
+            }
+          }
+          function Assert-NoReparseTree {
+            param([string]$Path)
+            $items = @((Get-Item -LiteralPath $Path -Force)) + @(Get-ChildItem -LiteralPath $Path -Force -Recurse)
+            foreach ($item in $items) {
+              if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Reparse point is not permitted in a Cargo seed: $($item.FullName)"
+              }
+            }
+          }
+          function Copy-SeedTree {
+            param([string]$Source, [string]$Destination)
+            & robocopy.exe $Source $Destination /E /COPY:DAT /DCOPY:DAT /XJ /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "Cargo seed copy failed with exit code $LASTEXITCODE" }
+          }
+          function Get-ManifestDigest {
+            param([string]$Path)
+            $root = [IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\', '/'))
+            $records = [Collections.Generic.List[string]]::new()
+            foreach ($file in @(Get-ChildItem -LiteralPath $root -Force -Recurse -File)) {
+              $relative = $file.FullName.Substring($root.Length).TrimStart([char[]]@('\', '/')).Replace('\', '/')
+              $streams = @(Get-Item -LiteralPath $file.FullName -Stream *)
+              if ($streams.Count -ne 1 -or $streams[0].Stream -cne ':$DATA') {
+                throw "Alternate data stream is not permitted in a Cargo seed: $($file.FullName)"
+              }
+              $digest = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              $records.Add("$relative`0$($file.Length)`0$digest")
+            }
+            $records.Sort([StringComparer]::Ordinal)
+            $bytes = [Text.Encoding]::UTF8.GetBytes([string]::Join("`n", $records))
+            return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+          }
+
+          $defaultCargoHome = if ([string]::IsNullOrWhiteSpace($env:CARGO_HOME)) {
+            Join-Path $env:USERPROFILE '.cargo'
+          } else {
+            $env:CARGO_HOME
+          }
+          $sourceA = (Resolve-Path -LiteralPath 'source-a').Path
+          $sourceB = (Resolve-Path -LiteralPath 'source-b-with-deliberately-different-path-length').Path
+          $cargoA = Join-Path $env:RUNNER_TEMP 'ca'
+          $cargoB = Join-Path $env:RUNNER_TEMP 'cargo-seed-b-with-deliberately-different-physical-path-length'
+          $targetA = Join-Path $env:RUNNER_TEMP 'ta'
+          $targetB = Join-Path $env:RUNNER_TEMP 'target-b-with-deliberately-different-physical-path-length'
+          foreach ($path in @($cargoA, $cargoB, $targetA, $targetB)) {
+            if (Test-Path -LiteralPath $path) { throw "Reproducibility root must be absent: $path" }
+          }
+          foreach ($path in @($defaultCargoHome, $sourceA, $sourceB, $env:RUNNER_TEMP)) {
+            Assert-NoReparsePathChain $path
+          }
+          foreach ($path in @($cargoA, $cargoB)) {
+            [IO.Directory]::CreateDirectory((Join-Path $path 'registry')) | Out-Null
+            [IO.Directory]::CreateDirectory((Join-Path $path 'git')) | Out-Null
+            [IO.Directory]::CreateDirectory((Join-Path $path 'bin')) | Out-Null
+          }
+          foreach ($seed in @($cargoA, $cargoB)) {
+            Copy-SeedTree (Join-Path $defaultCargoHome 'registry\cache') (Join-Path $seed 'registry\cache')
+            Copy-SeedTree (Join-Path $defaultCargoHome 'registry\index') (Join-Path $seed 'registry\index')
+            Copy-SeedTree (Join-Path $defaultCargoHome 'git\db') (Join-Path $seed 'git\db')
+            [IO.File]::Copy((Join-Path $defaultCargoHome 'bin\cargo-auditable.exe'), (Join-Path $seed 'bin\cargo-auditable.exe'), $false)
+            [IO.File]::Copy((Join-Path $defaultCargoHome '.crates.toml'), (Join-Path $seed '.crates.toml'), $false)
+            [IO.File]::Copy((Join-Path $defaultCargoHome '.crates2.json'), (Join-Path $seed '.crates2.json'), $false)
+            Assert-NoReparsePathChain $seed
+            Assert-NoReparseTree $seed
+          }
+          $manifestA = Get-ManifestDigest $cargoA
+          $manifestB = Get-ManifestDigest $cargoB
+          if ($manifestA -cne $manifestB) { throw 'Independent Cargo seed manifests differ' }
+
+          $roots = @($sourceA, $sourceB, $cargoA, $cargoB, $targetA, $targetB) |
+            ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd([char[]]@('\', '/')) }
+          $uniqueRoots = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+          foreach ($root in $roots) {
+            if (-not $uniqueRoots.Add($root)) { throw "Reproducibility roots are not distinct: $root" }
+          }
+          for ($left = 0; $left -lt $roots.Count; $left++) {
+            for ($right = $left + 1; $right -lt $roots.Count; $right++) {
+              if (
+                ($roots[$left] + '\').StartsWith($roots[$right] + '\', [StringComparison]::OrdinalIgnoreCase) -or
+                ($roots[$right] + '\').StartsWith($roots[$left] + '\', [StringComparison]::OrdinalIgnoreCase)
+              ) { throw 'Reproducibility roots overlap' }
+            }
+          }
+          foreach ($pair in @(@($sourceA, $sourceB), @($cargoA, $cargoB), @($targetA, $targetB))) {
+            if ($pair[0].Length -eq $pair[1].Length) { throw 'A/B path lengths must deliberately differ' }
+          }
+          "REPRO_SOURCE_A=$sourceA" >> $env:GITHUB_ENV
+          "REPRO_SOURCE_B=$sourceB" >> $env:GITHUB_ENV
+          "REPRO_CARGO_A=$cargoA" >> $env:GITHUB_ENV
+          "REPRO_CARGO_B=$cargoB" >> $env:GITHUB_ENV
+          "REPRO_TARGET_A=$targetA" >> $env:GITHUB_ENV
+          "REPRO_TARGET_B=$targetB" >> $env:GITHUB_ENV
+          "REPRO_CARGO_SEED_SHA256=$manifestA" >> $env:GITHUB_ENV
+
+      - name: Build twice from clean independent unequal roots
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $expectedProperties = @(
+            'schema_version', 'contract', 'wrapper_sha256', 'source_commit', 'source_tree_sha', 'source_date_epoch',
+            'source_archive_sha256', 'cargo_seed_manifest_sha256', 'cargo_expanded_manifest_sha256',
+            'cargo_manifest_exclusions', 'cargo_auditable_sha256', 'ffmpeg_manifest_sha256',
+            'ffmpeg_version', 'rustc_version', 'rustc_commit', 'cargo_version', 'cargo_commit',
+            'llvm_ar_sha256', 'llvm_ar_version', 'libclang_sha256', 'libclang_version',
+            'offline', 'canonical_root', 'executable_sha256', 'identity_sha256',
+            'cleanup_succeeded', 'executable'
+          )
+          function Invoke-ReproducibleBuild {
+            param(
+              [string]$Source,
+              [string]$Target,
+              [string]$CargoSeed,
+              [string]$ReceiptPath
+            )
+            $script = Join-Path $Source 'scripts\build-reproducible-windows.ps1'
+            $priorCargoHome = [Environment]::GetEnvironmentVariable('CARGO_HOME', 'Process')
+            try {
+              [Environment]::SetEnvironmentVariable('CARGO_HOME', $CargoSeed, 'Process')
+              $command = "`"$env:VCVARS64`" >nul && pwsh -NoProfile -File `"$script`" -SourceRoot `"$Source`" -TargetDir `"$Target`" -FfmpegDir `"$env:FFMPEG_DIR`" -GitSha ${{ steps.source.outputs.commit }} -SourceDateEpoch ${{ steps.source.outputs.epoch }}"
+              $output = @(cmd.exe /d /s /c $command)
+              $buildExit = $LASTEXITCODE
+            } finally {
+              [Environment]::SetEnvironmentVariable('CARGO_HOME', $priorCargoHome, 'Process')
+            }
+            if ($buildExit -ne 0) { exit $buildExit }
+            $receiptLines = @($output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if ($receiptLines.Count -ne 1) { throw 'Reproducible wrapper did not emit exactly one JSON receipt' }
+            try { $receipt = $receiptLines[0] | ConvertFrom-Json } catch { throw 'Reproducible wrapper emitted invalid JSON' }
+            $observedProperties = @($receipt.PSObject.Properties.Name)
+            if (@(Compare-Object $expectedProperties $observedProperties -SyncWindow 0).Count -ne 0) {
+              throw 'Reproducible wrapper receipt schema changed'
+            }
+            if (
+              $receipt.schema_version -ne 1 -or
+              $receipt.contract -cne 'collide-windows-canonical-repro-v1' -or
+              -not $receipt.offline -or -not $receipt.cleanup_succeeded -or
+              $receipt.canonical_root -cne 'C:\cosrepro' -or
+              (Test-Path -LiteralPath 'C:\cosrepro')
+            ) { throw 'Canonical build transaction did not finish cleanly and offline' }
+            $expectedExecutable = [IO.Path]::GetFullPath((Join-Path $Target 'release\collide-o-scope.exe'))
+            if ([IO.Path]::GetFullPath($receipt.executable) -cne $expectedExecutable) {
+              throw 'Receipt executable is not the intended caller target'
+            }
+            $publishedHash = (Get-FileHash -LiteralPath $expectedExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
+            $wrapperHash = (Get-FileHash -LiteralPath $script -Algorithm SHA256).Hash.ToLowerInvariant()
+            if (
+              $publishedHash -cne $receipt.executable_sha256 -or
+              $wrapperHash -cne $receipt.wrapper_sha256 -or
+              $receipt.cargo_seed_manifest_sha256 -cne $env:REPRO_CARGO_SEED_SHA256 -or
+              $receipt.source_commit -cne '${{ steps.source.outputs.commit }}' -or
+              (($receipt.cargo_manifest_exclusions -join ',') -cne '.global-cache,.package-cache,.package-cache-mutate,git/checkouts/ntsc-rs-5808ee35e7b6c97f/4b79500/.git/index,git/checkouts/ntsc-rs-5808ee35e7b6c97f/4b79500/.git/logs/HEAD,git/checkouts/ntsc-rs-5808ee35e7b6c97f/4b79500/.git/logs/refs/heads/master,git/checkouts/ntsc-rs-5808ee35e7b6c97f/4b79500/crates/openfx-plugin/vendor/openfx/.git/index,git/checkouts/ntsc-rs-5808ee35e7b6c97f/4b79500/crates/openfx-plugin/vendor/openfx/.git/logs/HEAD,git/checkouts/ntsc-rs-5808ee35e7b6c97f/4b79500/crates/openfx-plugin/vendor/openfx/.git/logs/refs/heads/master')
+            ) { throw 'Reproducible wrapper receipt disagrees with its reviewed inputs or output' }
+            [IO.File]::WriteAllText($ReceiptPath, ($receiptLines[0] + "`n"), [Text.UTF8Encoding]::new($false))
+            return $receipt
+          }
+
+          $receiptAPath = Join-Path $env:RUNNER_TEMP 'canonical-repro-receipt-a.json'
+          $receiptBPath = Join-Path $env:RUNNER_TEMP 'canonical-repro-receipt-b.json'
+          $receiptA = Invoke-ReproducibleBuild $env:REPRO_SOURCE_A $env:REPRO_TARGET_A $env:REPRO_CARGO_A $receiptAPath
+          if (Test-Path -LiteralPath 'C:\cosrepro') { throw 'Build A left the canonical root present' }
+          $receiptB = Invoke-ReproducibleBuild $env:REPRO_SOURCE_B $env:REPRO_TARGET_B $env:REPRO_CARGO_B $receiptBPath
+          if (Test-Path -LiteralPath 'C:\cosrepro') { throw 'Build B left the canonical root present' }
+          foreach ($property in $expectedProperties | Where-Object { $_ -cne 'executable' }) {
+            $left = $receiptA.$property | ConvertTo-Json -Compress -Depth 8
+            $right = $receiptB.$property | ConvertTo-Json -Compress -Depth 8
+            if ($left -cne $right) { throw "Independent build receipts differ at $property" }
+          }
 
       - name: Generate reproducible CycloneDX SBOM
         shell: pwsh
@@ -251,8 +489,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path release | Out-Null
           python source-a\scripts\verify-release.py prepare `
-            --executable "$env:RUNNER_TEMP\target-a\release\collide-o-scope.exe" `
-            --second-executable "$env:RUNNER_TEMP\target-b\release\collide-o-scope.exe" `
+            --executable "$env:REPRO_TARGET_A\release\collide-o-scope.exe" `
+            --second-executable "$env:REPRO_TARGET_B\release\collide-o-scope.exe" `
             --ffmpeg-bin "$env:FFMPEG_DIR\bin" `
             --ffmpeg-version "$env:FFMPEG_VERSION" `
             --ffmpeg-archive-sha256 "$env:FFMPEG_WINDOWS_SHA256" `
