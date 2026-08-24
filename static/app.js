@@ -8299,8 +8299,14 @@ function syncStageHealth(health = {}) {
   const p50 = boundedMetric(health?.frame_time_p50_us) / 1000;
   const p95 = boundedMetric(health?.frame_time_p95_us) / 1000;
   const p99 = boundedMetric(health?.frame_time_p99_us) / 1000;
+  const latenessP50 = boundedMetric(health?.schedule_lateness_p50_us) / 1000;
+  const latenessP95 = boundedMetric(health?.schedule_lateness_p95_us) / 1000;
+  const latenessP99 = boundedMetric(health?.schedule_lateness_p99_us) / 1000;
+  const skippedTicks = boundedMetric(
+    health?.skipped_program_ticks ?? health?.missed_deadlines,
+  );
   document.getElementById('stage-health-summary').textContent =
-    `${fps.toFixed(1)} fps · frame ${p50.toFixed(2)}/${p95.toFixed(2)}/${p99.toFixed(2)} ms p50/p95/p99 · missed ${boundedMetric(health?.missed_deadlines)} · ${boundedMetric(output.width)}×${boundedMetric(output.height)} @ ${(boundedMetric(output.refresh_millihz) / 1000).toFixed(3)} Hz`;
+    `${fps.toFixed(1)} fps · frame ${p50.toFixed(2)}/${p95.toFixed(2)}/${p99.toFixed(2)} ms p50/p95/p99 · lateness ${latenessP50.toFixed(3)}/${latenessP95.toFixed(3)}/${latenessP99.toFixed(3)} ms · skipped ${skippedTicks} · ${boundedMetric(output.width)}×${boundedMetric(output.height)} @ ${(boundedMetric(output.refresh_millihz) / 1000).toFixed(3)} Hz`;
   const budgets = health?.budgets || {};
   document.getElementById('stage-health-budgets').textContent = [
     budgetText('GPU', budgets.gpu), budgetText('media', budgets.media),
