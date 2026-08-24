@@ -404,6 +404,11 @@ pub(crate) fn available_space(path: &Path) -> io::Result<u64> {
 }
 
 #[cfg(unix)]
+fn statvfs_field_u64<T: Into<u64>>(value: T) -> u64 {
+    value.into()
+}
+
+#[cfg(unix)]
 pub(crate) fn available_space(path: &Path) -> io::Result<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -415,7 +420,7 @@ pub(crate) fn available_space(path: &Path) -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
     let stats = unsafe { stats.assume_init() };
-    Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+    Ok(statvfs_field_u64(stats.f_bavail).saturating_mul(statvfs_field_u64(stats.f_frsize)))
 }
 
 #[cfg(not(any(windows, unix)))]
