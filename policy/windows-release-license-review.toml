@@ -1,0 +1,43 @@
+# Checked-in technical review for the exact native distribution admitted by
+# `.github/workflows/release-trust.yml`. This is provenance and policy evidence,
+# not legal advice or an Authenticode signature.
+schema_version = 1
+review_id = "windows-ffmpeg-8.1.2-2026-08-24"
+review_owner = "release-engineering"
+reviewed = 2026-08-24
+scope = "Mechanical review of the pinned Windows native runtime, repository notices, Cargo license inventory, and packaging boundary"
+legal_conclusion = false
+decision = "admit_only_the_exact_reviewed_distribution"
+
+[ffmpeg]
+version = "8.1.2"
+distribution = "Gyan full shared Windows build"
+archive_sha256 = "274923c68904a9b76c73b908f57923dafba81155856cd742138515ded570d066"
+source_commit = "38b88335f99e76ed89ff3c93f877fdefce736c13"
+source_url = "https://github.com/FFmpeg/FFmpeg/commit/38b88335f99e76ed89ff3c93f877fdefce736c13"
+runtime_license = "GPL-3.0-or-later"
+buildconf_sha256 = "c6bda1522d327c29f4834ef68d8749b0de94029678b5d34ad444e9a6b77520ec"
+runtime_license_text_sha256 = "040708d6a654aed3dbc2bc4fae8f247ba2817ebe08898042b601016e9fe870ac"
+distribution_license_sha256 = "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+distribution_readme_sha256 = "8672bfd3c809f7813176307ff87f084f4847bc894729879f2875739ec28aec8c"
+required_build_flags = ["--enable-gpl", "--enable-version3", "--enable-shared"]
+forbidden_build_flags = ["--enable-nonfree"]
+
+[packaging]
+required_package_notices = [
+  "LICENSE",
+  "COPYRIGHT.md",
+  "FFMPEG-BUILDCONF.txt",
+  "FFMPEG-README.txt",
+  "LICENSES/FFmpeg-GPL-3.0-or-later.txt",
+]
+
+[authenticode]
+status = "unavailable"
+reason = "No managed Authenticode certificate or remote Windows signing service is configured for this repository"
+artifact_claim = "The reproducible Windows executable is unsigned; Sigstore authenticates SHA256SUMS and provenance, not the PE Authenticode trust chain"
+
+[reviewed_materials]
+cargo = "Pinned cargo-deny inventory plus cargo-audit and unexpired exception policy; mechanical status only"
+repository = "LICENSE, COPYRIGHT.md, LICENSES, Cargo.lock, and release packaging code"
+native = "Pinned Gyan archive hash, FFmpeg source commit, runtime GPL text, build configuration, distribution LICENSE, and README"

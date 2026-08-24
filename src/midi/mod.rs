@@ -23,6 +23,9 @@ use std::time::{Duration, Instant};
 
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 
+use crate::action_correlation::{
+    ActionEnvelope, ActionIdentity, ActionSequencer, ActionSourceClass,
+};
 use crate::controller_profile::{
     is_well_formed_controller_midi, AutomationOrigin, ControllerDecoder, ControllerEvent,
     ControllerProfileError, MidiDeviceSelector, ResolvedControllerProfile, RuntimeControlAddress,
@@ -162,6 +165,33 @@ struct RawMidiMessage {
     len: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MidiClockUpdate {
+    Pulse { timestamp_us: u64 },
+    Start,
+}
+
+/// One driver-minted raw action after bounded decoding. Compatibility CC
+/// state remains inert inside this value until Main applies it at the same
+/// correlated lifecycle seam as the typed controller events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MidiActionBatch {
+    events: std::ops::Range<usize>,
+    compatibility_cc: Option<(u8, u8)>,
+    clock_update: Option<MidiClockUpdate>,
+    decoder_state_changed: bool,
+}
+
+impl MidiActionBatch {
+    pub fn event_range(&self) -> std::ops::Range<usize> {
+        self.events.clone()
+    }
+
+    pub fn decoder_state_changed(&self) -> bool {
+        self.decoder_state_changed
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LoopFingerprint {
     bytes: [u8; 3],
@@ -192,6 +222,40 @@ impl MidiFeedbackRateGate {
     }
 }
 
+struct MidiActionQueues {
+    admitted: VecDeque<ActionEnvelope<RawMidiMessage>>,
+    displaced: VecDeque<ActionIdentity>,
+}
+
+impl MidiActionQueues {
+    fn new() -> Self {
+        Self {
+            admitted: VecDeque::with_capacity(MIDI_RAW_QUEUE_CAPACITY),
+            displaced: VecDeque::with_capacity(MIDI_RAW_QUEUE_CAPACITY),
+        }
+    }
+
+    fn unresolved_len(&self) -> usize {
+        self.admitted.len().saturating_add(self.displaced.len())
+    }
+
+    fn displace_admitted(&mut self) {
+        debug_assert!(self.unresolved_len() <= MIDI_RAW_QUEUE_CAPACITY);
+        while let Some(action) = self.admitted.pop_front() {
+            self.displaced.push_back(action.identity());
+        }
+        debug_assert!(self.unresolved_len() <= MIDI_RAW_QUEUE_CAPACITY);
+    }
+
+    fn drain_displaced(&mut self, output: &mut [Option<ActionIdentity>]) -> usize {
+        let count = output.len().min(self.displaced.len());
+        for slot in output.iter_mut().take(count) {
+            *slot = self.displaced.pop_front();
+        }
+        count
+    }
+}
+
 struct MidiShared {
     /// CC value table: f32 bits, 0..1, indexed by CC number.
     cc_values: [AtomicU32; 128],
@@ -203,24 +267,26 @@ struct MidiShared {
     clock_interval_us: std::sync::atomic::AtomicU64,
     /// Driver timestamp of the previous pulse, microseconds.
     clock_prev_ts: std::sync::atomic::AtomicU64,
-    raw_queue: Mutex<VecDeque<RawMidiMessage>>,
+    action_queues: Mutex<MidiActionQueues>,
     recent_feedback: Mutex<VecDeque<LoopFingerprint>>,
     feedback: Mutex<BTreeMap<(u8, u8), [u8; 3]>>,
     counters: MidiAtomicCounters,
+    action_sequencer: Arc<ActionSequencer>,
 }
 
 impl MidiShared {
-    fn new() -> Self {
+    fn new(action_sequencer: Arc<ActionSequencer>) -> Self {
         Self {
             cc_values: std::array::from_fn(|_| AtomicU32::new(0)),
             last_cc: AtomicU32::new(0),
             clock_pulses: std::sync::atomic::AtomicU64::new(0),
             clock_interval_us: std::sync::atomic::AtomicU64::new(0),
             clock_prev_ts: std::sync::atomic::AtomicU64::new(0),
-            raw_queue: Mutex::new(VecDeque::with_capacity(MIDI_RAW_QUEUE_CAPACITY)),
+            action_queues: Mutex::new(MidiActionQueues::new()),
             recent_feedback: Mutex::new(VecDeque::with_capacity(MIDI_FEEDBACK_KEYS_CAPACITY)),
             feedback: Mutex::new(BTreeMap::new()),
             counters: MidiAtomicCounters::default(),
+            action_sequencer,
         }
     }
 
@@ -230,12 +296,15 @@ impl MidiShared {
     /// pitch bend, aftertouch, and transport messages must never overwrite an
     /// armed CC binding.
     fn handle_message(&self, timestamp: u64, message: &[u8]) {
+        self.handle_message_at(Instant::now(), timestamp, message);
+    }
+
+    fn handle_message_at(&self, ingress: Instant, timestamp: u64, message: &[u8]) {
         self.counters.raw_received.fetch_add(1, Ordering::Relaxed);
         if !is_well_formed_controller_midi(message) {
             self.counters.malformed.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let status = message[0];
         let expected = message.len();
         let mut bytes = [0_u8; 3];
         bytes[..expected].copy_from_slice(message);
@@ -245,52 +314,32 @@ impl MidiShared {
                 .fetch_add(1, Ordering::Relaxed);
             return;
         }
-        match status {
-            // Control Change on any channel: [0xBn, cc, value]
-            s if s & 0xF0 == 0xB0 => {
-                let cc = message[1] as usize;
-                let value = message[2] as f32 / 127.0;
-                self.cc_values[cc].store(value.to_bits(), Ordering::Relaxed);
-                self.last_cc.store(cc as u32 + 1, Ordering::Relaxed);
-            }
-            // Timing Clock: 24 pulses per quarter note.
-            0xF8 => {
-                let prev = self.clock_prev_ts.swap(timestamp, Ordering::Relaxed);
-                if prev > 0 && timestamp > prev {
-                    let dt = (timestamp - prev) as f64;
-                    if (2_000.0..=100_000.0).contains(&dt) {
-                        let old = f64::from_bits(self.clock_interval_us.load(Ordering::Relaxed));
-                        let ema = if old > 0.0 { old * 0.9 + dt * 0.1 } else { dt };
-                        self.clock_interval_us
-                            .store(ema.to_bits(), Ordering::Relaxed);
-                    }
-                }
-                self.clock_pulses.fetch_add(1, Ordering::Relaxed);
-            }
-            // Start: rewind to beat zero. (Continue 0xFB resumes without reset.)
-            0xFA => {
-                self.clock_pulses.store(0, Ordering::Relaxed);
-                self.clock_prev_ts.store(0, Ordering::Relaxed);
-            }
-            _ => {}
-        }
         let raw = RawMidiMessage {
             timestamp_us: timestamp,
             bytes,
             len: expected as u8,
         };
-        let Ok(mut queue) = self.raw_queue.try_lock() else {
+        let Ok(mut queues) = self.action_queues.try_lock() else {
             self.counters
                 .input_queue_dropped
                 .fetch_add(1, Ordering::Relaxed);
             return;
         };
-        if queue.len() == MIDI_RAW_QUEUE_CAPACITY {
+        // Admitted messages and identities displaced by a lifecycle barrier
+        // share the original fixed 1,024-action ceiling. Until Main consumes
+        // displaced identities, new callback work is refused before minting;
+        // no reconfiguration can overwrite correlation evidence or grow a
+        // second unbounded queue.
+        if queues.unresolved_len() >= MIDI_RAW_QUEUE_CAPACITY {
             self.counters
                 .input_queue_dropped
                 .fetch_add(1, Ordering::Relaxed);
         } else {
-            queue.push_back(raw);
+            queues.admitted.push_back(self.action_sequencer.envelope_at(
+                ActionSourceClass::Midi,
+                ingress,
+                raw,
+            ));
         }
     }
 
@@ -310,15 +359,35 @@ impl MidiShared {
     }
 
     fn clear_protocol_queues(&self) {
-        if let Ok(mut queue) = self.raw_queue.lock() {
-            queue.clear();
-        }
+        // Lifecycle barriers must retain every already-minted identity for
+        // Main to terminalize as Superseded. This transfer is FIFO and cannot
+        // exceed MIDI_RAW_QUEUE_CAPACITY because callback admission accounts
+        // for both halves of the fixed action queue.
+        self.action_queues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .displace_admitted();
         if let Ok(mut feedback) = self.feedback.lock() {
             feedback.clear();
         }
         if let Ok(mut recent) = self.recent_feedback.lock() {
             recent.clear();
         }
+    }
+
+    fn drain_displaced_action_identities(&self, output: &mut [Option<ActionIdentity>]) -> usize {
+        self.action_queues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain_displaced(output)
+    }
+
+    fn displaced_action_identity_count(&self) -> usize {
+        self.action_queues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .displaced
+            .len()
     }
 }
 
@@ -353,8 +422,12 @@ pub struct MidiEngine {
 
 impl MidiEngine {
     pub fn new() -> Self {
+        Self::with_action_sequencer(Arc::new(ActionSequencer::default()))
+    }
+
+    pub fn with_action_sequencer(action_sequencer: Arc<ActionSequencer>) -> Self {
         Self {
-            shared: Arc::new(MidiShared::new()),
+            shared: Arc::new(MidiShared::new(action_sequencer)),
             worker: None,
             decoder: ControllerDecoder::new(ResolvedControllerProfile::legacy_four_cc()),
             local_counters: MidiCounters::default(),
@@ -470,6 +543,62 @@ impl MidiEngine {
         }
     }
 
+    #[cfg(test)]
+    pub fn inject_message_for_test(&self, ingress: Instant, timestamp: u64, message: &[u8]) {
+        self.shared.handle_message_at(ingress, timestamp, message);
+    }
+
+    /// Apply legacy-slot/MIDI-learn compatibility state exactly once, after
+    /// dequeue and under the batch's original ActionIdentity. Returning false
+    /// means the raw CC was an exact compatibility no-op; typed decoded events
+    /// may still independently apply under the same identity.
+    pub fn apply_correlated_compatibility(&self, batch: &MidiActionBatch) -> bool {
+        let Some((cc, raw_value)) = batch.compatibility_cc else {
+            return false;
+        };
+        let value_bits = (f32::from(raw_value) / 127.0).to_bits();
+        let prior_value =
+            self.shared.cc_values[usize::from(cc)].swap(value_bits, Ordering::Relaxed);
+        let prior_last = self
+            .shared
+            .last_cc
+            .swap(u32::from(cc) + 1, Ordering::Relaxed);
+        prior_value != value_bits || prior_last != u32::from(cc) + 1
+    }
+
+    /// Apply transport-clock state only after Main dequeues the action under
+    /// its original identity. The driver callback merely admits a fixed raw
+    /// message; no rendered clock fact can change before this seam.
+    pub fn apply_correlated_clock(&self, batch: &MidiActionBatch) -> bool {
+        match batch.clock_update {
+            Some(MidiClockUpdate::Pulse { timestamp_us }) => {
+                let prev = self
+                    .shared
+                    .clock_prev_ts
+                    .swap(timestamp_us, Ordering::Relaxed);
+                if prev > 0 && timestamp_us > prev {
+                    let dt = (timestamp_us - prev) as f64;
+                    if (2_000.0..=100_000.0).contains(&dt) {
+                        let old =
+                            f64::from_bits(self.shared.clock_interval_us.load(Ordering::Relaxed));
+                        let ema = if old > 0.0 { old * 0.9 + dt * 0.1 } else { dt };
+                        self.shared
+                            .clock_interval_us
+                            .store(ema.to_bits(), Ordering::Relaxed);
+                    }
+                }
+                self.shared.clock_pulses.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Some(MidiClockUpdate::Start) => {
+                let pulses = self.shared.clock_pulses.swap(0, Ordering::Relaxed);
+                let previous = self.shared.clock_prev_ts.swap(0, Ordering::Relaxed);
+                pulses != 0 || previous != 0
+            }
+            None => false,
+        }
+    }
+
     pub fn apply_profile(
         &mut self,
         profile: ResolvedControllerProfile,
@@ -491,23 +620,51 @@ impl MidiEngine {
         self.decoder.profile()
     }
 
+    /// Drain identities displaced by `stop` or `apply_profile` into caller-owned
+    /// fixed storage, in original ingress order.
+    ///
+    /// Only the returned prefix is written. If `output` is smaller than the
+    /// pending set, the remainder stays queued and is returned by a later call.
+    /// Main must terminalize every returned identity as `Superseded`. The
+    /// admitted and displaced halves share `MIDI_RAW_QUEUE_CAPACITY`, so this
+    /// evidence path cannot grow beyond the pre-existing input ceiling.
+    pub fn drain_displaced_action_identities(
+        &self,
+        output: &mut [Option<ActionIdentity>],
+    ) -> usize {
+        self.shared.drain_displaced_action_identities(output)
+    }
+
+    pub fn displaced_action_identity_count(&self) -> usize {
+        self.shared.displaced_action_identity_count()
+    }
+
     pub fn request_rescan(&self) {
         if let Some(worker) = &self.worker {
             worker.wake_rescan.store(true, Ordering::Release);
         }
     }
 
-    pub fn drain_events(&mut self, output: &mut Vec<ControllerEvent>) {
+    /// Decode bounded raw input while retaining the one envelope minted by
+    /// the driver callback for each admitted MIDI message. A range may be
+    /// empty when a well-formed but unmapped message is explicitly refused by
+    /// the application; fan-out remains one correlated transport action.
+    pub fn drain_correlated_events(
+        &mut self,
+        output: &mut Vec<ControllerEvent>,
+        batches: &mut Vec<ActionEnvelope<MidiActionBatch>>,
+    ) {
         let before = output.len();
         let output_limit = before.saturating_add(MIDI_EVENT_DRAIN_CAPACITY);
         let mut raw = VecDeque::new();
-        if let Ok(mut queue) = self.shared.raw_queue.try_lock() {
-            std::mem::swap(&mut *queue, &mut raw);
+        if let Ok(mut queues) = self.shared.action_queues.try_lock() {
+            std::mem::swap(&mut queues.admitted, &mut raw);
         }
         for message in raw {
+            let event_start = output.len();
             let report = self.decoder.decode_bounded(
-                message.timestamp_us,
-                &message.bytes[..usize::from(message.len)],
+                message.payload().timestamp_us,
+                &message.payload().bytes[..usize::from(message.payload().len)],
                 output,
                 output_limit,
             );
@@ -515,15 +672,37 @@ impl MidiEngine {
                 .local_counters
                 .event_queue_dropped
                 .saturating_add(report.dropped_events as u64);
-            if report.matched_bindings == 0 && message.bytes[0] < 0xf0 {
+            if report.matched_bindings == 0 && message.payload().bytes[0] < 0xf0 {
                 self.local_counters.channel_or_unmapped =
                     self.local_counters.channel_or_unmapped.saturating_add(1);
             }
+            let event_end = output.len();
+            let compatibility_cc = (message.payload().bytes[0] & 0xf0 == 0xb0)
+                .then(|| (message.payload().bytes[1], message.payload().bytes[2]));
+            let clock_update = match message.payload().bytes[0] {
+                0xf8 => Some(MidiClockUpdate::Pulse {
+                    timestamp_us: message.payload().timestamp_us,
+                }),
+                0xfa => Some(MidiClockUpdate::Start),
+                _ => None,
+            };
+            batches.push(message.map(|_| MidiActionBatch {
+                events: event_start..event_end,
+                compatibility_cc,
+                clock_update,
+                decoder_state_changed: report.state_changed,
+            }));
         }
         self.local_counters.decoded_events = self
             .local_counters
             .decoded_events
             .saturating_add((output.len() - before) as u64);
+    }
+
+    #[cfg(test)]
+    pub fn drain_events(&mut self, output: &mut Vec<ControllerEvent>) {
+        let mut batches = Vec::new();
+        self.drain_correlated_events(output, &mut batches);
     }
 
     pub fn queue_feedback(
@@ -835,21 +1014,36 @@ mod tests {
 
     const PULSE_US_120_BPM: u64 = 20_833;
 
-    fn feed_120_bpm_quarter(engine: &MidiEngine) {
+    fn feed_120_bpm_quarter(engine: &mut MidiEngine) {
         let first_timestamp = 1_000_000;
         for pulse in 0..24 {
             engine
                 .shared
                 .handle_message(first_timestamp + pulse * PULSE_US_120_BPM, &[0xF8]);
         }
+        assert_eq!(engine.shared.clock_pulses.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.shared.clock_prev_ts.load(Ordering::Relaxed), 0);
+        let mut events = Vec::new();
+        let mut batches = Vec::new();
+        engine.drain_correlated_events(&mut events, &mut batches);
+        assert_eq!(batches.len(), 24);
+        assert!(batches
+            .iter()
+            .all(|batch| engine.apply_correlated_clock(batch.payload())));
     }
 
     #[test]
     fn learn_accepts_control_change_on_any_channel() {
-        let engine = MidiEngine::new();
+        let mut engine = MidiEngine::new();
 
         engine.shared.handle_message(0, &[0xB7, 74, 100]);
-
+        assert_eq!(engine.take_last_cc(), None);
+        assert_eq!(engine.cc_value(74), 0.0);
+        let mut events = Vec::new();
+        let mut batches = Vec::new();
+        engine.drain_correlated_events(&mut events, &mut batches);
+        assert_eq!(batches.len(), 1);
+        assert!(engine.apply_correlated_compatibility(batches[0].payload()));
         assert_eq!(engine.take_last_cc(), Some(74));
         assert!((engine.cc_value(74) - 100.0 / 127.0).abs() < f32::EPSILON);
     }
@@ -888,7 +1082,13 @@ mod tests {
         assert_eq!(engine.shared.clock_pulses.load(Ordering::Relaxed), 0);
         assert_eq!(engine.shared.clock_prev_ts.load(Ordering::Relaxed), 0);
         assert_eq!(engine.cc_value(74), 0.0);
-        assert!(engine.shared.raw_queue.lock().unwrap().is_empty());
+        assert!(engine
+            .shared
+            .action_queues
+            .lock()
+            .unwrap()
+            .admitted
+            .is_empty());
     }
 
     #[test]
@@ -907,7 +1107,7 @@ mod tests {
         let mut engine = MidiEngine::new();
         let sampled_at = Instant::now();
         engine.last_advance = sampled_at;
-        feed_120_bpm_quarter(&engine);
+        feed_120_bpm_quarter(&mut engine);
 
         let (bpm, beat) = engine
             .clock_state_at(sampled_at)
@@ -922,11 +1122,16 @@ mod tests {
         let mut engine = MidiEngine::new();
         let sampled_at = Instant::now();
         engine.last_advance = sampled_at;
-        feed_120_bpm_quarter(&engine);
+        feed_120_bpm_quarter(&mut engine);
         assert!(engine.clock_state_at(sampled_at).is_some());
 
         engine.shared.handle_message(2_000_000, &[0xFA]);
-
+        assert_ne!(engine.shared.clock_pulses.load(Ordering::Relaxed), 0);
+        let mut events = Vec::new();
+        let mut batches = Vec::new();
+        engine.drain_correlated_events(&mut events, &mut batches);
+        assert_eq!(batches.len(), 1);
+        assert!(engine.apply_correlated_clock(batches[0].payload()));
         assert_eq!(engine.shared.clock_pulses.load(Ordering::Relaxed), 0);
         assert_eq!(engine.shared.clock_prev_ts.load(Ordering::Relaxed), 0);
         assert_eq!(engine.clock_state_at(sampled_at), None);
@@ -938,7 +1143,7 @@ mod tests {
         let mut engine = MidiEngine::new();
         let sampled_at = Instant::now();
         engine.last_advance = sampled_at;
-        feed_120_bpm_quarter(&engine);
+        feed_120_bpm_quarter(&mut engine);
         let active = engine
             .clock_state_at(sampled_at)
             .expect("clock should become active");
@@ -994,7 +1199,7 @@ mod tests {
             engine.shared.handle_message(timestamp, &[0xb0, 1, 64]);
         }
         assert_eq!(
-            engine.shared.raw_queue.lock().unwrap().len(),
+            engine.shared.action_queues.lock().unwrap().admitted.len(),
             MIDI_RAW_QUEUE_CAPACITY
         );
         assert_eq!(
@@ -1005,6 +1210,110 @@ mod tests {
                 .load(Ordering::Relaxed),
             17
         );
+    }
+
+    #[test]
+    fn callback_mints_once_and_decode_preserves_the_exact_shared_identity() {
+        let sequencer = Arc::new(ActionSequencer::default());
+        let mut engine = MidiEngine::with_action_sequencer(sequencer.clone());
+        let ingress = Instant::now()
+            .checked_sub(Duration::from_millis(7))
+            .unwrap();
+
+        engine
+            .shared
+            .handle_message_at(ingress, 123, &[0xb0, 1, 64]);
+        let queued_identity = engine
+            .shared
+            .action_queues
+            .lock()
+            .unwrap()
+            .admitted
+            .front()
+            .unwrap()
+            .identity();
+        assert_eq!(queued_identity.sequence().get(), 1);
+        assert_eq!(queued_identity.source(), ActionSourceClass::Midi);
+        assert_eq!(queued_identity.ingress(), ingress);
+
+        let next_transport = sequencer.envelope(ActionSourceClass::Browser, ());
+        assert_eq!(next_transport.sequence().get(), 2);
+
+        let mut events = Vec::new();
+        let mut batches = Vec::new();
+        engine.drain_correlated_events(&mut events, &mut batches);
+        assert_eq!(events.len(), 1);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].identity(), queued_identity);
+        assert_eq!(batches[0].payload().event_range(), 0..1);
+        assert_eq!(engine.take_last_cc(), None);
+        assert_eq!(engine.cc_value(1), 0.0);
+        assert!(engine.apply_correlated_compatibility(batches[0].payload()));
+        assert_eq!(engine.take_last_cc(), Some(1));
+        assert!((engine.cc_value(1) - 64.0 / 127.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn stop_and_profile_replacement_return_every_displaced_identity_once_in_fifo_order() {
+        let sequencer = Arc::new(ActionSequencer::default());
+        let mut engine = MidiEngine::with_action_sequencer(sequencer);
+        let origin = Instant::now();
+        for offset in 0..3 {
+            engine.shared.handle_message_at(
+                origin + Duration::from_micros(offset),
+                offset,
+                &[0xb0, 1, 64],
+            );
+        }
+        let mut expected = engine
+            .shared
+            .action_queues
+            .lock()
+            .unwrap()
+            .admitted
+            .iter()
+            .map(ActionEnvelope::identity)
+            .collect::<Vec<_>>();
+
+        engine.stop();
+        assert_eq!(engine.displaced_action_identity_count(), 3);
+        assert!(engine
+            .shared
+            .action_queues
+            .lock()
+            .unwrap()
+            .admitted
+            .is_empty());
+
+        engine
+            .shared
+            .handle_message_at(origin + Duration::from_micros(3), 3, &[0xb0, 1, 65]);
+        expected.push(
+            engine
+                .shared
+                .action_queues
+                .lock()
+                .unwrap()
+                .admitted
+                .front()
+                .unwrap()
+                .identity(),
+        );
+        engine
+            .apply_profile(engine.resolved_profile().clone())
+            .unwrap();
+        assert_eq!(engine.displaced_action_identity_count(), expected.len());
+
+        let mut returned = Vec::new();
+        let mut scratch = [None; 2];
+        while engine.displaced_action_identity_count() != 0 {
+            let count = engine.drain_displaced_action_identities(&mut scratch);
+            assert!(count > 0);
+            returned.extend(scratch[..count].iter().copied().flatten());
+        }
+        assert_eq!(returned, expected);
+        assert_eq!(engine.drain_displaced_action_identities(&mut scratch), 0);
+        assert_eq!(engine.displaced_action_identity_count(), 0);
     }
 
     #[test]
@@ -1114,16 +1423,37 @@ mod tests {
             })
             .unwrap();
         assert!(engine.shared.feedback.lock().unwrap().is_empty());
-        assert!(engine.shared.raw_queue.lock().unwrap().is_empty());
+        assert!(engine
+            .shared
+            .action_queues
+            .lock()
+            .unwrap()
+            .admitted
+            .is_empty());
+        let displaced = engine.displaced_action_identity_count();
+        assert_eq!(displaced, 1);
+        let admitted_capacity = MIDI_RAW_QUEUE_CAPACITY - displaced;
         for timestamp in 0..MIDI_RAW_QUEUE_CAPACITY as u64 {
             engine.shared.handle_message(timestamp, &[0xb0, 7, 127]);
         }
+        assert_eq!(
+            engine.shared.action_queues.lock().unwrap().admitted.len(),
+            admitted_capacity
+        );
+        assert_eq!(
+            engine
+                .shared
+                .counters
+                .input_queue_dropped
+                .load(Ordering::Relaxed),
+            displaced as u64
+        );
         let mut events = Vec::new();
         engine.drain_events(&mut events);
         assert_eq!(events.len(), MIDI_EVENT_DRAIN_CAPACITY);
         assert_eq!(
             engine.local_counters.event_queue_dropped,
-            (MIDI_RAW_QUEUE_CAPACITY * crate::controller_profile::CONTROLLER_PROFILE_MAX_BINDINGS
+            (admitted_capacity * crate::controller_profile::CONTROLLER_PROFILE_MAX_BINDINGS
                 - MIDI_EVENT_DRAIN_CAPACITY) as u64
         );
     }

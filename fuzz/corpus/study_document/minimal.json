@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "abi": { "major": 1, "minor": 0 },
+  "metadata": {
+    "name": "Minimal",
+    "author": "collide-o-scope",
+    "description": "Seed corpus",
+    "license": {
+      "identifier": "CC0-1.0",
+      "notice": "This notice covers the Study data only.",
+      "publication_boundary": "study_data_only_does_not_license_host"
+    }
+  },
+  "capabilities": ["current_color"],
+  "instructions": [
+    { "op": "load_current_color", "dst": 0 },
+    { "op": "output_color", "color": 0 }
+  ]
+}

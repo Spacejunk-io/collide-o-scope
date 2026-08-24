@@ -205,6 +205,7 @@ let layerStackRevision = 0;
 let compositionRevision = 0;
 let presetRevision = 0;
 let latestCreative = null;
+let latestConstraintDiagnostics = [];
 let latestLayerIdentities = [];
 let latestLayers = [];
 let latestAutopilotSnapshot = {};
@@ -220,6 +221,10 @@ let mediaPendingFrozen = null;
 let mediaRequestSequence = 0;
 let outputAuthoritativeOpen = false;
 let outputAuthoritativeDisplay = '';
+let outputAuthoritativeGeneration = 0;
+let webAuthoredRevision = 0;
+let webOperationalRevision = 0;
+let webTelemetryRevision = 0;
 let outputPendingOpen = null;
 let outputRequestSequence = 0;
 
@@ -298,6 +303,9 @@ function connect() {
     try {
       const msg = JSON.parse(e.data);
       if (msg.type === 'state') {
+        webAuthoredRevision = Number(msg.authored_revision) || 0;
+        webOperationalRevision = Number(msg.operational_revision) || 0;
+        webTelemetryRevision = Number(msg.telemetry_revision) || 0;
         syncEffects(msg.effects);
         syncMasterTransform(msg.master_transform);
         syncNtsc(msg.ntsc);
@@ -305,6 +313,7 @@ function connect() {
         compositionRevision = Number(msg.composition_revision) || 0;
         syncLayers(msg.layers);
         syncCreative(msg.creative);
+        syncConstraintDiagnostics(msg.constraint_diagnostics);
         syncPerformance(msg.performance);
         syncLibrary(msg.library);
         syncMediaSafety(msg.media_safety);
@@ -329,14 +338,60 @@ function connect() {
         syncPerformanceRecorder(msg.performance_recorder);
         syncMasterMotion(msg.master_motion);
         syncSpout(msg.spout);
-        syncRemote(msg.remote_url);
+        syncRemote(msg.remote_url, msg.remote_status);
         syncMorph(msg.morph);
-        syncOutputWindow(msg.legacy_output_window ?? msg.output_window, msg.output_error, msg.output_display, msg.output_displays);
+        syncOutputWindow(msg.legacy_output_window ?? msg.output_window, msg.output_error, msg.output_display, msg.output_displays, msg.output_display_generation);
         syncRecorder(msg.recorder);
         syncStageHealth(msg.stage_health);
         syncMonitorBay(msg.monitor_bay);
         syncBlackout(msg.blackout);
         syncQuantize(msg.quantized_pending || 0);
+        syncRangeEditors(document);
+      } else if (msg.type === 'live') {
+        const authored = Number(msg.authored_revision) || 0;
+        const operationalRevision = Number(msg.operational_revision) || 0;
+        const telemetryRevision = Number(msg.telemetry_revision) || 0;
+        // Never render a live domain against the wrong authored graph. Closing
+        // invokes the established reconnect path, whose first message is a
+        // separately cached complete state generation.
+        if (Number(msg.wire_version) !== 2 || authored !== webAuthoredRevision) {
+          console.warn('[ws] live base mismatch; requesting a coherent reconnect');
+          ws.close(4001, 'state revision mismatch');
+          return;
+        }
+        const op = msg.operational || {};
+        const telemetry = msg.telemetry || {};
+        if (operationalRevision >= webOperationalRevision) {
+          webOperationalRevision = operationalRevision;
+          syncTransport(op.program_frozen, op.media_frozen);
+          syncExport(op.export_progress, op.export_error, op.export_status, op.export_warnings, op.export_motion);
+          syncRecovery(op.recovery_available, op.recovery_status);
+          syncPatchSave(op.patch_save_status || '');
+          syncPatchLoad(op.patch_load_status || '');
+          syncControllerRuntime(op.controller_runtime);
+          syncOscRuntime(op.osc_runtime);
+          syncSpout(op.spout);
+          syncRemote(op.remote_url, op.remote_status);
+          syncOutputWindow(op.output_window, op.output_error, op.output_display, op.output_displays, op.output_display_generation);
+          syncRecorder(op.recorder);
+          syncBlackout(op.blackout);
+          syncQuantize(op.quantized_pending || 0);
+          syncConstraintDiagnostics(op.constraint_diagnostics);
+        }
+        if (telemetryRevision >= webTelemetryRevision) {
+          webTelemetryRevision = telemetryRevision;
+          syncModulation(telemetry.modulation);
+          syncControlFilters(telemetry.modulation);
+          syncAudio(telemetry.audio);
+          syncMidi(telemetry.midi);
+          syncTemporal(telemetry.temporal);
+          syncGesture(telemetry.gesture);
+          syncPerformanceRecorder(telemetry.performance_recorder);
+          syncMasterMotion(telemetry.master_motion);
+          syncMorph(telemetry.morph);
+          syncStageHealth(telemetry.stage_health);
+          syncMonitorBay(telemetry.monitor_bay);
+        }
         syncRangeEditors(document);
       }
     } catch (err) {
@@ -765,6 +820,103 @@ function creativeSetStatus(message, isError = false) {
   if (!creativeStatus) return;
   creativeStatus.textContent = message;
   creativeStatus.classList.toggle('error', isError);
+}
+
+function constraintScopeLabel(scope) {
+  if (!scope || typeof scope.kind !== 'string') return 'unknown scope';
+  return scope.stable_id === undefined
+    ? scope.kind
+    : `${scope.kind} #${scope.stable_id}`;
+}
+
+function constraintRemediationPreview(diagnostic, candidate) {
+  return (diagnostic.remediation_previews || []).find((preview) =>
+    String(preview.candidate_id) === String(candidate.id)
+      && Number(preview.base_revision) === Number(candidate.base_revision)
+  ) || null;
+}
+
+function constraintPixelOrderLabel(order) {
+  return Array.isArray(order) && order.length ? order.join(' → ') : 'unchanged';
+}
+
+function confirmConstraintRemediation(diagnostic, candidate, preview) {
+  if (!diagnostic || !candidate || !preview) return;
+  if (Number(candidate.base_revision) !== compositionRevision
+      || Number(preview.base_revision) !== compositionRevision) {
+    creativeSetStatus('Remediation preview is stale; refresh before applying it.', true);
+    return;
+  }
+  const consequence = preview.consequence || {};
+  const plan = consequence.plan || {};
+  const before = constraintPixelOrderLabel(consequence.pixel_order_before);
+  const after = constraintPixelOrderLabel(consequence.pixel_order_after);
+  const confirmed = window.confirm(
+    `${candidate.description}\n\nPixel order before:\n${before}\n\nPixel order after:\n${after}\n\nPlan: ${plan.kind || 'unknown'}, ${plan.full_frame_passes || 0} full-frame pass(es), ${plan.retained_surface_layers || 0} retained surface(s), ${plan.creative_bytes || 0} B\n\nApply this exact planner preview?`,
+  );
+  if (!confirmed) return;
+  creativeSend({
+    action: 'apply_constraint_remediation',
+    candidate_id: String(candidate.id),
+    composition_revision: compositionRevision,
+  }, 'Applying confirmed planner remediation…');
+}
+
+/// Render planner-owned protocol fields. This deliberately never searches the
+/// human `text` for a repair or severity decision.
+function syncConstraintDiagnostics(diagnostics) {
+  latestConstraintDiagnostics = Array.isArray(diagnostics) ? diagnostics : [];
+  if (!creativeStatus) return;
+  const diagnostic = latestConstraintDiagnostics[0];
+  if (!diagnostic) {
+    delete creativeStatus.dataset.constraintCode;
+    if (latestCreative?.status) {
+      creativeSetStatus(
+        latestCreative.status,
+        /reject|error|invalid|cycle|budget|missing|stale/i.test(latestCreative.status),
+      );
+    }
+    return;
+  }
+
+  const scopes = (diagnostic.affected || []).map(constraintScopeLabel).join(', ');
+  const delta = diagnostic.resource_delta
+    ? `<span class="constraint-delta">${escapeHtml(diagnostic.resource_delta.resource)}: ${escapeHtml(diagnostic.resource_delta.resulting_total)} / ${escapeHtml(diagnostic.resource_delta.limit)}</span>`
+    : '';
+  const helpUrl = typeof diagnostic.help_url === 'string'
+    && diagnostic.help_url.startsWith('/help/constraints/')
+    ? diagnostic.help_url
+    : '#creative-panel';
+  const repairs = (diagnostic.remediations || []).map((candidate) => {
+    const preview = constraintRemediationPreview(diagnostic, candidate);
+    if (!preview) return '';
+    const consequence = preview.consequence || {};
+    const plan = consequence.plan || {};
+    const planSummary = `${plan.kind || 'unknown'} · ${plan.full_frame_passes || 0} full-frame pass(es) · ${plan.retained_surface_layers || 0} retained surface(s) · ${plan.creative_bytes || 0} B`;
+    return `<li data-candidate-id="${escapeHtml(candidate.id)}">
+      <span>${escapeHtml(candidate.description)}</span>
+      <span class="constraint-preview">${escapeHtml(constraintPixelOrderLabel(consequence.pixel_order_before))} → ${escapeHtml(constraintPixelOrderLabel(consequence.pixel_order_after))}</span>
+      <span class="constraint-preview">${escapeHtml(planSummary)}</span>
+      <button type="button" class="constraint-apply" data-candidate-id="${escapeHtml(candidate.id)}">Preview and apply…</button>
+    </li>`;
+  }).join('');
+  creativeStatus.dataset.constraintCode = diagnostic.code || 'unknown';
+  creativeStatus.classList.add('error');
+  creativeStatus.innerHTML = `<span class="constraint-code">${escapeHtml(diagnostic.code || 'constraint_error')}</span>
+    <span>${escapeHtml(diagnostic.text || 'Creative plan rejected.')}</span>
+    ${scopes ? `<span class="constraint-scopes">Affected: ${escapeHtml(scopes)}</span>` : ''}
+    ${delta}
+    ${repairs ? `<ul class="constraint-remediations" aria-label="Planner remediation candidates">${repairs}</ul>` : ''}
+    <a class="constraint-help" href="${escapeHtml(helpUrl)}" target="_blank" rel="noopener">Why this was refused</a>`;
+  creativeStatus.querySelectorAll('.constraint-apply').forEach((button) => {
+    button.addEventListener('click', () => {
+      const candidate = (diagnostic.remediations || []).find((item) =>
+        String(item.id) === String(button.dataset.candidateId)
+      );
+      const preview = candidate ? constraintRemediationPreview(diagnostic, candidate) : null;
+      confirmConstraintRemediation(diagnostic, candidate, preview);
+    });
+  });
 }
 
 function creativeSend(action, pending) {
@@ -5649,7 +5801,10 @@ function syncLibrary(files) {
       try {
         const r = await fetch(`/delete?name=${encodeURIComponent(filename)}`, { method: 'POST' });
         const text = await r.text();
-        libUploadStatus.textContent = r.ok ? `${text} → Recycle Bin` : `${filename}: ${text}`;
+        let result = null;
+        try { result = JSON.parse(text); } catch { /* legacy/plain transport refusal */ }
+        const detail = result?.name || result?.error || text;
+        libUploadStatus.textContent = r.ok ? `${detail} → Recycle Bin` : `${filename}: ${detail}`;
       } catch {
         libUploadStatus.textContent = `${filename}: remove failed`;
       }
@@ -5722,11 +5877,14 @@ function uploadClip(file, statusElement = libUploadStatus) {
     xhr.onload = () => {
       const response = xhr.responseText.trim();
       const ok = xhr.status === 200;
+      let result = null;
+      try { result = JSON.parse(response); } catch { /* legacy/plain transport refusal */ }
+      const detail = result?.name || result?.error || response;
       statusElement.textContent = ok
-        ? `${response} added`
-        : `${file.name}: ${response || 'upload failed'}`;
+        ? `${detail} added`
+        : `${file.name}: ${detail || 'upload failed'}`;
       statusElement.classList.toggle('error', !ok);
-      finish({ ok, filename: ok ? response : '', error: ok ? '' : response });
+      finish({ ok, filename: ok ? detail : '', error: ok ? '' : detail });
     };
     xhr.onerror = () => {
       statusElement.textContent = `${file.name}: upload failed`;
@@ -7982,10 +8140,14 @@ const outputDisplay = document.getElementById('output-display');
 
 outputDisplay?.addEventListener('change', () => {
   const displayId = outputDisplay.value;
-  if (!sendAction({ action: 'set_output_display', display_id: displayId })) {
+  if (!sendAction({ action: 'set_output_display', display_id: displayId, inventory_generation: outputAuthoritativeGeneration })) {
     outputDisplay.value = outputAuthoritativeDisplay;
     renderOutputWindow(outputAuthoritativeOpen, false, 'Control connection is offline.');
   }
+});
+
+document.getElementById('output-display-rescan')?.addEventListener('click', () => {
+  sendAction({ action: 'rescan_output_displays' });
 });
 
 outputWindow.addEventListener('change', () => {
@@ -8039,9 +8201,12 @@ function syncOutputDisplays(selected, displays) {
   if (canSync(outputDisplay)) outputDisplay.value = wanted;
 }
 
-function syncOutputWindow(open, error = '', selectedDisplay = '', displays = []) {
+function syncOutputWindow(open, error = '', selectedDisplay = '', displays = [], inventoryGeneration = 0) {
   outputAuthoritativeOpen = !!open;
   outputAuthoritativeDisplay = typeof selectedDisplay === 'string' ? selectedDisplay : '';
+  outputAuthoritativeGeneration = Number.isSafeInteger(inventoryGeneration) && inventoryGeneration >= 0
+    ? inventoryGeneration
+    : 0;
   syncOutputDisplays(outputAuthoritativeDisplay, displays);
   if (outputPendingOpen === outputAuthoritativeOpen || error) {
     outputRequestSequence += 1;
@@ -8209,6 +8374,7 @@ const stageHealthHud = document.getElementById('stage-health-hud');
 const stageEndpoint = document.getElementById('stage-output-endpoint');
 const stageTestCard = document.getElementById('stage-test-card');
 const stageIdentification = document.getElementById('stage-output-identification');
+const buildIdentity = document.getElementById('build-identity');
 
 stageHealthHud.addEventListener('change', () => {
   sendAction({ action: 'set_stage_health_hud', enabled: stageHealthHud.checked });
@@ -8276,7 +8442,35 @@ function ensureStageEndpoint(endpointId, label = endpointId) {
   stageEndpoint.add(new Option(String(label || endpointId).slice(0, 256), endpointId));
 }
 
+function boundedIdentityField(value, maxLength = 512) {
+  return String(value ?? 'unreported').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+    .slice(0, maxLength);
+}
+
+function syncBuildIdentity(identity = {}) {
+  const fields = [
+    ['version', `${boundedIdentityField(identity.package_name, 80)} ${boundedIdentityField(identity.version, 80)}`],
+    ['git', `${boundedIdentityField(identity.git_sha, 80)}${identity.git_dirty ? ' (dirty)' : ' (clean)'}`],
+    ['artifact', identity.published_artifact ? 'published' : 'local/unpublished'],
+    ['target', boundedIdentityField(identity.target, 160)],
+    ['profile', boundedIdentityField(identity.profile, 80)],
+    ['features', boundedIdentityField(identity.enabled_features, 512)],
+    ['rustc', boundedIdentityField(identity.rustc_vv, 2048)],
+    ['cargo', boundedIdentityField(identity.cargo_version, 256)],
+    ['linker', boundedIdentityField(identity.linker_identity, 512)],
+    ['sdk', boundedIdentityField(identity.sdk_identity, 512)],
+    ['FFmpeg libs', boundedIdentityField(identity.ffmpeg_libraries, 1024)],
+    ['ffmpeg binary', `${boundedIdentityField(identity.ffmpeg_binary_version, 512)} · ${boundedIdentityField(identity.ffmpeg_binary_sha256, 80)}`],
+    ['ffprobe binary', `${boundedIdentityField(identity.ffprobe_binary_version, 512)} · ${boundedIdentityField(identity.ffprobe_binary_sha256, 80)}`],
+    ['shaders', boundedIdentityField(identity.shader_bundle_sha256, 80)],
+    ['Cargo.lock', boundedIdentityField(identity.cargo_lock_sha256, 80)],
+    ['identity', boundedIdentityField(identity.identity_sha256, 80)],
+  ];
+  buildIdentity.textContent = fields.map(([label, value]) => `${label}: ${value}`).join('\n');
+}
+
 function syncStageHealth(health = {}) {
+  syncBuildIdentity(health?.build_identity || {});
   const tools = health?.tools || {};
   if (canSync(stageHealthHud)) stageHealthHud.checked = !!tools.health_hud_enabled;
   if (canSync(stageTestCard)) stageTestCard.value = ['off', 'smpte_bars', 'grid'].includes(tools.test_card)
@@ -8307,6 +8501,19 @@ function syncStageHealth(health = {}) {
   );
   document.getElementById('stage-health-summary').textContent =
     `${fps.toFixed(1)} fps · frame ${p50.toFixed(2)}/${p95.toFixed(2)}/${p99.toFixed(2)} ms p50/p95/p99 · lateness ${latenessP50.toFixed(3)}/${latenessP95.toFixed(3)}/${latenessP99.toFixed(3)} ms · skipped ${skippedTicks} · ${boundedMetric(output.width)}×${boundedMetric(output.height)} @ ${(boundedMetric(output.refresh_millihz) / 1000).toFixed(3)} Hz`;
+  const gpuTiming = health?.gpu_timing || {};
+  const actionTiming = health?.action_timing || {};
+  const flightRecorder = health?.flight_recorder || {};
+  const latencyTriple = value => [value?.p50_us, value?.p95_us, value?.p99_us]
+    .map(micros => (boundedMetric(micros) / 1000).toFixed(3)).join('/');
+  const gpuText = gpuTiming.supported
+    ? `GPU p95 ms source ${(boundedMetric(gpuTiming?.source_prepare?.p95_us) / 1000).toFixed(3)} · creative ${(boundedMetric(gpuTiming?.creative_composition?.p95_us) / 1000).toFixed(3)} · temporal ${(boundedMetric(gpuTiming?.temporal_motion?.p95_us) / 1000).toFixed(3)} · Mosh/VHS ${(boundedMetric(gpuTiming?.mosh_vhs?.p95_us) / 1000).toFixed(3)} · resolve ${(boundedMetric(gpuTiming?.audience_resolve?.p95_us) / 1000).toFixed(3)} · submit ${(boundedMetric(gpuTiming?.submission?.p95_us) / 1000).toFixed(3)}`
+    : 'GPU timestamps unsupported on this adapter/backend';
+  const flightText = flightRecorder.enabled
+    ? `private flight recorder ${boundedMetric(flightRecorder.rotation_seconds)} s × ${boundedMetric(flightRecorder.retained_rotations)} · ${boundedMetric(flightRecorder.queued_events)} queued · ${boundedMetric(flightRecorder.dropped_full)} pressure drops`
+    : 'private flight recorder unavailable';
+  document.getElementById('stage-health-timing').textContent =
+    `${gpuText} · action ms p50/p95/p99 ingress→apply ${latencyTriple(actionTiming?.ingress_to_apply)} · apply→submit ${latencyTriple(actionTiming?.apply_to_submit)} · sequence ${boundedMetric(actionTiming?.last_presented_sequence)} · generation ${boundedMetric(actionTiming?.last_submission_generation)} · ${flightText}`;
   const budgets = health?.budgets || {};
   document.getElementById('stage-health-budgets').textContent = [
     budgetText('GPU', budgets.gpu), budgetText('media', budgets.media),
@@ -8474,10 +8681,19 @@ function syncMonitorBay(bay = {}) {
 
 // --- Remote / QR ---
 
-function syncRemote(url) {
+function syncRemote(url, status) {
   const el = document.getElementById('remote-url');
-  if (el && url && el.textContent !== url) {
-    el.textContent = url;
+  const qr = document.getElementById('qr-img');
+  const available = typeof url === 'string' && url.length > 0;
+  if (qr) {
+    qr.hidden = !available;
+    qr.setAttribute('aria-hidden', available ? 'false' : 'true');
+  }
+  if (el) {
+    const next = available
+      ? url
+      : (typeof status === 'string' && status.length > 0 ? status : 'LAN unavailable');
+    if (el.textContent !== next) el.textContent = next;
   }
 }
 

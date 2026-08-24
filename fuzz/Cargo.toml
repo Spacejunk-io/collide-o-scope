@@ -1,0 +1,87 @@
+[package]
+name = "collide-o-scope-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "study_document"
+path = "fuzz_targets/study_document.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "publication_gate"
+path = "fuzz_targets/publication_gate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "patch_yaml"
+path = "fuzz_targets/patch_yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "controller_profile_midi"
+path = "fuzz_targets/controller_profile_midi.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "osc_packet"
+path = "fuzz_targets/osc_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recovery_journal_record"
+path = "fuzz_targets/recovery_journal_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_metadata"
+path = "fuzz_targets/proxy_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "web_action_json"
+path = "fuzz_targets/web_action_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "motion_sidecar_json"
+path = "fuzz_targets/motion_sidecar_json.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

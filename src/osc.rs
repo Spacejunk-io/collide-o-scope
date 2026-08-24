@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::action_correlation::{
+    ActionEnvelope, ActionIdentity, ActionSequencer, ActionSourceClass,
+};
 use crate::controller_profile::{
     bounded_status, default_control_state_dir, read_bounded_document, write_atomic_document,
     AutomationOrigin, AutomationValue, BoundedDocumentReadError, ControlParameter,
@@ -600,47 +603,119 @@ struct RecentFeedback {
     sent_at: Instant,
 }
 
+struct OscActionQueues {
+    admitted: VecDeque<ActionEnvelope<OscEvent>>,
+    displaced: VecDeque<ActionIdentity>,
+}
+
+impl OscActionQueues {
+    fn new() -> Self {
+        Self {
+            admitted: VecDeque::with_capacity(OSC_EVENT_QUEUE_CAPACITY),
+            displaced: VecDeque::with_capacity(OSC_EVENT_QUEUE_CAPACITY),
+        }
+    }
+
+    fn unresolved_len(&self) -> usize {
+        self.admitted.len().saturating_add(self.displaced.len())
+    }
+
+    fn displace_admitted(&mut self) {
+        debug_assert!(self.unresolved_len() <= OSC_EVENT_QUEUE_CAPACITY);
+        while let Some(action) = self.admitted.pop_front() {
+            self.displaced.push_back(action.identity());
+        }
+        debug_assert!(self.unresolved_len() <= OSC_EVENT_QUEUE_CAPACITY);
+    }
+
+    fn drain_displaced(&mut self, output: &mut [Option<ActionIdentity>]) -> usize {
+        let count = output.len().min(self.displaced.len());
+        for slot in output.iter_mut().take(count) {
+            *slot = self.displaced.pop_front();
+        }
+        count
+    }
+}
+
 struct OscShared {
-    events: Mutex<VecDeque<OscEvent>>,
+    action_queues: Mutex<OscActionQueues>,
     feedback: Mutex<BTreeMap<(SocketAddr, RuntimeControlAddress), FeedbackEntry>>,
     recent: Mutex<VecDeque<RecentFeedback>>,
     counters: OscAtomicCounters,
+    action_sequencer: Arc<ActionSequencer>,
 }
 
 impl Default for OscShared {
     fn default() -> Self {
-        Self {
-            events: Mutex::new(VecDeque::with_capacity(OSC_EVENT_QUEUE_CAPACITY)),
-            feedback: Mutex::new(BTreeMap::new()),
-            recent: Mutex::new(VecDeque::with_capacity(OSC_FEEDBACK_KEYS_CAPACITY)),
-            counters: OscAtomicCounters::default(),
-        }
+        Self::new(Arc::new(ActionSequencer::default()))
     }
 }
 
 impl OscShared {
+    fn new(action_sequencer: Arc<ActionSequencer>) -> Self {
+        Self {
+            action_queues: Mutex::new(OscActionQueues::new()),
+            feedback: Mutex::new(BTreeMap::new()),
+            recent: Mutex::new(VecDeque::with_capacity(OSC_FEEDBACK_KEYS_CAPACITY)),
+            counters: OscAtomicCounters::default(),
+            action_sequencer,
+        }
+    }
+
     fn push_event(&self, event: OscEvent) {
-        let Ok(mut queue) = self.events.try_lock() else {
+        self.push_event_at(Instant::now(), event);
+    }
+
+    fn push_event_at(&self, ingress: Instant, event: OscEvent) {
+        let Ok(mut queues) = self.action_queues.try_lock() else {
             self.counters.queue_dropped.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        if queue.len() == OSC_EVENT_QUEUE_CAPACITY {
+        // Admitted events and identities displaced by a configuration barrier
+        // share the original fixed 1,024-action ceiling. Until Main consumes
+        // displaced identities, new UDP work is refused before minting; no
+        // reconfiguration can overwrite evidence or grow an unbounded queue.
+        if queues.unresolved_len() >= OSC_EVENT_QUEUE_CAPACITY {
             self.counters.queue_dropped.fetch_add(1, Ordering::Relaxed);
         } else {
-            queue.push_back(event);
+            queues.admitted.push_back(self.action_sequencer.envelope_at(
+                ActionSourceClass::Osc,
+                ingress,
+                event,
+            ));
         }
     }
 
     fn clear_protocol_queues(&self) {
-        if let Ok(mut events) = self.events.lock() {
-            events.clear();
-        }
+        // Configuration replacement must retain every already-minted identity
+        // for Main to terminalize as Superseded. The FIFO transfer cannot
+        // exceed OSC_EVENT_QUEUE_CAPACITY because receive admission accounts
+        // for both halves of the fixed action queue.
+        self.action_queues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .displace_admitted();
         if let Ok(mut feedback) = self.feedback.lock() {
             feedback.clear();
         }
         if let Ok(mut recent) = self.recent.lock() {
             recent.clear();
         }
+    }
+
+    fn drain_displaced_action_identities(&self, output: &mut [Option<ActionIdentity>]) -> usize {
+        self.action_queues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain_displaced(output)
+    }
+
+    fn displaced_action_identity_count(&self) -> usize {
+        self.action_queues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .displaced
+            .len()
     }
 }
 
@@ -710,10 +785,17 @@ pub struct OscEngine {
 
 impl OscEngine {
     pub fn new(config: OscConfigDocument) -> Result<Self, OscError> {
+        Self::with_action_sequencer(config, Arc::new(ActionSequencer::default()))
+    }
+
+    pub fn with_action_sequencer(
+        config: OscConfigDocument,
+        action_sequencer: Arc<ActionSequencer>,
+    ) -> Result<Self, OscError> {
         config.validate()?;
         Ok(Self {
             config,
-            shared: Arc::new(OscShared::default()),
+            shared: Arc::new(OscShared::new(action_sequencer)),
             worker: None,
             local_counters: OscCounters::default(),
         })
@@ -753,6 +835,11 @@ impl OscEngine {
                 let _ = join.join();
             }
         }
+        // The stop barrier owns every admitted identity, including shutdown
+        // when no replacement configuration will run. Preserve them FIFO for
+        // Main to terminalize as Superseded instead of silently dropping the
+        // last UDP batch with the engine.
+        self.shared.clear_protocol_queues();
     }
 
     pub fn apply_config(&mut self, config: OscConfigDocument) -> Result<(), OscError> {
@@ -769,9 +856,28 @@ impl OscEngine {
         Ok(())
     }
 
-    pub fn drain_events(&mut self, output: &mut Vec<OscEvent>) {
-        if let Ok(mut events) = self.shared.events.try_lock() {
-            output.extend(events.drain(..));
+    /// Drain identities displaced by `apply_config` into caller-owned fixed
+    /// storage, in original UDP ingress order.
+    ///
+    /// Only the returned prefix is written. If `output` is smaller than the
+    /// pending set, the remainder stays queued and is returned by a later call.
+    /// Main must terminalize every returned identity as `Superseded`. The
+    /// admitted and displaced halves share `OSC_EVENT_QUEUE_CAPACITY`, so this
+    /// evidence path cannot grow beyond the pre-existing event ceiling.
+    pub fn drain_displaced_action_identities(
+        &self,
+        output: &mut [Option<ActionIdentity>],
+    ) -> usize {
+        self.shared.drain_displaced_action_identities(output)
+    }
+
+    pub fn displaced_action_identity_count(&self) -> usize {
+        self.shared.displaced_action_identity_count()
+    }
+
+    pub fn drain_events(&mut self, output: &mut Vec<ActionEnvelope<OscEvent>>) {
+        if let Ok(mut queues) = self.shared.action_queues.try_lock() {
+            output.extend(queues.admitted.drain(..));
         }
     }
 
@@ -945,6 +1051,7 @@ fn receive_osc_batch(
     while attempts < OSC_MAX_RECEIVE_ATTEMPTS_PER_TICK && !stop.load(Ordering::Acquire) {
         match socket.recv_from(buffer) {
             Ok((length, peer)) => {
+                let ingress = Instant::now();
                 attempts += 1;
                 shared
                     .counters
@@ -954,7 +1061,7 @@ fn receive_osc_batch(
                     shared.counters.malformed.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                if !packet_rate.admit(Instant::now()) {
+                if !packet_rate.admit(ingress) {
                     shared.counters.rate_dropped.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -972,7 +1079,7 @@ fn receive_osc_batch(
                                     .fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
-                            shared.push_event(event);
+                            shared.push_event_at(ingress, event);
                         }
                     }
                     Err(_) => {
@@ -1006,7 +1113,7 @@ fn is_osc_feedback_echo(shared: &OscShared, event: OscEvent) -> bool {
             }
         }
         AutomationValue::Delta(_) | AutomationValue::Trigger | AutomationValue::Gate(_) => {
-            return false
+            return false;
         }
     };
     if !value.is_finite() {
@@ -1337,7 +1444,10 @@ mod tests {
             Err(OscError::LanNotExplicitlyEnabled)
         );
         assert_eq!(engine.config, default);
-        assert_eq!(engine.shared.events.lock().unwrap().len(), 1);
+        assert_eq!(
+            engine.shared.action_queues.lock().unwrap().admitted.len(),
+            1
+        );
         assert_eq!(engine.shared.feedback.lock().unwrap().len(), 1);
 
         engine
@@ -1347,7 +1457,14 @@ mod tests {
                 ..OscConfigDocument::default()
             })
             .unwrap();
-        assert!(engine.shared.events.lock().unwrap().is_empty());
+        assert!(engine
+            .shared
+            .action_queues
+            .lock()
+            .unwrap()
+            .admitted
+            .is_empty());
+        assert_eq!(engine.displaced_action_identity_count(), 1);
         assert!(engine.shared.feedback.lock().unwrap().is_empty());
     }
 
@@ -1484,7 +1601,7 @@ mod tests {
             shared.push_event(event);
         }
         assert_eq!(
-            shared.events.lock().unwrap().len(),
+            shared.action_queues.lock().unwrap().admitted.len(),
             OSC_EVENT_QUEUE_CAPACITY
         );
         assert_eq!(shared.counters.queue_dropped.load(Ordering::Relaxed), 17);
@@ -1516,6 +1633,154 @@ mod tests {
             OSC_FEEDBACK_KEYS_CAPACITY
         );
         assert_eq!(engine.local_counters.feedback_dropped, 9);
+    }
+
+    #[test]
+    fn udp_adapter_mints_at_ingress_and_drain_keeps_the_shared_identity() {
+        let sequencer = Arc::new(ActionSequencer::default());
+        let mut engine =
+            OscEngine::with_action_sequencer(OscConfigDocument::default(), sequencer.clone())
+                .unwrap();
+        let ingress = Instant::now()
+            .checked_sub(Duration::from_millis(5))
+            .unwrap();
+        let event = OscEvent {
+            address: RuntimeControlAddress::Master(ControlParameter::Amount),
+            value: AutomationValue::Absolute(0.25),
+            origin: AutomationOrigin::Osc(peer()),
+        };
+
+        engine.shared.push_event_at(ingress, event);
+        let queued_identity = engine
+            .shared
+            .action_queues
+            .lock()
+            .unwrap()
+            .admitted
+            .front()
+            .unwrap()
+            .identity();
+        assert_eq!(queued_identity.sequence().get(), 1);
+        assert_eq!(queued_identity.source(), ActionSourceClass::Osc);
+        assert_eq!(queued_identity.ingress(), ingress);
+        assert_eq!(
+            sequencer
+                .envelope(ActionSourceClass::Native, ())
+                .sequence()
+                .get(),
+            2
+        );
+
+        let mut drained = Vec::new();
+        engine.drain_events(&mut drained);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].identity(), queued_identity);
+        assert_eq!(*drained[0].payload(), event);
+    }
+
+    #[test]
+    fn config_replacement_returns_every_displaced_identity_once_in_fifo_order() {
+        let sequencer = Arc::new(ActionSequencer::default());
+        let mut engine =
+            OscEngine::with_action_sequencer(OscConfigDocument::default(), sequencer).unwrap();
+        let origin = Instant::now();
+        let event = OscEvent {
+            address: RuntimeControlAddress::Master(ControlParameter::Amount),
+            value: AutomationValue::Absolute(0.25),
+            origin: AutomationOrigin::Osc(peer()),
+        };
+        for offset in 0..3 {
+            engine
+                .shared
+                .push_event_at(origin + Duration::from_micros(offset), event);
+        }
+        let mut expected = engine
+            .shared
+            .action_queues
+            .lock()
+            .unwrap()
+            .admitted
+            .iter()
+            .map(ActionEnvelope::identity)
+            .collect::<Vec<_>>();
+
+        engine.apply_config(OscConfigDocument::default()).unwrap();
+        assert_eq!(engine.displaced_action_identity_count(), 3);
+        assert!(engine
+            .shared
+            .action_queues
+            .lock()
+            .unwrap()
+            .admitted
+            .is_empty());
+
+        engine
+            .shared
+            .push_event_at(origin + Duration::from_micros(3), event);
+        expected.push(
+            engine
+                .shared
+                .action_queues
+                .lock()
+                .unwrap()
+                .admitted
+                .front()
+                .unwrap()
+                .identity(),
+        );
+        engine.apply_config(OscConfigDocument::default()).unwrap();
+        assert_eq!(engine.displaced_action_identity_count(), expected.len());
+
+        let mut returned = Vec::new();
+        let mut scratch = [None; 2];
+        while engine.displaced_action_identity_count() != 0 {
+            let count = engine.drain_displaced_action_identities(&mut scratch);
+            assert!(count > 0);
+            returned.extend(scratch[..count].iter().copied().flatten());
+        }
+        assert_eq!(returned, expected);
+        assert_eq!(engine.drain_displaced_action_identities(&mut scratch), 0);
+        assert_eq!(engine.displaced_action_identity_count(), 0);
+    }
+
+    #[test]
+    fn stop_moves_every_admitted_identity_to_displaced_fifo() {
+        let sequencer = Arc::new(ActionSequencer::default());
+        let mut engine =
+            OscEngine::with_action_sequencer(OscConfigDocument::default(), sequencer).unwrap();
+        let origin = Instant::now();
+        let event = OscEvent {
+            address: RuntimeControlAddress::Master(ControlParameter::Amount),
+            value: AutomationValue::Absolute(0.5),
+            origin: AutomationOrigin::Osc(peer()),
+        };
+        for offset in 0..3 {
+            engine
+                .shared
+                .push_event_at(origin + Duration::from_micros(offset), event);
+        }
+        let expected = engine
+            .shared
+            .action_queues
+            .lock()
+            .unwrap()
+            .admitted
+            .iter()
+            .map(ActionEnvelope::identity)
+            .collect::<Vec<_>>();
+
+        engine.stop();
+        let queues = engine.shared.action_queues.lock().unwrap();
+        assert!(queues.admitted.is_empty());
+        assert_eq!(
+            queues.displaced.iter().copied().collect::<Vec<_>>(),
+            expected
+        );
+        drop(queues);
+
+        let mut scratch = [None; 3];
+        assert_eq!(engine.drain_displaced_action_identities(&mut scratch), 3);
+        assert_eq!(scratch.into_iter().flatten().collect::<Vec<_>>(), expected);
     }
 
     #[test]
@@ -1653,7 +1918,7 @@ mod tests {
             let mut events = Vec::new();
             engine.drain_events(&mut events);
             if let Some(event) = events.into_iter().next() {
-                return Some(event);
+                return Some(event.into_payload());
             }
             if last_send.elapsed() >= RETRY_INTERVAL {
                 sender.send_to(&packet, bound).unwrap();

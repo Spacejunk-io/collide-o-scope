@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "gate": "P1 physical action-to-photon fixture",
+  "status": "not_executed",
+  "measurement_domain": "physical_action_to_photon",
+  "engine_submission_is_not_photon_time": true,
+  "reason_code": "physical_fixture_unavailable",
+  "missing_apparatus": [
+    "simultaneously_visible electrically coupled input LED",
+    "high-speed camera or dual-channel photodiode/ADC",
+    "controlled target display"
+  ],
+  "latency_percentiles": null,
+  "p6_promotion_allowed": false,
+  "source_commit_audited": "000411d383205596b46feb09de32f7eaa5aeb0c6",
+  "protocol": "docs/evidence/p1-action-to-photon-fixture-protocol.md"
+}

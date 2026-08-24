@@ -16,6 +16,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::de;
@@ -894,7 +895,7 @@ impl StableModAddress {
 
 /// Dense lookup rebuilt only when creative topology changes. Missing stable
 /// targets never allocate sparse ID-sized arrays and simply resolve to None.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StableModAddressBook {
     addresses: BTreeMap<StableModTarget, StableModAddress>,
     targets: Vec<StableModTarget>,
@@ -1043,6 +1044,497 @@ impl StableModAddressBook {
     )]
     pub fn is_empty(&self) -> bool {
         self.targets.is_empty()
+    }
+}
+
+/// Opt-in, deliberately expensive verification for the warmed address-book
+/// cache. Every cache hit independently recompiles the address book and
+/// compares its exact ordered target signature before the cached book is used.
+/// This is a diagnostic mode, not a production benchmark configuration.
+pub const STABLE_MOD_CACHE_VERIFY_ENV: &str = "COLLIDE_O_SCOPE_VERIFY_STABLE_MOD_CACHE";
+
+/// Exact reasons an address-book topology revision was advanced.
+///
+/// This mask is intentionally narrower than a future compiled render plan.
+/// The address book depends on ordered layer/group rack ownership, ordered
+/// stable node identity, node kind/modulation shape, and group-matte presence.
+/// It does *not* depend on route/tap values, Study document contents, source
+/// texture/raster epochs, output size/precision, or renderer/device generation.
+/// Those omitted invalidators are the reason P2a stops at this cache instead
+/// of extending the lifetime of composition/dependency/GPU plans without a
+/// complete cross-subsystem revision contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StableModInvalidationReasons(u8);
+
+impl StableModInvalidationReasons {
+    pub const COLD_START: Self = Self(1 << 0);
+    pub const LAYER_MEMBERSHIP_OR_ORDER: Self = Self(1 << 1);
+    pub const GROUP_MEMBERSHIP_OR_ORDER: Self = Self(1 << 2);
+    pub const NODE_MEMBERSHIP_OR_ORDER: Self = Self(1 << 3);
+    pub const NODE_KIND_OR_MODULATION_SHAPE: Self = Self(1 << 4);
+    pub const GROUP_MATTE_TOPOLOGY: Self = Self(1 << 5);
+    pub const FORCED_RECOMPILE_MISMATCH: Self = Self(1 << 6);
+    /// A future signature atom changed without being classified above. This
+    /// still invalidates safely and makes the missing diagnostic vocabulary
+    /// visible instead of silently calling the change a hit.
+    pub const UNCLASSIFIED_SIGNATURE_CHANGE: Self = Self(1 << 7);
+
+    pub const fn contains(self, reason: Self) -> bool {
+        self.0 & reason.0 != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    fn insert(&mut self, reason: Self) {
+        self.0 |= reason.0;
+    }
+}
+
+impl fmt::Display for StableModInvalidationReasons {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut wrote = false;
+        for (reason, label) in [
+            (Self::COLD_START, "cold-start"),
+            (Self::LAYER_MEMBERSHIP_OR_ORDER, "layer-membership-or-order"),
+            (Self::GROUP_MEMBERSHIP_OR_ORDER, "group-membership-or-order"),
+            (Self::NODE_MEMBERSHIP_OR_ORDER, "node-membership-or-order"),
+            (
+                Self::NODE_KIND_OR_MODULATION_SHAPE,
+                "node-kind-or-modulation-shape",
+            ),
+            (Self::GROUP_MATTE_TOPOLOGY, "group-matte-topology"),
+            (Self::FORCED_RECOMPILE_MISMATCH, "forced-recompile-mismatch"),
+            (
+                Self::UNCLASSIFIED_SIGNATURE_CHANGE,
+                "unclassified-signature-change",
+            ),
+        ] {
+            if self.contains(reason) {
+                if wrote {
+                    formatter.write_str(",")?;
+                }
+                formatter.write_str(label)?;
+                wrote = true;
+            }
+        }
+        if !wrote {
+            formatter.write_str("none")?;
+        }
+        Ok(())
+    }
+}
+
+/// Bounded counters for proving warm reuse and diagnosing every rebuild.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StableModTopologyCacheStats {
+    pub queries: u64,
+    pub hits: u64,
+    pub invalidations: u64,
+    pub address_book_rebuilds: u64,
+    pub forced_recompiles: u64,
+    pub forced_recompile_mismatches: u64,
+    pub signature_capacity_grows: u64,
+    pub offset_capacity_grows: u64,
+    pub structural_revision: u64,
+    pub cold_start_invalidations: u64,
+    pub layer_invalidations: u64,
+    pub group_invalidations: u64,
+    pub node_membership_invalidations: u64,
+    pub node_shape_invalidations: u64,
+    pub group_matte_invalidations: u64,
+    pub unclassified_invalidations: u64,
+    pub last_invalidation_reasons: StableModInvalidationReasons,
+    pub signature_capacity: usize,
+    pub offset_capacity: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StableModTopologyAtom {
+    Rack(StableModScope),
+    GroupMatte {
+        group_id: GroupId,
+        present: bool,
+    },
+    Node {
+        node_id: NodeId,
+        kind: NodeKindTag,
+        modulation_shape: u8,
+    },
+}
+
+fn stable_mod_node_shape(node: &RuntimeVisualNode) -> u8 {
+    match node.kind {
+        RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Rectangle(_)) => 1,
+        RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Ellipse(_)) => 2,
+        RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(_)) => 3,
+        _ => 0,
+    }
+}
+
+fn push_stable_mod_rack_signature(
+    signature: &mut Vec<StableModTopologyAtom>,
+    scope: StableModScope,
+    rack: &RuntimeVisualRack,
+) {
+    signature.push(StableModTopologyAtom::Rack(scope));
+    signature.extend(rack.iter().map(|node| StableModTopologyAtom::Node {
+        node_id: node.stable_id,
+        kind: node.kind.tag(),
+        modulation_shape: stable_mod_node_shape(node),
+    }));
+}
+
+fn collect_stable_mod_topology_signature(
+    signature: &mut Vec<StableModTopologyAtom>,
+    master_rack: &RuntimeVisualRack,
+    layer_racks: &[(StableLayerId, RuntimeVisualRack)],
+    composition: &RuntimeComposition,
+) {
+    signature.clear();
+    push_stable_mod_rack_signature(signature, StableModScope::Master, master_rack);
+    for (layer_id, rack) in layer_racks {
+        push_stable_mod_rack_signature(signature, StableModScope::Layer(*layer_id), rack);
+    }
+    for group in composition.groups() {
+        signature.push(StableModTopologyAtom::GroupMatte {
+            group_id: group.id,
+            present: group.matte.is_some(),
+        });
+        push_stable_mod_rack_signature(signature, StableModScope::Group(group.id), &group.rack);
+    }
+}
+
+fn stable_mod_layer_order(
+    signature: &[StableModTopologyAtom],
+) -> impl Iterator<Item = StableLayerId> + '_ {
+    signature.iter().filter_map(|atom| match atom {
+        StableModTopologyAtom::Rack(StableModScope::Layer(layer_id)) => Some(*layer_id),
+        _ => None,
+    })
+}
+
+fn stable_mod_group_order(
+    signature: &[StableModTopologyAtom],
+) -> impl Iterator<Item = GroupId> + '_ {
+    signature.iter().filter_map(|atom| match atom {
+        StableModTopologyAtom::Rack(StableModScope::Group(group_id)) => Some(*group_id),
+        _ => None,
+    })
+}
+
+fn stable_mod_group_matte(signature: &[StableModTopologyAtom], wanted: GroupId) -> Option<bool> {
+    signature.iter().find_map(|atom| match atom {
+        StableModTopologyAtom::GroupMatte { group_id, present } if *group_id == wanted => {
+            Some(*present)
+        }
+        _ => None,
+    })
+}
+
+fn stable_mod_rack_scopes(
+    signature: &[StableModTopologyAtom],
+) -> impl Iterator<Item = StableModScope> + '_ {
+    signature.iter().filter_map(|atom| match atom {
+        StableModTopologyAtom::Rack(scope) => Some(*scope),
+        _ => None,
+    })
+}
+
+fn stable_mod_nodes_in_scope(
+    signature: &[StableModTopologyAtom],
+    wanted: StableModScope,
+) -> impl Iterator<Item = (NodeId, NodeKindTag, u8)> + '_ {
+    let mut scope = None;
+    signature.iter().filter_map(move |atom| match atom {
+        StableModTopologyAtom::Rack(next) => {
+            scope = Some(*next);
+            None
+        }
+        StableModTopologyAtom::Node {
+            node_id,
+            kind,
+            modulation_shape,
+        } if scope == Some(wanted) => Some((*node_id, *kind, *modulation_shape)),
+        _ => None,
+    })
+}
+
+fn classify_stable_mod_signature_change(
+    old: &[StableModTopologyAtom],
+    new: &[StableModTopologyAtom],
+) -> StableModInvalidationReasons {
+    if old.is_empty() {
+        return StableModInvalidationReasons::COLD_START;
+    }
+    let mut reasons = StableModInvalidationReasons::default();
+    if !stable_mod_layer_order(old).eq(stable_mod_layer_order(new)) {
+        reasons.insert(StableModInvalidationReasons::LAYER_MEMBERSHIP_OR_ORDER);
+    }
+    if !stable_mod_group_order(old).eq(stable_mod_group_order(new)) {
+        reasons.insert(StableModInvalidationReasons::GROUP_MEMBERSHIP_OR_ORDER);
+    }
+    for group_id in stable_mod_group_order(old) {
+        let Some(new_matte) = stable_mod_group_matte(new, group_id) else {
+            continue;
+        };
+        if stable_mod_group_matte(old, group_id) != Some(new_matte) {
+            reasons.insert(StableModInvalidationReasons::GROUP_MATTE_TOPOLOGY);
+        }
+    }
+    for scope in stable_mod_rack_scopes(old) {
+        if !stable_mod_rack_scopes(new).any(|candidate| candidate == scope) {
+            continue;
+        }
+        let identities_equal = stable_mod_nodes_in_scope(old, scope)
+            .map(|(node_id, _, _)| node_id)
+            .eq(stable_mod_nodes_in_scope(new, scope).map(|(node_id, _, _)| node_id));
+        if !identities_equal {
+            reasons.insert(StableModInvalidationReasons::NODE_MEMBERSHIP_OR_ORDER);
+            continue;
+        }
+        if !stable_mod_nodes_in_scope(old, scope)
+            .map(|(_, kind, shape)| (kind, shape))
+            .eq(stable_mod_nodes_in_scope(new, scope).map(|(_, kind, shape)| (kind, shape)))
+        {
+            reasons.insert(StableModInvalidationReasons::NODE_KIND_OR_MODULATION_SHAPE);
+        }
+    }
+    if reasons.is_empty() {
+        reasons.insert(StableModInvalidationReasons::UNCLASSIFIED_SIGNATURE_CHANGE);
+    }
+    reasons
+}
+
+fn stable_mod_cache_verify_from_env() -> bool {
+    std::env::var(STABLE_MOD_CACHE_VERIFY_ENV)
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+}
+
+/// One reusable, exact address-book plan plus its retained per-frame offset
+/// storage. The exact topology signature is rebuilt into a retained scratch
+/// vector each query; warmed value-only frames allocate no address map or
+/// offset array.
+#[derive(Debug)]
+pub struct StableModTopologyCache {
+    initialized: bool,
+    signature: Vec<StableModTopologyAtom>,
+    signature_scratch: Vec<StableModTopologyAtom>,
+    address_book: Arc<StableModAddressBook>,
+    frame: StableModulationFrame,
+    force_recompile_verification: bool,
+    stats: StableModTopologyCacheStats,
+}
+
+impl Default for StableModTopologyCache {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            signature: Vec::new(),
+            signature_scratch: Vec::new(),
+            address_book: Arc::new(StableModAddressBook::default()),
+            frame: StableModulationFrame::default(),
+            force_recompile_verification: stable_mod_cache_verify_from_env(),
+            stats: StableModTopologyCacheStats::default(),
+        }
+    }
+}
+
+impl StableModTopologyCache {
+    /// Seed an offline cache with the exact immutable book compiled during job
+    /// admission. `compiled` must have been built from the three adjacent
+    /// topology arguments; this crate-private seam exists so export clones can
+    /// share that book rather than cloning its maps every frame.
+    pub(crate) fn from_precompiled_composition(
+        compiled: Arc<StableModAddressBook>,
+        master_rack: &RuntimeVisualRack,
+        layer_racks: &[(StableLayerId, RuntimeVisualRack)],
+        composition: &RuntimeComposition,
+    ) -> Self {
+        let mut cache = Self::default();
+        cache.refresh_signature_scratch(master_rack, layer_racks, composition);
+        cache.signature.clone_from(&cache.signature_scratch);
+        cache.address_book = compiled;
+        cache.initialized = true;
+        cache.record_invalidation(StableModInvalidationReasons::COLD_START);
+        cache.ensure_offset_capacity();
+        cache
+    }
+
+    /// Test/diagnostic constructor for the forced independent-recompile mode.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "production enables verification through STABLE_MOD_CACHE_VERIFY_ENV"
+        )
+    )]
+    pub fn with_forced_recompile_verification(enabled: bool) -> Self {
+        Self {
+            force_recompile_verification: enabled,
+            ..Self::default()
+        }
+    }
+
+    fn refresh_signature_scratch(
+        &mut self,
+        master_rack: &RuntimeVisualRack,
+        layer_racks: &[(StableLayerId, RuntimeVisualRack)],
+        composition: &RuntimeComposition,
+    ) {
+        let before = self.signature_scratch.capacity();
+        collect_stable_mod_topology_signature(
+            &mut self.signature_scratch,
+            master_rack,
+            layer_racks,
+            composition,
+        );
+        if self.signature_scratch.capacity() != before {
+            self.stats.signature_capacity_grows =
+                self.stats.signature_capacity_grows.saturating_add(1);
+        }
+    }
+
+    fn ensure_offset_capacity(&mut self) {
+        let before = self.frame.offsets.capacity();
+        self.frame.offsets.resize(self.address_book.len(), 0.0);
+        if self.frame.offsets.capacity() != before {
+            self.stats.offset_capacity_grows = self.stats.offset_capacity_grows.saturating_add(1);
+        }
+    }
+
+    fn record_invalidation(&mut self, reasons: StableModInvalidationReasons) {
+        self.stats.invalidations = self.stats.invalidations.saturating_add(1);
+        self.stats.address_book_rebuilds = self.stats.address_book_rebuilds.saturating_add(1);
+        self.stats.structural_revision = self.stats.structural_revision.saturating_add(1);
+        self.stats.last_invalidation_reasons = reasons;
+        if reasons.contains(StableModInvalidationReasons::COLD_START) {
+            self.stats.cold_start_invalidations =
+                self.stats.cold_start_invalidations.saturating_add(1);
+        }
+        if reasons.contains(StableModInvalidationReasons::LAYER_MEMBERSHIP_OR_ORDER) {
+            self.stats.layer_invalidations = self.stats.layer_invalidations.saturating_add(1);
+        }
+        if reasons.contains(StableModInvalidationReasons::GROUP_MEMBERSHIP_OR_ORDER) {
+            self.stats.group_invalidations = self.stats.group_invalidations.saturating_add(1);
+        }
+        if reasons.contains(StableModInvalidationReasons::NODE_MEMBERSHIP_OR_ORDER) {
+            self.stats.node_membership_invalidations =
+                self.stats.node_membership_invalidations.saturating_add(1);
+        }
+        if reasons.contains(StableModInvalidationReasons::NODE_KIND_OR_MODULATION_SHAPE) {
+            self.stats.node_shape_invalidations =
+                self.stats.node_shape_invalidations.saturating_add(1);
+        }
+        if reasons.contains(StableModInvalidationReasons::GROUP_MATTE_TOPOLOGY) {
+            self.stats.group_matte_invalidations =
+                self.stats.group_matte_invalidations.saturating_add(1);
+        }
+        if reasons.contains(StableModInvalidationReasons::UNCLASSIFIED_SIGNATURE_CHANGE) {
+            self.stats.unclassified_invalidations =
+                self.stats.unclassified_invalidations.saturating_add(1);
+        }
+        log::debug!(
+            "stable modulation topology revision {} rebuilt: {reasons}",
+            self.stats.structural_revision
+        );
+    }
+
+    fn refresh_address_book(
+        &mut self,
+        master_rack: &RuntimeVisualRack,
+        layer_racks: &[(StableLayerId, RuntimeVisualRack)],
+        composition: &RuntimeComposition,
+    ) -> Result<(), String> {
+        self.stats.queries = self.stats.queries.saturating_add(1);
+        self.refresh_signature_scratch(master_rack, layer_racks, composition);
+
+        if !self.initialized || self.signature != self.signature_scratch {
+            let reasons = if self.initialized {
+                classify_stable_mod_signature_change(&self.signature, &self.signature_scratch)
+            } else {
+                StableModInvalidationReasons::COLD_START
+            };
+            // Compile before publishing the candidate signature: a refused
+            // topology leaves the last complete cache transaction untouched.
+            let compiled =
+                StableModAddressBook::from_composition(master_rack, layer_racks, composition)?;
+            self.signature.clone_from(&self.signature_scratch);
+            self.address_book = Arc::new(compiled);
+            self.initialized = true;
+            self.record_invalidation(reasons);
+            self.ensure_offset_capacity();
+            return Ok(());
+        }
+
+        if self.force_recompile_verification {
+            self.stats.forced_recompiles = self.stats.forced_recompiles.saturating_add(1);
+            let forced =
+                StableModAddressBook::from_composition(master_rack, layer_racks, composition)?;
+            if &forced != self.address_book.as_ref() {
+                let reasons = StableModInvalidationReasons::FORCED_RECOMPILE_MISMATCH;
+                self.stats.forced_recompile_mismatches =
+                    self.stats.forced_recompile_mismatches.saturating_add(1);
+                self.address_book = Arc::new(forced);
+                self.record_invalidation(reasons);
+                self.ensure_offset_capacity();
+                log::error!(
+                    "stable modulation cache verification found a stale compiled signature"
+                );
+                return Ok(());
+            }
+        }
+
+        self.stats.hits = self.stats.hits.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn evaluate<'a>(
+        &'a mut self,
+        matrix: &ModMatrix,
+        master_rack: &RuntimeVisualRack,
+        layer_racks: &[(StableLayerId, RuntimeVisualRack)],
+        composition: &RuntimeComposition,
+    ) -> Result<StableModCachedFrame<'a>, String> {
+        self.refresh_address_book(master_rack, layer_racks, composition)?;
+        matrix.stable_frame_into(&self.address_book, &mut self.frame);
+        Ok(StableModCachedFrame {
+            address_book: &self.address_book,
+            frame: &self.frame,
+        })
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "bounded cache counters are retained for diagnostics and acceptance receipts"
+        )
+    )]
+    pub fn stats(&self) -> StableModTopologyCacheStats {
+        let mut stats = self.stats;
+        stats.signature_capacity = self.signature_scratch.capacity();
+        stats.offset_capacity = self.frame.offsets.capacity();
+        stats
+    }
+}
+
+/// Borrowed result of one cache evaluation. It prevents the retained offset
+/// storage from being overwritten while a caller applies the frame.
+pub struct StableModCachedFrame<'a> {
+    address_book: &'a StableModAddressBook,
+    frame: &'a StableModulationFrame,
+}
+
+impl StableModCachedFrame<'_> {
+    pub fn address_book(&self) -> &StableModAddressBook {
+        self.address_book
+    }
+
+    pub fn frame(&self) -> &StableModulationFrame {
+        self.frame
     }
 }
 
@@ -1332,7 +1824,7 @@ fn saved_scope_key(scope: SavedStableModScope) -> String {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StableModulationFrame {
     offsets: Vec<f32>,
 }
@@ -3941,7 +4433,17 @@ impl ModMatrix {
     /// address book. A persisted route whose scope, node, or parameter is
     /// currently missing remains stored in `routings` but contributes zero.
     pub fn stable_frame(&self, book: &StableModAddressBook) -> StableModulationFrame {
-        let mut offsets = vec![0.0; book.len()];
+        let mut frame = StableModulationFrame::default();
+        self.stable_frame_into(book, &mut frame);
+        frame
+    }
+
+    /// Refill caller-owned stable-offset storage without replacing its
+    /// allocation. Shrinking a topology shortens the visible frame while
+    /// retaining capacity for a later bounded expansion.
+    fn stable_frame_into(&self, book: &StableModAddressBook, frame: &mut StableModulationFrame) {
+        frame.offsets.resize(book.len(), 0.0);
+        frame.offsets.fill(0.0);
         for routing in &self.routings {
             let CompiledTarget::Stable(target) = routing.compiled_target else {
                 continue;
@@ -3951,11 +4453,10 @@ impl ModMatrix {
             };
             let [min, max] = book.target(address).unwrap_or(target).range();
             let amount = routing.cached_value() * finite_or(routing.depth, 0.0) * (max - min) * 0.5;
-            if let Some(slot) = offsets.get_mut(address.index()) {
+            if let Some(slot) = frame.offsets.get_mut(address.index()) {
                 *slot += amount;
             }
         }
-        StableModulationFrame { offsets }
     }
 
     /// Modulate one layer. Batch callers should prefer [`Self::modulate_layers`]
@@ -6474,6 +6975,454 @@ mod tests {
                 assert_eq!(changed.blend, original.blend);
             }
         }
+    }
+
+    fn stable_cache_test_rack(node_ids: &[u64]) -> RuntimeVisualRack {
+        use crate::visual_rack::{RuntimeVisualNode, RuntimeVisualNodeKind, ShiftParams};
+
+        RuntimeVisualRack::try_from_parts(
+            node_ids
+                .iter()
+                .map(|id| {
+                    RuntimeVisualNode::authored(
+                        NodeId::new(*id).unwrap(),
+                        RuntimeVisualNodeKind::Shift(ShiftParams::default()),
+                    )
+                })
+                .collect(),
+            node_ids.iter().copied().max().map(|id| id + 1).or(Some(3)),
+        )
+        .unwrap()
+    }
+
+    fn stable_cache_empty_composition() -> RuntimeComposition {
+        RuntimeComposition::try_from_parts(Vec::new(), Vec::new(), Some(1), 0.5).unwrap()
+    }
+
+    #[test]
+    fn stable_topology_cache_reuses_book_and_offsets_for_value_only_frames() {
+        let master = RuntimeVisualRack::empty();
+        let layer_id = StableLayerId::new(11).unwrap();
+        let node_id = NodeId::new(3).unwrap();
+        let mut layers = vec![(layer_id, stable_cache_test_rack(&[node_id.get()]))];
+        let composition = stable_cache_empty_composition();
+        let mut matrix = ModMatrix::new();
+        matrix.routings = vec![Routing::new(
+            ModSource::Midi(0),
+            "node/layer/11/3/amount",
+            0.75,
+        )];
+        matrix.routings[0].cached = 0.4;
+
+        let mut cache = StableModTopologyCache::with_forced_recompile_verification(false);
+        let (first_book, first_offsets, first_capacity, expected_offsets) = {
+            let cached = cache
+                .evaluate(&matrix, &master, &layers, &composition)
+                .unwrap();
+            let expected = matrix.stable_frame(cached.address_book());
+            assert_eq!(cached.frame().offsets, expected.offsets);
+            (
+                cached.address_book() as *const StableModAddressBook,
+                cached.frame().offsets.as_ptr(),
+                cached.frame().offsets.capacity(),
+                expected.offsets,
+            )
+        };
+
+        // Wet and the Shift amount are bounded parameter values. Neither can
+        // change which stable destinations exist.
+        let node = layers[0].1.get_mut(node_id).unwrap();
+        node.wet = 0.25;
+        let RuntimeVisualNodeKind::Shift(mut shift) = node.kind else {
+            panic!("fixture node changed kind");
+        };
+        shift.amount = 0.9;
+        node.kind = RuntimeVisualNodeKind::Shift(shift);
+
+        let (second_book, second_offsets, second_capacity) = {
+            let cached = cache
+                .evaluate(&matrix, &master, &layers, &composition)
+                .unwrap();
+            assert_eq!(cached.frame().offsets, expected_offsets);
+            (
+                cached.address_book() as *const StableModAddressBook,
+                cached.frame().offsets.as_ptr(),
+                cached.frame().offsets.capacity(),
+            )
+        };
+        assert_eq!(second_book, first_book, "value edits rebuilt the book");
+        assert_eq!(second_offsets, first_offsets, "value edits moved offsets");
+        assert_eq!(second_capacity, first_capacity);
+
+        let stats = cache.stats();
+        assert_eq!(stats.queries, 2);
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.invalidations, 1);
+        assert_eq!(stats.address_book_rebuilds, 1);
+        assert_eq!(stats.structural_revision, 1);
+        assert_eq!(stats.offset_capacity_grows, 1);
+        assert_eq!(stats.cold_start_invalidations, 1);
+    }
+
+    #[test]
+    fn precompiled_export_cache_and_live_cache_share_exact_plan_semantics() {
+        let master = stable_cache_test_rack(&[3]);
+        let layers = vec![(
+            StableLayerId::new(11).unwrap(),
+            stable_cache_test_rack(&[4]),
+        )];
+        let composition = stable_cache_empty_composition();
+        let mut matrix = ModMatrix::new();
+        matrix.routings = vec![
+            Routing::new(ModSource::Midi(0), "node/master/3/amount", 0.5),
+            Routing::new(ModSource::Midi(1), "node/layer/11/4/amount", -0.75),
+        ];
+        matrix.routings[0].cached = 0.25;
+        matrix.routings[1].cached = -0.5;
+
+        let admitted = Arc::new(
+            StableModAddressBook::from_composition(&master, &layers, &composition).unwrap(),
+        );
+        let admitted_pointer = Arc::as_ptr(&admitted);
+        let mut export_cache = StableModTopologyCache::from_precompiled_composition(
+            Arc::clone(&admitted),
+            &master,
+            &layers,
+            &composition,
+        );
+        let mut live_cache = StableModTopologyCache::with_forced_recompile_verification(false);
+
+        let (export_book, export_offsets) = {
+            let cached = export_cache
+                .evaluate(&matrix, &master, &layers, &composition)
+                .unwrap();
+            (
+                cached.address_book().clone(),
+                cached.frame().offsets.clone(),
+            )
+        };
+        let (live_book, live_offsets) = {
+            let cached = live_cache
+                .evaluate(&matrix, &master, &layers, &composition)
+                .unwrap();
+            (
+                cached.address_book().clone(),
+                cached.frame().offsets.clone(),
+            )
+        };
+
+        assert_eq!(export_book, live_book);
+        assert_eq!(export_offsets, live_offsets);
+        assert_eq!(Arc::as_ptr(&export_cache.address_book), admitted_pointer);
+        assert_eq!(export_cache.stats().address_book_rebuilds, 1);
+        assert_eq!(export_cache.stats().hits, 1);
+        assert_eq!(live_cache.stats().address_book_rebuilds, 1);
+    }
+
+    #[test]
+    fn stable_topology_cache_classifies_every_address_invalidator() {
+        use crate::composition::RuntimeRootItem;
+        use crate::visual_rack::{GrainParams, RuntimeVisualNodeKind};
+
+        let master = RuntimeVisualRack::empty();
+        let first_layer = StableLayerId::new(11).unwrap();
+        let second_layer = StableLayerId::new(12).unwrap();
+        let mut layers = vec![
+            (first_layer, stable_cache_test_rack(&[3])),
+            (second_layer, stable_cache_test_rack(&[3])),
+        ];
+        let group_id = GroupId::new(7).unwrap();
+        let mut composition = RuntimeComposition::try_from_parts(
+            vec![runtime_group_with_matte(group_id.get(), None)],
+            vec![RuntimeRootItem::Group { group_id }],
+            Some(8),
+            0.5,
+        )
+        .unwrap();
+        let matrix = ModMatrix::new();
+        let mut cache = StableModTopologyCache::with_forced_recompile_verification(false);
+
+        cache
+            .evaluate(&matrix, &master, &layers, &composition)
+            .unwrap();
+        assert_eq!(cache.stats().structural_revision, 1);
+
+        layers.swap(0, 1);
+        cache
+            .evaluate(&matrix, &master, &layers, &composition)
+            .unwrap();
+        assert!(cache
+            .stats()
+            .last_invalidation_reasons
+            .contains(StableModInvalidationReasons::LAYER_MEMBERSHIP_OR_ORDER));
+
+        layers[0].1.get_mut(NodeId::new(3).unwrap()).unwrap().kind =
+            RuntimeVisualNodeKind::Grain(GrainParams::default());
+        cache
+            .evaluate(&matrix, &master, &layers, &composition)
+            .unwrap();
+        assert_eq!(
+            cache.stats().last_invalidation_reasons,
+            StableModInvalidationReasons::NODE_KIND_OR_MODULATION_SHAPE
+        );
+
+        layers[0]
+            .1
+            .push(RuntimeVisualNodeKind::Grain(GrainParams::default()))
+            .unwrap();
+        cache
+            .evaluate(&matrix, &master, &layers, &composition)
+            .unwrap();
+        assert_eq!(
+            cache.stats().last_invalidation_reasons,
+            StableModInvalidationReasons::NODE_MEMBERSHIP_OR_ORDER
+        );
+
+        layers[0]
+            .1
+            .move_node(
+                NodeId::new(4).unwrap(),
+                0,
+                crate::visual_rack::LegacyRackScope::Layer,
+            )
+            .unwrap();
+        cache
+            .evaluate(&matrix, &master, &layers, &composition)
+            .unwrap();
+        assert_eq!(
+            cache.stats().last_invalidation_reasons,
+            StableModInvalidationReasons::NODE_MEMBERSHIP_OR_ORDER
+        );
+
+        composition.group_mut(group_id).unwrap().matte = Some(default_runtime_matte());
+        cache
+            .evaluate(&matrix, &master, &layers, &composition)
+            .unwrap();
+        assert_eq!(
+            cache.stats().last_invalidation_reasons,
+            StableModInvalidationReasons::GROUP_MATTE_TOPOLOGY
+        );
+
+        let second_group = GroupId::new(8).unwrap();
+        composition = RuntimeComposition::try_from_parts(
+            vec![
+                runtime_group_with_matte(group_id.get(), Some(default_runtime_matte())),
+                runtime_group_with_matte(second_group.get(), None),
+            ],
+            vec![
+                RuntimeRootItem::Group { group_id },
+                RuntimeRootItem::Group {
+                    group_id: second_group,
+                },
+            ],
+            Some(9),
+            0.5,
+        )
+        .unwrap();
+        cache
+            .evaluate(&matrix, &master, &layers, &composition)
+            .unwrap();
+        assert!(cache
+            .stats()
+            .last_invalidation_reasons
+            .contains(StableModInvalidationReasons::GROUP_MEMBERSHIP_OR_ORDER));
+
+        let first_group = composition.group(group_id).unwrap().clone();
+        let second_group_value = composition.group(second_group).unwrap().clone();
+        composition = RuntimeComposition::try_from_parts(
+            vec![second_group_value, first_group],
+            vec![
+                RuntimeRootItem::Group { group_id },
+                RuntimeRootItem::Group {
+                    group_id: second_group,
+                },
+            ],
+            Some(9),
+            0.5,
+        )
+        .unwrap();
+        cache
+            .evaluate(&matrix, &master, &layers, &composition)
+            .unwrap();
+        assert_eq!(
+            cache.stats().last_invalidation_reasons,
+            StableModInvalidationReasons::GROUP_MEMBERSHIP_OR_ORDER
+        );
+
+        let stats = cache.stats();
+        assert_eq!(stats.structural_revision, 8);
+        assert_eq!(stats.address_book_rebuilds, 8);
+        assert_eq!(stats.layer_invalidations, 1);
+        assert_eq!(stats.group_invalidations, 2);
+        assert_eq!(stats.node_membership_invalidations, 2);
+        assert_eq!(stats.node_shape_invalidations, 1);
+        assert_eq!(stats.group_matte_invalidations, 1);
+        assert_eq!(stats.unclassified_invalidations, 0);
+    }
+
+    #[test]
+    fn mask_variant_is_part_of_the_exact_modulation_shape_signature() {
+        use crate::visual_rack::{
+            EllipseMask, RectangleMask, RuntimeMaskParams, RuntimeVisualNode, RuntimeVisualNodeKind,
+        };
+
+        let node_id = NodeId::new(3).unwrap();
+        let mut master = RuntimeVisualRack::try_from_parts(
+            vec![RuntimeVisualNode::authored(
+                node_id,
+                RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Rectangle(RectangleMask::default())),
+            )],
+            Some(4),
+        )
+        .unwrap();
+        let layers = Vec::new();
+        let composition = stable_cache_empty_composition();
+        let matrix = ModMatrix::new();
+        let mut cache = StableModTopologyCache::with_forced_recompile_verification(false);
+        let rectangle_book = cache
+            .evaluate(&matrix, &master, &layers, &composition)
+            .unwrap()
+            .address_book()
+            .clone();
+
+        master.get_mut(node_id).unwrap().kind =
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Ellipse(EllipseMask::default()));
+        let ellipse_book = cache
+            .evaluate(&matrix, &master, &layers, &composition)
+            .unwrap()
+            .address_book()
+            .clone();
+
+        assert_ne!(rectangle_book, ellipse_book);
+        assert_eq!(
+            cache.stats().last_invalidation_reasons,
+            StableModInvalidationReasons::NODE_KIND_OR_MODULATION_SHAPE
+        );
+        assert_eq!(cache.stats().node_shape_invalidations, 1);
+    }
+
+    #[test]
+    fn stable_offset_capacity_survives_structural_shrink_and_restore() {
+        let master = RuntimeVisualRack::empty();
+        let layer_id = StableLayerId::new(11).unwrap();
+        let full_rack = stable_cache_test_rack(&[3, 4]);
+        let mut layers = vec![(layer_id, full_rack.clone())];
+        let composition = stable_cache_empty_composition();
+        let matrix = ModMatrix::new();
+        let mut cache = StableModTopologyCache::with_forced_recompile_verification(false);
+
+        let (full_pointer, full_capacity) = {
+            let cached = cache
+                .evaluate(&matrix, &master, &layers, &composition)
+                .unwrap();
+            (
+                cached.frame().offsets.as_ptr(),
+                cached.frame().offsets.capacity(),
+            )
+        };
+        layers[0].1 = stable_cache_test_rack(&[3]);
+        let (small_pointer, small_capacity) = {
+            let cached = cache
+                .evaluate(&matrix, &master, &layers, &composition)
+                .unwrap();
+            (
+                cached.frame().offsets.as_ptr(),
+                cached.frame().offsets.capacity(),
+            )
+        };
+        layers[0].1 = full_rack;
+        let (restored_pointer, restored_capacity) = {
+            let cached = cache
+                .evaluate(&matrix, &master, &layers, &composition)
+                .unwrap();
+            (
+                cached.frame().offsets.as_ptr(),
+                cached.frame().offsets.capacity(),
+            )
+        };
+
+        assert_eq!(small_pointer, full_pointer);
+        assert_eq!(restored_pointer, full_pointer);
+        assert_eq!(small_capacity, full_capacity);
+        assert_eq!(restored_capacity, full_capacity);
+        assert_eq!(cache.stats().offset_capacity_grows, 1);
+    }
+
+    #[test]
+    fn forced_recompile_mode_repairs_a_stale_compiled_signature() {
+        let master = RuntimeVisualRack::empty();
+        let layers = vec![(
+            StableLayerId::new(11).unwrap(),
+            stable_cache_test_rack(&[3]),
+        )];
+        let composition = stable_cache_empty_composition();
+        let matrix = ModMatrix::new();
+        let mut cache = StableModTopologyCache::with_forced_recompile_verification(true);
+        cache
+            .evaluate(&matrix, &master, &layers, &composition)
+            .unwrap();
+
+        let stale = Arc::make_mut(&mut cache.address_book);
+        let removed = stale.targets.pop().expect("fixture book has targets");
+        stale.addresses.remove(&removed);
+
+        let repaired_len = cache
+            .evaluate(&matrix, &master, &layers, &composition)
+            .unwrap()
+            .address_book()
+            .len();
+        let fresh = StableModAddressBook::from_composition(&master, &layers, &composition).unwrap();
+        assert_eq!(repaired_len, fresh.len());
+        let stats = cache.stats();
+        assert_eq!(stats.forced_recompiles, 1);
+        assert_eq!(stats.forced_recompile_mismatches, 1);
+        assert_eq!(stats.structural_revision, 2);
+        assert_eq!(
+            stats.last_invalidation_reasons,
+            StableModInvalidationReasons::FORCED_RECOMPILE_MISMATCH
+        );
+    }
+
+    #[test]
+    fn address_cache_stops_before_study_program_topology() {
+        use crate::visual_rack::{RuntimeVisualNode, RuntimeVisualNodeKind, StudyRackParams};
+
+        let node_id = NodeId::new(3).unwrap();
+        let mut master = RuntimeVisualRack::try_from_parts(
+            vec![RuntimeVisualNode::authored(
+                node_id,
+                RuntimeVisualNodeKind::Study(StudyRackParams {
+                    document_digest: Some([1; 32]),
+                }),
+            )],
+            Some(4),
+        )
+        .unwrap();
+        let layers = Vec::new();
+        let composition = stable_cache_empty_composition();
+        let matrix = ModMatrix::new();
+        let mut cache = StableModTopologyCache::with_forced_recompile_verification(false);
+        let first_book = {
+            let cached = cache
+                .evaluate(&matrix, &master, &layers, &composition)
+                .unwrap();
+            cached.address_book() as *const StableModAddressBook
+        };
+
+        master.get_mut(node_id).unwrap().kind = RuntimeVisualNodeKind::Study(StudyRackParams {
+            document_digest: Some([2; 32]),
+        });
+        let second_book = {
+            let cached = cache
+                .evaluate(&matrix, &master, &layers, &composition)
+                .unwrap();
+            cached.address_book() as *const StableModAddressBook
+        };
+
+        assert_eq!(second_book, first_book);
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().structural_revision, 1);
+        assert_eq!(cache.stats().address_book_rebuilds, 1);
     }
 
     #[test]

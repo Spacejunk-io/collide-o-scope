@@ -1,0 +1,758 @@
+name: Release trust
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Candidate tag whose version must match Cargo.toml
+        required: true
+        default: v1.7.0
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  FFMPEG_VERSION: 8.1.2
+  FFMPEG_WINDOWS_SHA256: 274923c68904a9b76c73b908f57923dafba81155856cd742138515ded570d066
+  FFMPEG_SOURCE_COMMIT: 38b88335f99e76ed89ff3c93f877fdefce736c13
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+
+jobs:
+  verification-gate:
+    name: Require exact-commit CI and adversarial success
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      tag_object: ${{ steps.source.outputs.tag_object }}
+      required_runs: ${{ steps.required.outputs.required_runs }}
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out candidate tag verifier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Resolve one immutable candidate commit
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse 'HEAD^{commit}')"
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            event_commit="$(git rev-parse "$GITHUB_SHA^{commit}")"
+            if [ "$event_commit" != "$commit" ]; then
+              echo "Tag-push event SHA and candidate tag disagree" >&2
+              exit 1
+            fi
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          python scripts/verify-release.py annotated-tag \
+            --tag "$RELEASE_TAG" \
+            --commit "$commit" \
+            --remote origin \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Prove the required-workflow gate rejects stale status
+        run: |
+          python scripts/wait-required-workflows.py --self-test
+          python scripts/check-release-workflow.py
+          python scripts/verify-release.py self-test
+          python scripts/finalize-release-receipt.py self-test
+
+      - name: Wait for newest exact-commit verification runs
+        id: required
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/wait-required-workflows.py \
+            --repository "${{ github.repository }}" \
+            --commit "${{ steps.source.outputs.commit }}" \
+            --workflow ci.yml \
+            --workflow adversarial.yml \
+            --timeout-seconds 8400 \
+            --poll-seconds 20 \
+            --final-candidate-evidence \
+            --github-output "$GITHUB_OUTPUT"
+
+  reproduce-sign-publish:
+    name: Reproduce, attest, and sign
+    needs: verification-gate
+    runs-on: windows-2022
+    timeout-minutes: 90
+    outputs:
+      commit: ${{ needs.verification-gate.outputs.commit }}
+      tag_object: ${{ needs.verification-gate.outputs.tag_object }}
+      draft_id: ${{ steps.initial-draft.outputs.draft_id }}
+      draft_tag: ${{ steps.initial-draft.outputs.draft_tag }}
+      draft_state: ${{ steps.initial-draft.outputs.draft_state }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out independent source A
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.verification-gate.outputs.commit }}
+          path: source-a
+          fetch-depth: 0
+
+      - name: Check out independent source B
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.verification-gate.outputs.commit }}
+          path: source-b
+          fetch-depth: 0
+
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.0 --profile minimal
+
+      - name: Cache Cargo downloads and release tools
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: release-tools-windows-auditable-0.7.5-cyclonedx-0.5.9-deny-0.20.2-audit-0.22.2-${{ hashFiles('source-a/Cargo.lock') }}
+
+      - name: Download pinned FFmpeg shared runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = Join-Path $env:RUNNER_TEMP "ffmpeg-$env:FFMPEG_VERSION-full_build-shared.zip"
+          $destination = Join-Path $env:RUNNER_TEMP "ffmpeg-$env:FFMPEG_VERSION-windows"
+          $url = "https://github.com/GyanD/codexffmpeg/releases/download/$env:FFMPEG_VERSION/ffmpeg-$env:FFMPEG_VERSION-full_build-shared.zip"
+          Invoke-WebRequest -Uri $url -OutFile $archive -MaximumRetryCount 3 -RetryIntervalSec 5
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          if ($actual -ne $env:FFMPEG_WINDOWS_SHA256) { throw "FFmpeg archive checksum mismatch" }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $ffmpeg = Get-ChildItem -LiteralPath $destination -Directory -Recurse |
+            Where-Object Name -eq "ffmpeg-$env:FFMPEG_VERSION-full_build-shared" |
+            Select-Object -First 1
+          if ($null -eq $ffmpeg) { throw "FFmpeg shared runtime was not found" }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ([string]::IsNullOrWhiteSpace($vsPath)) { throw "Visual Studio C++ tools were not found" }
+          "FFMPEG_DIR=$($ffmpeg.FullName)" >> $env:GITHUB_ENV
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+          "VCVARS64=$(Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat')" >> $env:GITHUB_ENV
+          (Join-Path $ffmpeg.FullName "bin") >> $env:GITHUB_PATH
+
+      - name: Install pinned release tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Install-PinnedCargoTool {
+            param(
+              [string]$Binary,
+              [string]$Expected,
+              [string]$Package,
+              [string]$Version,
+              [string[]]$VersionArguments = @("--version")
+            )
+            $command = Get-Command $Binary -ErrorAction SilentlyContinue
+            $observed = if ($null -eq $command) { "" } else { (& $command.Source @VersionArguments).Trim() }
+            if ($observed -ne $Expected) {
+              cmd /c "`"$env:VCVARS64`" >nul && cargo install --locked --force $Package --version $Version"
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            $verified = (& $Binary @VersionArguments).Trim()
+            if ($verified -ne $Expected) {
+              throw "$Binary version mismatch: expected '$Expected', got '$verified'"
+            }
+          }
+          $installed = (cargo install --list) -join "`n"
+          if ($installed -notmatch '(?m)^cargo-auditable v0\.7\.5:$') {
+            cmd /c "`"$env:VCVARS64`" >nul && cargo install --locked --force cargo-auditable --version 0.7.5"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $verifiedInstalled = (cargo install --list) -join "`n"
+          if ($verifiedInstalled -notmatch '(?m)^cargo-auditable v0\.7\.5:$') {
+            throw "cargo-auditable 0.7.5 is not the installed package"
+          }
+          Install-PinnedCargoTool cargo-cyclonedx "cargo-cyclonedx-cyclonedx 0.5.9" cargo-cyclonedx 0.5.9 -VersionArguments @("cyclonedx", "--version")
+          Install-PinnedCargoTool cargo-deny "cargo-deny 0.20.2" cargo-deny 0.20.2
+          Install-PinnedCargoTool cargo-audit "cargo-audit 0.22.2" cargo-audit 0.22.2
+
+      - name: Enforce dependency, license, and vendor gates
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Push-Location source-a
+          cargo fetch --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify-vendored-wgpu-hal.py --self-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/check-dependency-policy.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo deny check advisories bans sources
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/run-cargo-audit.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo deny check licenses
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/prepare-dependency-evidence.py --self-test --output "$env:RUNNER_TEMP\dependency-license-inventory.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+
+      - name: Validate tag and derive deterministic epoch
+        id: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Select-String -Path source-a\Cargo.toml -Pattern '^version = "([0-9]+\.[0-9]+\.[0-9]+)"$').Matches[0].Groups[1].Value
+          if ($env:RELEASE_TAG -ne "v$version") { throw "Tag $env:RELEASE_TAG does not match Cargo version $version" }
+          $commit = "${{ needs.verification-gate.outputs.commit }}".ToLowerInvariant()
+          $sourceA = (git -C source-a rev-parse 'HEAD^{commit}').Trim().ToLowerInvariant()
+          $sourceB = (git -C source-b rev-parse 'HEAD^{commit}').Trim().ToLowerInvariant()
+          if ($sourceA -ne $commit -or $sourceB -ne $commit) {
+            throw "Independent sources and verified commit are not identical"
+          }
+          python source-a\scripts\verify-release.py annotated-tag `
+            --tag "$env:RELEASE_TAG" `
+            --commit $commit `
+            --tag-object "${{ needs.verification-gate.outputs.tag_object }}" `
+            --remote origin
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $epoch = (git -C source-a show -s --format=%ct HEAD).Trim()
+          "commit=$commit" >> $env:GITHUB_OUTPUT
+          "epoch=$epoch" >> $env:GITHUB_OUTPUT
+
+      - name: Build twice from clean independent checkouts
+        shell: pwsh
+        run: |
+          cmd /c "`"$env:VCVARS64`" >nul && pwsh -NoProfile -File source-a\scripts\build-reproducible-windows.ps1 -SourceRoot source-a -TargetDir `"$env:RUNNER_TEMP\target-a`" -FfmpegDir `"$env:FFMPEG_DIR`" -GitSha ${{ steps.source.outputs.commit }} -SourceDateEpoch ${{ steps.source.outputs.epoch }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmd /c "`"$env:VCVARS64`" >nul && pwsh -NoProfile -File source-b\scripts\build-reproducible-windows.ps1 -SourceRoot source-b -TargetDir `"$env:RUNNER_TEMP\target-b`" -FfmpegDir `"$env:FFMPEG_DIR`" -GitSha ${{ steps.source.outputs.commit }} -SourceDateEpoch ${{ steps.source.outputs.epoch }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Generate reproducible CycloneDX SBOM
+        shell: pwsh
+        run: |
+          $env:SOURCE_DATE_EPOCH = "${{ steps.source.outputs.epoch }}"
+          Push-Location source-a
+          cargo cyclonedx --format json --spec-version 1.5 --override-filename collide-o-scope.cdx.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          if (-not (Test-Path -LiteralPath source-a\collide-o-scope.cdx.json)) { throw "SBOM was not generated" }
+
+      - name: Assemble deterministic package and provenance
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release | Out-Null
+          python source-a\scripts\verify-release.py prepare `
+            --executable "$env:RUNNER_TEMP\target-a\release\collide-o-scope.exe" `
+            --second-executable "$env:RUNNER_TEMP\target-b\release\collide-o-scope.exe" `
+            --ffmpeg-bin "$env:FFMPEG_DIR\bin" `
+            --ffmpeg-version "$env:FFMPEG_VERSION" `
+            --ffmpeg-archive-sha256 "$env:FFMPEG_WINDOWS_SHA256" `
+            --ffmpeg-source-commit "$env:FFMPEG_SOURCE_COMMIT" `
+            --sbom source-a\collide-o-scope.cdx.json `
+            --dependency-inventory "$env:RUNNER_TEMP\dependency-license-inventory.json" `
+            --tag "$env:RELEASE_TAG" `
+            --commit "${{ steps.source.outputs.commit }}" `
+            --source-date-epoch "${{ steps.source.outputs.epoch }}" `
+            --output release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python source-a\scripts\verify-release.py verify --directory release --tag "$env:RELEASE_TAG" --commit "${{ steps.source.outputs.commit }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install pinned cosign
+        uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
+        with:
+          cosign-release: v2.6.0
+
+      - name: Keyless-sign the checksum manifest
+        shell: pwsh
+        run: |
+          cosign sign-blob --yes --bundle release\SHA256SUMS.sigstore.json release\SHA256SUMS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cosign verify-blob `
+            --bundle release\SHA256SUMS.sigstore.json `
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com `
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/release-trust.yml@refs/.*$" `
+            release\SHA256SUMS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python source-a\scripts\verify-release.py verify --directory release --tag "$env:RELEASE_TAG" --commit "${{ steps.source.outputs.commit }}" --require-signature
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Attest release evidence
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: release/*
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ env.RELEASE_TAG }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Revalidate the live tag before publication
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          python source-a\scripts\verify-release.py annotated-tag `
+            --tag "$env:RELEASE_TAG" `
+            --commit "${{ needs.verification-gate.outputs.commit }}" `
+            --tag-object "${{ needs.verification-gate.outputs.tag_object }}" `
+            --remote origin
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Create release and upload initial assets once
+        id: initial-draft
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          python source-a\scripts\verify-release.py release-absent `
+            --repository "${{ github.repository }}" `
+            --tag "$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $assets = @(Get-ChildItem -LiteralPath release -File | Sort-Object Name)
+          if ($assets.Count -ne 10) {
+            throw "Create-only publication requires exactly ten initial assets"
+          }
+          gh release create "$env:RELEASE_TAG" `
+            --repo "${{ github.repository }}" `
+            --target "${{ needs.verification-gate.outputs.commit }}" `
+            --verify-tag `
+            --draft `
+            --generate-notes
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $draftJson = gh release view "$env:RELEASE_TAG" `
+            --repo "${{ github.repository }}" `
+            --json databaseId,tagName,isDraft
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $draft = $draftJson | ConvertFrom-Json
+          if (
+            -not ($draft.databaseId -is [long] -or $draft.databaseId -is [int]) -or
+            [long]$draft.databaseId -le 0 -or
+            $draft.tagName -cne $env:RELEASE_TAG -or
+            $draft.isDraft -ne $true
+          ) {
+            throw "New release did not resolve to one exact authenticated draft"
+          }
+          $draftId = [long]$draft.databaseId
+          "draft_id=$draftId" >> $env:GITHUB_OUTPUT
+          "draft_tag=$($draft.tagName)" >> $env:GITHUB_OUTPUT
+          "draft_state=$($draft.isDraft.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          $assetPaths = @($assets | ForEach-Object FullName)
+          gh release upload "$env:RELEASE_TAG" @assetPaths `
+            --repo "${{ github.repository }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $uploadedDraft = gh release view "$env:RELEASE_TAG" `
+            --repo "${{ github.repository }}" `
+            --json databaseId,tagName,isDraft | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (
+            [long]$uploadedDraft.databaseId -ne $draftId -or
+            $uploadedDraft.tagName -cne $env:RELEASE_TAG -or
+            $uploadedDraft.isDraft -ne $true
+          ) {
+            throw "Initial upload is no longer bound to the created draft"
+          }
+
+  redownload-verify:
+    name: Verify draft and publish only after persistence checks
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - verification-gate
+      - reproduce-sign-publish
+    runs-on: windows-2022
+    timeout-minutes: 20
+    env:
+      EXPECTED_DRAFT_ID: ${{ needs.reproduce-sign-publish.outputs.draft_id }}
+      EXPECTED_DRAFT_TAG: ${{ needs.reproduce-sign-publish.outputs.draft_tag }}
+      EXPECTED_DRAFT_STATE: ${{ needs.reproduce-sign-publish.outputs.draft_state }}
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out verifier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.reproduce-sign-publish.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Install pinned cosign
+        uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
+        with:
+          cosign-release: v2.6.0
+
+      - name: Redownload published assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $draftJson = gh release view "$env:RELEASE_TAG" `
+            --repo "${{ github.repository }}" `
+            --json databaseId,tagName,isDraft
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $draft = $draftJson | ConvertFrom-Json
+          if (
+            [long]$draft.databaseId -ne [long]$env:EXPECTED_DRAFT_ID -or
+            $draft.tagName -cne $env:EXPECTED_DRAFT_TAG -or
+            $env:EXPECTED_DRAFT_TAG -cne $env:RELEASE_TAG -or
+            $draft.isDraft -ne $true -or
+            $env:EXPECTED_DRAFT_STATE -cne "true"
+          ) {
+            throw "Release identity changed or was published before draft verification"
+          }
+          New-Item -ItemType Directory -Path downloaded | Out-Null
+          gh release download "$env:RELEASE_TAG" --repo "${{ github.repository }}" --dir downloaded
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify exact initial assets, identity, and every attestation
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUIRED_RUNS_JSON: ${{ needs.verification-gate.outputs.required_runs }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $expected = "${{ needs.reproduce-sign-publish.outputs.commit }}".ToLowerInvariant()
+          python scripts\verify-release.py annotated-tag `
+            --tag "$env:RELEASE_TAG" `
+            --commit $expected `
+            --tag-object "${{ needs.verification-gate.outputs.tag_object }}" `
+            --remote origin
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cosign verify-blob `
+            --bundle downloaded\SHA256SUMS.sigstore.json `
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com `
+            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release-trust.yml@${{ github.ref }}" `
+            downloaded\SHA256SUMS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts\verify-release.py verify `
+            --directory downloaded `
+            --tag "$env:RELEASE_TAG" `
+            --commit $expected `
+            --require-signature `
+            --report-output "$env:RUNNER_TEMP\downloaded-verification.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $assets = @(Get-ChildItem -LiteralPath downloaded -File | Sort-Object Name)
+          if ($assets.Count -ne 10) { throw "Exact initial release must contain ten assets" }
+          $attestationIdentity = "https://github.com/${{ github.repository }}/.github/workflows/release-trust.yml@${{ github.ref }}"
+          $attestationSourceRef = "refs/tags/$env:RELEASE_TAG"
+          $attestations = @()
+          foreach ($asset in $assets) {
+            gh attestation verify $asset.FullName `
+              --repo "${{ github.repository }}" `
+              --cert-identity $attestationIdentity `
+              --cert-oidc-issuer https://token.actions.githubusercontent.com `
+              --predicate-type https://slsa.dev/provenance/v1 `
+              --source-ref $attestationSourceRef `
+              --source-digest $expected
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $attestations += [ordered]@{
+              name = $asset.Name
+              sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset.FullName).Hash.ToLowerInvariant()
+              verified = $true
+            }
+          }
+          $attestationDocument = [ordered]@{
+            schema_version = 2
+            repository = "${{ github.repository }}"
+            commit = $expected
+            policy = [ordered]@{
+              repository = "${{ github.repository }}"
+              certificate_identity = $attestationIdentity
+              certificate_oidc_issuer = "https://token.actions.githubusercontent.com"
+              predicate_type = "https://slsa.dev/provenance/v1"
+              source_ref = $attestationSourceRef
+              source_digest = $expected
+            }
+            assets = $attestations
+          }
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::WriteAllText(
+            "$env:RUNNER_TEMP\initial-asset-attestations.json",
+            (($attestationDocument | ConvertTo-Json -Depth 4) + "`n"),
+            $utf8
+          )
+          if ([string]::IsNullOrWhiteSpace($env:REQUIRED_RUNS_JSON)) {
+            throw "Required-run receipt was not propagated"
+          }
+          [IO.File]::WriteAllText(
+            "$env:RUNNER_TEMP\required-workflows.json",
+            ($env:REQUIRED_RUNS_JSON + "`n"),
+            $utf8
+          )
+
+      - name: Build the bounded external final-release receipt
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path final-release | Out-Null
+          $releaseUrl = "https://github.com/${{ github.repository }}/releases/tag/$env:RELEASE_TAG"
+          $receipt = "final-release\collide-o-scope-$env:RELEASE_TAG-final-release-receipt.json"
+          python scripts\finalize-release-receipt.py build `
+            --directory downloaded `
+            --verification-report "$env:RUNNER_TEMP\downloaded-verification.json" `
+            --attestations "$env:RUNNER_TEMP\initial-asset-attestations.json" `
+            --required-runs "$env:RUNNER_TEMP\required-workflows.json" `
+            --tag "$env:RELEASE_TAG" `
+            --commit "${{ needs.reproduce-sign-publish.outputs.commit }}" `
+            --tag-object "${{ needs.verification-gate.outputs.tag_object }}" `
+            --repository "${{ github.repository }}" `
+            --release-url $releaseUrl `
+            --release-database-id "$env:EXPECTED_DRAFT_ID" `
+            --workflow-identity "https://github.com/${{ github.repository }}/.github/workflows/release-trust.yml@${{ github.ref }}" `
+            --output $receipt `
+            --summary-output "final-release\release-summary.md"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts\finalize-release-receipt.py validate --receipt $receipt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Keyless-sign the frozen final-release receipt
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $receipt = "final-release\collide-o-scope-$env:RELEASE_TAG-final-release-receipt.json"
+          $bundle = "final-release\collide-o-scope-$env:RELEASE_TAG-final-release-receipt.sigstore.json"
+          cosign sign-blob --yes --bundle $bundle $receipt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cosign verify-blob `
+            --bundle $bundle `
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com `
+            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release-trust.yml@${{ github.ref }}" `
+            $receipt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Attest the frozen final-release receipt
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: final-release/collide-o-scope-${{ env.RELEASE_TAG }}-final-release-receipt.json
+
+      - name: Verify and publish the external final-release receipt
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $receipt = "final-release\collide-o-scope-$env:RELEASE_TAG-final-release-receipt.json"
+          $bundle = "final-release\collide-o-scope-$env:RELEASE_TAG-final-release-receipt.sigstore.json"
+          $expectedDraftId = [long]$env:EXPECTED_DRAFT_ID
+          $expected = "${{ needs.reproduce-sign-publish.outputs.commit }}"
+          $attestationIdentity = "https://github.com/${{ github.repository }}/.github/workflows/release-trust.yml@${{ github.ref }}"
+          $attestationSourceRef = "refs/tags/$env:RELEASE_TAG"
+          $beforeUploadJson = gh release view "$env:RELEASE_TAG" `
+            --repo "${{ github.repository }}" `
+            --json databaseId,tagName,isDraft
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $beforeUpload = $beforeUploadJson | ConvertFrom-Json
+          if (
+            [long]$beforeUpload.databaseId -ne $expectedDraftId -or
+            $beforeUpload.tagName -cne $env:EXPECTED_DRAFT_TAG -or
+            $beforeUpload.isDraft -ne $true
+          ) {
+            throw "Final receipt upload is not bound to the authenticated draft"
+          }
+          gh attestation verify $receipt `
+            --repo "${{ github.repository }}" `
+            --cert-identity $attestationIdentity `
+            --cert-oidc-issuer https://token.actions.githubusercontent.com `
+            --predicate-type https://slsa.dev/provenance/v1 `
+            --source-ref $attestationSourceRef `
+            --source-digest $expected
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release upload "$env:RELEASE_TAG" $receipt $bundle --repo "${{ github.repository }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release edit "$env:RELEASE_TAG" `
+            --repo "${{ github.repository }}" `
+            --notes-file "final-release\release-summary.md"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $viewJson = gh release view "$env:RELEASE_TAG" `
+            --repo "${{ github.repository }}" `
+            --json databaseId,tagName,body,assets,isDraft
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $view = $viewJson | ConvertFrom-Json
+          $expectedUrl = "https://github.com/${{ github.repository }}/releases/tag/$env:RELEASE_TAG"
+          $expectedBody = (Get-Content -LiteralPath "final-release\release-summary.md" -Raw).TrimEnd()
+          if (
+            [long]$view.databaseId -ne $expectedDraftId -or
+            $view.tagName -cne $env:EXPECTED_DRAFT_TAG -or
+            $view.isDraft -ne $true -or
+            $view.body.TrimEnd() -cne $expectedBody
+          ) {
+            throw "Draft release state, URL, or final summary differs after edit"
+          }
+          $expectedAssets = @(
+            @(Get-ChildItem -LiteralPath downloaded -File | ForEach-Object Name)
+            (Split-Path -Leaf $receipt)
+            (Split-Path -Leaf $bundle)
+          ) | Sort-Object
+          $publishedAssets = @($view.assets | ForEach-Object name | Sort-Object)
+          if (
+            $expectedAssets.Count -ne 12 -or
+            $publishedAssets.Count -ne 12 -or
+            (Compare-Object -ReferenceObject $expectedAssets -DifferenceObject $publishedAssets).Count -ne 0
+          ) {
+            throw "Draft release asset inventory differs after final receipt upload"
+          }
+          New-Item -ItemType Directory -Path published-complete | Out-Null
+          gh release download "$env:RELEASE_TAG" `
+            --repo "${{ github.repository }}" `
+            --dir published-complete
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $publishedFiles = @(Get-ChildItem -LiteralPath published-complete -File | Sort-Object Name)
+          if ($publishedFiles.Count -ne 12) {
+            throw "Fresh post-edit download did not contain exactly twelve assets"
+          }
+          for ($index = 0; $index -lt $expectedAssets.Count; $index++) {
+            if ($publishedFiles[$index].Name -cne $expectedAssets[$index]) {
+              throw "Fresh post-edit asset inventory differs by exact name"
+            }
+          }
+          $expectedSources = [System.Collections.Generic.Dictionary[string,string]]::new(
+            [System.StringComparer]::Ordinal
+          )
+          foreach ($asset in @(Get-ChildItem -LiteralPath downloaded -File)) {
+            $expectedSources.Add($asset.Name, $asset.FullName)
+          }
+          $expectedSources.Add((Split-Path -Leaf $receipt), $receipt)
+          $expectedSources.Add((Split-Path -Leaf $bundle), $bundle)
+          foreach ($published in $publishedFiles) {
+            if (-not $expectedSources.ContainsKey($published.Name)) {
+              throw "Fresh post-edit download contains an unexpected asset"
+            }
+            $publishedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $published.FullName).Hash
+            $expectedHash = (
+              Get-FileHash -Algorithm SHA256 -LiteralPath $expectedSources[$published.Name]
+            ).Hash
+            if ($publishedHash -cne $expectedHash) {
+              throw "Fresh post-edit asset differs from the exact initially verified bytes: $($published.Name)"
+            }
+          }
+          New-Item -ItemType Directory -Path published-initial | Out-Null
+          $initialNames = @(Get-ChildItem -LiteralPath downloaded -File | ForEach-Object Name)
+          if ($initialNames.Count -ne 10) {
+            throw "Initial verification inventory no longer contains exactly ten assets"
+          }
+          foreach ($name in $initialNames) {
+            Copy-Item -LiteralPath (Join-Path published-complete $name) `
+              -Destination (Join-Path published-initial $name)
+          }
+          $publishedChecksums = "published-initial\SHA256SUMS"
+          $publishedChecksumBundle = "published-initial\SHA256SUMS.sigstore.json"
+          cosign verify-blob `
+            --bundle $publishedChecksumBundle `
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com `
+            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release-trust.yml@${{ github.ref }}" `
+            $publishedChecksums
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts\verify-release.py verify `
+            --directory published-initial `
+            --tag "$env:RELEASE_TAG" `
+            --commit "${{ needs.reproduce-sign-publish.outputs.commit }}" `
+            --require-signature
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($asset in @(Get-ChildItem -LiteralPath published-initial -File)) {
+            gh attestation verify $asset.FullName `
+              --repo "${{ github.repository }}" `
+              --cert-identity $attestationIdentity `
+              --cert-oidc-issuer https://token.actions.githubusercontent.com `
+              --predicate-type https://slsa.dev/provenance/v1 `
+              --source-ref $attestationSourceRef `
+              --source-digest $expected
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $publishedReceipt = Join-Path published-complete (Split-Path -Leaf $receipt)
+          $publishedBundle = Join-Path published-complete (Split-Path -Leaf $bundle)
+          python scripts\finalize-release-receipt.py validate --receipt $publishedReceipt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cosign verify-blob `
+            --bundle $publishedBundle `
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com `
+            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release-trust.yml@${{ github.ref }}" `
+            $publishedReceipt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh attestation verify $publishedReceipt `
+            --repo "${{ github.repository }}" `
+            --cert-identity $attestationIdentity `
+            --cert-oidc-issuer https://token.actions.githubusercontent.com `
+            --predicate-type https://slsa.dev/provenance/v1 `
+            --source-ref $attestationSourceRef `
+            --source-digest $expected
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts\verify-release.py annotated-tag `
+            --tag "$env:RELEASE_TAG" `
+            --commit "${{ needs.reproduce-sign-publish.outputs.commit }}" `
+            --tag-object "${{ needs.verification-gate.outputs.tag_object }}" `
+            --remote origin
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release edit "$env:RELEASE_TAG" `
+            --repo "${{ github.repository }}" `
+            --draft=false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $publishedViewJson = gh release view "$env:RELEASE_TAG" `
+            --repo "${{ github.repository }}" `
+            --json databaseId,tagName,url,body,assets,isDraft
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $publishedView = $publishedViewJson | ConvertFrom-Json
+          $finalAssets = @($publishedView.assets | ForEach-Object name | Sort-Object)
+          if (
+            [long]$publishedView.databaseId -ne $expectedDraftId -or
+            $publishedView.tagName -cne $env:EXPECTED_DRAFT_TAG -or
+            $publishedView.isDraft -ne $false -or
+            $publishedView.url -cne $expectedUrl -or
+            $publishedView.body.TrimEnd() -cne $expectedBody -or
+            $finalAssets.Count -ne 12 -or
+            (Compare-Object -ReferenceObject $expectedAssets -DifferenceObject $finalAssets).Count -ne 0
+          ) {
+            throw "Final publication did not preserve the verified URL, body, and exact assets"
+          }
+          for ($index = 0; $index -lt $expectedAssets.Count; $index++) {
+            if ($finalAssets[$index] -cne $expectedAssets[$index]) {
+              throw "Final publication changed exact asset-name casing"
+            }
+          }
+          New-Item -ItemType Directory -Path published-final-state | Out-Null
+          gh release download "$env:RELEASE_TAG" `
+            --repo "${{ github.repository }}" `
+            --dir published-final-state
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $finalFiles = @(
+            Get-ChildItem -LiteralPath published-final-state -File | Sort-Object Name
+          )
+          if ($finalFiles.Count -ne 12) {
+            throw "Final published redownload did not contain exactly twelve assets"
+          }
+          for ($index = 0; $index -lt $expectedAssets.Count; $index++) {
+            if ($finalFiles[$index].Name -cne $expectedAssets[$index]) {
+              throw "Final published redownload changed exact asset names"
+            }
+            $draftHash = (
+              Get-FileHash -Algorithm SHA256 `
+                -LiteralPath (Join-Path published-complete $expectedAssets[$index])
+            ).Hash
+            $finalHash = (
+              Get-FileHash -Algorithm SHA256 -LiteralPath $finalFiles[$index].FullName
+            ).Hash
+            if ($finalHash -cne $draftHash) {
+              throw "Final published asset differs from verified draft bytes: $($expectedAssets[$index])"
+            }
+          }
+          python scripts\verify-release.py annotated-tag `
+            --tag "$env:RELEASE_TAG" `
+            --commit "${{ needs.reproduce-sign-publish.outputs.commit }}" `
+            --tag-object "${{ needs.verification-gate.outputs.tag_object }}" `
+            --remote origin
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

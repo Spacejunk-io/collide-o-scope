@@ -296,8 +296,10 @@ impl MatteCompositePipeline {
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+                    has_dynamic_offset: true,
+                    min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<
+                        MatteCompositeUniforms,
+                    >() as u64),
                 },
                 count: None,
             }],
@@ -520,7 +522,7 @@ pub(crate) fn encode_matte_composite(
     });
     pass.set_pipeline(&pipeline.pipeline);
     pass.set_bind_group(0, &texture_group, &[]);
-    pass.set_bind_group(1, &uniform_group, &[]);
+    pass.set_bind_group(1, &uniform_group, &[0]);
     pass.draw(0..3, 0..1);
 }
 
@@ -927,7 +929,7 @@ mod tests {
             });
             pass.set_pipeline(&pipeline.pipeline);
             pass.set_bind_group(0, &textures, &[]);
-            pass.set_bind_group(1, &uniform_group, &[]);
+            pass.set_bind_group(1, &uniform_group, &[0]);
             pass.draw(0..3, 0..1);
         }
         readback_target(device, queue, &mut encoder, &target)

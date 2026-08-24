@@ -46,6 +46,15 @@ pub async fn serve(uri: axum::http::Uri) -> Response {
             )
                 .into_response();
         }
+        _ if path.starts_with("help/constraints/") => {
+            let key = path.trim_start_matches("help/");
+            return match crate::diagnostics::operator_help_html(key) {
+                Some(page) => {
+                    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], page).into_response()
+                }
+                None => (StatusCode::NOT_FOUND, "Unknown constraint code").into_response(),
+            };
+        }
         _ => {
             return (StatusCode::NOT_FOUND, "Not found").into_response();
         }
@@ -56,7 +65,7 @@ pub async fn serve(uri: axum::http::Uri) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::STYLE_CSS;
+    use super::{APP_JS, STYLE_CSS};
 
     #[test]
     fn panel_columns_share_the_scroll_contract_without_magnifying_range_thumbs() {
@@ -77,5 +86,55 @@ mod tests {
             !thumb_hover.contains("transform"),
             "hovering a range cursor must not change its size"
         );
+    }
+
+    #[tokio::test]
+    async fn constraint_help_is_generated_only_for_closed_codes() {
+        use axum::body::to_bytes;
+
+        let response = super::serve("/help/constraints/route-cycle".parse().unwrap()).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("Current-frame route cycle"));
+        assert!(body.contains("constraints/route-cycle"));
+
+        let response = super::serve("/help/constraints/not-a-code".parse().unwrap()).await;
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn panel_renders_planner_fields_without_parsing_human_text() {
+        assert!(APP_JS.contains("syncConstraintDiagnostics(msg.constraint_diagnostics)"));
+        assert!(APP_JS.contains("creativeStatus.dataset.constraintCode = diagnostic.code"));
+        assert!(APP_JS.contains("diagnostic.resource_delta"));
+        assert!(APP_JS.contains("diagnostic.remediations"));
+        assert!(!APP_JS.contains("diagnostic.text.includes("));
+        assert!(!APP_JS.contains("diagnostic.text.match("));
+    }
+
+    #[test]
+    fn remediation_confirmation_uses_only_the_published_preview_and_cancel_sends_nothing() {
+        let start = APP_JS
+            .find("function confirmConstraintRemediation(")
+            .expect("remediation confirmation function");
+        let end = APP_JS[start..]
+            .find("\n}\n")
+            .map(|offset| start + offset)
+            .expect("confirmation function end");
+        let function = &APP_JS[start..end];
+        let confirm = function
+            .find("window.confirm(")
+            .expect("explicit confirmation");
+        let cancel = function
+            .find("if (!confirmed) return;")
+            .expect("cancel is an exact no-op");
+        let send = function
+            .find("action: 'apply_constraint_remediation'")
+            .expect("confirmed typed action");
+        assert!(confirm < cancel && cancel < send);
+        assert!(function.contains("candidate_id: String(candidate.id)"));
+        assert!(function.contains("composition_revision: compositionRevision"));
+        assert!(!function.contains("operations:"));
     }
 }

@@ -538,20 +538,57 @@ pub enum CompositionError {
 impl fmt::Display for CompositionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TooManyGroups { count, limit } => write!(formatter, "composition has {count} groups; limit is {limit}"),
-            Self::TooManyLayers { count, limit } => write!(formatter, "composition has {count} layers; limit is {limit}"),
-            Self::GroupNameTooLong { bytes, limit } => write!(formatter, "group name is {bytes} bytes; limit is {limit}"),
+            Self::TooManyGroups { count, limit } => write!(
+                formatter,
+                "composition has {count} groups; limit is {limit}"
+            ),
+            Self::TooManyLayers { count, limit } => write!(
+                formatter,
+                "composition has {count} layers; limit is {limit}"
+            ),
+            Self::GroupNameTooLong { bytes, limit } => {
+                write!(formatter, "group name is {bytes} bytes; limit is {limit}")
+            }
             Self::DuplicateGroupId(id) => write!(formatter, "duplicate group id {}", id.get()),
             Self::DuplicateRootItem(item) => write!(formatter, "duplicate root item {item:?}"),
-            Self::DuplicateLayer(layer) => write!(formatter, "layer position {} occurs more than once in composition", layer.get()),
-            Self::UnknownGroup(id) => write!(formatter, "root references missing group {}", id.get()),
-            Self::UnrootedGroup(id) => write!(formatter, "group {} is not present at the root", id.get()),
-            Self::UnknownLayer(layer) => write!(formatter, "composition references unknown layer position {}", layer.get()),
-            Self::MissingLayer(layer) => write!(formatter, "composition omits layer position {}", layer.get()),
-            Self::InvalidNextGroupId { next, greatest_observed } => write!(formatter, "next group id {next} must advance past live or missing referenced id {greatest_observed}"),
+            Self::DuplicateLayer(layer) => write!(
+                formatter,
+                "layer position {} occurs more than once in composition",
+                layer.get()
+            ),
+            Self::UnknownGroup(id) => {
+                write!(formatter, "root references missing group {}", id.get())
+            }
+            Self::UnrootedGroup(id) => {
+                write!(formatter, "group {} is not present at the root", id.get())
+            }
+            Self::UnknownLayer(layer) => write!(
+                formatter,
+                "composition references unknown layer position {}",
+                layer.get()
+            ),
+            Self::MissingLayer(layer) => write!(
+                formatter,
+                "composition omits layer position {}",
+                layer.get()
+            ),
+            Self::InvalidNextGroupId {
+                next,
+                greatest_observed,
+            } => write!(
+                formatter,
+                "next group id {next} must advance past live or missing referenced id {greatest_observed}"
+            ),
             Self::GroupIdExhausted => formatter.write_str("group identity space is exhausted"),
-            Self::InvalidMoveIndex { index, len } => write!(formatter, "composition move index {index} exceeds length {len}"),
-            Self::GroupRack { group_id, error } => write!(formatter, "group {} rack is invalid: {error}", group_id.get()),
+            Self::InvalidMoveIndex { index, len } => write!(
+                formatter,
+                "composition move index {index} exceeds length {len}"
+            ),
+            Self::GroupRack { group_id, error } => write!(
+                formatter,
+                "group {} rack is invalid: {error}",
+                group_id.get()
+            ),
         }
     }
 }
@@ -1248,26 +1285,67 @@ impl fmt::Display for RuntimeCompositionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TooManyGroups { count, limit } => {
-                write!(formatter, "runtime composition has {count} groups; limit is {limit}")
+                write!(
+                    formatter,
+                    "runtime composition has {count} groups; limit is {limit}"
+                )
             }
             Self::TooManyLayers { count, limit } => {
-                write!(formatter, "runtime composition has {count} layers; limit is {limit}")
+                write!(
+                    formatter,
+                    "runtime composition has {count} layers; limit is {limit}"
+                )
             }
-            Self::DuplicateGroupId(id) => write!(formatter, "duplicate runtime group id {}", id.get()),
-            Self::DuplicateRootItem(item) => write!(formatter, "duplicate runtime root item {item:?}"),
+            Self::DuplicateGroupId(id) => {
+                write!(formatter, "duplicate runtime group id {}", id.get())
+            }
+            Self::DuplicateRootItem(item) => {
+                write!(formatter, "duplicate runtime root item {item:?}")
+            }
             Self::DuplicateLayer(layer_id) => write!(
                 formatter,
                 "live layer {} occurs more than once in runtime composition",
                 layer_id.get()
             ),
-            Self::UnknownGroup(id) => write!(formatter, "runtime root references missing group {}", id.get()),
-            Self::UnrootedGroup(id) => write!(formatter, "runtime group {} is not present at the root", id.get()),
-            Self::UnknownLayer(layer_id) => write!(formatter, "runtime composition references unknown live layer {}", layer_id.get()),
-            Self::MissingLayer(layer_id) => write!(formatter, "runtime composition omits live layer {}", layer_id.get()),
-            Self::InvalidNextGroupId { next, greatest_observed } => write!(formatter, "next runtime group id {next} must advance past live or missing referenced id {greatest_observed}"),
-            Self::GroupIdExhausted => formatter.write_str("runtime group identity space is exhausted"),
-            Self::InvalidMoveIndex { index, len } => write!(formatter, "runtime composition move index {index} exceeds length {len}"),
-            Self::GroupRack { group_id, error } => write!(formatter, "runtime group {} rack is invalid: {error}", group_id.get()),
+            Self::UnknownGroup(id) => write!(
+                formatter,
+                "runtime root references missing group {}",
+                id.get()
+            ),
+            Self::UnrootedGroup(id) => write!(
+                formatter,
+                "runtime group {} is not present at the root",
+                id.get()
+            ),
+            Self::UnknownLayer(layer_id) => write!(
+                formatter,
+                "runtime composition references unknown live layer {}",
+                layer_id.get()
+            ),
+            Self::MissingLayer(layer_id) => write!(
+                formatter,
+                "runtime composition omits live layer {}",
+                layer_id.get()
+            ),
+            Self::InvalidNextGroupId {
+                next,
+                greatest_observed,
+            } => write!(
+                formatter,
+                "next runtime group id {next} must advance past live or missing referenced id {greatest_observed}"
+            ),
+            Self::GroupIdExhausted => {
+                formatter.write_str("runtime group identity space is exhausted")
+            }
+            Self::InvalidMoveIndex { index, len } => write!(
+                formatter,
+                "runtime composition move index {index} exceeds length {len}"
+            ),
+            Self::GroupRack { group_id, error } => write!(
+                formatter,
+                "runtime group {} rack is invalid: {error}",
+                group_id.get()
+            ),
         }
     }
 }

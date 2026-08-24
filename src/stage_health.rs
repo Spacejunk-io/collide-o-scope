@@ -198,10 +198,209 @@ pub struct LayerStageHealthSnapshot {
     pub dropped_frames: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub status: String,
+    #[serde(default)]
+    pub source_color: crate::video::SourceColorDescriptor,
+    #[serde(default)]
+    pub source_display: crate::video::SourceDisplayDescriptor,
+    #[serde(default)]
+    pub conversion_policy: crate::video::SourceConversionPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageLatencyPercentilesSnapshot {
+    pub p50_us: u32,
+    pub p95_us: u32,
+    pub p99_us: u32,
+    pub samples: u16,
+}
+
+impl From<crate::action_correlation::LatencyPercentiles> for StageLatencyPercentilesSnapshot {
+    fn from(value: crate::action_correlation::LatencyPercentiles) -> Self {
+        Self {
+            p50_us: value.p50_us,
+            p95_us: value.p95_us,
+            p99_us: value.p99_us,
+            samples: value.samples,
+        }
+    }
+}
+
+impl From<crate::renderer::gpu_timing::GpuLatencyPercentiles> for StageLatencyPercentilesSnapshot {
+    fn from(value: crate::renderer::gpu_timing::GpuLatencyPercentiles) -> Self {
+        Self {
+            p50_us: value.p50_us,
+            p95_us: value.p95_us,
+            p99_us: value.p99_us,
+            samples: value.samples,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageActionTimingSnapshot {
+    pub ingress_to_apply: StageLatencyPercentilesSnapshot,
+    pub apply_to_submit: StageLatencyPercentilesSnapshot,
+    pub last_presented_sequence: u64,
+    pub last_submission_generation: u64,
+    pub pending: u16,
+    pub uncorrelated_over_capacity: u64,
+}
+
+impl From<crate::action_correlation::ActionTimingSnapshot> for StageActionTimingSnapshot {
+    fn from(value: crate::action_correlation::ActionTimingSnapshot) -> Self {
+        Self {
+            ingress_to_apply: value.ingress_to_apply.into(),
+            apply_to_submit: value.apply_to_submit.into(),
+            last_presented_sequence: value.last_presented_sequence,
+            last_submission_generation: value.last_submission_generation,
+            pending: value.pending,
+            uncorrelated_over_capacity: value.uncorrelated_over_capacity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageGpuTimingSnapshot {
+    pub supported: bool,
+    pub source_prepare: StageLatencyPercentilesSnapshot,
+    pub creative_composition: StageLatencyPercentilesSnapshot,
+    pub temporal_motion: StageLatencyPercentilesSnapshot,
+    pub mosh_vhs: StageLatencyPercentilesSnapshot,
+    pub audience_resolve: StageLatencyPercentilesSnapshot,
+    pub submission: StageLatencyPercentilesSnapshot,
+    pub last_submission_generation: u64,
+    pub dropped_busy_frames: u64,
+    pub map_failures: u64,
+}
+
+impl From<crate::renderer::gpu_timing::GpuTimingSnapshot> for StageGpuTimingSnapshot {
+    fn from(value: crate::renderer::gpu_timing::GpuTimingSnapshot) -> Self {
+        Self {
+            supported: value.supported,
+            source_prepare: value.source_prepare.into(),
+            creative_composition: value.creative_composition.into(),
+            temporal_motion: value.temporal_motion.into(),
+            mosh_vhs: value.mosh_vhs.into(),
+            audience_resolve: value.audience_resolve.into(),
+            submission: value.submission.into(),
+            last_submission_generation: value.last_submission_generation,
+            dropped_busy_frames: value.dropped_busy_frames,
+            map_failures: value.map_failures,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageFlightRecorderSnapshot {
+    pub enabled: bool,
+    pub queued_events: u64,
+    pub dropped_full: u64,
+    /// Fixed production policy: active plus two independently durable files.
+    pub retained_rotations: u8,
+    pub rotation_seconds: u8,
+    pub total_byte_cap: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageDecoderRetirementHealth {
+    #[default]
+    Healthy,
+    Saturated,
+    Stuck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageDecoderRetirementSnapshot {
+    pub health: StageDecoderRetirementHealth,
+    pub active_workers: u16,
+    pub retiring_workers: u16,
+    pub stuck_workers: u16,
+    pub owned_workers: u16,
+    pub peak_owned_workers: u16,
+    pub peak_retiring_workers: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_retirement_age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_worker_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub oldest_source_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_source_generation: Option<u64>,
+    pub completed_workers: u64,
+    pub panicked_workers: u64,
+    pub admission_refusals: u64,
+    pub hard_cap: u16,
+    pub churn_cap: u16,
+    pub accepting_new_workers: bool,
+}
+
+impl Default for StageDecoderRetirementSnapshot {
+    fn default() -> Self {
+        Self {
+            health: StageDecoderRetirementHealth::Healthy,
+            active_workers: 0,
+            retiring_workers: 0,
+            stuck_workers: 0,
+            owned_workers: 0,
+            peak_owned_workers: 0,
+            peak_retiring_workers: 0,
+            oldest_retirement_age_ms: None,
+            oldest_worker_id: None,
+            oldest_source_fingerprint: String::new(),
+            oldest_source_generation: None,
+            completed_workers: 0,
+            panicked_workers: 0,
+            admission_refusals: 0,
+            hard_cap: u16::try_from(crate::video::DECODER_WORKER_HARD_CAP).unwrap_or(u16::MAX),
+            churn_cap: u16::try_from(crate::video::DECODER_RETIREMENT_CHURN_CAP)
+                .unwrap_or(u16::MAX),
+            accepting_new_workers: true,
+        }
+    }
+}
+
+impl From<crate::video::DecoderRetirementSnapshot> for StageDecoderRetirementSnapshot {
+    fn from(value: crate::video::DecoderRetirementSnapshot) -> Self {
+        let health = match value.health {
+            crate::video::DecoderRetirementHealth::Healthy => StageDecoderRetirementHealth::Healthy,
+            crate::video::DecoderRetirementHealth::Saturated => {
+                StageDecoderRetirementHealth::Saturated
+            }
+            crate::video::DecoderRetirementHealth::Stuck => StageDecoderRetirementHealth::Stuck,
+        };
+        Self {
+            health,
+            active_workers: u16::try_from(value.active_workers).unwrap_or(u16::MAX),
+            retiring_workers: u16::try_from(value.retiring_workers).unwrap_or(u16::MAX),
+            stuck_workers: u16::try_from(value.stuck_workers).unwrap_or(u16::MAX),
+            owned_workers: u16::try_from(value.owned_workers).unwrap_or(u16::MAX),
+            peak_owned_workers: u16::try_from(value.peak_owned_workers).unwrap_or(u16::MAX),
+            peak_retiring_workers: u16::try_from(value.peak_retiring_workers).unwrap_or(u16::MAX),
+            oldest_retirement_age_ms: value
+                .oldest_retirement_age
+                .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX)),
+            oldest_worker_id: value.oldest_retiree.map(|identity| identity.worker_id),
+            oldest_source_fingerprint: value
+                .oldest_retiree
+                .map_or_else(String::new, |identity| identity.source.short_hex()),
+            oldest_source_generation: value
+                .oldest_retiree
+                .map(|identity| identity.source_generation),
+            completed_workers: value.completed_workers,
+            panicked_workers: value.panicked_workers,
+            admission_refusals: value.admission_refusals,
+            hard_cap: u16::try_from(value.hard_cap).unwrap_or(u16::MAX),
+            churn_cap: u16::try_from(value.churn_cap).unwrap_or(u16::MAX),
+            accepting_new_workers: value.accepting_new_workers,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StageHealthSnapshot {
+    #[serde(default = "current_build_identity_snapshot")]
+    pub build_identity: crate::build_identity::BuildIdentitySnapshot,
     pub fps: f32,
     pub frame_time_p50_us: u32,
     pub frame_time_p95_us: u32,
@@ -222,6 +421,14 @@ pub struct StageHealthSnapshot {
     pub layers_truncated: bool,
     pub output: StageOutputSnapshot,
     pub gpu: StageGpuSnapshot,
+    #[serde(default)]
+    pub gpu_timing: StageGpuTimingSnapshot,
+    #[serde(default)]
+    pub action_timing: StageActionTimingSnapshot,
+    #[serde(default)]
+    pub flight_recorder: StageFlightRecorderSnapshot,
+    #[serde(default)]
+    pub decoder_retirement: StageDecoderRetirementSnapshot,
     pub budgets: StageBudgetSetSnapshot,
     pub tools: StageToolsSnapshot,
 }
@@ -229,6 +436,7 @@ pub struct StageHealthSnapshot {
 impl Default for StageHealthSnapshot {
     fn default() -> Self {
         Self {
+            build_identity: current_build_identity_snapshot(),
             fps: 0.0,
             frame_time_p50_us: 0,
             frame_time_p95_us: 0,
@@ -243,6 +451,10 @@ impl Default for StageHealthSnapshot {
             layers_truncated: false,
             output: StageOutputSnapshot::default(),
             gpu: StageGpuSnapshot::default(),
+            gpu_timing: StageGpuTimingSnapshot::default(),
+            action_timing: StageActionTimingSnapshot::default(),
+            flight_recorder: StageFlightRecorderSnapshot::default(),
+            decoder_retirement: StageDecoderRetirementSnapshot::default(),
             budgets: StageBudgetSetSnapshot::default(),
             tools: StageToolsSnapshot::default(),
         }
@@ -257,6 +469,9 @@ pub struct LayerStageHealthInput<'a> {
     pub pending_frames: u32,
     pub dropped_frames: u64,
     pub status: &'a str,
+    pub source_color: crate::video::SourceColorDescriptor,
+    pub source_display: crate::video::SourceDisplayDescriptor,
+    pub conversion_policy: crate::video::SourceConversionPolicy,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -299,6 +514,8 @@ pub struct StageHealthPublishInput<'a> {
     pub layers: &'a [LayerStageHealthInput<'a>],
     pub output: StageOutputInput<'a>,
     pub gpu: StageGpuInput<'a>,
+    pub gpu_timing: crate::renderer::gpu_timing::GpuTimingSnapshot,
+    pub action_timing: crate::action_correlation::ActionTimingSnapshot,
     pub budgets: StageBudgetSetInput<'a>,
     pub tools: &'a StageToolState,
 }
@@ -379,9 +596,13 @@ impl StageHealthMonitor {
                 pending_frames: layer.pending_frames.min(1_024),
                 dropped_frames: layer.dropped_frames,
                 status: bounded_text(layer.status),
+                source_color: layer.source_color,
+                source_display: layer.source_display,
+                conversion_policy: layer.conversion_policy,
             })
             .collect();
         StageHealthSnapshot {
+            build_identity: current_build_identity_snapshot(),
             fps,
             frame_time_p50_us: percentile(&sorted[..self.count], 50),
             frame_time_p95_us: percentile(&sorted[..self.count], 95),
@@ -407,6 +628,10 @@ impl StageHealthMonitor {
                 backend: bounded_text(input.gpu.backend),
                 device: bounded_text(input.gpu.device),
             },
+            gpu_timing: input.gpu_timing.into(),
+            action_timing: input.action_timing.into(),
+            flight_recorder: StageFlightRecorderSnapshot::default(),
+            decoder_retirement: StageDecoderRetirementSnapshot::default(),
             budgets: StageBudgetSetSnapshot {
                 gpu: budget_snapshot(input.budgets.gpu),
                 media: budget_snapshot(input.budgets.media),
@@ -416,6 +641,10 @@ impl StageHealthMonitor {
             tools: stage_tools_snapshot(input.tools),
         }
     }
+}
+
+fn current_build_identity_snapshot() -> crate::build_identity::BuildIdentitySnapshot {
+    crate::build_identity::current().snapshot()
 }
 
 fn percentile(sorted: &[u32], percentile: usize) -> u32 {
@@ -474,6 +703,74 @@ pub fn paint_editor_preview_health(
             f64::from(snapshot.output.refresh_millihz) / 1_000.0,
             snapshot.output.identity
         ));
+        if snapshot.gpu_timing.supported {
+            ui.label(format!(
+                "GPU p95 ms source {:.3} | creative {:.3} | temporal {:.3} | Mosh/VHS {:.3} | resolve {:.3} | submit {:.3}",
+                f64::from(snapshot.gpu_timing.source_prepare.p95_us) / 1_000.0,
+                f64::from(snapshot.gpu_timing.creative_composition.p95_us) / 1_000.0,
+                f64::from(snapshot.gpu_timing.temporal_motion.p95_us) / 1_000.0,
+                f64::from(snapshot.gpu_timing.mosh_vhs.p95_us) / 1_000.0,
+                f64::from(snapshot.gpu_timing.audience_resolve.p95_us) / 1_000.0,
+                f64::from(snapshot.gpu_timing.submission.p95_us) / 1_000.0,
+            ));
+        } else {
+            ui.weak("GPU timestamps unsupported on this adapter/backend");
+        }
+        ui.label(format!(
+            "Action p95 ingress→apply {:.3} ms | apply→submit {:.3} ms | sequence {} | generation {} | pending {}",
+            f64::from(snapshot.action_timing.ingress_to_apply.p95_us) / 1_000.0,
+            f64::from(snapshot.action_timing.apply_to_submit.p95_us) / 1_000.0,
+            snapshot.action_timing.last_presented_sequence,
+            snapshot.action_timing.last_submission_generation,
+            snapshot.action_timing.pending,
+        ));
+        if snapshot.flight_recorder.enabled {
+            ui.label(format!(
+                "Private flight recorder {} s × {} | queued {} | pressure drops {}",
+                snapshot.flight_recorder.rotation_seconds,
+                snapshot.flight_recorder.retained_rotations,
+                snapshot.flight_recorder.queued_events,
+                snapshot.flight_recorder.dropped_full,
+            ));
+        } else {
+            ui.weak("Private flight recorder unavailable");
+        }
+        let retire_age = snapshot
+            .decoder_retirement
+            .oldest_retirement_age_ms
+            .map_or_else(|| "n/a".to_owned(), |age| format!("{age} ms"));
+        let retire_identity = snapshot
+            .decoder_retirement
+            .oldest_worker_id
+            .map_or_else(|| "none".to_owned(), |worker_id| {
+                format!(
+                    "worker {worker_id} source {} generation {}",
+                    snapshot.decoder_retirement.oldest_source_fingerprint,
+                    snapshot
+                        .decoder_retirement
+                        .oldest_source_generation
+                        .unwrap_or_default(),
+                )
+            });
+        let decoder_retirement_label = format!(
+            "Decoder workers active/retiring/stuck {}/{}/{} | owned {}/{} | oldest {} ({}) | admission refusals {}",
+            snapshot.decoder_retirement.active_workers,
+            snapshot.decoder_retirement.retiring_workers,
+            snapshot.decoder_retirement.stuck_workers,
+            snapshot.decoder_retirement.owned_workers,
+            snapshot.decoder_retirement.hard_cap,
+            retire_age,
+            retire_identity,
+            snapshot.decoder_retirement.admission_refusals,
+        );
+        if matches!(
+            snapshot.decoder_retirement.health,
+            StageDecoderRetirementHealth::Stuck
+        ) {
+            ui.colored_label(egui::Color32::RED, decoder_retirement_label);
+        } else {
+            ui.label(decoder_retirement_label);
+        }
         ui.label(format!(
             "GPU {} ({})  |  media {}  |  Mosh send {}  |  motion {}",
             snapshot.gpu.adapter,
@@ -487,8 +784,15 @@ pub fn paint_editor_preview_health(
                 .decoded_age_ms
                 .map_or_else(|| "n/a".to_string(), |age| format!("{age} ms"));
             ui.label(format!(
-                "{}  decoded {age}  pending {}  drops {}  {}",
-                layer.name, layer.pending_frames, layer.dropped_frames, layer.status
+                "{}  decoded {age}  pending {}  drops {}  color {:?}/{:?}/{:?}  convert {:?}  {}",
+                layer.name,
+                layer.pending_frames,
+                layer.dropped_frames,
+                layer.source_color.matrix.value,
+                layer.source_color.range.value,
+                layer.source_color.transfer.value,
+                layer.conversion_policy.kind,
+                layer.status
             ));
         }
     });
@@ -514,6 +818,9 @@ mod tests {
             pending_frames: 1,
             dropped_frames: 3,
             status: "healthy",
+            source_color: Default::default(),
+            source_display: Default::default(),
+            conversion_policy: Default::default(),
         }
     }
 
@@ -537,6 +844,8 @@ mod tests {
                 backend: "Vulkan",
                 device: "Device",
             },
+            gpu_timing: crate::renderer::gpu_timing::GpuTimingSnapshot::default(),
+            action_timing: crate::action_correlation::ActionTimingSnapshot::default(),
             budgets: StageBudgetSetInput::default(),
             tools,
         }
@@ -565,6 +874,38 @@ mod tests {
         assert_eq!(snapshot.schedule_lateness_p99_us, 99);
         assert_eq!(snapshot.skipped_program_ticks, 4);
         assert_eq!(snapshot.missed_deadlines, 4);
+    }
+
+    #[test]
+    fn timing_spine_fields_are_additive_for_legacy_stage_snapshots() {
+        let mut legacy = serde_json::to_value(StageHealthSnapshot::default()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("gpu_timing");
+        object.remove("action_timing");
+        object.remove("decoder_retirement");
+        let restored: StageHealthSnapshot = serde_json::from_value(legacy).unwrap();
+        assert!(!restored.gpu_timing.supported);
+        assert_eq!(restored.action_timing.ingress_to_apply.samples, 0);
+        assert_eq!(restored.action_timing.apply_to_submit.samples, 0);
+        assert_eq!(
+            restored.decoder_retirement.health,
+            StageDecoderRetirementHealth::Healthy
+        );
+    }
+
+    #[test]
+    fn source_descriptor_fields_are_additive_for_legacy_layer_health() {
+        let legacy = serde_json::json!({
+            "layer_id": "1",
+            "name": "legacy.mov",
+            "pending_frames": 0,
+            "dropped_frames": 0,
+            "status": "ready"
+        });
+        let restored: LayerStageHealthSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.source_color, Default::default());
+        assert_eq!(restored.source_display, Default::default());
+        assert_eq!(restored.conversion_policy, Default::default());
     }
 
     #[test]
@@ -630,6 +971,9 @@ mod tests {
                 pending_frames: u32::MAX,
                 dropped_frames: u64::MAX,
                 status: &long,
+                source_color: Default::default(),
+                source_display: Default::default(),
+                conversion_policy: Default::default(),
             })
             .collect::<Vec<_>>();
         let tools = StageToolState::default();

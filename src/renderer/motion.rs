@@ -3447,6 +3447,7 @@ mod tests {
                 codec_vectors_available: false,
                 required_as_donor: false,
                 required_as_garden_signal: false,
+                required_as_study_input: false,
             }],
             MotionDeviceLimits::new(8_192, u64::MAX),
         )
@@ -3917,6 +3918,7 @@ mod tests {
                     codec_vectors_available: false,
                     required_as_donor: false,
                     required_as_garden_signal: false,
+                    required_as_study_input: false,
                 }],
                 MotionDeviceLimits::new(device.limits().max_texture_dimension_2d, u64::MAX),
             )
@@ -4439,6 +4441,7 @@ mod tests {
                     codec_vectors_available: false,
                     required_as_donor: true,
                     required_as_garden_signal: false,
+                    required_as_study_input: false,
                 }],
                 MotionDeviceLimits::new(device.limits().max_texture_dimension_2d, u64::MAX),
             )
@@ -4621,6 +4624,7 @@ mod tests {
             codec_vectors_available: false,
             required_as_donor: false,
             required_as_garden_signal: true,
+            required_as_study_input: false,
         };
         let plan = MotionResourcePlan::preflight(
             &[request],
@@ -4701,6 +4705,7 @@ mod tests {
                 codec_vectors_available: false,
                 required_as_donor: false,
                 required_as_garden_signal: false,
+                required_as_study_input: false,
             }],
             MotionDeviceLimits::new(device.limits().max_texture_dimension_2d, u64::MAX),
         )

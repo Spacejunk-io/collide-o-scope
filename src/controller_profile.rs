@@ -990,12 +990,19 @@ pub enum ControllerProfileAction {
 }
 
 impl ControllerProfileAction {
-    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, ControllerProfileError> {
+    /// Bounded structural decode only. Transport handlers use this seam to
+    /// distinguish malformed JSON (which has no engine action identity) from a
+    /// syntactically valid but semantically refused action (which does).
+    pub fn decode_json_bytes(bytes: &[u8]) -> Result<Self, ControllerProfileError> {
         if bytes.len() > CONTROLLER_PROFILE_ACTION_MAX_BYTES {
             return Err(ControllerProfileError::ActionBytes(bytes.len()));
         }
-        let action: Self = serde_json::from_slice(bytes)
-            .map_err(|error| ControllerProfileError::Json(error.to_string()))?;
+        serde_json::from_slice(bytes)
+            .map_err(|error| ControllerProfileError::Json(error.to_string()))
+    }
+
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, ControllerProfileError> {
+        let action = Self::decode_json_bytes(bytes)?;
         if let Self::Import { document } = &action {
             // Validate the authored values and the independently bounded
             // pretty-JSON representation before Main resolves live IDs.
@@ -1221,6 +1228,9 @@ pub struct ControllerDecodeReport {
     pub matched_bindings: usize,
     pub emitted_events: usize,
     pub dropped_events: usize,
+    /// A legitimate non-emitting button edge (for example Toggle release)
+    /// changed decoder state and therefore needs a non-Refused lifecycle.
+    pub state_changed: bool,
 }
 
 /// Exact wire-shape admission shared by the driver callback and the pure
@@ -1337,28 +1347,33 @@ impl ControllerDecoder {
                 continue;
             }
             report.matched_bindings = report.matched_bindings.saturating_add(1);
-            let value = if let Some(mode) = binding.button_mode {
+            let (value, button_candidate) = if let Some(mode) = binding.button_mode {
                 let pressed = match binding.source {
                     MidiInputSource::Note { .. } => family == 0x90 && raw > 0,
                     MidiInputSource::ControlChange { .. } => raw >= binding.press_threshold,
                 };
-                let state = self.buttons.entry(binding.id).or_default();
-                let rising = pressed && !state.pressed;
-                let changed = pressed != state.pressed;
-                state.pressed = pressed;
-                match mode {
+                let prior = self.buttons.get(&binding.id).copied().unwrap_or_default();
+                let mut candidate = prior;
+                let rising = pressed && !prior.pressed;
+                let changed = pressed != prior.pressed;
+                candidate.pressed = pressed;
+                let value = match mode {
                     MidiButtonMode::Momentary if rising => Some(AutomationValue::Trigger),
                     MidiButtonMode::Momentary => None,
                     MidiButtonMode::Toggle if rising => {
-                        state.toggled = !state.toggled;
-                        Some(AutomationValue::Gate(state.toggled))
+                        candidate.toggled = !candidate.toggled;
+                        Some(AutomationValue::Gate(candidate.toggled))
                     }
                     MidiButtonMode::Toggle => None,
                     MidiButtonMode::Gate if changed => Some(AutomationValue::Gate(pressed)),
                     MidiButtonMode::Gate => None,
-                }
+                };
+                (value, Some((prior, candidate)))
             } else {
-                decode_continuous(binding.encoding, raw, binding.relative_step)
+                (
+                    decode_continuous(binding.encoding, raw, binding.relative_step),
+                    None,
+                )
             };
             if let Some(value) = value {
                 if output.len() < output_limit {
@@ -1372,8 +1387,22 @@ impl ControllerDecoder {
                         },
                     });
                     report.emitted_events = report.emitted_events.saturating_add(1);
+                    if let Some((prior, candidate)) = button_candidate {
+                        if candidate != prior {
+                            self.buttons.insert(binding.id, candidate);
+                            report.state_changed = true;
+                        }
+                    }
                 } else {
+                    // Event admission and the hidden edge are one transaction.
+                    // Leaving the prior state intact lets the next admitted
+                    // press produce the event instead of silently consuming it.
                     report.dropped_events = report.dropped_events.saturating_add(1);
+                }
+            } else if let Some((prior, candidate)) = button_candidate {
+                if candidate != prior {
+                    self.buttons.insert(binding.id, candidate);
+                    report.state_changed = true;
                 }
             }
         }
@@ -2012,6 +2041,81 @@ mod tests {
                 AutomationValue::Gate(false),
             ]
         );
+    }
+
+    #[test]
+    fn button_edges_and_event_capacity_commit_as_one_transaction() {
+        for mode in [MidiButtonMode::Toggle, MidiButtonMode::Gate] {
+            let profile = ResolvedControllerProfile {
+                name: format!("{mode:?} capacity"),
+                input: MidiDeviceSelector::FirstAvailable,
+                output: MidiDeviceSelector::FirstAvailable,
+                bindings: vec![ResolvedControllerBinding {
+                    id: 1,
+                    source: MidiInputSource::Note { note: 60 },
+                    channel: MidiChannelFilter::Omni,
+                    encoding: MidiValueEncoding::Absolute,
+                    button_mode: Some(mode),
+                    press_threshold: 64,
+                    relative_step: 0.1,
+                    target: RuntimeControlAddress::Master(ControlParameter::Enabled),
+                    feedback: None,
+                }]
+                .into_boxed_slice(),
+            };
+            let mut decoder = ControllerDecoder::new(profile);
+            let mut events = Vec::new();
+
+            let refused_press = decoder.decode_bounded(1, &[0x90, 60, 127], &mut events, 0);
+            assert_eq!(refused_press.dropped_events, 1);
+            assert!(!refused_press.state_changed);
+            assert!(decoder.buttons.is_empty(), "{mode:?} press was consumed");
+
+            let admitted_press = decoder.decode_bounded(2, &[0x90, 60, 127], &mut events, 1);
+            assert_eq!(admitted_press.emitted_events, 1);
+            assert!(admitted_press.state_changed);
+            assert!(matches!(
+                events[0].kind,
+                ControllerEventKind::Control {
+                    value: AutomationValue::Gate(true),
+                    ..
+                }
+            ));
+            events.clear();
+
+            let refused_release = decoder.decode_bounded(3, &[0x80, 60, 0], &mut events, 0);
+            match mode {
+                MidiButtonMode::Toggle => {
+                    assert_eq!(refused_release.dropped_events, 0);
+                    assert!(refused_release.state_changed);
+                    let next_press = decoder.decode_bounded(4, &[0x90, 60, 127], &mut events, 1);
+                    assert_eq!(next_press.emitted_events, 1);
+                    assert!(matches!(
+                        events[0].kind,
+                        ControllerEventKind::Control {
+                            value: AutomationValue::Gate(false),
+                            ..
+                        }
+                    ));
+                }
+                MidiButtonMode::Gate => {
+                    assert_eq!(refused_release.dropped_events, 1);
+                    assert!(!refused_release.state_changed);
+                    let admitted_release =
+                        decoder.decode_bounded(4, &[0x80, 60, 0], &mut events, 1);
+                    assert_eq!(admitted_release.emitted_events, 1);
+                    assert!(admitted_release.state_changed);
+                    assert!(matches!(
+                        events[0].kind,
+                        ControllerEventKind::Control {
+                            value: AutomationValue::Gate(false),
+                            ..
+                        }
+                    ));
+                }
+                MidiButtonMode::Momentary => unreachable!(),
+            }
+        }
     }
 
     #[test]

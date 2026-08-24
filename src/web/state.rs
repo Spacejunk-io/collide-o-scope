@@ -1,13 +1,20 @@
 //! Shared state between the web control panel and the render engine.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fmt;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 
+use crate::action_correlation::{
+    ActionCorrelationMonitor, ActionDisposition, ActionEnvelope, ActionIdentity, ActionSequencer,
+    ActionSourceClass, ActionTimingSnapshot,
+};
+use crate::durable_file::UploadAdmission;
 use crate::effects::EffectUniforms;
 use crate::image_routing::{LayerImageStage, MatteChannel};
 use crate::performance::{
@@ -21,32 +28,78 @@ use crate::visual_rack::EdgeTiming;
 /// Empty is valid and renders as the stable numeric Scene identity.
 pub const MAX_SCENE_NAME_BYTES: usize = 128;
 
-/// Lifecycle of the authenticated loopback control listener. This is kept
-/// separate from browser connection count: zero connected browsers can be a
-/// perfectly healthy server, while a bind failure means the local panel is
-/// genuinely unavailable for this process.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ControlServerStatus {
-    NotStarted,
+/// One listener's lifecycle. Loopback IPv4, loopback IPv6, and LAN TLS each
+/// own a separate value so success on one socket can never conceal failure on
+/// another.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ControlListenerStatus {
+    #[default]
+    Stopped,
     Starting,
-    Listening,
-    Unavailable(String),
+    Listening {
+        address: SocketAddr,
+    },
+    Unavailable {
+        reason: String,
+    },
 }
 
-/// Atomic native-shell view of the local listener and its bearer-token URL.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ControlServerInfo {
-    pub local_url: String,
-    pub status: ControlServerStatus,
-}
+/// A bearer-token URL may be exposed only at the two deliberate local UI
+/// boundaries: the native Open Panel link and the authenticated QR surface.
+/// Debug formatting is always redacted so assertion/panic/log formatting
+/// cannot copy the session secret into diagnostics.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ControlAccessUrl(String);
 
-impl Default for ControlServerInfo {
-    fn default() -> Self {
-        Self {
-            local_url: String::new(),
-            status: ControlServerStatus::NotStarted,
-        }
+impl ControlAccessUrl {
+    pub(crate) fn new(url: String) -> Self {
+        Self(url)
     }
+
+    pub fn expose_to_local_ui(&self) -> &str {
+        &self.0
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for ControlAccessUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ControlAccessUrl(<redacted>)")
+    }
+}
+
+/// Atomic native-shell view of all listener roles for one server generation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ControlServerInfo {
+    pub generation: u64,
+    pub loopback_ipv4: ControlListenerStatus,
+    pub loopback_ipv6: ControlListenerStatus,
+    pub lan_tls: ControlListenerStatus,
+    pub(crate) loopback_ipv4_url: Option<ControlAccessUrl>,
+    pub(crate) loopback_ipv6_url: Option<ControlAccessUrl>,
+    pub lan_url: Option<ControlAccessUrl>,
+    /// First twelve hexadecimal digits of SHA-256(session token). This is a
+    /// correlation label, not an authentication credential.
+    pub session_fingerprint: String,
+}
+
+impl ControlServerInfo {
+    pub fn local_url(&self) -> Option<&ControlAccessUrl> {
+        self.loopback_ipv4_url
+            .as_ref()
+            .or(self.loopback_ipv6_url.as_ref())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlListenerSlot {
+    LoopbackIpv4,
+    LoopbackIpv6,
+    LanTls,
 }
 
 /// Shared state accessible by both the web server and the render loop.
@@ -54,9 +107,18 @@ pub struct WebState {
     /// Full app snapshot (pushed from render loop each frame)
     pub app: RwLock<AppSnapshot>,
     /// Broadcast channel for pushing state to all WebSocket clients
-    pub tx: broadcast::Sender<String>,
-    /// Actions queue: browser pushes commands, render loop drains them
-    pub actions: Mutex<Vec<WebAction>>,
+    /// Newest-only serialized state. A slow browser observes the latest
+    /// coherent generation; obsolete 30 Hz snapshots are never queued.
+    pub tx: watch::Sender<Arc<String>>,
+    snapshot_requested: AtomicBool,
+    full_snapshot_generation: AtomicU64,
+    last_full_snapshot: std::sync::RwLock<Arc<String>>,
+    serialized_publications: AtomicU64,
+    /// Actions queue: browser pushes commands, render loop drains them. The
+    /// engine-owned envelope is deliberately internal and non-serialized.
+    pub actions: Mutex<Vec<ActionEnvelope<WebAction>>>,
+    action_sequencer: Arc<ActionSequencer>,
+    action_correlation: std::sync::Mutex<ActionCorrelationMonitor>,
     /// Latest validated, path-free controller-profile JSON for the dedicated
     /// authenticated import/export endpoint. Keeping it outside AppSnapshot
     /// avoids rebroadcasting up to 256 KiB on every render frame.
@@ -79,17 +141,33 @@ pub struct WebState {
     library_media_helper_gate: std::sync::Mutex<()>,
     /// Library folder for clip uploads (set by the app; None until known).
     pub library_folder: std::sync::RwLock<Option<std::path::PathBuf>>,
-    /// Per-session access token. Every client must present it once (the local
-    /// startup URL and QR code carry it) and then receives a strict cookie.
-    pub access_token: String,
-    /// Full remote URL (LAN address + token), set by the server at startup.
-    pub lan_url: std::sync::RwLock<String>,
-    /// Truthful loopback listener lifecycle and authenticated local URL for the
-    /// native recovery strip.
+    /// One process-wide admission ledger shared by every listener role.
+    upload_admission: UploadAdmission,
+    /// Clone of Main's Arc-backed host-local media policy. Mode changes made
+    /// by Main are therefore visible to upload preflight without a new wire
+    /// or patch-owned policy surface.
+    upload_media_safety_policy: std::sync::RwLock<crate::media_safety::MediaSafetyPolicy>,
+    /// Linearizes the final upload name operation against library changes and
+    /// control-server retirement. The upload has already synced and probed
+    /// its file before taking this short gate.
+    upload_publication_gate: std::sync::Mutex<()>,
+    /// Truthful independent listener lifecycles plus the two deliberately
+    /// local bearer-token URL surfaces.
     control_server: std::sync::RwLock<ControlServerInfo>,
+    /// Rejects late status writes from a retired/crashed prior server after a
+    /// restart has installed a newer generation.
+    control_server_generation: AtomicU64,
+    /// The current generation is no longer allowed to publish uploads once
+    /// retirement begins, even while in-flight socket futures are draining.
+    control_server_stopping_generation: AtomicU64,
     /// Rejects thumbnail/preview writes from a folder that is no longer the
     /// active library, even if its background ffmpeg worker finishes later.
     library_generation: AtomicU64,
+    /// Immutable, bounded index currently visible to Main and authenticated
+    /// page/search requests. Publication is generation checked so a slow old
+    /// directory scan cannot replace a newer folder's result.
+    library_index: std::sync::RwLock<Arc<crate::library_index::LibraryIndex>>,
+    library_index_revision: AtomicU64,
     /// Server-owned phone-stream membership and monotonic sample freshness.
     gyro_streams: std::sync::Mutex<GyroStreamRegistry>,
     /// B11: which clients currently declare themselves watching the
@@ -129,14 +207,16 @@ struct GyroStreamRegistry {
 }
 
 impl GyroStreamRegistry {
-    fn set_stream(&mut self, client_id: u64, enabled: bool) {
-        self.declared_clients.insert(client_id);
+    fn set_stream(&mut self, client_id: u64, enabled: bool) -> bool {
+        let mut changed = self.declared_clients.insert(client_id);
         if enabled {
+            changed |= !self.ever_enabled;
             self.ever_enabled = true;
-            self.streamers.insert(client_id);
+            changed |= self.streamers.insert(client_id);
         } else {
-            self.streamers.remove(&client_id);
+            changed |= self.streamers.remove(&client_id);
         }
+        changed
     }
 
     fn note_sample_at(&mut self, client_id: u64, now: Instant) {
@@ -187,6 +267,69 @@ pub enum EnqueueOutcome {
     Added,
     Coalesced,
     Dropped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionIngressDisposition {
+    Queued,
+    QueuedAfterCoalescing,
+    Coalesced,
+    Refused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ActionIngressAck {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub sequence: u64,
+    pub disposition: ActionIngressDisposition,
+}
+
+/// Owns one minted ingress identity until it is synchronously transferred to
+/// the bounded action queue or given a terminal disposition. Because the
+/// guard itself is captured by every async admission future, cancellation at
+/// any lock await records exactly one Refused receipt instead of orphaning the
+/// sequence.
+pub(crate) struct ActionIngressTerminalGuard {
+    state: Arc<WebState>,
+    identity: Option<ActionIdentity>,
+}
+
+impl ActionIngressTerminalGuard {
+    fn new(state: Arc<WebState>, identity: ActionIdentity) -> Self {
+        Self {
+            state,
+            identity: Some(identity),
+        }
+    }
+
+    pub(crate) fn identity(&self) -> ActionIdentity {
+        self.identity
+            .expect("an armed ingress guard has an identity")
+    }
+
+    pub(crate) fn terminalize(mut self, disposition: ActionDisposition) -> ActionIngressAck {
+        let identity = self
+            .identity
+            .take()
+            .expect("an ingress identity is terminalized exactly once");
+        self.state
+            .terminal_action_identity_with_ack(identity, disposition)
+    }
+
+    fn disarm(&mut self) {
+        self.identity = None;
+    }
+}
+
+impl Drop for ActionIngressTerminalGuard {
+    fn drop(&mut self) {
+        if let Some(identity) = self.identity.take() {
+            self.state
+                .record_terminal_action_identity(identity, ActionDisposition::Refused);
+        }
+    }
 }
 
 fn default_new_layer_fit() -> FitMode {
@@ -964,12 +1107,9 @@ impl PresetLibrarySnapshot {
 
 /// Convert a read-only journal scan into the two additive AppSnapshot fields.
 /// A bad tail remains visible even when a valid prefix offers recovery.
-#[cfg_attr(
-    test,
-    allow(
-        dead_code,
-        reason = "App tests isolate startup from the operator's default recovery journal"
-    )
+#[allow(
+    dead_code,
+    reason = "retained as a pure legacy-scan adapter while App publishes asynchronous writer status"
 )]
 pub fn recovery_snapshot_fields(scan: &crate::recovery_journal::RecoveryScan) -> (bool, String) {
     let status = scan.warning.clone().unwrap_or_else(|| {
@@ -1221,6 +1361,18 @@ const fn shutter_quality_key(value: crate::motion::CurvedShutterQuality) -> &'st
 pub struct AppSnapshot {
     #[serde(rename = "type")]
     pub msg_type: String,
+    /// Additive browser publication protocol. Version 1 is the legacy full
+    /// state shape; version 2 adds revision-checked live-domain messages.
+    #[serde(default)]
+    pub wire_version: u16,
+    #[serde(default)]
+    pub authored_revision: u64,
+    #[serde(default)]
+    pub operational_revision: u64,
+    #[serde(default)]
+    pub telemetry_revision: u64,
+    #[serde(default)]
+    pub live_interval_ms: u16,
     pub effects: EffectsSnapshot,
     /// Authored transform applied after the layer stack. Missing data from an
     /// older server/client is the exact legacy full-frame identity.
@@ -1262,7 +1414,16 @@ pub struct AppSnapshot {
     pub composition_revision: u64,
     #[serde(default)]
     pub creative: CreativeCompositionSnapshot,
+    /// Stable planner refusals. Legacy prose remains in `creative.status`,
+    /// while new controllers branch only on these closed codes and scopes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraint_diagnostics: Vec<crate::diagnostics::ConstraintDiagnostic>,
+    /// Bounded first visual page retained for older bundled panels.
     pub library: Vec<String>,
+    /// Revision/count/status plus the bounded current page. The complete
+    /// index is available only through the authenticated paging endpoint.
+    #[serde(default)]
+    pub library_index: crate::library_index::LibraryIndexSnapshot,
     /// Legacy mirror of `program_frozen` for older bundled clients.
     pub paused: bool,
     #[serde(default)]
@@ -1319,7 +1480,12 @@ pub struct AppSnapshot {
     pub monitor_bay: crate::monitor_bay::MonitorBaySnapshot,
     /// Remote control URL (LAN address with access token) for the QR code
     #[serde(default)]
-    pub remote_url: String,
+    #[serde(skip_serializing_if = "ControlAccessUrl::is_empty")]
+    pub remote_url: ControlAccessUrl,
+    /// Independent LAN HTTPS listener truth. Empty/default older snapshots are
+    /// treated as unavailable by the panel rather than preserving a stale QR.
+    #[serde(default)]
+    pub remote_status: String,
     /// Whether the fullscreen output window is open
     #[serde(default)]
     pub output_window: bool,
@@ -1337,6 +1503,11 @@ pub struct AppSnapshot {
     /// this running host session and are revalidated by Main before use.
     #[serde(default)]
     pub output_displays: Vec<OutputDisplaySnapshot>,
+    /// Generation of the retained host monitor inventory used to construct
+    /// `output_displays`. Current clients echo this with display-targeting
+    /// commands; legacy clients omit it and still receive ID revalidation.
+    #[serde(default)]
+    pub output_display_generation: u64,
     /// Non-empty when creating or maintaining an output surface failed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub output_error: String,
@@ -1392,6 +1563,11 @@ impl Default for AppSnapshot {
     fn default() -> Self {
         Self {
             msg_type: "state".to_string(),
+            wire_version: 2,
+            authored_revision: 0,
+            operational_revision: 0,
+            telemetry_revision: 0,
+            live_interval_ms: 84,
             effects: EffectsSnapshot::default(),
             master_transform: SpatialTransform::default(),
             ntsc: NtscSnapshot::default(),
@@ -1404,7 +1580,9 @@ impl Default for AppSnapshot {
             layer_stack_revision: 0,
             composition_revision: 0,
             creative: CreativeCompositionSnapshot::default(),
+            constraint_diagnostics: Vec::new(),
             library: Vec::new(),
+            library_index: crate::library_index::LibraryIndexSnapshot::default(),
             paused: false,
             program_frozen: false,
             media_frozen: false,
@@ -1421,11 +1599,13 @@ impl Default for AppSnapshot {
             recorder: ProgramRecorderSnapshot::default(),
             stage_health: crate::stage_health::StageHealthSnapshot::default(),
             monitor_bay: crate::monitor_bay::MonitorBaySnapshot::default(),
-            remote_url: String::new(),
+            remote_url: ControlAccessUrl::default(),
+            remote_status: String::new(),
             output_window: false,
             legacy_output_window: false,
             output_display: String::new(),
             output_displays: Vec::new(),
+            output_display_generation: 0,
             output_error: String::new(),
             morph: MorphSnapshot::default(),
             blackout: false,
@@ -1443,6 +1623,71 @@ impl Default for AppSnapshot {
             quantized_pending: 0,
         }
     }
+}
+
+/// Medium-frequency host/runtime truth. It is deliberately separate from the
+/// authored graph and from fast meters, even though both domains share one
+/// newest-only transport publication for bounded fan-out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebOperationalSnapshot {
+    pub program_frozen: bool,
+    pub media_frozen: bool,
+    pub export_progress: f32,
+    pub export_error: String,
+    pub export_status: String,
+    pub export_warnings: Vec<String>,
+    pub export_motion: ExportMotionSnapshot,
+    pub controller_runtime: ControllerRuntimeSnapshot,
+    pub osc_runtime: OscRuntimeSnapshot,
+    pub spout: SpoutSnapshot,
+    pub recorder: ProgramRecorderSnapshot,
+    pub remote_url: ControlAccessUrl,
+    pub remote_status: String,
+    pub output_window: bool,
+    pub output_error: String,
+    pub output_display: String,
+    pub output_displays: Vec<OutputDisplaySnapshot>,
+    pub output_display_generation: u64,
+    pub blackout: bool,
+    pub recovery_available: bool,
+    pub recovery_status: String,
+    pub patch_save_status: String,
+    pub patch_load_status: String,
+    pub quantized_pending: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraint_diagnostics: Vec<crate::diagnostics::ConstraintDiagnostic>,
+}
+
+/// The bounded 10–15 Hz meter domain. No layer graph, scene bank, library
+/// listing, rack, or other authored collection is carried here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebFastTelemetrySnapshot {
+    pub modulation: ModSnapshot,
+    pub audio: AudioSnapshot,
+    pub midi: MidiSnapshot,
+    pub temporal: TemporalSnapshot,
+    pub gesture: GestureStatusSnapshot,
+    pub performance_recorder: PerformanceStatusSnapshot,
+    pub master_motion: MotionSnapshot,
+    pub codec_mosh: CodecMoshLiveSnapshot,
+    pub morph: MorphSnapshot,
+    pub stage_health: crate::stage_health::StageHealthSnapshot,
+    pub monitor_bay: crate::monitor_bay::MonitorBaySnapshot,
+}
+
+/// Revision-checked live publication. A client may apply it only to the exact
+/// authored base named here; a mismatch requires a fresh full state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebLiveSnapshot {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub wire_version: u16,
+    pub authored_revision: u64,
+    pub operational_revision: u64,
+    pub telemetry_revision: u64,
+    pub live_interval_ms: u16,
+    pub operational: WebOperationalSnapshot,
+    pub telemetry: WebFastTelemetrySnapshot,
 }
 
 /// A JSON-friendly snapshot of the current effect parameters.
@@ -4479,6 +4724,15 @@ pub enum WebAction {
         param: String,
         value: serde_json::Value,
     },
+    /// Explicitly confirm one immutable planner-authored remediation preview.
+    /// The engine resolves the ID only against its currently published
+    /// diagnostic, verifies the exact composition revision, and then routes
+    /// the declared operation through the ordinary action/history path.
+    #[serde(rename = "apply_constraint_remediation")]
+    ApplyConstraintRemediation {
+        candidate_id: crate::diagnostics::RemediationCandidateId,
+        composition_revision: u64,
+    },
     /// Set one direct per-layer effect parameter.
     #[serde(rename = "set_layer_effect")]
     SetLayerEffect {
@@ -4886,9 +5140,19 @@ pub enum WebAction {
     SetOutputWindow { enabled: bool },
     /// Select the physical display used by legacy fullscreen Output. Empty is
     /// Automatic; all non-empty IDs come from `output_displays` and are
-    /// revalidated against the live winit inventory before any window moves.
+    /// revalidated against the retained winit inventory before any window
+    /// moves. Current clients echo the inventory generation; older clients
+    /// omit it and retain the ID-membership barrier.
     #[serde(rename = "set_output_display")]
-    SetOutputDisplay { display_id: String },
+    SetOutputDisplay {
+        display_id: String,
+        #[serde(default)]
+        inventory_generation: Option<u64>,
+    },
+    /// Explicitly refresh the monitor inventory shared by legacy Output and
+    /// StageMap. This is a host operation and never enters creative history.
+    #[serde(rename = "rescan_output_displays")]
+    RescanOutputDisplays,
     /// Legacy open/close command retained for older control panels.
     #[serde(rename = "toggle_output_window")]
     ToggleOutputWindow,
@@ -5438,6 +5702,7 @@ impl WebAction {
                 | Self::ClearMotionMemory
                 | Self::SetOutputWindow { .. }
                 | Self::SetOutputDisplay { .. }
+                | Self::RescanOutputDisplays
                 | Self::ToggleOutputWindow
                 | Self::SetSpout { .. }
                 | Self::SetSpoutResolution { .. }
@@ -5487,6 +5752,7 @@ impl WebAction {
             | Self::SetBlackout { .. }
             | Self::SetOutputWindow { .. }
             | Self::SetOutputDisplay { .. }
+            | Self::RescanOutputDisplays
             | Self::ToggleOutputWindow
             | Self::SetMasterPaused { .. }
             | Self::SetProgramFrozen { .. }
@@ -5572,17 +5838,43 @@ impl WebAction {
     }
 }
 
-fn enqueue_bounded(queue: &mut Vec<WebAction>, action: WebAction) -> EnqueueOutcome {
+trait QueuedWebAction {
+    fn web_action(&self) -> &WebAction;
+}
+
+impl QueuedWebAction for WebAction {
+    fn web_action(&self) -> &WebAction {
+        self
+    }
+}
+
+impl QueuedWebAction for ActionEnvelope<WebAction> {
+    fn web_action(&self) -> &WebAction {
+        self.payload()
+    }
+}
+
+struct EnqueueReport<T> {
+    outcome: EnqueueOutcome,
+    terminal: Option<(T, ActionDisposition)>,
+}
+
+fn enqueue_bounded_detailed<T: QueuedWebAction>(queue: &mut Vec<T>, action: T) -> EnqueueReport<T> {
     // A rescan has no payload. Keep the earliest pending barrier in place so
     // later uploads cannot move it behind a clip-selection action.
-    if matches!(action, WebAction::RescanLibrary)
-        && queue
-            .iter()
-            .any(|candidate| matches!(candidate, WebAction::RescanLibrary))
-    {
-        return EnqueueOutcome::Coalesced;
+    if matches!(
+        action.web_action(),
+        WebAction::RescanLibrary | WebAction::RescanOutputDisplays
+    ) && queue.iter().any(|candidate| {
+        std::mem::discriminant(candidate.web_action())
+            == std::mem::discriminant(action.web_action())
+    }) {
+        return EnqueueReport {
+            outcome: EnqueueOutcome::Coalesced,
+            terminal: Some((action, ActionDisposition::Coalesced)),
+        };
     }
-    let seek_target = match &action {
+    let seek_target = match action.web_action() {
         WebAction::SeekClipSlot {
             layer_id, slot_id, ..
         }
@@ -5593,56 +5885,98 @@ fn enqueue_bounded(queue: &mut Vec<WebAction>, action: WebAction) -> EnqueueOutc
     };
     if let Some((layer_id, slot_id)) = seek_target {
         let replaces_last = match queue.last() {
-            Some(WebAction::SeekClipSlot {
-                layer_id: pending_layer,
-                slot_id: pending_slot,
-                ..
-            })
-            | Some(WebAction::SeekClipSlotTimecode {
-                layer_id: pending_layer,
-                slot_id: pending_slot,
-                ..
-            }) => pending_layer == layer_id && pending_slot == slot_id,
-            _ => false,
+            Some(candidate) => match candidate.web_action() {
+                WebAction::SeekClipSlot {
+                    layer_id: pending_layer,
+                    slot_id: pending_slot,
+                    ..
+                }
+                | WebAction::SeekClipSlotTimecode {
+                    layer_id: pending_layer,
+                    slot_id: pending_slot,
+                    ..
+                } => pending_layer == layer_id && pending_slot == slot_id,
+                _ => false,
+            },
+            None => false,
         };
         if replaces_last {
-            *queue.last_mut().expect("the matching final seek exists") = action;
-            return EnqueueOutcome::Coalesced;
+            let prior = std::mem::replace(
+                queue.last_mut().expect("the matching final seek exists"),
+                action,
+            );
+            return EnqueueReport {
+                outcome: EnqueueOutcome::Coalesced,
+                terminal: Some((prior, ActionDisposition::Coalesced)),
+            };
         }
     }
-    if let Some(key) = action.coalesce_key() {
+    if let Some(key) = action.web_action().coalesce_key() {
         // Captures, resets, saves, topology changes, and other uncoalesced
         // commands observe ordered state. Never move a later absolute value
         // across one of those semantic barriers.
         let barrier = queue
             .iter()
-            .rposition(|candidate| candidate.coalesce_key().is_none())
+            .rposition(|candidate| candidate.web_action().coalesce_key().is_none())
             .map_or(0, |position| position + 1);
         if let Some(position) = queue[barrier..]
             .iter()
-            .rposition(|candidate| candidate.coalesce_key().as_deref() == Some(key.as_str()))
+            .rposition(|candidate| {
+                candidate.web_action().coalesce_key().as_deref() == Some(key.as_str())
+            })
             .map(|position| barrier + position)
         {
-            queue.remove(position);
+            let prior = queue.remove(position);
             queue.push(action);
-            return EnqueueOutcome::Coalesced;
+            return EnqueueReport {
+                outcome: EnqueueOutcome::Coalesced,
+                terminal: Some((prior, ActionDisposition::Coalesced)),
+            };
         }
     }
 
-    if action.is_priority() {
+    if action.web_action().is_priority() {
         if queue.len() >= MAX_PENDING_ACTIONS {
             let position = queue
                 .iter()
-                .position(|candidate| !candidate.is_priority())
+                .position(|candidate| !candidate.web_action().is_priority())
                 .unwrap_or(0);
-            queue.remove(position);
+            let prior = queue.remove(position);
+            queue.push(action);
+            return EnqueueReport {
+                outcome: EnqueueOutcome::Added,
+                terminal: Some((prior, ActionDisposition::Superseded)),
+            };
         }
     } else if queue.len() >= MAX_PENDING_ACTIONS - PRIORITY_ACTION_RESERVE {
-        return EnqueueOutcome::Dropped;
+        return EnqueueReport {
+            outcome: EnqueueOutcome::Dropped,
+            terminal: Some((action, ActionDisposition::Refused)),
+        };
     }
 
     queue.push(action);
-    EnqueueOutcome::Added
+    EnqueueReport {
+        outcome: EnqueueOutcome::Added,
+        terminal: None,
+    }
+}
+
+#[cfg(test)]
+fn enqueue_bounded(queue: &mut Vec<WebAction>, action: WebAction) -> EnqueueOutcome {
+    enqueue_bounded_detailed(queue, action).outcome
+}
+
+fn web_action_source(action: &WebAction) -> ActionSourceClass {
+    match action {
+        WebAction::Quantized { inner } => web_action_source(inner),
+        WebAction::Gyro { .. }
+        | WebAction::GyroStream { .. }
+        | WebAction::Pad { .. }
+        | WebAction::GestureSample { .. }
+        | WebAction::BendPad { .. } => ActionSourceClass::Phone,
+        _ => ActionSourceClass::Browser,
+    }
 }
 
 impl EffectsSnapshot {
@@ -6049,17 +6383,17 @@ impl EffectsSnapshot {
 
 impl WebState {
     pub fn new() -> Result<Arc<Self>, String> {
-        let (tx, _) = broadcast::channel(64);
-        let mut token_bytes = [0_u8; 16];
-        // A weak control token is worse than refusing to expose the control
-        // server. Entropy failure therefore aborts startup instead of falling
-        // back to a predictable clock value.
-        getrandom::fill(&mut token_bytes)
-            .map_err(|error| format!("OS entropy unavailable for web control token: {error}"))?;
+        let (tx, _) = watch::channel(Arc::new(String::new()));
         Ok(Arc::new(Self {
             app: RwLock::new(AppSnapshot::default()),
             tx,
-            actions: Mutex::new(Vec::new()),
+            snapshot_requested: AtomicBool::new(false),
+            full_snapshot_generation: AtomicU64::new(0),
+            last_full_snapshot: std::sync::RwLock::new(Arc::new(String::new())),
+            serialized_publications: AtomicU64::new(0),
+            actions: Mutex::new(Vec::with_capacity(MAX_PENDING_ACTIONS)),
+            action_sequencer: Arc::new(ActionSequencer::default()),
+            action_correlation: std::sync::Mutex::new(ActionCorrelationMonitor::default()),
             controller_profile_export: std::sync::RwLock::new(
                 crate::controller_profile::export_controller_profile_json(
                     &crate::controller_profile::ControllerProfileDocument::default(),
@@ -6072,22 +6406,297 @@ impl WebState {
             library_media_cache_bytes: std::sync::Mutex::new(0),
             library_media_helper_gate: std::sync::Mutex::new(()),
             library_folder: std::sync::RwLock::new(None),
-            access_token: token_bytes
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
-            lan_url: std::sync::RwLock::new(String::new()),
+            upload_admission: UploadAdmission::default(),
+            upload_media_safety_policy: std::sync::RwLock::new(
+                crate::media_safety::MediaSafetyPolicy::default(),
+            ),
+            upload_publication_gate: std::sync::Mutex::new(()),
             control_server: std::sync::RwLock::new(ControlServerInfo::default()),
+            control_server_generation: AtomicU64::new(0),
+            control_server_stopping_generation: AtomicU64::new(0),
             library_generation: AtomicU64::new(0),
+            library_index: std::sync::RwLock::new(Arc::new(
+                crate::library_index::LibraryIndex::empty(),
+            )),
+            library_index_revision: AtomicU64::new(0),
             gyro_streams: std::sync::Mutex::new(GyroStreamRegistry::default()),
             monitor_watchers: std::sync::Mutex::new(HashMap::new()),
             next_client_id: AtomicU64::new(1),
         }))
     }
 
-    pub async fn enqueue_action(&self, action: WebAction) -> EnqueueOutcome {
-        let mut queue = self.actions.lock().await;
-        enqueue_bounded(&mut queue, action)
+    pub async fn enqueue_action(self: &Arc<Self>, action: WebAction) -> EnqueueOutcome {
+        self.enqueue_action_with_ack(action).await.0
+    }
+
+    pub(crate) async fn enqueue_action_with_ack(
+        self: &Arc<Self>,
+        action: WebAction,
+    ) -> (EnqueueOutcome, ActionIngressAck) {
+        let action = self.envelope_web_action(action);
+        self.enqueue_enveloped_action_with_ack(action).await
+    }
+
+    pub(crate) fn envelope_web_action(&self, action: WebAction) -> ActionEnvelope<WebAction> {
+        let source = web_action_source(&action);
+        self.action_sequencer.envelope(source, action)
+    }
+
+    pub(crate) fn action_ingress_terminal_guard(
+        self: &Arc<Self>,
+        identity: ActionIdentity,
+    ) -> ActionIngressTerminalGuard {
+        ActionIngressTerminalGuard::new(self.clone(), identity)
+    }
+
+    pub(crate) fn enqueue_enveloped_action_with_ack(
+        self: &Arc<Self>,
+        action: ActionEnvelope<WebAction>,
+    ) -> impl std::future::Future<Output = (EnqueueOutcome, ActionIngressAck)> + Send + 'static
+    {
+        let guard = self.action_ingress_terminal_guard(action.identity());
+        self.enqueue_guarded_action_with_ack(action, guard)
+    }
+
+    pub(crate) fn enqueue_guarded_action_with_ack(
+        self: &Arc<Self>,
+        action: ActionEnvelope<WebAction>,
+        mut guard: ActionIngressTerminalGuard,
+    ) -> impl std::future::Future<Output = (EnqueueOutcome, ActionIngressAck)> + Send + 'static
+    {
+        debug_assert_eq!(guard.identity(), action.identity());
+        let state = self.clone();
+        async move {
+            let sequence = action.sequence().get();
+            let mut queue = state.actions.lock().await;
+            // From this synchronous point onward either the queue owns the exact
+            // envelope or enqueue_bounded_detailed returns it as a terminal.
+            guard.disarm();
+            let report = enqueue_bounded_detailed(&mut queue, action);
+            drop(queue);
+            if let Some((terminal, disposition)) = report.terminal {
+                state.record_terminal_action(&terminal, disposition);
+            }
+            let disposition = match report.outcome {
+                EnqueueOutcome::Added => ActionIngressDisposition::Queued,
+                EnqueueOutcome::Coalesced => ActionIngressDisposition::QueuedAfterCoalescing,
+                EnqueueOutcome::Dropped => ActionIngressDisposition::Refused,
+            };
+            (
+                report.outcome,
+                ActionIngressAck {
+                    kind: "action_ack",
+                    sequence,
+                    disposition,
+                },
+            )
+        }
+    }
+
+    pub(crate) fn terminal_action_identity_with_ack(
+        &self,
+        identity: ActionIdentity,
+        disposition: ActionDisposition,
+    ) -> ActionIngressAck {
+        self.record_terminal_action_identity(identity, disposition);
+        ActionIngressAck {
+            kind: "action_ack",
+            sequence: identity.sequence().get(),
+            disposition: if disposition == ActionDisposition::Coalesced {
+                ActionIngressDisposition::Coalesced
+            } else {
+                ActionIngressDisposition::Refused
+            },
+        }
+    }
+
+    /// A connecting browser requests one fresh full snapshot. Main consumes
+    /// the flag at its next accepted event-loop boundary; no serializer or
+    /// application mutation runs on the socket task.
+    pub(crate) fn request_snapshot(&self) -> u64 {
+        self.snapshot_requested.store(true, Ordering::Release);
+        self.full_snapshot_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn take_snapshot_request(&self) -> bool {
+        self.snapshot_requested.swap(false, Ordering::AcqRel)
+    }
+
+    pub(crate) fn publish_serialized_snapshot(&self, message: String) -> u64 {
+        let message = Arc::new(message);
+        *self
+            .last_full_snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = message.clone();
+        self.tx.send_replace(message);
+        self.serialized_publications.fetch_add(1, Ordering::Relaxed);
+        self.full_snapshot_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1)
+    }
+
+    pub(crate) fn publish_serialized_telemetry(&self, message: String) -> u64 {
+        self.tx.send_replace(Arc::new(message));
+        self.serialized_publications
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1)
+    }
+
+    pub(crate) fn full_snapshot_generation(&self) -> u64 {
+        self.full_snapshot_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn last_full_snapshot(&self) -> Arc<String> {
+        self.last_full_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn serialized_publications_for_test(&self) -> u64 {
+        self.serialized_publications.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_action_apply<T>(
+        &self,
+        action: &ActionEnvelope<T>,
+        applied: Instant,
+    ) -> bool {
+        self.action_correlation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_apply(action, applied)
+    }
+
+    pub(crate) fn record_action_identity_apply(
+        &self,
+        identity: ActionIdentity,
+        applied: Instant,
+    ) -> bool {
+        self.action_correlation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_apply_identity(identity, applied)
+    }
+
+    pub(crate) fn record_terminal_action<T>(
+        &self,
+        action: &ActionEnvelope<T>,
+        disposition: ActionDisposition,
+    ) {
+        self.action_correlation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_terminal(action.sequence(), action.source(), disposition);
+    }
+
+    pub(crate) fn record_terminal_action_identity(
+        &self,
+        identity: ActionIdentity,
+        disposition: ActionDisposition,
+    ) {
+        self.action_correlation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_terminal_identity(identity, disposition);
+    }
+
+    /// Clone the one process-wide sequencer into another transport adapter.
+    /// The sequencer is deliberately internal and has no serialization path.
+    pub(crate) fn action_sequencer(&self) -> Arc<ActionSequencer> {
+        self.action_sequencer.clone()
+    }
+
+    pub(crate) fn record_action_submission(
+        &self,
+        highest_applied_sequence: u64,
+        submission_generation: u64,
+        submitted: Instant,
+    ) {
+        let Some(highest_applied) =
+            crate::action_correlation::ActionSequence::from_nonzero(highest_applied_sequence)
+        else {
+            return;
+        };
+        self.action_correlation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_submission(highest_applied, submission_generation, submitted);
+    }
+
+    pub(crate) fn action_timing_snapshot(&self) -> ActionTimingSnapshot {
+        self.action_correlation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot()
+    }
+
+    /// Visit newly completed, payload-free action receipts without allocating
+    /// or exposing the underlying fixed ring. The cursor follows completion
+    /// order, not action sequence: independent adapters may complete older
+    /// ingress identities after a newer action has already terminated.
+    pub(crate) fn for_each_action_receipt_after(
+        &self,
+        after_completion: u64,
+        mut visit: impl FnMut(crate::action_correlation::ActionCorrelationReceipt),
+    ) -> u64 {
+        let monitor = self
+            .action_correlation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cursor = after_completion;
+        for (completion, receipt) in monitor.receipts_after(after_completion) {
+            cursor = cursor.max(completion);
+            visit(*receipt);
+        }
+        cursor
+    }
+
+    pub(crate) fn supersede_all_pending_actions(&self) {
+        let mut actions = self.actions.blocking_lock();
+        for action in actions.drain(..) {
+            self.record_terminal_action(&action, ActionDisposition::Superseded);
+        }
+    }
+
+    pub(crate) fn terminalize_all_applied_actions_not_yet_presented(&self) -> usize {
+        self.action_correlation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .terminalize_all_pending(ActionDisposition::NotYetPresented)
+    }
+
+    pub(crate) fn retain_pending_actions(&self, mut keep: impl FnMut(&WebAction) -> bool) {
+        let mut actions = self.actions.blocking_lock();
+        let mut retained = Vec::with_capacity(actions.capacity());
+        for action in actions.drain(..) {
+            if keep(action.payload()) {
+                retained.push(action);
+            } else {
+                self.record_terminal_action(&action, ActionDisposition::Superseded);
+            }
+        }
+        *actions = retained;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn envelope_for_test(&self, action: WebAction) -> ActionEnvelope<WebAction> {
+        self.action_sequencer
+            .envelope(web_action_source(&action), action)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn action_receipts_for_test(
+        &self,
+    ) -> Vec<crate::action_correlation::ActionCorrelationReceipt> {
+        self.action_correlation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .receipts()
+            .copied()
+            .collect()
     }
 
     pub fn publish_controller_profile_export(
@@ -6107,6 +6716,98 @@ impl WebState {
             Ok(bytes) => bytes.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
+    }
+
+    /// Atomically establish socket-local gesture ownership only after the
+    /// matching Begin envelope has crossed the bounded queue barrier. The
+    /// terminal guard remains armed while either lock is awaited, so shutdown
+    /// cancellation cannot leave an owner without a queued boundary.
+    pub(crate) async fn enqueue_browser_history_begin_with_ack(
+        self: &Arc<Self>,
+        client_id: u64,
+        gesture_id: u64,
+        action: ActionEnvelope<WebAction>,
+        guard: ActionIngressTerminalGuard,
+    ) -> Result<(EnqueueOutcome, ActionIngressAck), ActionIngressAck> {
+        let mut active = self.browser_history_gesture.lock().await;
+        if active.is_some() {
+            return Err(guard.terminalize(ActionDisposition::Refused));
+        }
+        let admitted = self.enqueue_guarded_action_with_ack(action, guard).await;
+        if admitted.0 != EnqueueOutcome::Dropped {
+            *active = Some(BrowserHistoryGesture {
+                client_id,
+                gesture_id,
+                coalesce_key: None,
+                dirty: false,
+            });
+        }
+        Ok(admitted)
+    }
+
+    /// Validate and enqueue End/Cancel under the same ownership lock, then
+    /// clear the owner synchronously only when queue admission succeeded.
+    pub(crate) async fn enqueue_browser_history_finish_with_ack(
+        self: &Arc<Self>,
+        client_id: u64,
+        gesture_id: u64,
+        cancel: bool,
+        action: ActionEnvelope<WebAction>,
+        guard: ActionIngressTerminalGuard,
+    ) -> Result<(EnqueueOutcome, ActionIngressAck), ActionIngressAck> {
+        let mut active = self.browser_history_gesture.lock().await;
+        let valid = active.as_ref().is_some_and(|active| {
+            active.client_id == client_id
+                && active.gesture_id == gesture_id
+                && (!cancel || !active.dirty)
+        });
+        if !valid {
+            return Err(guard.terminalize(ActionDisposition::Refused));
+        }
+        let admitted = self.enqueue_guarded_action_with_ack(action, guard).await;
+        if admitted.0 != EnqueueOutcome::Dropped {
+            *active = None;
+        }
+        Ok(admitted)
+    }
+
+    /// Perform gesture ownership admission and queue admission as one
+    /// cancellation-safe transaction. Dirty/coalesce ownership is published
+    /// only after the exact action envelope has entered the bounded queue.
+    pub(crate) async fn enqueue_browser_action_during_gesture_with_ack(
+        self: &Arc<Self>,
+        client_id: u64,
+        action: ActionEnvelope<WebAction>,
+        guard: ActionIngressTerminalGuard,
+    ) -> Result<(EnqueueOutcome, ActionIngressAck), ActionIngressAck> {
+        let performance_only = action.payload().is_performance_only_for_history();
+        let candidate_key = (!performance_only)
+            .then(|| action.payload().coalesce_key())
+            .flatten();
+        let mut active = self.browser_history_gesture.lock().await;
+        let mut publish_key = None;
+        if !performance_only {
+            if let Some(owner) = active.as_ref() {
+                let valid = owner.client_id == client_id
+                    && candidate_key.as_ref().is_some_and(|key| {
+                        owner.coalesce_key.as_ref().is_none_or(|owned| owned == key)
+                    });
+                if !valid {
+                    return Err(guard.terminalize(ActionDisposition::Refused));
+                }
+                publish_key = candidate_key;
+            }
+        }
+        let admitted = self.enqueue_guarded_action_with_ack(action, guard).await;
+        if admitted.0 != EnqueueOutcome::Dropped {
+            if let Some(owner) = active.as_mut() {
+                if let Some(key) = publish_key {
+                    owner.coalesce_key.get_or_insert(key);
+                    owner.dirty = true;
+                }
+            }
+        }
+        Ok(admitted)
     }
 
     pub async fn begin_browser_history_gesture(&self, client_id: u64, gesture_id: u64) -> bool {
@@ -6205,7 +6906,15 @@ impl WebState {
             // a future queue-policy change cannot silently reopen this race.
             let outcome = {
                 let mut queue = self.actions.lock().await;
-                enqueue_bounded(&mut queue, WebAction::EndHistoryGesture { gesture_id })
+                let action = self.action_sequencer.envelope(
+                    ActionSourceClass::Browser,
+                    WebAction::EndHistoryGesture { gesture_id },
+                );
+                let report = enqueue_bounded_detailed(&mut queue, action);
+                if let Some((terminal, disposition)) = report.terminal {
+                    self.record_terminal_action(&terminal, disposition);
+                }
+                report.outcome
             };
             debug_assert_ne!(outcome, EnqueueOutcome::Dropped);
             *active = None;
@@ -6224,32 +6933,151 @@ impl WebState {
             .clone()
     }
 
-    pub(crate) fn mark_control_server_starting(&self, local_url: String) {
+    pub(crate) fn upload_admission(&self) -> UploadAdmission {
+        self.upload_admission.clone()
+    }
+
+    pub(crate) fn set_upload_media_safety_policy(
+        &self,
+        policy: crate::media_safety::MediaSafetyPolicy,
+    ) {
+        *self
+            .upload_media_safety_policy
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
+    }
+
+    pub(crate) fn upload_media_safety_policy(&self) -> crate::media_safety::MediaSafetyPolicy {
+        self.upload_media_safety_policy
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn with_upload_publication_gate<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let _gate = self
+            .upload_publication_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        operation()
+    }
+
+    pub(crate) fn control_server_generation(&self) -> u64 {
+        self.control_server_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn control_server_generation_accepts_upload(&self, generation: u64) -> bool {
+        generation != 0
+            && self.control_server_generation() == generation
+            && self
+                .control_server_stopping_generation
+                .load(Ordering::Acquire)
+                != generation
+    }
+
+    pub(crate) fn mark_control_server_stopping(&self, generation: u64) {
+        self.with_upload_publication_gate(|| {
+            if self.control_server_generation() == generation {
+                self.control_server_stopping_generation
+                    .store(generation, Ordering::Release);
+            }
+        });
+    }
+
+    pub(crate) fn begin_control_server_generation(&self) -> u64 {
+        let _gate = self
+            .upload_publication_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let generation = self
+            .control_server_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                Some(generation.wrapping_add(1).max(1))
+            })
+            .unwrap_or_else(|generation| generation)
+            .wrapping_add(1)
+            .max(1);
+        self.control_server_stopping_generation
+            .store(0, Ordering::Release);
+        generation
+    }
+
+    pub(crate) fn publish_control_server_info(&self, info: ControlServerInfo) {
+        if info.generation != self.control_server_generation.load(Ordering::Acquire) {
+            return;
+        }
+        let mut published = self
+            .control_server
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *published = info;
+    }
+
+    pub(crate) fn update_control_listener(
+        &self,
+        generation: u64,
+        slot: ControlListenerSlot,
+        status: ControlListenerStatus,
+    ) {
+        if generation != self.control_server_generation.load(Ordering::Acquire) {
+            return;
+        }
         let mut info = self
             .control_server
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        info.local_url = local_url;
-        info.status = ControlServerStatus::Starting;
+        if info.generation != generation {
+            return;
+        }
+        match slot {
+            ControlListenerSlot::LoopbackIpv4 => {
+                if !matches!(status, ControlListenerStatus::Listening { .. }) {
+                    info.loopback_ipv4_url = None;
+                }
+                info.loopback_ipv4 = status;
+            }
+            ControlListenerSlot::LoopbackIpv6 => {
+                if !matches!(status, ControlListenerStatus::Listening { .. }) {
+                    info.loopback_ipv6_url = None;
+                }
+                info.loopback_ipv6 = status;
+            }
+            ControlListenerSlot::LanTls => {
+                if !matches!(status, ControlListenerStatus::Listening { .. }) {
+                    info.lan_url = None;
+                }
+                info.lan_tls = status;
+            }
+        }
     }
 
-    pub(crate) fn mark_control_server_listening(&self) {
-        self.control_server
+    pub(crate) fn mark_control_server_stopped(&self, generation: u64) {
+        if generation != self.control_server_generation.load(Ordering::Acquire) {
+            return;
+        }
+        self.control_server_stopping_generation
+            .store(generation, Ordering::Release);
+        let mut info = self
+            .control_server
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .status = ControlServerStatus::Listening;
-    }
-
-    pub(crate) fn mark_control_server_unavailable(&self, error: String) {
-        self.control_server
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .status = ControlServerStatus::Unavailable(error);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if info.generation == generation {
+            info.loopback_ipv4 = ControlListenerStatus::Stopped;
+            info.loopback_ipv6 = ControlListenerStatus::Stopped;
+            info.lan_tls = ControlListenerStatus::Stopped;
+            info.loopback_ipv4_url = None;
+            info.loopback_ipv6_url = None;
+            info.lan_url = None;
+        }
     }
 
     /// Start a new folder identity. Workers must compare their captured value
     /// at the cache-write boundary before publishing decoded previews.
     pub fn begin_library_generation(&self) -> u64 {
+        let _gate = self
+            .upload_publication_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.library_generation
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
                 Some(generation.wrapping_add(1).max(1))
@@ -6259,12 +7087,72 @@ impl WebState {
             .max(1)
     }
 
+    /// Publish a new library generation only after the caller's bounded worker
+    /// admission succeeds. The same gate used by upload publication excludes a
+    /// concurrent generation change between preparing and committing the scan.
+    pub fn admit_library_generation<E>(
+        &self,
+        admit: impl FnOnce(u64) -> Result<(), E>,
+    ) -> Result<u64, E> {
+        let _gate = self
+            .upload_publication_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self.library_generation.load(Ordering::Acquire);
+        let generation = current.wrapping_add(1).max(1);
+        admit(generation)?;
+        self.library_generation.store(generation, Ordering::Release);
+        Ok(generation)
+    }
+
     pub fn library_generation(&self) -> u64 {
         self.library_generation.load(Ordering::Acquire)
     }
 
     pub fn library_generation_is_current(&self, generation: u64) -> bool {
         generation != 0 && self.library_generation() == generation
+    }
+
+    /// Publishes one immutable bounded result only while its folder identity
+    /// is still current. The second check occurs while holding the publication
+    /// lock, closing the ordinary stale-worker check/write race.
+    pub fn publish_library_index(
+        &self,
+        generation: u64,
+        mut index: crate::library_index::LibraryIndex,
+    ) -> bool {
+        if index.generation() != generation || !self.library_generation_is_current(generation) {
+            return false;
+        }
+        let mut published = self
+            .library_index
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.library_generation_is_current(generation) {
+            return false;
+        }
+        let revision = self
+            .library_index_revision
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
+                Some(revision.wrapping_add(1).max(1))
+            })
+            .unwrap_or_else(|revision| revision)
+            .wrapping_add(1)
+            .max(1);
+        index.set_revision(revision);
+        *published = Arc::new(index);
+        true
+    }
+
+    pub fn library_index(&self) -> Arc<crate::library_index::LibraryIndex> {
+        self.library_index
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn library_index_snapshot(&self) -> crate::library_index::LibraryIndexSnapshot {
+        self.library_index().snapshot()
     }
 
     pub(crate) fn publish_thumbnail_with_budget(
@@ -6405,15 +7293,16 @@ impl WebState {
 
     /// B11: record a client's monitor-watch declaration. `enabled` refreshes
     /// the watcher's instant; `false` removes it immediately.
-    pub fn set_monitor_watch(&self, client_id: u64, enabled: bool) {
+    pub fn set_monitor_watch(&self, client_id: u64, enabled: bool) -> bool {
         let mut watchers = self
             .monitor_watchers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if enabled {
             watchers.insert(client_id, Instant::now());
+            true
         } else {
-            watchers.remove(&client_id);
+            watchers.remove(&client_id).is_some()
         }
     }
 
@@ -6439,11 +7328,11 @@ impl WebState {
         !watchers.is_empty()
     }
 
-    pub fn set_gyro_stream(&self, client_id: u64, enabled: bool) {
+    pub fn set_gyro_stream(&self, client_id: u64, enabled: bool) -> bool {
         self.gyro_streams
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .set_stream(client_id, enabled);
+            .set_stream(client_id, enabled)
     }
 
     pub fn note_gyro_sample(&self, client_id: u64) {
@@ -6481,34 +7370,84 @@ mod protocol_tests {
     }
 
     #[test]
-    fn native_control_server_info_reports_listener_lifecycle_truthfully() {
-        let state = WebState::new().expect("test token");
+    fn native_control_server_info_keeps_every_listener_lifecycle_independent() {
+        assert_eq!(
+            ControlListenerStatus::default(),
+            ControlListenerStatus::Stopped
+        );
+        let state = WebState::new().expect("test state");
         assert_eq!(state.control_server_info(), ControlServerInfo::default());
 
-        let local_url = format!("http://127.0.0.1:3030/?key={}", state.access_token);
-        state.mark_control_server_starting(local_url.clone());
+        let generation = state.begin_control_server_generation();
+        let local_url =
+            ControlAccessUrl::new("http://127.0.0.1:3030/?key=seeded-secret".to_string());
+        state.publish_control_server_info(ControlServerInfo {
+            generation,
+            loopback_ipv4: ControlListenerStatus::Starting,
+            loopback_ipv6: ControlListenerStatus::Starting,
+            lan_tls: ControlListenerStatus::Starting,
+            loopback_ipv4_url: Some(local_url.clone()),
+            loopback_ipv6_url: None,
+            lan_url: None,
+            session_fingerprint: "0123456789ab".to_string(),
+        });
+        state.update_control_listener(
+            generation,
+            ControlListenerSlot::LoopbackIpv4,
+            ControlListenerStatus::Listening {
+                address: "127.0.0.1:3030".parse().unwrap(),
+            },
+        );
+        state.update_control_listener(
+            generation,
+            ControlListenerSlot::LanTls,
+            ControlListenerStatus::Unavailable {
+                reason: "address already in use".to_string(),
+            },
+        );
+        let info = state.control_server_info();
+        assert!(matches!(
+            info.loopback_ipv4,
+            ControlListenerStatus::Listening { .. }
+        ));
+        assert_eq!(info.loopback_ipv6, ControlListenerStatus::Starting);
         assert_eq!(
-            state.control_server_info(),
-            ControlServerInfo {
-                local_url: local_url.clone(),
-                status: ControlServerStatus::Starting,
+            info.lan_tls,
+            ControlListenerStatus::Unavailable {
+                reason: "address already in use".to_string()
             }
         );
-
-        state.mark_control_server_listening();
+        assert!(info.lan_url.is_none());
         assert_eq!(
-            state.control_server_info().status,
-            ControlServerStatus::Listening
+            info.local_url().unwrap().expose_to_local_ui(),
+            local_url.expose_to_local_ui()
+        );
+        assert!(!format!("{info:?}").contains("seeded-secret"));
+        let snapshot = AppSnapshot {
+            remote_url: local_url.clone(),
+            ..AppSnapshot::default()
+        };
+        assert!(!format!("{snapshot:?}").contains("seeded-secret"));
+        assert_eq!(
+            serde_json::to_value(&snapshot).unwrap()["remote_url"],
+            local_url.expose_to_local_ui(),
+            "the authenticated browser wire deliberately receives the URL"
         );
 
-        state.mark_control_server_unavailable("address already in use".to_string());
-        assert_eq!(
-            state.control_server_info(),
-            ControlServerInfo {
-                local_url,
-                status: ControlServerStatus::Unavailable("address already in use".to_string()),
-            }
+        let retired_generation = generation;
+        let current_generation = state.begin_control_server_generation();
+        state.publish_control_server_info(ControlServerInfo {
+            generation: current_generation,
+            ..ControlServerInfo::default()
+        });
+        state.update_control_listener(
+            retired_generation,
+            ControlListenerSlot::LoopbackIpv4,
+            ControlListenerStatus::Unavailable {
+                reason: "late task crash".to_string(),
+            },
         );
+        assert_eq!(state.control_server_info().generation, current_generation);
     }
 
     #[test]
@@ -6526,19 +7465,38 @@ mod protocol_tests {
         assert!(!state.library_generation_is_current(0));
     }
 
+    #[test]
+    fn bounded_library_index_publication_rejects_stale_generations_and_revises() {
+        let state = WebState::new().expect("test state");
+        let first = state.begin_library_generation();
+        let second = state.begin_library_generation();
+        assert!(!state
+            .publish_library_index(first, crate::library_index::LibraryIndex::scanning(first),));
+        assert!(state
+            .publish_library_index(second, crate::library_index::LibraryIndex::scanning(second),));
+        let scanning = state.library_index_snapshot();
+        assert_eq!(scanning.generation, second);
+        assert_eq!(scanning.revision, 1);
+        assert_eq!(
+            scanning.status,
+            crate::library_index::LibraryScanStatus::Scanning
+        );
+
+        assert!(state.publish_library_index(
+            second,
+            crate::library_index::LibraryIndex::error(second, "injected failure"),
+        ));
+        let failed = state.library_index_snapshot();
+        assert_eq!(failed.revision, 2);
+        assert_eq!(failed.error, "injected failure");
+    }
+
     fn set_bpm(value: f32) -> WebAction {
         WebAction::SetBpm { value }
     }
 
     #[test]
-    fn web_state_token_is_128_bits_and_queue_is_bounded() {
-        let state = WebState::new().expect("OS entropy");
-        assert_eq!(state.access_token.len(), 32);
-        assert!(state
-            .access_token
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit()));
-
+    fn web_action_queue_is_bounded() {
         let mut queue = Vec::new();
         for value in 0..1000 {
             assert_ne!(
@@ -6598,8 +7556,10 @@ mod protocol_tests {
         .unwrap();
         assert!(matches!(
             &display,
-            WebAction::SetOutputDisplay { display_id }
-                if display_id == "display-0123456789abcdef-2"
+            WebAction::SetOutputDisplay {
+                display_id,
+                inventory_generation: None,
+            } if display_id == "display-0123456789abcdef-2"
         ));
         assert_eq!(display.coalesce_key().as_deref(), Some("output:display"));
         assert!(display.is_priority());
@@ -6609,8 +7569,24 @@ mod protocol_tests {
             serde_json::from_str(r#"{"action":"set_output_display","display_id":""}"#).unwrap();
         assert!(matches!(
             automatic,
-            WebAction::SetOutputDisplay { display_id } if display_id.is_empty()
+            WebAction::SetOutputDisplay { display_id, .. } if display_id.is_empty()
         ));
+        let generation_checked: WebAction = serde_json::from_str(
+            r#"{"action":"set_output_display","display_id":"display-0123456789abcdef-2","inventory_generation":7}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            generation_checked,
+            WebAction::SetOutputDisplay {
+                inventory_generation: Some(7),
+                ..
+            }
+        ));
+        let rescan: WebAction =
+            serde_json::from_str(r#"{"action":"rescan_output_displays"}"#).unwrap();
+        assert!(matches!(rescan, WebAction::RescanOutputDisplays));
+        assert!(rescan.is_priority());
+        assert!(rescan.is_performance_only_for_history());
     }
 
     #[test]
@@ -8448,12 +9424,35 @@ mod protocol_tests {
         assert!(js.contains("className = 'library-actions'"));
         assert!(js.contains("window.confirm"));
         assert!(html.contains("id=\"output-status\" role=\"status\" aria-live=\"polite\""));
-        assert!(js.contains("syncOutputWindow(msg.legacy_output_window ?? msg.output_window, msg.output_error, msg.output_display, msg.output_displays)"));
+        assert!(js.contains("syncOutputWindow(msg.legacy_output_window ?? msg.output_window, msg.output_error, msg.output_display, msg.output_displays, msg.output_display_generation)"));
         assert!(js.contains("sendAction({ action: 'set_output_window', enabled })"));
-        assert!(js.contains("sendAction({ action: 'set_output_display', display_id: displayId })"));
+        assert!(js.contains("sendAction({ action: 'set_output_display', display_id: displayId, inventory_generation: outputAuthoritativeGeneration })"));
+        assert!(js.contains("sendAction({ action: 'rescan_output_displays' })"));
         assert!(html.contains("id=\"output-display\""));
         assert!(js.contains("outputPendingOpen"));
         assert!(!js.contains("sendAction({ action: 'toggle_output_window' })"));
+    }
+
+    #[test]
+    fn browser_live_domains_are_versioned_and_refuse_the_wrong_authored_base() {
+        let js = include_str!("../../static/app.js");
+        assert!(js.contains("msg.type === 'live'"));
+        assert!(js.contains("Number(msg.wire_version) !== 2"));
+        assert!(js.contains("authored !== webAuthoredRevision"));
+        assert!(js.contains("ws.close(4001, 'state revision mismatch')"));
+        assert!(js.contains("const op = msg.operational || {}"));
+        assert!(js.contains("const telemetry = msg.telemetry || {}"));
+        assert!(js.contains("syncStageHealth(telemetry.stage_health)"));
+
+        let full = AppSnapshot {
+            authored_revision: 7,
+            operational_revision: 11,
+            telemetry_revision: 13,
+            ..AppSnapshot::default()
+        };
+        let encoded = serde_json::to_value(full).unwrap();
+        assert_eq!(encoded["wire_version"], 2);
+        assert_eq!(encoded["authored_revision"], 7);
     }
 
     #[test]
@@ -8843,7 +9842,10 @@ mod protocol_tests {
             "bypassMasterFx.checked = !!layer.bypass_master_fx",
             "Skips inherited Digital/Analog/Cellular/Motion processing; own Layer FX/opacity/key/blend remain. VHS still finishes the complete program once; any contributing bypass links the shared Temporal family dry while history stays warm.",
         ] {
-            assert!(js.contains(contract), "missing bypass UI contract: {contract}");
+            assert!(
+                js.contains(contract),
+                "missing bypass UI contract: {contract}"
+            );
         }
     }
 
@@ -10501,7 +11503,10 @@ mod protocol_tests {
             "id=\"autopilot-reset\"",
             "id=\"autopilot-status\" class=\"scene-status autopilot-status\" role=\"status\" aria-live=\"polite\"",
         ] {
-            assert!(html.contains(contract), "missing accessible HTML: {contract}");
+            assert!(
+                html.contains(contract),
+                "missing accessible HTML: {contract}"
+            );
         }
         assert!(js.contains("clipSeek.addEventListener('input', sendSeek)"));
         assert!(js.contains("clipSeek.addEventListener('change', sendSeek)"));
@@ -10736,13 +11741,18 @@ mod protocol_tests {
         );
 
         let queue = state.actions.lock().await;
+        assert_eq!(queue.len(), 3);
         assert!(matches!(
-            queue.as_slice(),
-            [
-                WebAction::BeginHistoryGesture { gesture_id: 41 },
-                WebAction::EndHistoryGesture { gesture_id: 41 },
-                WebAction::BeginHistoryGesture { gesture_id: 42 }
-            ]
+            queue[0].payload(),
+            WebAction::BeginHistoryGesture { gesture_id: 41 }
+        ));
+        assert!(matches!(
+            queue[1].payload(),
+            WebAction::EndHistoryGesture { gesture_id: 41 }
+        ));
+        assert!(matches!(
+            queue[2].payload(),
+            WebAction::BeginHistoryGesture { gesture_id: 42 }
         ));
     }
 
@@ -12454,5 +13464,161 @@ mod protocol_tests {
         assert_eq!(value["recorded_events"], 5);
         assert_eq!(value["live_only_events"], 90);
         assert_eq!(value["checksum"], snapshot.checksum);
+    }
+
+    #[tokio::test]
+    async fn enveloped_coalescing_keeps_the_new_ingress_and_classifies_the_old_one() {
+        let state = WebState::new().unwrap();
+        let set = |value| WebAction::SetParam {
+            param: "brightness".to_string(),
+            value: serde_json::json!(value),
+        };
+        assert_eq!(state.enqueue_action(set(0.25)).await, EnqueueOutcome::Added);
+        assert_eq!(
+            state.enqueue_action(set(0.75)).await,
+            EnqueueOutcome::Coalesced
+        );
+
+        let queue = state.actions.lock().await;
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].sequence().get(), 2);
+        assert!(matches!(
+            queue[0].payload(),
+            WebAction::SetParam { value, .. } if value.as_f64() == Some(0.75)
+        ));
+        drop(queue);
+
+        let receipts = state.action_receipts_for_test();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].sequence.get(), 1);
+        assert_eq!(receipts[0].disposition, ActionDisposition::Coalesced);
+    }
+
+    #[tokio::test]
+    async fn every_socket_enqueue_gets_one_monotonic_payload_free_disposition() {
+        let state = WebState::new().unwrap();
+        let action = |value| WebAction::SetParam {
+            param: "brightness".to_string(),
+            value: serde_json::json!(value),
+        };
+        let (first_outcome, first_ack) = state.enqueue_action_with_ack(action(0.25)).await;
+        let (second_outcome, second_ack) = state.enqueue_action_with_ack(action(0.75)).await;
+        assert_eq!(first_outcome, EnqueueOutcome::Added);
+        assert_eq!(first_ack.sequence, 1);
+        assert_eq!(first_ack.disposition, ActionIngressDisposition::Queued);
+        assert_eq!(second_outcome, EnqueueOutcome::Coalesced);
+        assert_eq!(second_ack.sequence, 2);
+        assert_eq!(
+            second_ack.disposition,
+            ActionIngressDisposition::QueuedAfterCoalescing
+        );
+        let encoded = serde_json::to_string(&second_ack).unwrap();
+        assert!(encoded.contains("\"type\":\"action_ack\""));
+        assert!(!encoded.contains("brightness"));
+        assert!(!encoded.contains("0.75"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_while_waiting_for_the_action_queue_refuses_exactly_once() {
+        let state = WebState::new().unwrap();
+        let held_queue = state.actions.lock().await;
+        let envelope = state.envelope_web_action(WebAction::SetBlackout { enabled: true });
+        let pending = state.enqueue_enveloped_action_with_ack(envelope);
+        let task = tokio::spawn(pending);
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(held_queue);
+
+        let receipts = state.action_receipts_for_test();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].sequence.get(), 1);
+        assert_eq!(receipts[0].disposition, ActionDisposition::Refused);
+        assert!(state.actions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_at_the_gesture_lock_refuses_without_publishing_an_owner() {
+        let state = WebState::new().unwrap();
+        let held_gesture = state.browser_history_gesture.lock().await;
+        let envelope = state.envelope_web_action(WebAction::BeginHistoryGesture { gesture_id: 41 });
+        let terminal = state.action_ingress_terminal_guard(envelope.identity());
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            task_state
+                .enqueue_browser_history_begin_with_ack(7, 41, envelope, terminal)
+                .await
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(held_gesture);
+
+        assert!(state.browser_history_gesture.lock().await.is_none());
+        assert!(state.actions.lock().await.is_empty());
+        let receipts = state.action_receipts_for_test();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].sequence.get(), 1);
+        assert_eq!(receipts[0].disposition, ActionDisposition::Refused);
+    }
+
+    #[tokio::test]
+    async fn browser_phone_and_native_adapters_share_one_engine_sequencer() {
+        let state = WebState::new().unwrap();
+        let shared = state.action_sequencer();
+        assert_eq!(
+            state
+                .enqueue_action(WebAction::SetBlackout { enabled: true })
+                .await,
+            EnqueueOutcome::Added
+        );
+        let native = shared.envelope(ActionSourceClass::Native, ());
+        assert_eq!(
+            state
+                .enqueue_action(WebAction::Gyro {
+                    alpha: 1.0,
+                    beta: 2.0,
+                    gamma: 3.0,
+                })
+                .await,
+            EnqueueOutcome::Added
+        );
+
+        let queue = state.actions.lock().await;
+        assert_eq!(queue[0].sequence().get(), 1);
+        assert_eq!(queue[0].source(), ActionSourceClass::Browser);
+        assert_eq!(native.sequence().get(), 2);
+        assert_eq!(native.source(), ActionSourceClass::Native);
+        assert_eq!(queue[1].sequence().get(), 3);
+        assert_eq!(queue[1].source(), ActionSourceClass::Phone);
+    }
+
+    #[tokio::test]
+    async fn dequeue_apply_and_audience_submit_share_one_engine_sequence() {
+        let state = WebState::new().unwrap();
+        assert_eq!(
+            state
+                .enqueue_action(WebAction::Gyro {
+                    alpha: 1.0,
+                    beta: 2.0,
+                    gamma: 3.0,
+                })
+                .await,
+            EnqueueOutcome::Added
+        );
+        let action = state.actions.lock().await.pop().unwrap();
+        assert_eq!(action.source(), ActionSourceClass::Phone);
+        assert!(state.record_action_apply(&action, Instant::now()));
+        state.record_action_submission(action.sequence().get(), 19, Instant::now());
+
+        let snapshot = state.action_timing_snapshot();
+        assert_eq!(snapshot.last_presented_sequence, action.sequence().get());
+        assert_eq!(snapshot.last_submission_generation, 19);
+        assert_eq!(snapshot.pending, 0);
+        let receipts = state.action_receipts_for_test();
+        assert_eq!(
+            receipts.last().unwrap().disposition,
+            ActionDisposition::Presented
+        );
     }
 }

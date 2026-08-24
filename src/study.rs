@@ -18,7 +18,11 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 
 pub const STUDY_SCHEMA_VERSION: u16 = 1;
 pub const STUDY_ABI_MAJOR: u16 = 1;
-pub const STUDY_ABI_MINOR: u16 = 0;
+/// Highest append-only minor understood by this build. ABI 1.0 remains the
+/// serialization default so constructing an old document cannot silently
+/// opt into new opcode semantics.
+pub const STUDY_ABI_MINOR: u16 = 1;
+pub const STUDY_LEGACY_ABI_MINOR: u16 = 0;
 pub const STUDY_MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
 pub const STUDY_MAX_INSTRUCTIONS: usize = 256;
 pub const STUDY_MAX_REGISTERS: usize = 64;
@@ -71,14 +75,12 @@ pub const DATA_ONLY_STUDY_AUTHORITY: StudyAuthority = StudyAuthority {
 /// The ABI gate is a **backward window on minor only**, per the operator's
 /// R3 ruling (2026-08-19): validation accepts `major == STUDY_ABI_MAJOR &&
 /// minor <= STUDY_ABI_MINOR` and rejects everything else. The window landed
-/// with the CPU reference evaluator (`study_eval.rs`), the commit R3 named:
-/// that evaluator freezes the ABI as 1.0 with the R1 history-age and R2
-/// determinism rulings baked in, and opcode codes are append-only from here
-/// (the `NodeKindTag` discipline — new opcodes append with a minor bump,
-/// and nothing is ever renumbered or reused). An evaluator that executes
-/// 1.N can execute 1.0 by construction when growth is append-only; a major
-/// bump stays a hard break. Behaviorally the window equals the previous
-/// exact-equality gate until the first minor bump.
+/// with the CPU reference evaluator (`study_eval.rs`), the commit R3 named.
+/// ABI 1.0 retains the R1 history-age and R2 determinism rulings byte for
+/// byte; ABI 1.1 is the first append-only extension. Opcode codes are never
+/// renumbered or reused (the `NodeKindTag` discipline). An evaluator that
+/// executes 1.N can execute 1.0 by construction when growth is append-only;
+/// a major bump stays a hard break.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StudyAbiVersion {
@@ -90,7 +92,7 @@ impl Default for StudyAbiVersion {
     fn default() -> Self {
         Self {
             major: STUDY_ABI_MAJOR,
-            minor: STUDY_ABI_MINOR,
+            minor: STUDY_LEGACY_ABI_MINOR,
         }
     }
 }
@@ -198,11 +200,8 @@ pub enum StudyInstruction {
         dst: StudyRegister,
         age: u8,
     },
-    /// Loads a `Vector2`, which in ABI 1.0 is a **dead-end type**: no opcode
-    /// converts a Vector2 to a Scalar or a Color, and `OutputColor` requires
-    /// a Color, so any Study declaring `MotionFieldRead` performs provably
-    /// dead computation. Recorded rather than "fixed": adding a conversion
-    /// opcode is an ABI change gated by the exact-equality version law.
+    /// Loads a `Vector2`. It remains a provable dead-end type in ABI 1.0;
+    /// ABI 1.1 can project it through the explicitly appended vector ops.
     LoadMotionVector {
         dst: StudyRegister,
     },
@@ -272,6 +271,39 @@ pub enum StudyInstruction {
         color: StudyRegister,
         turns: StudyRegister,
     },
+    /// ABI 1.1: project a motion/vector lane onto its X component.
+    VectorX {
+        dst: StudyRegister,
+        input: StudyRegister,
+    },
+    /// ABI 1.1: project a motion/vector lane onto its Y component.
+    VectorY {
+        dst: StudyRegister,
+        input: StudyRegister,
+    },
+    /// ABI 1.1: bounded Euclidean magnitude.
+    VectorMagnitude {
+        dst: StudyRegister,
+        input: StudyRegister,
+    },
+    /// ABI 1.1: unit direction; the zero vector maps to `[0, 0]`.
+    VectorNormalizedDirection {
+        dst: StudyRegister,
+        input: StudyRegister,
+    },
+    /// ABI 1.1: dot a vector against one finite authored constant vector.
+    VectorDotConstant {
+        dst: StudyRegister,
+        input: StudyRegister,
+        vector: [f32; 2],
+    },
+    /// ABI 1.1: clamp a scalar to `[0,1]` and mix two typed colors.
+    ScalarToColor {
+        dst: StudyRegister,
+        scalar: StudyRegister,
+        low: StudyRegister,
+        high: StudyRegister,
+    },
     OutputColor {
         color: StudyRegister,
     },
@@ -294,7 +326,13 @@ impl StudyInstruction {
             | Self::Multiply { dst, .. }
             | Self::Mix { dst, .. }
             | Self::Clamp01 { dst, .. }
-            | Self::HueRotate { dst, .. } => Some(*dst),
+            | Self::HueRotate { dst, .. }
+            | Self::VectorX { dst, .. }
+            | Self::VectorY { dst, .. }
+            | Self::VectorMagnitude { dst, .. }
+            | Self::VectorNormalizedDirection { dst, .. }
+            | Self::VectorDotConstant { dst, .. }
+            | Self::ScalarToColor { dst, .. } => Some(*dst),
             Self::OutputColor { .. } => None,
         }
     }
@@ -323,7 +361,40 @@ impl StudyInstruction {
             | Self::Mix { .. }
             | Self::Clamp01 { .. }
             | Self::HueRotate { .. }
+            | Self::VectorX { .. }
+            | Self::VectorY { .. }
+            | Self::VectorMagnitude { .. }
+            | Self::VectorNormalizedDirection { .. }
+            | Self::VectorDotConstant { .. }
+            | Self::ScalarToColor { .. }
             | Self::OutputColor { .. } => None,
+        }
+    }
+
+    const fn minimum_abi_minor(&self) -> u16 {
+        match self {
+            Self::VectorX { .. }
+            | Self::VectorY { .. }
+            | Self::VectorMagnitude { .. }
+            | Self::VectorNormalizedDirection { .. }
+            | Self::VectorDotConstant { .. }
+            | Self::ScalarToColor { .. } => 1,
+            Self::LoadCurrentColor { .. }
+            | Self::LoadHistoryColor { .. }
+            | Self::LoadMotionVector { .. }
+            | Self::LoadAudioBand { .. }
+            | Self::LoadBeatPhase { .. }
+            | Self::LoadDeterministicRandom { .. }
+            | Self::ConstantScalar { .. }
+            | Self::ConstantVector2 { .. }
+            | Self::ConstantColor { .. }
+            | Self::Add { .. }
+            | Self::Subtract { .. }
+            | Self::Multiply { .. }
+            | Self::Mix { .. }
+            | Self::Clamp01 { .. }
+            | Self::HueRotate { .. }
+            | Self::OutputColor { .. } => 0,
         }
     }
 }
@@ -357,6 +428,14 @@ impl StudyDocument {
         let mut derived_capabilities = BTreeSet::new();
         let mut output_count = 0_usize;
         for (index, instruction) in self.instructions.iter().enumerate() {
+            let required_minor = instruction.minimum_abi_minor();
+            if self.abi.minor < required_minor {
+                return Err(StudyError::OpcodeRequiresAbi {
+                    instruction: index,
+                    required_minor,
+                    declared_minor: self.abi.minor,
+                });
+            }
             if let Some(capability) = instruction.capability() {
                 derived_capabilities.insert(capability);
             }
@@ -434,6 +513,32 @@ impl StudyDocument {
                 StudyInstruction::HueRotate { dst, color, turns } => {
                     require_type(&register_types, *color, StudyValueType::Color, index)?;
                     require_type(&register_types, *turns, StudyValueType::Scalar, index)?;
+                    define_register(&mut register_types, *dst, StudyValueType::Color);
+                }
+                StudyInstruction::VectorX { dst, input }
+                | StudyInstruction::VectorY { dst, input }
+                | StudyInstruction::VectorMagnitude { dst, input } => {
+                    require_type(&register_types, *input, StudyValueType::Vector2, index)?;
+                    define_register(&mut register_types, *dst, StudyValueType::Scalar);
+                }
+                StudyInstruction::VectorNormalizedDirection { dst, input } => {
+                    require_type(&register_types, *input, StudyValueType::Vector2, index)?;
+                    define_register(&mut register_types, *dst, StudyValueType::Vector2);
+                }
+                StudyInstruction::VectorDotConstant { dst, input, vector } => {
+                    require_type(&register_types, *input, StudyValueType::Vector2, index)?;
+                    validate_finite_values(vector)?;
+                    define_register(&mut register_types, *dst, StudyValueType::Scalar);
+                }
+                StudyInstruction::ScalarToColor {
+                    dst,
+                    scalar,
+                    low,
+                    high,
+                } => {
+                    require_type(&register_types, *scalar, StudyValueType::Scalar, index)?;
+                    require_type(&register_types, *low, StudyValueType::Color, index)?;
+                    require_type(&register_types, *high, StudyValueType::Color, index)?;
                     define_register(&mut register_types, *dst, StudyValueType::Color);
                 }
                 StudyInstruction::OutputColor { color } => {
@@ -716,6 +821,11 @@ pub enum StudyError {
     TooManyCapabilities(usize),
     CapabilitiesNotCanonical,
     InstructionCount(usize),
+    OpcodeRequiresAbi {
+        instruction: usize,
+        required_minor: u16,
+        declared_minor: u16,
+    },
     RegisterReassigned(StudyRegister),
     RegisterReadBeforeDefinition(StudyRegister),
     TypeMismatch {
@@ -762,6 +872,14 @@ impl fmt::Display for StudyError {
             Self::InstructionCount(count) => write!(
                 formatter,
                 "Study has {count} instructions; valid range is 1..={STUDY_MAX_INSTRUCTIONS}"
+            ),
+            Self::OpcodeRequiresAbi {
+                instruction,
+                required_minor,
+                declared_minor,
+            } => write!(
+                formatter,
+                "Study instruction {instruction} requires ABI 1.{required_minor}, document declares 1.{declared_minor}"
             ),
             Self::RegisterReassigned(register) => {
                 write!(
@@ -828,7 +946,7 @@ mod tests {
     #[test]
     fn every_opcode_declares_its_capability_explicitly() {
         let dst = register(0);
-        let table: [(StudyInstruction, Option<StudyCapability>); 16] = [
+        let table: [(StudyInstruction, Option<StudyCapability>); 22] = [
             (
                 StudyInstruction::LoadCurrentColor { dst },
                 Some(StudyCapability::CurrentColor),
@@ -907,6 +1025,30 @@ mod tests {
                     dst,
                     color: dst,
                     turns: dst,
+                },
+                None,
+            ),
+            (StudyInstruction::VectorX { dst, input: dst }, None),
+            (StudyInstruction::VectorY { dst, input: dst }, None),
+            (StudyInstruction::VectorMagnitude { dst, input: dst }, None),
+            (
+                StudyInstruction::VectorNormalizedDirection { dst, input: dst },
+                None,
+            ),
+            (
+                StudyInstruction::VectorDotConstant {
+                    dst,
+                    input: dst,
+                    vector: [1.0, 0.0],
+                },
+                None,
+            ),
+            (
+                StudyInstruction::ScalarToColor {
+                    dst,
+                    scalar: dst,
+                    low: dst,
+                    high: dst,
                 },
                 None,
             ),
@@ -1041,14 +1183,33 @@ mod tests {
             document.validate(),
             Err(StudyError::UnsupportedAbi(_))
         ));
-        // The backward half of the window is vacuous until the first minor
-        // bump; this assertion is the shape that will begin admitting 1.0
-        // documents the day 1.1 exists.
+        // ABI 1.0 remains the construction/serialization default and is still
+        // accepted byte-for-byte; 1.1 is an explicit opt-in.
+        assert_eq!(StudyAbiVersion::default().minor, STUDY_LEGACY_ABI_MINOR);
+        document.abi = StudyAbiVersion::default();
+        document.validate().unwrap();
         document.abi = StudyAbiVersion {
             major: STUDY_ABI_MAJOR,
             minor: STUDY_ABI_MINOR,
         };
         document.validate().unwrap();
+
+        document.instructions.insert(
+            document.instructions.len() - 1,
+            StudyInstruction::VectorMagnitude {
+                dst: register(12),
+                input: register(12),
+            },
+        );
+        document.abi.minor = STUDY_LEGACY_ABI_MINOR;
+        assert!(matches!(
+            document.validate(),
+            Err(StudyError::OpcodeRequiresAbi {
+                required_minor: 1,
+                declared_minor: 0,
+                ..
+            })
+        ));
     }
 
     #[test]

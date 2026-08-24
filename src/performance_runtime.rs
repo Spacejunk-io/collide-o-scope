@@ -32,7 +32,8 @@ use crate::performance::{ClipSlotConfig, ClipSlotId, Scene, SceneId, MAX_SCENE_B
 use crate::spout_in::SpoutIn;
 use crate::transport::{CueId, NormalizedTime};
 use crate::video::{
-    decode_still_image_with_media_policy, SeedSelectError, StillImage, ThreadedDecoder,
+    decode_still_image_with_media_policy, DecodedImagePayload, SeedSelectError, StillImage,
+    ThreadedDecoder,
 };
 
 pub const DEFAULT_SPOUT_PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -483,6 +484,10 @@ impl Drop for PreparedLease {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the bounded preparation queue transfers each source exactly once; matching LayerSource layout keeps ownership conversion allocation-free"
+)]
 enum CpuLayerSource {
     Video(ThreadedDecoder),
     Still(StillImage),
@@ -510,7 +515,8 @@ struct CpuPreparedSource {
     width: u32,
     height: u32,
     source_fps: f32,
-    first_rgba: Vec<u8>,
+    first_rgba: DecodedImagePayload,
+    first_source_generation: u64,
     preload_bytes: u64,
 }
 
@@ -704,7 +710,8 @@ impl SystemSourcePreparer {
                 width,
                 height,
                 source_fps: 30.0,
-                first_rgba,
+                first_rgba: DecodedImagePayload::from_owned_rgba(first_rgba),
+                first_source_generation: 0,
                 preload_bytes,
             });
         }
@@ -756,6 +763,7 @@ impl SystemSourcePreparer {
             runtime_source_path,
             persisted_reference,
             first_rgba: first.rgba,
+            first_source_generation: first.source_generation,
             preload_bytes,
         })
     }
@@ -802,7 +810,8 @@ impl SystemSourcePreparer {
                     width: frame.width,
                     height: frame.height,
                     source_fps: 30.0,
-                    first_rgba: frame.pixels,
+                    first_rgba: DecodedImagePayload::from_owned_rgba(frame.pixels),
+                    first_source_generation: 0,
                     preload_bytes: plan.working_set_bytes,
                 };
                 prepared.validate().map_err(|error| {
@@ -876,6 +885,7 @@ impl PreparedTransaction {
         self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        render_generation: u64,
         layers: &[Layer],
     ) -> Result<GpuCommitPayload, PreparationFailure> {
         if let Err(message) = validate_live_targets(&self.replacements, layers) {
@@ -908,6 +918,7 @@ impl PreparedTransaction {
                 height,
                 source_fps,
                 first_rgba,
+                first_source_generation,
                 ..
             } = prepared;
             let source = source
@@ -930,6 +941,9 @@ impl PreparedTransaction {
                 source_fps,
                 lease.bytes,
                 &first_rgba,
+                target_layer.get(),
+                first_source_generation,
+                render_generation,
             )
             .map_err(|message| PreparationFailure {
                 generation,
@@ -1774,7 +1788,8 @@ mod tests {
                 width: 1,
                 height: 1,
                 source_fps: 30.0,
-                first_rgba,
+                first_rgba: DecodedImagePayload::from_owned_rgba(first_rgba),
+                first_source_generation: 0,
                 preload_bytes,
             })
         }
@@ -1819,7 +1834,8 @@ mod tests {
                 width: 1,
                 height: 1,
                 source_fps: 30.0,
-                first_rgba,
+                first_rgba: DecodedImagePayload::from_owned_rgba(first_rgba),
+                first_source_generation: 0,
                 preload_bytes: self.preload_bytes,
             })
         }
@@ -1952,7 +1968,7 @@ mod tests {
         runtime
             .take_ready(&key)
             .unwrap()
-            .activate_gpu(device, queue, std::slice::from_ref(layer))
+            .activate_gpu(device, queue, 1, std::slice::from_ref(layer))
             .unwrap_or_else(|error| panic!("GPU activation failed: {error}"))
     }
 
@@ -2234,7 +2250,7 @@ mod tests {
         let mut expected = crate::video::VideoDecoder::open(&fixture.to_string_lossy()).unwrap();
         let target_seconds = cue_at.get() * expected.duration_seconds();
         let expected = expected.seek_decode(target_seconds).unwrap();
-        assert_eq!(prepared.first_rgba().unwrap(), expected.rgba);
+        assert_eq!(prepared.first_rgba().unwrap(), expected.rgba.as_slice());
     }
 
     #[test]
@@ -2399,7 +2415,7 @@ mod tests {
         let prepared_a = runtime
             .take_ready(&key)
             .unwrap()
-            .activate_gpu(&device, &queue, std::slice::from_ref(&layer))
+            .activate_gpu(&device, &queue, 1, std::slice::from_ref(&layer))
             .unwrap_or_else(|error| panic!("A reopen GPU activation failed: {error}"));
         let return_receipt = prepared_a
             .commit(std::slice::from_mut(&mut layer), Instant::now())

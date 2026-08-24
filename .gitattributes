@@ -1,22 +1,29 @@
 # Keep source and contract assets byte-stable across Windows and Unix checkouts.
+.gitattributes text eol=lf
 *.rs text eol=lf
 *.wgsl text eol=lf
 *.js text eol=lf
 *.html text eol=lf
 *.css text eol=lf
 *.toml text eol=lf
+*.lock text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
 *.md text eol=lf
 *.json text eol=lf
+*.patch text eol=lf
 
 # License texts are conveyed verbatim; keep them byte-stable on every checkout.
 LICENSE text eol=lf
 LICENSES/** text eol=lf
 third_party/**/LICENSE* text eol=lf
 
+# The vendored wgpu-hal manifest hashes its full upstream tree byte-for-byte.
+third_party/wgpu-hal-29.0.3/** text eol=lf
+
 # Shell scripts and macOS property lists must never be checked out CRLF:
 # a CRLF shebang line makes a script unrunnable on macOS and Linux.
 *.sh text eol=lf
 *.plist text eol=lf
 *.py text eol=lf
+*.ps1 text eol=lf

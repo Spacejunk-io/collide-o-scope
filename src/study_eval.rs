@@ -34,9 +34,9 @@ use bytemuck::Zeroable;
 use sha2::{Digest, Sha256};
 
 use crate::study::{
-    StudyCapability, StudyDocument, StudyError, StudyInstruction, StudyRegister, STUDY_ABI_MAJOR,
-    STUDY_ABI_MINOR, STUDY_MAX_AUDIO_BANDS, STUDY_MAX_FINITE_VALUE, STUDY_MAX_HISTORY_AGE,
-    STUDY_MAX_REGISTERS,
+    StudyAbiVersion, StudyCapability, StudyDocument, StudyError, StudyInstruction, StudyRegister,
+    STUDY_ABI_MAJOR, STUDY_LEGACY_ABI_MINOR, STUDY_MAX_AUDIO_BANDS, STUDY_MAX_FINITE_VALUE,
+    STUDY_MAX_HISTORY_AGE, STUDY_MAX_REGISTERS,
 };
 
 /// Append-only version of the evaluation semantics themselves. Changing any
@@ -45,7 +45,7 @@ use crate::study::{
 /// S10b interpreter tranche, days after version 1 and before any consumer
 /// existed) added the HueRotate unorm input clamp so the CPU and GPU halves
 /// agree everywhere WGSL's non-finite handling is implementation-defined.
-pub const STUDY_EVAL_ALGORITHM_VERSION: u16 = 2;
+pub const STUDY_EVAL_ALGORITHM_VERSION: u16 = 3;
 
 /// Domain-separation lanes for the R2 deterministic-random hash. The layout
 /// is frozen: the first eight canonical-digest bytes little-endian, XOR the
@@ -114,6 +114,7 @@ pub struct StudyPixelInputs<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledStudy {
     instructions: Vec<StudyInstruction>,
+    abi: StudyAbiVersion,
     /// SHA-256 over the document's canonical serialized form — the exact
     /// bytes `StudyDocument::to_json_bytes` emits. This is the identity the
     /// R2 hash consumes, so the same document is the same randomness, live
@@ -140,7 +141,11 @@ impl CompiledStudy {
         for instruction in &document.instructions {
             match instruction {
                 StudyInstruction::LoadDeterministicRandom { domain, .. } => {
-                    resolved_random.push(Some(deterministic_random(&canonical_digest, *domain)));
+                    resolved_random.push(Some(deterministic_random_for_abi(
+                        &canonical_digest,
+                        document.abi,
+                        *domain,
+                    )));
                 }
                 StudyInstruction::LoadHistoryColor { age, .. } => {
                     if !required_history_ages.contains(age) {
@@ -154,6 +159,7 @@ impl CompiledStudy {
         required_history_ages.sort_unstable();
         Ok(Self {
             instructions: document.instructions.clone(),
+            abi: document.abi,
             canonical_digest,
             resolved_random,
             required_history_ages,
@@ -162,6 +168,10 @@ impl CompiledStudy {
 
     pub fn canonical_digest(&self) -> &[u8; 32] {
         &self.canonical_digest
+    }
+
+    pub const fn abi(&self) -> StudyAbiVersion {
+        self.abi
     }
 
     /// Authored ages this study reads, `1..=STUDY_MAX_HISTORY_AGE`,
@@ -280,6 +290,71 @@ impl CompiledStudy {
                         StudyValue::Color(bound_color(hue_rotate(color, turns))),
                     );
                 }
+                StudyInstruction::VectorX { dst, input } => {
+                    let StudyValue::Vector2(vector) = get(&registers, *input) else {
+                        unreachable!("validation typed the vector X input as Vector2");
+                    };
+                    set(&mut registers, *dst, StudyValue::Scalar(bound(vector[0])));
+                }
+                StudyInstruction::VectorY { dst, input } => {
+                    let StudyValue::Vector2(vector) = get(&registers, *input) else {
+                        unreachable!("validation typed the vector Y input as Vector2");
+                    };
+                    set(&mut registers, *dst, StudyValue::Scalar(bound(vector[1])));
+                }
+                StudyInstruction::VectorMagnitude { dst, input } => {
+                    let StudyValue::Vector2(vector) = get(&registers, *input) else {
+                        unreachable!("validation typed the magnitude input as Vector2");
+                    };
+                    let magnitude = (vector[0] * vector[0] + vector[1] * vector[1]).sqrt();
+                    set(&mut registers, *dst, StudyValue::Scalar(bound(magnitude)));
+                }
+                StudyInstruction::VectorNormalizedDirection { dst, input } => {
+                    let StudyValue::Vector2(vector) = get(&registers, *input) else {
+                        unreachable!("validation typed the direction input as Vector2");
+                    };
+                    let magnitude = (vector[0] * vector[0] + vector[1] * vector[1]).sqrt();
+                    let normalized = if magnitude.is_finite() && magnitude > 0.0 {
+                        [bound(vector[0] / magnitude), bound(vector[1] / magnitude)]
+                    } else {
+                        [0.0, 0.0]
+                    };
+                    set(&mut registers, *dst, StudyValue::Vector2(normalized));
+                }
+                StudyInstruction::VectorDotConstant { dst, input, vector } => {
+                    let StudyValue::Vector2(input) = get(&registers, *input) else {
+                        unreachable!("validation typed the dot input as Vector2");
+                    };
+                    set(
+                        &mut registers,
+                        *dst,
+                        StudyValue::Scalar(bound(input[0] * vector[0] + input[1] * vector[1])),
+                    );
+                }
+                StudyInstruction::ScalarToColor {
+                    dst,
+                    scalar,
+                    low,
+                    high,
+                } => {
+                    let StudyValue::Scalar(amount) = get(&registers, *scalar) else {
+                        unreachable!("validation typed scalar-to-color amount as Scalar");
+                    };
+                    let StudyValue::Color(low) = get(&registers, *low) else {
+                        unreachable!("validation typed scalar-to-color low as Color");
+                    };
+                    let StudyValue::Color(high) = get(&registers, *high) else {
+                        unreachable!("validation typed scalar-to-color high as Color");
+                    };
+                    let amount = amount.clamp(0.0, 1.0);
+                    set(
+                        &mut registers,
+                        *dst,
+                        StudyValue::Color(std::array::from_fn(|index| {
+                            bound(low[index] + (high[index] - low[index]) * amount)
+                        })),
+                    );
+                }
                 StudyInstruction::OutputColor { color } => {
                     let StudyValue::Color(color) = get(&registers, *color) else {
                         unreachable!("validation typed the output as a color");
@@ -302,12 +377,27 @@ impl CompiledStudy {
 /// domain lane (mixed), XOR the tag; SplitMix64 finalizer; top 24 bits over
 /// `2^24` so the result is exactly representable and in `[0, 1)`.
 pub fn deterministic_random(canonical_digest: &[u8; 32], domain: u32) -> f32 {
+    deterministic_random_for_abi(
+        canonical_digest,
+        StudyAbiVersion {
+            major: STUDY_ABI_MAJOR,
+            minor: STUDY_LEGACY_ABI_MINOR,
+        },
+        domain,
+    )
+}
+
+pub fn deterministic_random_for_abi(
+    canonical_digest: &[u8; 32],
+    abi: StudyAbiVersion,
+    domain: u32,
+) -> f32 {
     let document_lane = u64::from_le_bytes(
         canonical_digest[..8]
             .try_into()
             .expect("a SHA-256 digest always has eight leading bytes"),
     );
-    let abi_lane = (u64::from(STUDY_ABI_MAJOR) << 16) | u64::from(STUDY_ABI_MINOR);
+    let abi_lane = (u64::from(abi.major) << 16) | u64::from(abi.minor);
     let mut value = document_lane
         ^ abi_lane.wrapping_mul(STUDY_RANDOM_ABI_MIX)
         ^ u64::from(domain).wrapping_mul(STUDY_RANDOM_DOMAIN_MIX)
@@ -555,8 +645,10 @@ impl StudyProgramLibrary {
 /// 3 LoadAudioBand, 4 LoadBeatPhase, 5 LoadDeterministicRandom (resolved to
 /// an immediate at compile — the GPU never hashes), 6 ConstantScalar,
 /// 7 ConstantVector2, 8 ConstantColor, 9 Add, 10 Subtract, 11 Multiply,
-/// 12 Mix, 13 Clamp01, 14 HueRotate, 15 OutputColor. Codes are never
-/// renumbered or reused; growth is an R3 minor bump.
+/// 12 Mix, 13 Clamp01, 14 HueRotate, 15 OutputColor; ABI 1.1 appends
+/// 16 VectorX, 17 VectorY, 18 VectorMagnitude, 19 normalized direction,
+/// 20 dot-constant, and 21 ScalarToColor. Codes are never renumbered or
+/// reused; growth is an R3 minor bump.
 pub const STUDY_GPU_MAX_INSTRUCTIONS: usize = crate::study::STUDY_MAX_INSTRUCTIONS;
 
 /// One encoded instruction, 32 bytes, uniform-array stride safe.
@@ -653,6 +745,43 @@ impl CompiledStudy {
                         [0.0; 4],
                     );
                 }
+                StudyInstruction::VectorX { dst, input } => {
+                    encode(16, 0, dst.get(), input.get(), 0, [0.0; 4]);
+                }
+                StudyInstruction::VectorY { dst, input } => {
+                    encode(17, 0, dst.get(), input.get(), 0, [0.0; 4]);
+                }
+                StudyInstruction::VectorMagnitude { dst, input } => {
+                    encode(18, 0, dst.get(), input.get(), 0, [0.0; 4]);
+                }
+                StudyInstruction::VectorNormalizedDirection { dst, input } => {
+                    encode(19, 0, dst.get(), input.get(), 0, [0.0; 4]);
+                }
+                StudyInstruction::VectorDotConstant { dst, input, vector } => {
+                    encode(
+                        20,
+                        0,
+                        dst.get(),
+                        input.get(),
+                        0,
+                        [vector[0], vector[1], 0.0, 0.0],
+                    );
+                }
+                StudyInstruction::ScalarToColor {
+                    dst,
+                    scalar,
+                    low,
+                    high,
+                } => {
+                    encode(
+                        21,
+                        u32::from(scalar.get()),
+                        dst.get(),
+                        low.get(),
+                        high.get(),
+                        [0.0; 4],
+                    );
+                }
                 StudyInstruction::OutputColor { color } => {
                     encode(15, 0, 0, color.get(), 0, [0.0; 4]);
                 }
@@ -675,6 +804,27 @@ impl CompiledStudy {
             .iter()
             .filter(|instruction| matches!(instruction, StudyInstruction::LoadHistoryColor { .. }))
             .count() as u32
+    }
+
+    /// Motion is sampled once into the interpreter's input register even if
+    /// multiple `LoadMotionVector` instructions reference it.
+    pub fn motion_load_count(&self) -> u32 {
+        u32::from(
+            self.instructions.iter().any(|instruction| {
+                matches!(instruction, StudyInstruction::LoadMotionVector { .. })
+            }),
+        )
+    }
+
+    /// Whether a declared motion load can reach a typed, observable value in
+    /// this ABI. ABI 1.0 deliberately keeps `Vector2` as a dead-end type;
+    /// admitting a motion field for it would change the frozen 1.0 resource
+    /// contract without making the input usable. ABI 1.1's append-only vector
+    /// operations make the same load observable, so the composition planner
+    /// must provision the scope's primitive field even when ordinary Motion
+    /// parameters are exactly zero.
+    pub fn motion_input_is_observable(&self) -> bool {
+        self.abi.minor >= 1 && self.motion_load_count() != 0
     }
 }
 
@@ -710,6 +860,15 @@ pub(crate) mod tests {
             capabilities,
             instructions,
         }
+    }
+
+    pub(crate) fn document_abi_1_1(
+        capabilities: Vec<StudyCapability>,
+        instructions: Vec<StudyInstruction>,
+    ) -> StudyDocument {
+        let mut document = document(capabilities, instructions);
+        document.abi.minor = 1;
+        document
     }
 
     struct NoHistory;
@@ -1060,6 +1219,135 @@ pub(crate) mod tests {
         assert_eq!(out, [0.0, 0.0, 0.0, 1.0]);
     }
 
+    pub(crate) fn abi_1_1_motion_document() -> StudyDocument {
+        document_abi_1_1(
+            vec![StudyCapability::MotionFieldRead],
+            vec![
+                StudyInstruction::LoadMotionVector { dst: register(0) },
+                StudyInstruction::VectorX {
+                    dst: register(1),
+                    input: register(0),
+                },
+                StudyInstruction::VectorY {
+                    dst: register(2),
+                    input: register(0),
+                },
+                StudyInstruction::VectorMagnitude {
+                    dst: register(3),
+                    input: register(0),
+                },
+                StudyInstruction::VectorNormalizedDirection {
+                    dst: register(4),
+                    input: register(0),
+                },
+                StudyInstruction::VectorDotConstant {
+                    dst: register(5),
+                    input: register(4),
+                    vector: [0.25, 0.5],
+                },
+                StudyInstruction::ConstantColor {
+                    dst: register(6),
+                    value: [0.0, 0.0, 0.0, 1.0],
+                },
+                StudyInstruction::ConstantColor {
+                    dst: register(7),
+                    value: [1.0, 0.5, 0.25, 1.0],
+                },
+                StudyInstruction::ScalarToColor {
+                    dst: register(8),
+                    scalar: register(5),
+                    low: register(6),
+                    high: register(7),
+                },
+                StudyInstruction::OutputColor { color: register(8) },
+            ],
+        )
+    }
+
+    #[test]
+    fn abi_1_1_motion_reaches_color_with_finite_zero_and_hostile_laws() {
+        let compiled = CompiledStudy::compile(&abi_1_1_motion_document()).unwrap();
+        assert_eq!(compiled.abi().minor, 1);
+        assert_eq!(compiled.motion_load_count(), 1);
+        let evaluate = |motion| {
+            compiled.evaluate_pixel(
+                &StudyFrameContext::default(),
+                &StudyPixelInputs {
+                    current: [0.0; 4],
+                    motion,
+                    history: &NoHistory,
+                },
+            )
+        };
+        // Zero, both axes, a 3/4/5 diagonal, and the admitted finite maximum
+        // pin the projection/normalization law independently of the GPU twin.
+        for (motion, expected_amount) in [
+            ([0.0, 0.0], 0.0),
+            ([1.0, 0.0], 0.25),
+            ([0.0, 1.0], 0.5),
+            ([3.0, 4.0], 0.55),
+            (
+                [STUDY_MAX_FINITE_VALUE, STUDY_MAX_FINITE_VALUE],
+                0.530_330_06,
+            ),
+        ] {
+            let output = evaluate(motion);
+            for (observed, expected) in output.iter().zip([
+                expected_amount,
+                expected_amount * 0.5,
+                expected_amount * 0.25,
+                1.0,
+            ]) {
+                assert!(
+                    (observed - expected).abs() < 1.0e-6,
+                    "{motion:?}: {output:?}"
+                );
+            }
+        }
+        // Non-finite motion lands on the existing neutral bound before any
+        // ABI-1.1 arithmetic.
+        assert_eq!(evaluate([f32::NAN, f32::INFINITY]), [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn abi_1_1_instruction_budget_edges_fail_closed_before_execution() {
+        let repeated = StudyInstruction::ConstantScalar {
+            dst: register(0),
+            value: 0.0,
+        };
+        let at_limit = document_abi_1_1(vec![], vec![repeated.clone(); STUDY_GPU_MAX_INSTRUCTIONS]);
+        assert!(matches!(
+            at_limit.validate(),
+            Err(StudyError::RegisterReassigned(_))
+        ));
+        let over_limit = document_abi_1_1(
+            vec![],
+            vec![repeated; STUDY_GPU_MAX_INSTRUCTIONS.saturating_add(1)],
+        );
+        assert!(matches!(
+            over_limit.validate(),
+            Err(StudyError::InstructionCount(count)) if count == STUDY_GPU_MAX_INSTRUCTIONS + 1
+        ));
+    }
+
+    #[test]
+    fn abi_1_1_gpu_words_append_without_renumbering_abi_1_0() {
+        let compiled = CompiledStudy::compile(&abi_1_1_motion_document()).unwrap();
+        let ops = compiled.encode_gpu_program();
+        assert_eq!(ops[1].words, [16, 1, 0, 0]);
+        assert_eq!(ops[2].words, [17, 2, 0, 0]);
+        assert_eq!(ops[3].words, [18, 3, 0, 0]);
+        assert_eq!(ops[4].words, [19, 4, 0, 0]);
+        assert_eq!(ops[5].words, [20, 5, 4, 0]);
+        assert_eq!(ops[5].immediate, [0.25, 0.5, 0.0, 0.0]);
+        assert_eq!(ops[8].words, [21 | (5 << 16), 8, 6, 7]);
+        assert_eq!(ops[9].words, [15, 0, 8, 0]);
+
+        let legacy = CompiledStudy::compile(&every_opcode_document()).unwrap();
+        assert_eq!(legacy.abi().minor, 0);
+        assert_eq!(legacy.encode_gpu_program()[15].words, [15, 0, 14, 0]);
+    }
+
     /// A document exercising all sixteen opcodes with valid SSA, shared by
     /// the encoding golden below and the GPU agreement fixtures.
     pub(crate) fn every_opcode_document() -> StudyDocument {
@@ -1203,7 +1491,7 @@ pub(crate) mod tests {
             compiled.evaluate_pixel(&StudyFrameContext::default(), &pixel([0.0; 4], &NoHistory))
         };
         assert_eq!(rotate(2.0), rotate(1.0));
-        assert_eq!(STUDY_EVAL_ALGORITHM_VERSION, 2);
+        assert_eq!(STUDY_EVAL_ALGORITHM_VERSION, 3);
     }
 
     #[test]

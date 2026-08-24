@@ -13,7 +13,7 @@
 //! its host-memory plan as a measurement of free VRAM.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,12 @@ pub const PERFORMANCE_MAX_PRELOAD_BYTES: u64 = 512 * 1024 * 1024;
 pub const PERFORMANCE_MAX_REVERSE_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 #[allow(dead_code)]
 pub const PERFORMANCE_MAX_REVERSE_CACHE_BYTES_PER_DECODER: u64 = 32 * 1024 * 1024;
+/// Aggregate ceiling for physical packed decoder-image allocations.  Unlike
+/// the reverse-cache budget this includes the live/mailbox image and recycled
+/// slots.  The floor admits two UHD sources plus their bounded cache working
+/// sets even when host memory discovery is unavailable; Expert mode remains
+/// bounded by its independently admitted planning budget.
+pub const DECODED_IMAGE_LEDGER_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Host-local admission model for prepared performance media. Active sources
 /// are intentionally non-evictable; admission or LRU eviction applies only to
@@ -371,71 +377,143 @@ struct MediaSafetyInner {
     physical_memory_bytes: Option<u64>,
     planning_budget_bytes: u64,
     reserved_bytes: Mutex<u64>,
-    reverse_cache_ledger: Arc<ReverseCacheLedger>,
+    decoded_image_ledger: Arc<DecodedImageLedger>,
 }
 
-/// Session-shared accounting for decoded frames retained solely to make
-/// reverse/source-time selection cheap. Every cached frame owns a lease from
-/// this ledger; moving a cache keeps the lease alive, while eviction, clear,
-/// and drop release the exact admitted byte count.
+/// Allocation and ownership truth for immutable decoded-image payloads.
 ///
-/// This is separate from [`MediaSafetyPolicy`]'s Expert source reservation:
-/// Safe sources also retain reverse frames, so relying on Expert-only working
-/// set accounting would leave the aggregate performance-cache ceiling inert.
+/// A lease belongs to one physical allocation (including while that allocation
+/// is idle in a decoder's bounded recycle pool). Cloning a payload changes only
+/// the logical-owner counters; it never reserves these bytes again.
 #[derive(Debug)]
-pub(crate) struct ReverseCacheLedger {
+pub(crate) struct DecodedImageLedger {
     max_bytes: u64,
-    reserved_bytes: Mutex<u64>,
+    physical_bytes: Mutex<u64>,
+    peak_physical_bytes: AtomicU64,
+    allocations: AtomicU64,
+    reuses: AtomicU64,
+    materialization_copied_bytes: AtomicU64,
+    reference_copied_bytes: AtomicU64,
+    invalidations: AtomicU64,
+    logical_owners: [AtomicU64; 4],
 }
 
-impl ReverseCacheLedger {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DecodedImageLedgerSnapshot {
+    pub(crate) max_bytes: u64,
+    pub(crate) physical_bytes: u64,
+    pub(crate) peak_physical_bytes: u64,
+    pub(crate) allocations: u64,
+    pub(crate) reuses: u64,
+    pub(crate) materialization_copied_bytes: u64,
+    pub(crate) reference_copied_bytes: u64,
+    pub(crate) invalidations: u64,
+    pub(crate) forward_owners: u64,
+    pub(crate) cache_owners: u64,
+    pub(crate) upload_owners: u64,
+    pub(crate) readonly_owners: u64,
+}
+
+impl DecodedImageLedger {
     pub(crate) fn new(max_bytes: u64) -> Arc<Self> {
         Arc::new(Self {
             max_bytes,
-            reserved_bytes: Mutex::new(0),
+            physical_bytes: Mutex::new(0),
+            peak_physical_bytes: AtomicU64::new(0),
+            allocations: AtomicU64::new(0),
+            reuses: AtomicU64::new(0),
+            materialization_copied_bytes: AtomicU64::new(0),
+            reference_copied_bytes: AtomicU64::new(0),
+            invalidations: AtomicU64::new(0),
+            logical_owners: std::array::from_fn(|_| AtomicU64::new(0)),
         })
     }
 
     pub(crate) fn try_reserve(
         self: &Arc<Self>,
         bytes: u64,
-    ) -> Result<ReverseCacheLease, &'static str> {
-        let mut reserved = lock_recover(&self.reserved_bytes);
-        let requested_total = reserved
+    ) -> Result<DecodedImageLease, &'static str> {
+        let mut physical = lock_recover(&self.physical_bytes);
+        let requested = physical
             .checked_add(bytes)
-            .ok_or("reverse cache byte accounting overflow")?;
-        if requested_total > self.max_bytes {
-            return Err("aggregate reverse cache budget exceeded");
+            .ok_or("decoded image byte accounting overflow")?;
+        if requested > self.max_bytes {
+            return Err("aggregate decoded image budget exceeded");
         }
-        *reserved = requested_total;
-        drop(reserved);
-        Ok(ReverseCacheLease {
+        *physical = requested;
+        self.peak_physical_bytes
+            .fetch_max(requested, Ordering::Relaxed);
+        drop(physical);
+        Ok(DecodedImageLease {
             ledger: self.clone(),
             bytes,
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn max_bytes(&self) -> u64 {
-        self.max_bytes
+    pub(crate) fn record_allocation(&self) {
+        self.allocations.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
-    pub(crate) fn reserved_bytes(&self) -> u64 {
-        *lock_recover(&self.reserved_bytes)
+    pub(crate) fn record_reuse(&self) {
+        self.reuses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_materialization_copy(&self, bytes: u64) {
+        self.materialization_copied_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_reference_copy(&self, bytes: u64) {
+        self.reference_copied_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_invalidation(&self) {
+        self.invalidations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_owner(&self, owner: usize) {
+        if let Some(counter) = self.logical_owners.get(owner) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn remove_owner(&self, owner: usize) {
+        if let Some(counter) = self.logical_owners.get(owner) {
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            });
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> DecodedImageLedgerSnapshot {
+        DecodedImageLedgerSnapshot {
+            max_bytes: self.max_bytes,
+            physical_bytes: *lock_recover(&self.physical_bytes),
+            peak_physical_bytes: self.peak_physical_bytes.load(Ordering::Relaxed),
+            allocations: self.allocations.load(Ordering::Relaxed),
+            reuses: self.reuses.load(Ordering::Relaxed),
+            materialization_copied_bytes: self.materialization_copied_bytes.load(Ordering::Relaxed),
+            reference_copied_bytes: self.reference_copied_bytes.load(Ordering::Relaxed),
+            invalidations: self.invalidations.load(Ordering::Relaxed),
+            forward_owners: self.logical_owners[0].load(Ordering::Relaxed),
+            cache_owners: self.logical_owners[1].load(Ordering::Relaxed),
+            upload_owners: self.logical_owners[2].load(Ordering::Relaxed),
+            readonly_owners: self.logical_owners[3].load(Ordering::Relaxed),
+        }
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct ReverseCacheLease {
-    ledger: Arc<ReverseCacheLedger>,
+pub(crate) struct DecodedImageLease {
+    ledger: Arc<DecodedImageLedger>,
     bytes: u64,
 }
 
-impl Drop for ReverseCacheLease {
+impl Drop for DecodedImageLease {
     fn drop(&mut self) {
-        let mut reserved = lock_recover(&self.ledger.reserved_bytes);
-        *reserved = reserved.saturating_sub(self.bytes);
+        let mut physical = lock_recover(&self.ledger.physical_bytes);
+        *physical = physical.saturating_sub(self.bytes);
     }
 }
 
@@ -474,16 +552,14 @@ impl MediaSafetyPolicy {
         let planning_budget_bytes = physical_memory_bytes
             .map(planning_budget_for_physical_memory)
             .unwrap_or(0);
-        let performance_budget =
-            PerformanceResourceBudget::for_planning_budget(planning_budget_bytes);
         Self {
             inner: Arc::new(MediaSafetyInner {
                 mode: AtomicU8::new(mode.as_u8()),
                 physical_memory_bytes,
                 planning_budget_bytes,
                 reserved_bytes: Mutex::new(0),
-                reverse_cache_ledger: ReverseCacheLedger::new(
-                    performance_budget.max_reverse_cache_bytes(),
+                decoded_image_ledger: DecodedImageLedger::new(
+                    planning_budget_bytes.max(DECODED_IMAGE_LEDGER_FLOOR_BYTES),
                 ),
             }),
         }
@@ -491,8 +567,6 @@ impl MediaSafetyPolicy {
 
     #[cfg(test)]
     pub(crate) fn for_test(mode: MediaSafetyMode, planning_budget_bytes: u64) -> Self {
-        let performance_budget =
-            PerformanceResourceBudget::for_planning_budget(planning_budget_bytes);
         Self {
             inner: Arc::new(MediaSafetyInner {
                 mode: AtomicU8::new(mode.as_u8()),
@@ -501,15 +575,23 @@ impl MediaSafetyPolicy {
                 ),
                 planning_budget_bytes,
                 reserved_bytes: Mutex::new(0),
-                reverse_cache_ledger: ReverseCacheLedger::new(
-                    performance_budget.max_reverse_cache_bytes(),
+                decoded_image_ledger: DecodedImageLedger::new(
+                    planning_budget_bytes.max(DECODED_IMAGE_LEDGER_FLOOR_BYTES),
                 ),
             }),
         }
     }
 
-    pub(crate) fn reverse_cache_ledger(&self) -> Arc<ReverseCacheLedger> {
-        self.inner.reverse_cache_ledger.clone()
+    pub(crate) fn decoded_image_ledger(&self) -> Arc<DecodedImageLedger> {
+        self.inner.decoded_image_ledger.clone()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Stage Health consumes this aggregate metric in the P4 landing"
+    )]
+    pub(crate) fn decoded_image_snapshot(&self) -> DecodedImageLedgerSnapshot {
+        self.inner.decoded_image_ledger.snapshot()
     }
 
     pub(crate) fn reverse_cache_bytes_per_decoder(&self) -> u64 {
@@ -1119,19 +1201,16 @@ mod tests {
     }
 
     #[test]
-    fn policy_clones_share_one_reverse_cache_ledger() {
+    fn policy_clones_share_one_decoded_image_ledger() {
         let policy = MediaSafetyPolicy::for_test(MediaSafetyMode::Safe, 640);
         let clone = policy.clone();
-        let original_ledger = policy.reverse_cache_ledger();
-        let cloned_ledger = clone.reverse_cache_ledger();
+        let original_ledger = policy.decoded_image_ledger();
+        let cloned_ledger = clone.decoded_image_ledger();
         assert!(Arc::ptr_eq(&original_ledger, &cloned_ledger));
-        assert_eq!(original_ledger.max_bytes(), 128);
-
         let lease = original_ledger.try_reserve(96).unwrap();
-        assert_eq!(cloned_ledger.reserved_bytes(), 96);
-        assert!(cloned_ledger.try_reserve(33).is_err());
+        assert_eq!(cloned_ledger.snapshot().physical_bytes, 96);
         drop(lease);
-        assert_eq!(cloned_ledger.reserved_bytes(), 0);
+        assert_eq!(cloned_ledger.snapshot().physical_bytes, 0);
     }
 
     #[test]

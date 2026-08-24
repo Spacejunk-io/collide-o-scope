@@ -38,22 +38,31 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Install stable Rust with lint components
+      - name: Install pinned Rust with lint components
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-          rustup default stable
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
           rustc --version --verbose
           cargo --version
 
       - name: Cache Cargo downloads
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Fetch the locked dependency graph
+        run: cargo fetch --locked
+
+      - name: Verify the vendored wgpu-hal archive and sole patch
+        # The dependency is path-patched, so `cargo fetch` intentionally does
+        # not cache the upstream .crate on a fresh runner. The verifier may
+        # download only its manifest-pinned archive and authenticates it before
+        # reading any member.
+        run: python scripts/verify-vendored-wgpu-hal.py --self-test
 
       - name: Install Linux native prerequisites
         if: runner.os == 'Linux'
@@ -90,9 +99,11 @@ jobs:
               build-essential \
               clang \
               curl \
+              iproute2 \
               libasound2-dev \
               libclang-dev \
               pkg-config \
+              tcpdump \
               xz-utils; then
               break
             elif [ "$attempt" -eq 3 ]; then
@@ -117,7 +128,7 @@ jobs:
       - name: Cache FFmpeg 8.1.2 libraries on Unix
         if: runner.os != 'Windows'
         id: ffmpeg-unix-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ runner.temp }}/ffmpeg-8.1.2
           key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-8.1.2-shared-v1
@@ -178,7 +189,7 @@ jobs:
       - name: Cache FFmpeg 8.1.2 shared build on Windows
         if: runner.os == 'Windows'
         id: ffmpeg-windows-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ runner.temp }}/ffmpeg-8.1.2-windows
           key: ffmpeg-Windows-${{ runner.arch }}-8.1.2-shared-v1
@@ -230,25 +241,98 @@ jobs:
           (Join-Path $ffmpeg.FullName "bin") >> $env:GITHUB_PATH
 
       - name: Check Rust formatting and JavaScript syntax
+        shell: bash
         run: |
+          set -euo pipefail
           cargo fmt --all -- --check
           node --check static/app.js
           node --check docs/ui-ux/wireframe.js
 
+      - name: Check generated capability registry
+        run: cargo run --locked --bin generate_capabilities -- --check
+
       - name: Check, test, and lint on Unix
         if: runner.os != 'Windows'
+        shell: bash
         run: |
-          cargo check --locked --all-targets
-          cargo test --locked --all-targets -- --test-threads=1
+          set -euo pipefail
+          cargo check --locked --all-targets --all-features
+          cargo test --locked --all-targets --all-features
           cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Check, test, and lint on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cmd /c "`"$env:VCVARS64`" >nul && cargo check --locked --all-targets"
+          cmd /c "`"$env:VCVARS64`" >nul && cargo check --locked --all-targets --all-features"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmd /c "`"$env:VCVARS64`" >nul && cargo test --locked --all-targets -- --test-threads=1"
+          cmd /c "`"$env:VCVARS64`" >nul && cargo test --locked --all-targets --all-features"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmd /c "`"$env:VCVARS64`" >nul && cargo clippy --locked --all-targets --all-features -- -D warnings"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Prove control-plane reachability and LAN packet secrecy
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --locked --bin collide-o-scope
+          sudo env "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" \
+            bash scripts/p0-control-server-netns.sh target/debug/collide-o-scope
+
+  dependency-policy:
+    name: Dependency policy and supply-chain provenance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustc --version --verbose
+          cargo --version
+
+      - name: Cache Cargo downloads and verification tools
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: dependency-policy-${{ runner.os }}-${{ runner.arch }}-deny-0.20.2-audit-0.22.2-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install pinned dependency verifiers
+        run: |
+          if [ "$(cargo-deny --version 2>/dev/null)" != "cargo-deny 0.20.2" ]; then
+            cargo install --locked --force cargo-deny --version 0.20.2
+          fi
+          test "$(cargo-deny --version)" = "cargo-deny 0.20.2"
+          if [ "$(cargo-audit --version 2>/dev/null)" != "cargo-audit 0.22.2" ]; then
+            cargo install --locked --force cargo-audit --version 0.22.2
+          fi
+          test "$(cargo-audit --version)" = "cargo-audit 0.22.2"
+
+      - name: Fetch locked dependencies and verify vendored source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          python scripts/verify-vendored-wgpu-hal.py --self-test
+
+      - name: Reject stale or unowned advisory exceptions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/check-dependency-policy.py
+          python scripts/check-release-workflow.py
+          python scripts/verify-release.py self-test
+
+      - name: Check advisories, bans, and sources
+        run: |
+          cargo deny check advisories bans sources
+          python scripts/run-cargo-audit.py
+
+      - name: Check declared dependency licenses separately
+        run: |
+          cargo deny check licenses
+          cargo deny list --format json

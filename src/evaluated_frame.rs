@@ -54,6 +54,11 @@ impl SourceTap {
 pub struct FramePlanContext {
     pub output_size: [u32; 2],
     pub time_seconds: f32,
+    /// Highest engine-minted control sequence applied before this immutable
+    /// frame was evaluated. Zero means no correlated action has entered the
+    /// frame; offline export intentionally remains zero because it has no live
+    /// ingress clock.
+    pub highest_applied_action_sequence: u64,
     /// Per-frame Study inputs, sampled from the same immutable frame sample
     /// the modulation matrix consumed (live) or derived from the frame index
     /// (export: audio is zero like every live source, beat comes from the
@@ -72,9 +77,15 @@ impl FramePlanContext {
             } else {
                 0.0
             },
+            highest_applied_action_sequence: 0,
             study_audio_bands: [0.0; 8],
             study_beat_phase: 0.0,
         }
+    }
+
+    pub fn with_highest_applied_action_sequence(mut self, sequence: u64) -> Self {
+        self.highest_applied_action_sequence = sequence;
+        self
     }
 
     /// Attach the frame's Study inputs, sanitized exactly as the CPU
@@ -835,6 +846,16 @@ mod tests {
         assert_eq!(plan.layers()[0].source.size, [1, 1]);
         assert_eq!(plan.layers()[0].source.slot, usize::MAX);
         assert_eq!(plan.layers()[0].source.stable_id, u64::MAX);
+    }
+
+    #[test]
+    fn live_action_sequence_is_additive_and_offline_context_stays_uncorrelated() {
+        let offline = FramePlanContext::new(1280, 720, 1.0);
+        assert_eq!(offline.highest_applied_action_sequence, 0);
+        let live = offline.with_highest_applied_action_sequence(47);
+        assert_eq!(live.highest_applied_action_sequence, 47);
+        assert_eq!(live.output_size, offline.output_size);
+        assert_eq!(live.time_seconds, offline.time_seconds);
     }
 
     #[test]

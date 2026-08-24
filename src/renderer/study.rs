@@ -5,9 +5,10 @@
 //! generated: a compiled Study arrives as a bounded uniform instruction
 //! buffer and the fragment stage walks it. Swapping studies is two
 //! `write_buffer` calls into fixed-stride arena slots — no reallocation, no
-//! pipeline change, no layout change. Two sampled textures (carrier and the
-//! committed clean-history D2 array), no sampler; every lookup is a
-//! `textureLoad`, inside the ordinary three-texture rack ceiling. The final
+//! pipeline change, no layout change. Three sampled textures (carrier, the
+//! committed clean-history D2 array, and the scope's primitive motion field),
+//! no sampler; every lookup is a `textureLoad`, inside the dedicated-pass
+//! ceiling. The final
 //! wet/blend law is the engine-wide `apply_node_law` shape, byte-shared
 //! through the one blend kernel.
 
@@ -37,7 +38,8 @@ pub struct StudyGpuFrameUniforms {
     pub wet: f32,
     /// The node's frozen `NodeBlend::code()`.
     pub blend_mode: u32,
-    pub _pad: u32,
+    /// ABI 1.1 motion availability for this exact committed field parity.
+    pub motion_valid: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<StudyGpuFrameUniforms>() == 64);
@@ -91,8 +93,13 @@ impl StudyGpuFrameUniforms {
             history_len,
             wet: sanitize(wet),
             blend_mode: blend.code(),
-            _pad: 0,
+            motion_valid: 0,
         }
+    }
+
+    pub const fn with_motion_valid(mut self, valid: bool) -> Self {
+        self.motion_valid = valid as u32;
+        self
     }
 }
 
@@ -125,8 +132,9 @@ impl StudyGpuExecutor {
             entries: &[
                 texture_entry(0, wgpu::TextureViewDimension::D2),
                 texture_entry(1, wgpu::TextureViewDimension::D2Array),
-                uniform_entry(2, STUDY_FRAME_UNIFORM_BYTES, true),
-                uniform_entry(3, STUDY_PROGRAM_UNIFORM_BYTES, true),
+                texture_entry(2, wgpu::TextureViewDimension::D2),
+                uniform_entry(3, STUDY_FRAME_UNIFORM_BYTES, true),
+                uniform_entry(4, STUDY_PROGRAM_UNIFORM_BYTES, true),
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -217,13 +225,30 @@ impl StudyGpuExecutor {
         );
     }
 
-    /// Bind the carrier and the committed history array. Callers cache the
-    /// group per (carrier, history) view pair; a warm frame creates nothing.
+    /// Bind the carrier and committed history with a defined-neutral motion
+    /// alias. Callers with an admitted motion field use the explicit variant.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "ABI 1.0 embedding adapters retain this neutral-motion convenience seam"
+        )
+    )]
     pub fn create_bind_group(
         &self,
         device: &wgpu::Device,
         carrier: &wgpu::TextureView,
         history: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        self.create_bind_group_with_motion(device, carrier, history, carrier)
+    }
+
+    pub fn create_bind_group_with_motion(
+        &self,
+        device: &wgpu::Device,
+        carrier: &wgpu::TextureView,
+        history: &wgpu::TextureView,
+        motion: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Study interpreter bind group"),
@@ -239,6 +264,10 @@ impl StudyGpuExecutor {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
+                    resource: wgpu::BindingResource::TextureView(motion),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &self.frame_arena,
                         offset: 0,
@@ -246,7 +275,7 @@ impl StudyGpuExecutor {
                     }),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 3,
+                    binding: 4,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &self.program_arena,
                         offset: 0,
@@ -323,7 +352,9 @@ fn uniform_entry(binding: u32, min_size: u64, dynamic: bool) -> wgpu::BindGroupL
 mod tests {
     use super::*;
     use crate::study::{StudyCapability, StudyInstruction};
-    use crate::study_eval::tests::{document, every_opcode_document, register};
+    use crate::study_eval::tests::{
+        abi_1_1_motion_document, document, every_opcode_document, register,
+    };
     use crate::study_eval::{StudyHistorySource, StudyPixelInputs};
 
     const SIZE: u32 = 32;
@@ -499,6 +530,15 @@ mod tests {
         frame: &crate::study_eval::StudyFrameContext,
         write_index: u32,
     ) -> Vec<[f32; 4]> {
+        cpu_reference_with_motion(compiled, frame, write_index, |_, _| [0.0, 0.0])
+    }
+
+    fn cpu_reference_with_motion(
+        compiled: &crate::study_eval::CompiledStudy,
+        frame: &crate::study_eval::StudyFrameContext,
+        write_index: u32,
+        motion: impl Fn(u32, u32) -> [f32; 2],
+    ) -> Vec<[f32; 4]> {
         let history = RingHistory { write_index };
         let mut out = Vec::with_capacity((SIZE * SIZE) as usize);
         for y in 0..SIZE {
@@ -507,13 +547,80 @@ mod tests {
                     frame,
                     &StudyPixelInputs {
                         current: carrier_pixel(x, y),
-                        motion: [0.0, 0.0],
+                        motion: motion(x, y),
                         history: &history,
                     },
                 ));
             }
         }
         out
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn gpu_study_abi_1_1_motion_reaches_output_and_absence_is_neutral() {
+        let Some((device, queue)) = acquire_device() else {
+            panic!("GPU adapter required");
+        };
+        let compiled = crate::study_eval::CompiledStudy::compile(&abi_1_1_motion_document())
+            .expect("ABI 1.1 motion document");
+        let executor = StudyGpuExecutor::new(&device, wgpu::TextureFormat::Rgba32Float, 1);
+        let carrier = float_texture(&device, &queue, 1, |_, x, y| carrier_pixel(x, y));
+        let history = float_texture(&device, &queue, HISTORY_LEN, |layer, _, _| {
+            history_layer_color(layer)
+        });
+        let carrier_view = carrier.create_view(&wgpu::TextureViewDescriptor::default());
+        let history_view = history.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let frame = crate::study_eval::StudyFrameContext::default();
+        executor.write_program(&queue, 0, &compiled.encode_gpu_program());
+
+        for (label, vector) in [
+            ("zero", [0.0, 0.0]),
+            ("x axis", [1.0, 0.0]),
+            ("y axis", [0.0, 1.0]),
+            ("diagonal", [3.0, 4.0]),
+            ("maximum", [65_504.0, 65_504.0]),
+            ("hostile", [f32::NAN, f32::INFINITY]),
+        ] {
+            let motion = float_texture(&device, &queue, 1, |_, _, _| {
+                [vector[0], vector[1], 0.0, 0.0]
+            });
+            let motion_view = motion.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = executor.create_bind_group_with_motion(
+                &device,
+                &carrier_view,
+                &history_view,
+                &motion_view,
+            );
+            executor.write_frame(
+                &queue,
+                0,
+                &StudyGpuFrameUniforms::from_context(&frame, &compiled, 0, HISTORY_LEN)
+                    .with_motion_valid(true),
+            );
+            let gpu = render_and_read(&device, &queue, &executor, &bind_group, 0);
+            let cpu = cpu_reference_with_motion(&compiled, &frame, 0, |_, _| vector);
+            assert_agreement(&gpu, &cpu, label);
+        }
+
+        let motion = float_texture(&device, &queue, 1, |_, _, _| [3.0, 4.0, 0.0, 0.0]);
+        let motion_view = motion.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = executor.create_bind_group_with_motion(
+            &device,
+            &carrier_view,
+            &history_view,
+            &motion_view,
+        );
+        executor.write_frame(
+            &queue,
+            0,
+            &StudyGpuFrameUniforms::from_context(&frame, &compiled, 0, HISTORY_LEN),
+        );
+        let absent = render_and_read(&device, &queue, &executor, &bind_group, 0);
+        assert!(absent.iter().all(|pixel| *pixel == [0.0, 0.0, 0.0, 1.0]));
     }
 
     fn assert_agreement(gpu: &[[f32; 4]], cpu: &[[f32; 4]], label: &str) {

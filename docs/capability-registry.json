@@ -1,0 +1,3099 @@
+{
+  "schema": "collide-o-scope-capability-registry/1",
+  "platforms": [
+    {
+      "platform": "windows",
+      "capabilities": [
+        {
+          "key": "accepted_creative_mutation_v1",
+          "title": "Accepted creative-mutation recording v1",
+          "platform": "windows",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_recording",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "d4-accepted-creative-mutation"
+          ],
+          "known_limitations": [
+            {
+              "code": "accepted_mutation_vocabulary_v1_only",
+              "text": "Only the frozen v1 scalar/color/enum creative vocabulary is recordable; topology, routes, safety/transport, and replay remain excluded."
+            }
+          ]
+        },
+        {
+          "key": "advanced_precision",
+          "title": "Advanced precision path",
+          "platform": "windows",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "physical_device_validation"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "m6-precision-gpu-receipt"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "One local GPU receipt does not prove all adapters or all three target platforms."
+            }
+          ]
+        },
+        {
+          "key": "bounded_mesh_warp",
+          "title": "Bounded mesh warp",
+          "platform": "windows",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "venue_requirement_not_established"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "venue_requirement_not_established"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "venue_requirement_not_established"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "venue_requirement_not_established"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "venue_requirement_required",
+              "text": "A demonstrated venue need must precede backend work and physical proof."
+            }
+          ]
+        },
+        {
+          "key": "capture_input",
+          "title": "External capture input",
+          "platform": "windows",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "backend_not_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "Target hardware or an external endpoint is required for interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "correlated_engine_gpu_timing",
+          "title": "Correlated engine and GPU-stage timing",
+          "platform": "windows",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "backend",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "interoperability_proof"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "physical_device_validation"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-capability-campaign-truth-closure",
+            "p1-action-to-photon-fixture-protocol",
+            "p1-action-to-photon-fixture-unexecuted"
+          ],
+          "known_limitations": [
+            {
+              "code": "engine_submission_is_not_photon_time",
+              "text": "Ingress-to-apply, apply-to-submit, queue submission, swapchain presentation, and optical emission are distinct domains; engine submission is never photon time."
+            },
+            {
+              "code": "physical_timing_and_performance_proof_required",
+              "text": "The physical action-to-photon fixture and the fixed-fixture instrumentation-overhead gate have not been executed on the target display/adapter."
+            },
+            {
+              "code": "optional_gpu_timestamps",
+              "text": "GPU stages report unsupported when the adapter lacks reliable timestamp-query support; CPU action correlation remains available."
+            }
+          ]
+        },
+        {
+          "key": "d3d11va_hardware_decode",
+          "title": "D3D11VA hardware decode",
+          "platform": "windows",
+          "status": "evaluation_required",
+          "reason": {
+            "kind": "evaluation",
+            "detail": "interoperability_proof"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "interoperability_proof"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "interoperability_proof"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "s12d-hw-decode-backend-note",
+            "hw-decode-interop-receipt"
+          ],
+          "known_limitations": [
+            {
+              "code": "windows_only",
+              "text": "The current evaluation backend is specifically D3D11VA on Windows."
+            },
+            {
+              "code": "evaluation_fixture_only",
+              "text": "The backend is constructed by the opt-in probe only; live decode remains software."
+            }
+          ]
+        },
+        {
+          "key": "exact_vfr_live_transport",
+          "title": "Exact PTS-driven VFR live transport",
+          "platform": "windows",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "exact_pts_timeline_not_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "live_program",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "exact_pts_timeline_not_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "v1.6.0-decoder-delivery-receipt"
+          ],
+          "known_limitations": [
+            {
+              "code": "average_frame_rate_cadence",
+              "text": "Live public cadence is derived from the stream average frame rate, not an exact PTS timeline."
+            }
+          ]
+        },
+        {
+          "key": "final_program_vhs",
+          "title": "Final-program VHS",
+          "platform": "windows",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "b5-codec-mosh-note"
+          ],
+          "known_limitations": [
+            {
+              "code": "asynchronous_final_program_latency",
+              "text": "Live VHS is an asynchronous final-program replacement; export runs the corresponding synchronous stage."
+            }
+          ]
+        },
+        {
+          "key": "full16_temporal_history",
+          "title": "Full-16 temporal history",
+          "platform": "windows",
+          "status": "rejected_by_measurement",
+          "reason": {
+            "kind": "rejected",
+            "detail": "measured_resource_tradeoff"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "rejected_by_measurement",
+              "reason": {
+                "kind": "rejected",
+                "detail": "measured_resource_tradeoff"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "rejected_by_measurement",
+              "reason": {
+                "kind": "rejected",
+                "detail": "measured_resource_tradeoff"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "rejected_by_measurement",
+              "reason": {
+                "kind": "rejected",
+                "detail": "measured_resource_tradeoff"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "s12c-full16-history-candidate-note",
+            "full16-history-candidate-receipt"
+          ],
+          "known_limitations": [
+            {
+              "code": "evaluation_fixture_only",
+              "text": "Full-16 temporal storage remains a measurement fixture and is not a production precision mode."
+            }
+          ]
+        },
+        {
+          "key": "live_recorder_audio_mux",
+          "title": "Live recorder audio mux",
+          "platform": "windows",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "owned_program_pcm_unavailable"
+          },
+          "surfaces": [
+            {
+              "surface": "live_recording",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "owned_program_pcm_unavailable"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "b9-performance-recorder-note"
+          ],
+          "known_limitations": [
+            {
+              "code": "video_only_recorder",
+              "text": "The live recorder publishes video and explicitly reports audio_not_muxed=true."
+            }
+          ]
+        },
+        {
+          "key": "ndi_input",
+          "title": "NDI input",
+          "platform": "windows",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "sdk_or_license_required"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "license_and_network_authorization_required",
+              "text": "SDK/license and venue network-policy authorization must precede integration proof."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "A licensed external endpoint is required for interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "ndi_output",
+          "title": "NDI output",
+          "platform": "windows",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "sdk_or_license_required"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "license_and_network_authorization_required",
+              "text": "SDK/license and venue network-policy authorization must precede integration proof."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "A licensed external endpoint is required for interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "proxy_browser_surface",
+          "title": "Browser proxy control",
+          "platform": "windows",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "s8c-browser-proxy-surface-note"
+          ],
+          "known_limitations": [
+            {
+              "code": "verified_content_identity_required",
+              "text": "Only sources with a verified cos-sha256 identity can be proxied."
+            },
+            {
+              "code": "original_media_used_for_export",
+              "text": "Offline export resolves the original media; a proxy never becomes patch or export identity."
+            }
+          ]
+        },
+        {
+          "key": "source_descriptor_color_truth",
+          "title": "Source descriptor and color-truth diagnostics",
+          "platform": "windows",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "backend",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "renderer_integration_proof"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "renderer_integration_proof"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p4b-source-descriptor-stop-receipt"
+          ],
+          "known_limitations": [
+            {
+              "code": "display_geometry_integration_stopped",
+              "text": "Descriptor and conversion-policy truth is visible and exported, but clean aperture, SAR, rotation, and mirror are not yet applied to live or exported pixels; those surfaces remain evaluation-only."
+            }
+          ]
+        },
+        {
+          "key": "spout_input",
+          "title": "Spout input",
+          "platform": "windows",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "live_source_unavailable_offline"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "physical_device_validation"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "windows_only",
+              "text": "The integrated Spout backend is Windows-only."
+            },
+            {
+              "code": "live_source_is_black_offline",
+              "text": "Offline export represents live Spout input with the explicit deterministic-black policy."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "An external sender and target adapter are required for physical interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "spout_output",
+          "title": "Spout output",
+          "platform": "windows",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "physical_device_validation"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "windows_only",
+              "text": "The integrated Spout backend is Windows-only."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "An external receiver and target adapter are required for physical interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "study_motion_abi_1_1",
+          "title": "Study motion ABI 1.1",
+          "platform": "windows",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "d1-study-motion-abi-1.1"
+          ],
+          "known_limitations": [
+            {
+              "code": "additive_abi_version_pinned",
+              "text": "ABI 1.1 is additive and explicitly selected; ABI 1.0 remains frozen, and unresolved or unsupported group motion resolves neutral."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "The retained implementation is cross-platform code, but its physical GPU receipt covers only the available audit adapter."
+            }
+          ]
+        },
+        {
+          "key": "supervised_gpu_recovery_phase_a",
+          "title": "Supervised GPU recovery (Phase A)",
+          "platform": "windows",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "backend",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "physical_device_validation"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p7-gpu-loss-phase-a"
+          ],
+          "known_limitations": [
+            {
+              "code": "transparent_gpu_continuity_unavailable",
+              "text": "Only Phase-A supervised restart is available; in-process Phase-B resource rebuild, source rebinding, and automatic audience continuity are unavailable."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "A packaged launcher deadline and real relaunch-to-recovery-surface measurement remain unexecuted."
+            }
+          ]
+        },
+        {
+          "key": "syphon_input",
+          "title": "Syphon input",
+          "platform": "windows",
+          "status": "unavailable_on_platform",
+          "reason": {
+            "kind": "unavailable",
+            "detail": "macos"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "macos"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "macos"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "macos"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "Target hardware or an external endpoint is required for interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "syphon_output",
+          "title": "Syphon output",
+          "platform": "windows",
+          "status": "unavailable_on_platform",
+          "reason": {
+            "kind": "unavailable",
+            "detail": "macos"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "macos"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "macos"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "macos"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "Target hardware or an external endpoint is required for interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "transactional_control_listeners",
+          "title": "Transactional control listeners and TLS identity",
+          "platform": "windows",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "backend",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "physical_device_validation"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-capability-campaign-truth-closure"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "The in-process listener, identity, and fault fixtures pass; second-host reachability and packet-capture proof remain environment-dependent."
+            }
+          ]
+        },
+        {
+          "key": "zero_copy_decode",
+          "title": "Zero-copy decode",
+          "platform": "windows",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "backend_not_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "Target hardware or an external endpoint is required for interoperability proof."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "platform": "macos",
+      "capabilities": [
+        {
+          "key": "accepted_creative_mutation_v1",
+          "title": "Accepted creative-mutation recording v1",
+          "platform": "macos",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_recording",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "d4-accepted-creative-mutation"
+          ],
+          "known_limitations": [
+            {
+              "code": "accepted_mutation_vocabulary_v1_only",
+              "text": "Only the frozen v1 scalar/color/enum creative vocabulary is recordable; topology, routes, safety/transport, and replay remain excluded."
+            }
+          ]
+        },
+        {
+          "key": "advanced_precision",
+          "title": "Advanced precision path",
+          "platform": "macos",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "physical_device_validation"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "m6-precision-gpu-receipt"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "One local GPU receipt does not prove all adapters or all three target platforms."
+            }
+          ]
+        },
+        {
+          "key": "bounded_mesh_warp",
+          "title": "Bounded mesh warp",
+          "platform": "macos",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "venue_requirement_not_established"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "venue_requirement_not_established"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "venue_requirement_not_established"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "venue_requirement_not_established"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "venue_requirement_required",
+              "text": "A demonstrated venue need must precede backend work and physical proof."
+            }
+          ]
+        },
+        {
+          "key": "capture_input",
+          "title": "External capture input",
+          "platform": "macos",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "backend_not_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "Target hardware or an external endpoint is required for interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "correlated_engine_gpu_timing",
+          "title": "Correlated engine and GPU-stage timing",
+          "platform": "macos",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "backend",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "interoperability_proof"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "physical_device_validation"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-capability-campaign-truth-closure",
+            "p1-action-to-photon-fixture-protocol",
+            "p1-action-to-photon-fixture-unexecuted"
+          ],
+          "known_limitations": [
+            {
+              "code": "engine_submission_is_not_photon_time",
+              "text": "Ingress-to-apply, apply-to-submit, queue submission, swapchain presentation, and optical emission are distinct domains; engine submission is never photon time."
+            },
+            {
+              "code": "physical_timing_and_performance_proof_required",
+              "text": "The physical action-to-photon fixture and the fixed-fixture instrumentation-overhead gate have not been executed on the target display/adapter."
+            },
+            {
+              "code": "optional_gpu_timestamps",
+              "text": "GPU stages report unsupported when the adapter lacks reliable timestamp-query support; CPU action correlation remains available."
+            }
+          ]
+        },
+        {
+          "key": "d3d11va_hardware_decode",
+          "title": "D3D11VA hardware decode",
+          "platform": "macos",
+          "status": "unavailable_on_platform",
+          "reason": {
+            "kind": "unavailable",
+            "detail": "windows"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "s12d-hw-decode-backend-note",
+            "hw-decode-interop-receipt"
+          ],
+          "known_limitations": [
+            {
+              "code": "windows_only",
+              "text": "The current evaluation backend is specifically D3D11VA on Windows."
+            },
+            {
+              "code": "evaluation_fixture_only",
+              "text": "The backend is constructed by the opt-in probe only; live decode remains software."
+            }
+          ]
+        },
+        {
+          "key": "exact_vfr_live_transport",
+          "title": "Exact PTS-driven VFR live transport",
+          "platform": "macos",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "exact_pts_timeline_not_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "live_program",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "exact_pts_timeline_not_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "v1.6.0-decoder-delivery-receipt"
+          ],
+          "known_limitations": [
+            {
+              "code": "average_frame_rate_cadence",
+              "text": "Live public cadence is derived from the stream average frame rate, not an exact PTS timeline."
+            }
+          ]
+        },
+        {
+          "key": "final_program_vhs",
+          "title": "Final-program VHS",
+          "platform": "macos",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "b5-codec-mosh-note"
+          ],
+          "known_limitations": [
+            {
+              "code": "asynchronous_final_program_latency",
+              "text": "Live VHS is an asynchronous final-program replacement; export runs the corresponding synchronous stage."
+            }
+          ]
+        },
+        {
+          "key": "full16_temporal_history",
+          "title": "Full-16 temporal history",
+          "platform": "macos",
+          "status": "rejected_by_measurement",
+          "reason": {
+            "kind": "rejected",
+            "detail": "measured_resource_tradeoff"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "rejected_by_measurement",
+              "reason": {
+                "kind": "rejected",
+                "detail": "measured_resource_tradeoff"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "rejected_by_measurement",
+              "reason": {
+                "kind": "rejected",
+                "detail": "measured_resource_tradeoff"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "rejected_by_measurement",
+              "reason": {
+                "kind": "rejected",
+                "detail": "measured_resource_tradeoff"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "s12c-full16-history-candidate-note",
+            "full16-history-candidate-receipt"
+          ],
+          "known_limitations": [
+            {
+              "code": "evaluation_fixture_only",
+              "text": "Full-16 temporal storage remains a measurement fixture and is not a production precision mode."
+            }
+          ]
+        },
+        {
+          "key": "live_recorder_audio_mux",
+          "title": "Live recorder audio mux",
+          "platform": "macos",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "owned_program_pcm_unavailable"
+          },
+          "surfaces": [
+            {
+              "surface": "live_recording",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "owned_program_pcm_unavailable"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "b9-performance-recorder-note"
+          ],
+          "known_limitations": [
+            {
+              "code": "video_only_recorder",
+              "text": "The live recorder publishes video and explicitly reports audio_not_muxed=true."
+            }
+          ]
+        },
+        {
+          "key": "ndi_input",
+          "title": "NDI input",
+          "platform": "macos",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "sdk_or_license_required"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "license_and_network_authorization_required",
+              "text": "SDK/license and venue network-policy authorization must precede integration proof."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "A licensed external endpoint is required for interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "ndi_output",
+          "title": "NDI output",
+          "platform": "macos",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "sdk_or_license_required"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "license_and_network_authorization_required",
+              "text": "SDK/license and venue network-policy authorization must precede integration proof."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "A licensed external endpoint is required for interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "proxy_browser_surface",
+          "title": "Browser proxy control",
+          "platform": "macos",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "s8c-browser-proxy-surface-note"
+          ],
+          "known_limitations": [
+            {
+              "code": "verified_content_identity_required",
+              "text": "Only sources with a verified cos-sha256 identity can be proxied."
+            },
+            {
+              "code": "original_media_used_for_export",
+              "text": "Offline export resolves the original media; a proxy never becomes patch or export identity."
+            }
+          ]
+        },
+        {
+          "key": "source_descriptor_color_truth",
+          "title": "Source descriptor and color-truth diagnostics",
+          "platform": "macos",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "backend",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "renderer_integration_proof"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "renderer_integration_proof"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p4b-source-descriptor-stop-receipt"
+          ],
+          "known_limitations": [
+            {
+              "code": "display_geometry_integration_stopped",
+              "text": "Descriptor and conversion-policy truth is visible and exported, but clean aperture, SAR, rotation, and mirror are not yet applied to live or exported pixels; those surfaces remain evaluation-only."
+            }
+          ]
+        },
+        {
+          "key": "spout_input",
+          "title": "Spout input",
+          "platform": "macos",
+          "status": "unavailable_on_platform",
+          "reason": {
+            "kind": "unavailable",
+            "detail": "windows"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "windows_only",
+              "text": "The integrated Spout backend is Windows-only."
+            },
+            {
+              "code": "live_source_is_black_offline",
+              "text": "Offline export represents live Spout input with the explicit deterministic-black policy."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "An external sender and target adapter are required for physical interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "spout_output",
+          "title": "Spout output",
+          "platform": "macos",
+          "status": "unavailable_on_platform",
+          "reason": {
+            "kind": "unavailable",
+            "detail": "windows"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "windows_only",
+              "text": "The integrated Spout backend is Windows-only."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "An external receiver and target adapter are required for physical interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "study_motion_abi_1_1",
+          "title": "Study motion ABI 1.1",
+          "platform": "macos",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "d1-study-motion-abi-1.1"
+          ],
+          "known_limitations": [
+            {
+              "code": "additive_abi_version_pinned",
+              "text": "ABI 1.1 is additive and explicitly selected; ABI 1.0 remains frozen, and unresolved or unsupported group motion resolves neutral."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "The retained implementation is cross-platform code, but its physical GPU receipt covers only the available audit adapter."
+            }
+          ]
+        },
+        {
+          "key": "supervised_gpu_recovery_phase_a",
+          "title": "Supervised GPU recovery (Phase A)",
+          "platform": "macos",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "backend",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "physical_device_validation"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p7-gpu-loss-phase-a"
+          ],
+          "known_limitations": [
+            {
+              "code": "transparent_gpu_continuity_unavailable",
+              "text": "Only Phase-A supervised restart is available; in-process Phase-B resource rebuild, source rebinding, and automatic audience continuity are unavailable."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "A packaged launcher deadline and real relaunch-to-recovery-surface measurement remain unexecuted."
+            }
+          ]
+        },
+        {
+          "key": "syphon_input",
+          "title": "Syphon input",
+          "platform": "macos",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "backend_not_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "Target hardware or an external endpoint is required for interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "syphon_output",
+          "title": "Syphon output",
+          "platform": "macos",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "backend_not_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "Target hardware or an external endpoint is required for interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "transactional_control_listeners",
+          "title": "Transactional control listeners and TLS identity",
+          "platform": "macos",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "backend",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "physical_device_validation"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-capability-campaign-truth-closure"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "The in-process listener, identity, and fault fixtures pass; second-host reachability and packet-capture proof remain environment-dependent."
+            }
+          ]
+        },
+        {
+          "key": "zero_copy_decode",
+          "title": "Zero-copy decode",
+          "platform": "macos",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "backend_not_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "Target hardware or an external endpoint is required for interoperability proof."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "platform": "linux",
+      "capabilities": [
+        {
+          "key": "accepted_creative_mutation_v1",
+          "title": "Accepted creative-mutation recording v1",
+          "platform": "linux",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_recording",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "d4-accepted-creative-mutation"
+          ],
+          "known_limitations": [
+            {
+              "code": "accepted_mutation_vocabulary_v1_only",
+              "text": "Only the frozen v1 scalar/color/enum creative vocabulary is recordable; topology, routes, safety/transport, and replay remain excluded."
+            }
+          ]
+        },
+        {
+          "key": "advanced_precision",
+          "title": "Advanced precision path",
+          "platform": "linux",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "physical_device_validation"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "m6-precision-gpu-receipt"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "One local GPU receipt does not prove all adapters or all three target platforms."
+            }
+          ]
+        },
+        {
+          "key": "bounded_mesh_warp",
+          "title": "Bounded mesh warp",
+          "platform": "linux",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "venue_requirement_not_established"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "venue_requirement_not_established"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "venue_requirement_not_established"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "venue_requirement_not_established"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "venue_requirement_required",
+              "text": "A demonstrated venue need must precede backend work and physical proof."
+            }
+          ]
+        },
+        {
+          "key": "capture_input",
+          "title": "External capture input",
+          "platform": "linux",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "backend_not_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "Target hardware or an external endpoint is required for interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "correlated_engine_gpu_timing",
+          "title": "Correlated engine and GPU-stage timing",
+          "platform": "linux",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "backend",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "interoperability_proof"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "physical_device_validation"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-capability-campaign-truth-closure",
+            "p1-action-to-photon-fixture-protocol",
+            "p1-action-to-photon-fixture-unexecuted"
+          ],
+          "known_limitations": [
+            {
+              "code": "engine_submission_is_not_photon_time",
+              "text": "Ingress-to-apply, apply-to-submit, queue submission, swapchain presentation, and optical emission are distinct domains; engine submission is never photon time."
+            },
+            {
+              "code": "physical_timing_and_performance_proof_required",
+              "text": "The physical action-to-photon fixture and the fixed-fixture instrumentation-overhead gate have not been executed on the target display/adapter."
+            },
+            {
+              "code": "optional_gpu_timestamps",
+              "text": "GPU stages report unsupported when the adapter lacks reliable timestamp-query support; CPU action correlation remains available."
+            }
+          ]
+        },
+        {
+          "key": "d3d11va_hardware_decode",
+          "title": "D3D11VA hardware decode",
+          "platform": "linux",
+          "status": "unavailable_on_platform",
+          "reason": {
+            "kind": "unavailable",
+            "detail": "windows"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "s12d-hw-decode-backend-note",
+            "hw-decode-interop-receipt"
+          ],
+          "known_limitations": [
+            {
+              "code": "windows_only",
+              "text": "The current evaluation backend is specifically D3D11VA on Windows."
+            },
+            {
+              "code": "evaluation_fixture_only",
+              "text": "The backend is constructed by the opt-in probe only; live decode remains software."
+            }
+          ]
+        },
+        {
+          "key": "exact_vfr_live_transport",
+          "title": "Exact PTS-driven VFR live transport",
+          "platform": "linux",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "exact_pts_timeline_not_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "live_program",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "exact_pts_timeline_not_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "v1.6.0-decoder-delivery-receipt"
+          ],
+          "known_limitations": [
+            {
+              "code": "average_frame_rate_cadence",
+              "text": "Live public cadence is derived from the stream average frame rate, not an exact PTS timeline."
+            }
+          ]
+        },
+        {
+          "key": "final_program_vhs",
+          "title": "Final-program VHS",
+          "platform": "linux",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "b5-codec-mosh-note"
+          ],
+          "known_limitations": [
+            {
+              "code": "asynchronous_final_program_latency",
+              "text": "Live VHS is an asynchronous final-program replacement; export runs the corresponding synchronous stage."
+            }
+          ]
+        },
+        {
+          "key": "full16_temporal_history",
+          "title": "Full-16 temporal history",
+          "platform": "linux",
+          "status": "rejected_by_measurement",
+          "reason": {
+            "kind": "rejected",
+            "detail": "measured_resource_tradeoff"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "rejected_by_measurement",
+              "reason": {
+                "kind": "rejected",
+                "detail": "measured_resource_tradeoff"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "rejected_by_measurement",
+              "reason": {
+                "kind": "rejected",
+                "detail": "measured_resource_tradeoff"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "rejected_by_measurement",
+              "reason": {
+                "kind": "rejected",
+                "detail": "measured_resource_tradeoff"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "s12c-full16-history-candidate-note",
+            "full16-history-candidate-receipt"
+          ],
+          "known_limitations": [
+            {
+              "code": "evaluation_fixture_only",
+              "text": "Full-16 temporal storage remains a measurement fixture and is not a production precision mode."
+            }
+          ]
+        },
+        {
+          "key": "live_recorder_audio_mux",
+          "title": "Live recorder audio mux",
+          "platform": "linux",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "owned_program_pcm_unavailable"
+          },
+          "surfaces": [
+            {
+              "surface": "live_recording",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "owned_program_pcm_unavailable"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "b9-performance-recorder-note"
+          ],
+          "known_limitations": [
+            {
+              "code": "video_only_recorder",
+              "text": "The live recorder publishes video and explicitly reports audio_not_muxed=true."
+            }
+          ]
+        },
+        {
+          "key": "ndi_input",
+          "title": "NDI input",
+          "platform": "linux",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "sdk_or_license_required"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "license_and_network_authorization_required",
+              "text": "SDK/license and venue network-policy authorization must precede integration proof."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "A licensed external endpoint is required for interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "ndi_output",
+          "title": "NDI output",
+          "platform": "linux",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "sdk_or_license_required"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "sdk_or_license_required"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "license_and_network_authorization_required",
+              "text": "SDK/license and venue network-policy authorization must precede integration proof."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "A licensed external endpoint is required for interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "proxy_browser_surface",
+          "title": "Browser proxy control",
+          "platform": "linux",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "s8c-browser-proxy-surface-note"
+          ],
+          "known_limitations": [
+            {
+              "code": "verified_content_identity_required",
+              "text": "Only sources with a verified cos-sha256 identity can be proxied."
+            },
+            {
+              "code": "original_media_used_for_export",
+              "text": "Offline export resolves the original media; a proxy never becomes patch or export identity."
+            }
+          ]
+        },
+        {
+          "key": "source_descriptor_color_truth",
+          "title": "Source descriptor and color-truth diagnostics",
+          "platform": "linux",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "backend",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "renderer_integration_proof"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "renderer_integration_proof"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p4b-source-descriptor-stop-receipt"
+          ],
+          "known_limitations": [
+            {
+              "code": "display_geometry_integration_stopped",
+              "text": "Descriptor and conversion-policy truth is visible and exported, but clean aperture, SAR, rotation, and mirror are not yet applied to live or exported pixels; those surfaces remain evaluation-only."
+            }
+          ]
+        },
+        {
+          "key": "spout_input",
+          "title": "Spout input",
+          "platform": "linux",
+          "status": "unavailable_on_platform",
+          "reason": {
+            "kind": "unavailable",
+            "detail": "windows"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "windows_only",
+              "text": "The integrated Spout backend is Windows-only."
+            },
+            {
+              "code": "live_source_is_black_offline",
+              "text": "Offline export represents live Spout input with the explicit deterministic-black policy."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "An external sender and target adapter are required for physical interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "spout_output",
+          "title": "Spout output",
+          "platform": "linux",
+          "status": "unavailable_on_platform",
+          "reason": {
+            "kind": "unavailable",
+            "detail": "windows"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "windows"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "windows_only",
+              "text": "The integrated Spout backend is Windows-only."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "An external receiver and target adapter are required for physical interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "study_motion_abi_1_1",
+          "title": "Study motion ABI 1.1",
+          "platform": "linux",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "d1-study-motion-abi-1.1"
+          ],
+          "known_limitations": [
+            {
+              "code": "additive_abi_version_pinned",
+              "text": "ABI 1.1 is additive and explicitly selected; ABI 1.0 remains frozen, and unresolved or unsupported group motion resolves neutral."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "The retained implementation is cross-platform code, but its physical GPU receipt covers only the available audit adapter."
+            }
+          ]
+        },
+        {
+          "key": "supervised_gpu_recovery_phase_a",
+          "title": "Supervised GPU recovery (Phase A)",
+          "platform": "linux",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "backend",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "physical_device_validation"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p7-gpu-loss-phase-a"
+          ],
+          "known_limitations": [
+            {
+              "code": "transparent_gpu_continuity_unavailable",
+              "text": "Only Phase-A supervised restart is available; in-process Phase-B resource rebuild, source rebinding, and automatic audience continuity are unavailable."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "A packaged launcher deadline and real relaunch-to-recovery-surface measurement remain unexecuted."
+            }
+          ]
+        },
+        {
+          "key": "syphon_input",
+          "title": "Syphon input",
+          "platform": "linux",
+          "status": "unavailable_on_platform",
+          "reason": {
+            "kind": "unavailable",
+            "detail": "macos"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "macos"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "macos"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "macos"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "Target hardware or an external endpoint is required for interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "syphon_output",
+          "title": "Syphon output",
+          "platform": "linux",
+          "status": "unavailable_on_platform",
+          "reason": {
+            "kind": "unavailable",
+            "detail": "macos"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "macos"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "macos"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "unavailable_on_platform",
+              "reason": {
+                "kind": "unavailable",
+                "detail": "macos"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "Target hardware or an external endpoint is required for interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "transactional_control_listeners",
+          "title": "Transactional control listeners and TLS identity",
+          "platform": "linux",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "native_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "backend",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "evaluation_required",
+              "reason": {
+                "kind": "evaluation",
+                "detail": "physical_device_validation"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-capability-campaign-truth-closure"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "The in-process listener, identity, and fault fixtures pass; second-host reachability and packet-capture proof remain environment-dependent."
+            }
+          ]
+        },
+        {
+          "key": "zero_copy_decode",
+          "title": "Zero-copy decode",
+          "platform": "linux",
+          "status": "deferred",
+          "reason": {
+            "kind": "deferred",
+            "detail": "backend_not_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "backend",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            },
+            {
+              "surface": "hardware_interoperability",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            },
+            {
+              "surface": "physical_venue",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p10-external-deferred-capability-evidence-boundary"
+          ],
+          "known_limitations": [
+            {
+              "code": "external_proof_required",
+              "text": "Target hardware or an external endpoint is required for interoperability proof."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

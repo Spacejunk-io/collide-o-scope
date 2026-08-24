@@ -12,7 +12,13 @@ use std::fmt;
 use super::{EvaluatedFramePlan, EvaluatedLayer, EvaluatedLayerMatte};
 use crate::composition::{
     BusAssignment, FlattenedGroupSpan, GroupOutputStage, RuntimeComposition,
-    RuntimeCompositionError, RuntimeRootItem,
+    RuntimeCompositionError, RuntimeRootItem, RuntimeRootItemKey,
+};
+use crate::diagnostics::{
+    ConstraintCode, ConstraintDiagnostic, ConstraintInvariant, ConstraintScope,
+    ConstraintScopeKind, ConstraintSeverity, DiagnosticValue, RemediationCandidate,
+    RemediationCandidateId, RemediationCode, RemediationOperation, RemediationPlanConsequence,
+    RemediationPlanKind, ResourceDelta, ResourceKind,
 };
 use crate::effects::params::{RefreshGardenGate, TemporalParams};
 use crate::effects::EffectUniforms;
@@ -359,6 +365,32 @@ impl EvaluatedCompositionPlan {
         match self {
             Self::LegacyExact(plan) => plan.temporal_master_path(),
             Self::Advanced(plan) => plan.temporal_master_path(),
+        }
+    }
+
+    /// Bounded facts exposed by a P10 immutable remediation preview. Legacy
+    /// exact deliberately reports a zero advanced-resource ledger.
+    pub fn remediation_consequence(&self) -> RemediationPlanConsequence {
+        match self {
+            Self::LegacyExact(plan) => RemediationPlanConsequence {
+                kind: RemediationPlanKind::LegacyExact,
+                topology_signature: plan.topology_signature(),
+                full_frame_passes: 0,
+                logical_texture_lookups_per_pixel: 0,
+                retained_surface_layers: 0,
+                creative_bytes: 0,
+            },
+            Self::Advanced(plan) => {
+                let resources = plan.resources();
+                RemediationPlanConsequence {
+                    kind: RemediationPlanKind::Advanced,
+                    topology_signature: plan.topology_signature(),
+                    full_frame_passes: resources.full_frame_passes,
+                    logical_texture_lookups_per_pixel: resources.logical_texture_lookups_per_pixel,
+                    retained_surface_layers: resources.retained_surface_layers,
+                    creative_bytes: resources.creative_bytes,
+                }
+            }
         }
     }
 
@@ -803,6 +835,10 @@ pub struct EvaluatedMotionFieldPlan {
     pub codec: MotionCodecFrameFacts,
     pub required_as_donor: bool,
     pub required_as_garden_signal: bool,
+    /// A resolved Study ABI whose typed output can observe this primitive
+    /// field. Kept distinct from donor/Garden routing so plan receipts and
+    /// resource admission state the real consumer.
+    pub required_as_study_input: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -819,6 +855,7 @@ pub struct EvaluatedMotionScopePlan {
     pub field_slot: Option<u8>,
     pub required_as_donor: bool,
     pub required_as_garden_signal: bool,
+    pub required_as_study_input: bool,
     pub donor_scope: Option<VisualScopeId>,
     pub donor_field_slot: Option<u8>,
     pub transplant_admitted: bool,
@@ -2229,11 +2266,9 @@ impl fmt::Display for CompositionPlanError {
                     id.get()
                 )
             }
-            Self::DuplicateLayerMotion(id) => write!(
-                formatter,
-                "motion input repeats stable layer {}",
-                id.get()
-            ),
+            Self::DuplicateLayerMotion(id) => {
+                write!(formatter, "motion input repeats stable layer {}", id.get())
+            }
             Self::MissingLayerMotion(id) => write!(
                 formatter,
                 "stable layer {} has no evaluated motion input",
@@ -2336,6 +2371,753 @@ impl fmt::Display for CompositionPlanError {
 }
 
 impl std::error::Error for CompositionPlanError {}
+
+fn diagnostic_scope(scope: VisualScopeId) -> ConstraintScope {
+    match scope {
+        VisualScopeId::Master => ConstraintScope::singleton(ConstraintScopeKind::Master),
+        VisualScopeId::Layer(id) => ConstraintScope::stable(ConstraintScopeKind::Layer, id.get()),
+        VisualScopeId::Group(id) => ConstraintScope::stable(ConstraintScopeKind::Group, id.get()),
+        VisualScopeId::Program => ConstraintScope::singleton(ConstraintScopeKind::Program),
+    }
+}
+
+fn diagnostic_root_scope(item: RuntimeRootItemKey) -> ConstraintScope {
+    match item {
+        RuntimeRootItemKey::Layer(id) => {
+            ConstraintScope::stable(ConstraintScopeKind::Layer, id.get())
+        }
+        RuntimeRootItemKey::Group(id) => {
+            ConstraintScope::stable(ConstraintScopeKind::Group, id.get())
+        }
+    }
+}
+
+fn diagnostic_layer_scopes(layers: &[StableLayerId]) -> Vec<ConstraintScope> {
+    layers
+        .iter()
+        .map(|id| ConstraintScope::stable(ConstraintScopeKind::Layer, id.get()))
+        .collect()
+}
+
+fn usize_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn bounded_diagnostic(
+    code: ConstraintCode,
+    invariant: ConstraintInvariant,
+    affected: Vec<ConstraintScope>,
+    resource: ResourceKind,
+    requested: u64,
+    limit: u64,
+    text: String,
+) -> ConstraintDiagnostic {
+    let mut diagnostic =
+        ConstraintDiagnostic::new(code, invariant, ConstraintSeverity::Error, affected, text)
+            .with_values(
+                DiagnosticValue::Unsigned(limit),
+                DiagnosticValue::Unsigned(requested),
+            );
+    if let Some(delta) = ResourceDelta::checked(resource, 0, requested, limit) {
+        diagnostic = diagnostic.with_resource_delta(delta);
+    }
+    diagnostic
+}
+
+fn value_diagnostic(
+    code: ConstraintCode,
+    invariant: ConstraintInvariant,
+    affected: Vec<ConstraintScope>,
+    expected: u64,
+    actual: u64,
+    text: String,
+) -> ConstraintDiagnostic {
+    ConstraintDiagnostic::new(code, invariant, ConstraintSeverity::Error, affected, text)
+        .with_values(
+            DiagnosticValue::Unsigned(expected),
+            DiagnosticValue::Unsigned(actual),
+        )
+}
+
+fn disable_bypass_remediation(
+    layers: &[StableLayerId],
+    bypass: crate::diagnostics::BypassKind,
+    base_revision: u64,
+    id: u64,
+    description: &str,
+) -> Vec<RemediationCandidate> {
+    if layers.is_empty() {
+        return Vec::new();
+    }
+    layers
+        .iter()
+        .enumerate()
+        .map(|(index, layer)| RemediationCandidate {
+            id: RemediationCandidateId(
+                id.saturating_mul(1_000)
+                    .saturating_add(u64::try_from(index).unwrap_or(u64::MAX)),
+            ),
+            code: RemediationCode::DisableConflictingBypass,
+            base_revision,
+            description: format!("{description} (layer {})", layer.get()),
+            operations: vec![RemediationOperation::SetBypass {
+                scope: ConstraintScope::stable(ConstraintScopeKind::Layer, layer.get()),
+                bypass,
+                enabled: false,
+            }],
+        })
+        .collect()
+}
+
+fn runtime_composition_diagnostic(error: &RuntimeCompositionError) -> ConstraintDiagnostic {
+    let program = || vec![ConstraintScope::singleton(ConstraintScopeKind::Program)];
+    match error {
+        RuntimeCompositionError::TooManyGroups { count, limit }
+        | RuntimeCompositionError::TooManyLayers { count, limit } => bounded_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            ResourceKind::RetainedSurfaces,
+            usize_u64(*count),
+            usize_u64(*limit),
+            error.to_string(),
+        ),
+        RuntimeCompositionError::DuplicateGroupId(id) => ConstraintDiagnostic::new(
+            ConstraintCode::DuplicateStableIdentity,
+            ConstraintInvariant::StableIdentitiesUnique,
+            ConstraintSeverity::Error,
+            vec![ConstraintScope::stable(
+                ConstraintScopeKind::Group,
+                id.get(),
+            )],
+            error.to_string(),
+        ),
+        RuntimeCompositionError::DuplicateRootItem(item) => ConstraintDiagnostic::new(
+            ConstraintCode::DuplicateStableIdentity,
+            ConstraintInvariant::StableIdentitiesUnique,
+            ConstraintSeverity::Error,
+            vec![diagnostic_root_scope(*item)],
+            error.to_string(),
+        ),
+        RuntimeCompositionError::DuplicateLayer(id) => ConstraintDiagnostic::new(
+            ConstraintCode::DuplicateStableIdentity,
+            ConstraintInvariant::StableIdentitiesUnique,
+            ConstraintSeverity::Error,
+            vec![ConstraintScope::stable(
+                ConstraintScopeKind::Layer,
+                id.get(),
+            )],
+            error.to_string(),
+        ),
+        RuntimeCompositionError::UnknownGroup(id) | RuntimeCompositionError::UnrootedGroup(id) => {
+            ConstraintDiagnostic::new(
+                ConstraintCode::MissingStableIdentity,
+                ConstraintInvariant::ReferencedIdentityExists,
+                ConstraintSeverity::Error,
+                vec![ConstraintScope::stable(
+                    ConstraintScopeKind::Group,
+                    id.get(),
+                )],
+                error.to_string(),
+            )
+        }
+        RuntimeCompositionError::UnknownLayer(id) | RuntimeCompositionError::MissingLayer(id) => {
+            ConstraintDiagnostic::new(
+                ConstraintCode::MissingStableIdentity,
+                ConstraintInvariant::ReferencedIdentityExists,
+                ConstraintSeverity::Error,
+                vec![ConstraintScope::stable(
+                    ConstraintScopeKind::Layer,
+                    id.get(),
+                )],
+                error.to_string(),
+            )
+        }
+        RuntimeCompositionError::InvalidNextGroupId {
+            next,
+            greatest_observed,
+        } => value_diagnostic(
+            ConstraintCode::StableIdentityMismatch,
+            ConstraintInvariant::StableIdentityPreserved,
+            program(),
+            greatest_observed.saturating_add(1),
+            *next,
+            error.to_string(),
+        ),
+        RuntimeCompositionError::GroupIdExhausted => ConstraintDiagnostic::new(
+            ConstraintCode::InternalPlannerError,
+            ConstraintInvariant::PlannerContractHeld,
+            ConstraintSeverity::Fatal,
+            program(),
+            error.to_string(),
+        ),
+        RuntimeCompositionError::InvalidMoveIndex { index, len } => value_diagnostic(
+            ConstraintCode::StableIdentityMismatch,
+            ConstraintInvariant::StableIdentityPreserved,
+            program(),
+            usize_u64(*len),
+            usize_u64(*index),
+            error.to_string(),
+        ),
+        RuntimeCompositionError::GroupRack { group_id, .. } => ConstraintDiagnostic::new(
+            ConstraintCode::RackInvalid,
+            ConstraintInvariant::RackTopologyValid,
+            ConstraintSeverity::Error,
+            vec![ConstraintScope::stable(
+                ConstraintScopeKind::Group,
+                group_id.get(),
+            )],
+            error.to_string(),
+        ),
+    }
+}
+
+fn image_graph_diagnostic(error: &ImageGraphError) -> ConstraintDiagnostic {
+    let program = || vec![ConstraintScope::singleton(ConstraintScopeKind::Program)];
+    match error {
+        ImageGraphError::TooManyScopes { count, limit } => bounded_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            ResourceKind::RetainedSurfaces,
+            usize_u64(*count),
+            usize_u64(*limit),
+            error.to_string(),
+        ),
+        ImageGraphError::TooManyDependencies { count, limit }
+        | ImageGraphError::TooManyCurrentTaps { count, limit }
+        | ImageGraphError::TooManyPreviousTaps { count, limit } => bounded_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            ResourceKind::TextureBindings,
+            usize_u64(*count),
+            usize_u64(*limit),
+            error.to_string(),
+        ),
+        ImageGraphError::DuplicateScope(scope) => ConstraintDiagnostic::new(
+            ConstraintCode::DuplicateStableIdentity,
+            ConstraintInvariant::StableIdentitiesUnique,
+            ConstraintSeverity::Error,
+            vec![diagnostic_scope(*scope)],
+            error.to_string(),
+        ),
+        ImageGraphError::MissingConsumer(scope) => ConstraintDiagnostic::new(
+            ConstraintCode::MissingStableIdentity,
+            ConstraintInvariant::ReferencedIdentityExists,
+            ConstraintSeverity::Error,
+            vec![diagnostic_scope(*scope)],
+            error.to_string(),
+        ),
+        ImageGraphError::CurrentProgramInput { consumer } => ConstraintDiagnostic::new(
+            ConstraintCode::RouteInvalid,
+            ConstraintInvariant::RouteTopologyValid,
+            ConstraintSeverity::Error,
+            vec![diagnostic_scope(*consumer)],
+            error.to_string(),
+        ),
+        ImageGraphError::CurrentCycle { scopes } => ConstraintDiagnostic::new(
+            ConstraintCode::RouteCycle,
+            ConstraintInvariant::RouteGraphAcyclic,
+            ConstraintSeverity::Error,
+            scopes.iter().copied().map(diagnostic_scope).collect(),
+            error.to_string(),
+        ),
+    }
+}
+
+fn resource_diagnostic(error: &ResourcePreflightError) -> ConstraintDiagnostic {
+    let program = || vec![ConstraintScope::singleton(ConstraintScopeKind::Program)];
+    match error {
+        ResourcePreflightError::ZeroDimension => value_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            1,
+            0,
+            error.to_string(),
+        ),
+        ResourcePreflightError::DimensionLimit { requested, limit } => value_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            u64::from(*limit),
+            u64::from(requested[0].max(requested[1])),
+            error.to_string(),
+        ),
+        ResourcePreflightError::Rack { .. } => ConstraintDiagnostic::new(
+            ConstraintCode::RackInvalid,
+            ConstraintInvariant::RackTopologyValid,
+            ConstraintSeverity::Error,
+            program(),
+            error.to_string(),
+        ),
+        ResourcePreflightError::FrameLogicalLookupBudget { lookups, limit } => bounded_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            ResourceKind::TextureBindings,
+            u64::from(*lookups),
+            u64::from(*limit),
+            error.to_string(),
+        ),
+        ResourcePreflightError::FrameSampleBudget { samples, limit } => bounded_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            ResourceKind::ShaderOperations,
+            u64::from(*samples),
+            u64::from(*limit),
+            error.to_string(),
+        ),
+        ResourcePreflightError::SampledTextureLimit { requested, limit } => bounded_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            ResourceKind::TextureBindings,
+            u64::from(*requested),
+            u64::from(*limit),
+            error.to_string(),
+        ),
+        ResourcePreflightError::TextureArrayLayerLimit { requested, limit } => bounded_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            ResourceKind::RetainedSurfaces,
+            u64::from(*requested),
+            u64::from(*limit),
+            error.to_string(),
+        ),
+        ResourcePreflightError::CreativeMemoryBudget { bytes, limit } => bounded_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            ResourceKind::GpuBytes,
+            *bytes,
+            *limit,
+            error.to_string(),
+        ),
+        ResourcePreflightError::ArithmeticOverflow => ConstraintDiagnostic::new(
+            ConstraintCode::InternalPlannerError,
+            ConstraintInvariant::PlannerContractHeld,
+            ConstraintSeverity::Fatal,
+            program(),
+            error.to_string(),
+        ),
+    }
+}
+
+fn residual_diagnostic(error: &ResidualResourceError) -> ConstraintDiagnostic {
+    let program = || vec![ConstraintScope::singleton(ConstraintScopeKind::Program)];
+    match error {
+        ResidualResourceError::InvalidDimensions(dimensions) => value_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            1,
+            u64::from(dimensions[0].min(dimensions[1])),
+            error.to_string(),
+        ),
+        ResidualResourceError::DeviceTextureDimension { dimensions, limit }
+        | ResidualResourceError::GridEdge { dimensions, limit } => value_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            u64::from(*limit),
+            u64::from(dimensions[0].max(dimensions[1])),
+            error.to_string(),
+        ),
+        ResidualResourceError::CellCount { count, limit } => bounded_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            ResourceKind::RetainedSurfaces,
+            *count,
+            *limit,
+            error.to_string(),
+        ),
+        ResidualResourceError::NodeBytes { bytes, limit }
+        | ResidualResourceError::AggregateBytes { bytes, limit } => bounded_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            ResourceKind::GpuBytes,
+            *bytes,
+            *limit,
+            error.to_string(),
+        ),
+        ResidualResourceError::TooManyActiveNodes { count, limit } => bounded_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            ResourceKind::RetainedSurfaces,
+            u64::from(*count),
+            u64::from(*limit),
+            error.to_string(),
+        ),
+        ResidualResourceError::SampledTextures { requested, limit } => bounded_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            ResourceKind::TextureBindings,
+            u64::from(*requested),
+            u64::from(*limit),
+            error.to_string(),
+        ),
+        ResidualResourceError::UniformStride { stride, alignment } => value_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            u64::from(*alignment),
+            *stride,
+            error.to_string(),
+        ),
+        ResidualResourceError::AllocatedCellBytes {
+            allocated,
+            expected,
+        }
+        | ResidualResourceError::AllocatedBytes {
+            allocated,
+            planned: expected,
+        }
+        | ResidualResourceError::AllocatedUniformStride {
+            allocated,
+            expected,
+        } => value_diagnostic(
+            ConstraintCode::GpuPlanRejected,
+            ConstraintInvariant::GpuPlanMatchesAcceptedPlan,
+            program(),
+            *expected,
+            *allocated,
+            error.to_string(),
+        ),
+        ResidualResourceError::AllocatedSurfacesPerNode {
+            allocated,
+            expected,
+        } => value_diagnostic(
+            ConstraintCode::GpuPlanRejected,
+            ConstraintInvariant::GpuPlanMatchesAcceptedPlan,
+            program(),
+            u64::from(*expected),
+            u64::from(*allocated),
+            error.to_string(),
+        ),
+        ResidualResourceError::ArithmeticOverflow => ConstraintDiagnostic::new(
+            ConstraintCode::InternalPlannerError,
+            ConstraintInvariant::PlannerContractHeld,
+            ConstraintSeverity::Fatal,
+            program(),
+            error.to_string(),
+        ),
+    }
+}
+
+fn motion_diagnostic(error: &MotionPlanError) -> ConstraintDiagnostic {
+    let program = || vec![ConstraintScope::singleton(ConstraintScopeKind::Program)];
+    match error {
+        MotionPlanError::InvalidDimensions(dimensions) => value_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            1,
+            u64::from(dimensions[0].min(dimensions[1])),
+            error.to_string(),
+        ),
+        MotionPlanError::FieldEdge { dimensions, limit }
+        | MotionPlanError::DeviceTextureDimension { dimensions, limit } => value_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            u64::from(*limit),
+            u64::from(dimensions[0].max(dimensions[1])),
+            error.to_string(),
+        ),
+        MotionPlanError::VectorCount { count, limit } => bounded_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            ResourceKind::RetainedSurfaces,
+            *count,
+            *limit,
+            error.to_string(),
+        ),
+        MotionPlanError::FieldBytes { bytes, limit }
+        | MotionPlanError::AggregateBytes { bytes, limit }
+        | MotionPlanError::DeviceBuffer { bytes, limit } => bounded_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            ResourceKind::GpuBytes,
+            *bytes,
+            *limit,
+            error.to_string(),
+        ),
+        MotionPlanError::TooManyActiveFields { count, limit }
+        | MotionPlanError::TooManyTransplants { count, limit }
+        | MotionPlanError::TooManyGardenSignals { count, limit }
+        | MotionPlanError::TooManyColliders { count, limit } => bounded_diagnostic(
+            ConstraintCode::ResourceLimitExceeded,
+            ConstraintInvariant::ResourceLedgerWithinCap,
+            program(),
+            ResourceKind::RetainedSurfaces,
+            u64::from(*count),
+            u64::from(*limit),
+            error.to_string(),
+        ),
+        MotionPlanError::MasterTransplant => ConstraintDiagnostic::new(
+            ConstraintCode::MotionRouteInvalid,
+            ConstraintInvariant::MotionRouteAdmissible,
+            ConstraintSeverity::Error,
+            vec![ConstraintScope::singleton(ConstraintScopeKind::Master)],
+            error.to_string(),
+        ),
+        MotionPlanError::ArithmeticOverflow => ConstraintDiagnostic::new(
+            ConstraintCode::InternalPlannerError,
+            ConstraintInvariant::PlannerContractHeld,
+            ConstraintSeverity::Fatal,
+            program(),
+            error.to_string(),
+        ),
+    }
+}
+
+impl CompositionPlanError {
+    /// Stable additive protocol form of every planner refusal. Human text is
+    /// retained verbatim for legacy clients; all machine decisions come from
+    /// the closed code/invariant/scope/value fields.
+    pub fn constraint_diagnostic(&self, base_revision: u64) -> ConstraintDiagnostic {
+        let program = || vec![ConstraintScope::singleton(ConstraintScopeKind::Program)];
+        match self {
+            Self::InvalidBaseLayerId { base_index } => value_diagnostic(
+                ConstraintCode::StableIdentityMismatch,
+                ConstraintInvariant::StableIdentityPreserved,
+                program(),
+                1,
+                usize_u64(*base_index),
+                self.to_string(),
+            ),
+            Self::DuplicateBaseLayerId(id)
+            | Self::DuplicateLayerRack(id)
+            | Self::DuplicateLayerMotion(id) => ConstraintDiagnostic::new(
+                ConstraintCode::DuplicateStableIdentity,
+                ConstraintInvariant::StableIdentitiesUnique,
+                ConstraintSeverity::Error,
+                vec![ConstraintScope::stable(
+                    ConstraintScopeKind::Layer,
+                    id.get(),
+                )],
+                self.to_string(),
+            ),
+            Self::MissingLayerRack(id)
+            | Self::UnknownLayerRack(id)
+            | Self::MissingLayerMotion(id)
+            | Self::UnknownLayerMotion(id) => ConstraintDiagnostic::new(
+                ConstraintCode::MissingStableIdentity,
+                ConstraintInvariant::ReferencedIdentityExists,
+                ConstraintSeverity::Error,
+                vec![ConstraintScope::stable(
+                    ConstraintScopeKind::Layer,
+                    id.get(),
+                )],
+                self.to_string(),
+            ),
+            Self::StudyLoadBudget { node, loads, limit } => bounded_diagnostic(
+                ConstraintCode::StudyBudgetExceeded,
+                ConstraintInvariant::StudyBudgetBounded,
+                vec![ConstraintScope::stable(
+                    ConstraintScopeKind::Node,
+                    node.get(),
+                )],
+                ResourceKind::ShaderOperations,
+                u64::from(*loads),
+                u64::from(*limit),
+                self.to_string(),
+            ),
+            Self::ScanProcessorVertexBudget {
+                node,
+                vertices,
+                limit,
+            } => bounded_diagnostic(
+                ConstraintCode::ScanVertexLimitExceeded,
+                ConstraintInvariant::ScanGeometryBounded,
+                vec![ConstraintScope::stable(
+                    ConstraintScopeKind::Node,
+                    node.get(),
+                )],
+                ResourceKind::ScanVertices,
+                u64::from(*vertices),
+                u64::from(*limit),
+                self.to_string(),
+            ),
+            Self::AvalancheHistoryBudget { nodes, limit } => bounded_diagnostic(
+                ConstraintCode::FilterAvalancheLimitExceeded,
+                ConstraintInvariant::FilterAvalancheBounded,
+                program(),
+                ResourceKind::RetainedSurfaces,
+                usize_u64(*nodes),
+                usize_u64(*limit),
+                self.to_string(),
+            ),
+            Self::Composition(error) => runtime_composition_diagnostic(error),
+            Self::Rack { scope, .. } | Self::RackCompile { scope, .. } => {
+                ConstraintDiagnostic::new(
+                    ConstraintCode::RackInvalid,
+                    ConstraintInvariant::RackTopologyValid,
+                    ConstraintSeverity::Error,
+                    vec![diagnostic_scope(*scope)],
+                    self.to_string(),
+                )
+            }
+            Self::RouteCapture { scope, .. } => ConstraintDiagnostic::new(
+                ConstraintCode::RouteInvalid,
+                ConstraintInvariant::RouteTopologyValid,
+                ConstraintSeverity::Error,
+                vec![diagnostic_scope(*scope)],
+                self.to_string(),
+            ),
+            Self::TooManyImageRoutes { count, limit } => bounded_diagnostic(
+                ConstraintCode::ResourceLimitExceeded,
+                ConstraintInvariant::ResourceLedgerWithinCap,
+                program(),
+                ResourceKind::TextureBindings,
+                usize_u64(*count),
+                usize_u64(*limit),
+                self.to_string(),
+            ),
+            Self::LayerMatteCount { count, layers } => value_diagnostic(
+                ConstraintCode::RouteInvalid,
+                ConstraintInvariant::RouteTopologyValid,
+                program(),
+                usize_u64(*layers),
+                usize_u64(*count),
+                self.to_string(),
+            ),
+            Self::ImageGraph(error) => image_graph_diagnostic(error),
+            Self::CurrentCycle { scopes } => ConstraintDiagnostic::new(
+                ConstraintCode::RouteCycle,
+                ConstraintInvariant::RouteGraphAcyclic,
+                ConstraintSeverity::Error,
+                scopes.iter().copied().map(diagnostic_scope).collect(),
+                self.to_string(),
+            ),
+            Self::AtomicGroupCycle { tasks } => ConstraintDiagnostic::new(
+                ConstraintCode::RouteCycle,
+                ConstraintInvariant::RouteGraphAcyclic,
+                ConstraintSeverity::Error,
+                tasks.iter().copied().map(diagnostic_scope).collect(),
+                self.to_string(),
+            ),
+            Self::AmbiguousMasterBypass { layers } => ConstraintDiagnostic::new(
+                ConstraintCode::MasterBypassOrderViolation,
+                ConstraintInvariant::DryBypassIsCanonicalPrefix,
+                ConstraintSeverity::Error,
+                diagnostic_layer_scopes(layers),
+                self.to_string(),
+            )
+            .with_remediations(disable_bypass_remediation(
+                layers,
+                crate::diagnostics::BypassKind::Master,
+                base_revision,
+                1,
+                "Disable the conflicting Master bypass on the affected layers",
+            )),
+            Self::TemporalBypassNotTopPrefix { layers } => ConstraintDiagnostic::new(
+                ConstraintCode::TemporalBypassOrderViolation,
+                ConstraintInvariant::DryBypassIsCanonicalPrefix,
+                ConstraintSeverity::Error,
+                diagnostic_layer_scopes(layers),
+                self.to_string(),
+            )
+            .with_remediations(disable_bypass_remediation(
+                layers,
+                crate::diagnostics::BypassKind::Temporal,
+                base_revision,
+                2,
+                "Disable Temporal bypass on the non-contiguous dry partition",
+            )),
+            Self::TemporalBypassUnsupportedTopology { layers, blockers } => {
+                let mut diagnostic = ConstraintDiagnostic::new(
+                    ConstraintCode::SelectiveMatteTopologyUnsupported,
+                    ConstraintInvariant::SelectiveMatteTopologyAdmissible,
+                    ConstraintSeverity::Error,
+                    diagnostic_layer_scopes(layers),
+                    self.to_string(),
+                );
+                diagnostic.actual = Some(DiagnosticValue::Text(
+                    blockers
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ));
+                diagnostic.with_remediations(disable_bypass_remediation(
+                    layers,
+                    crate::diagnostics::BypassKind::Temporal,
+                    base_revision,
+                    3,
+                    "Disable Temporal bypass on the unsupported partition",
+                ))
+            }
+            Self::TemporalBypassWithNtsc { layers } => ConstraintDiagnostic::new(
+                ConstraintCode::TemporalBypassVhsConflict,
+                ConstraintInvariant::TemporalBypassCompatibleWithVhs,
+                ConstraintSeverity::Error,
+                diagnostic_layer_scopes(layers),
+                self.to_string(),
+            )
+            .with_remediations(disable_bypass_remediation(
+                layers,
+                crate::diagnostics::BypassKind::Temporal,
+                base_revision,
+                4,
+                "Disable Temporal bypass on the affected layers while VHS remains enabled",
+            )),
+            Self::TemporalBypassWithMotionModulation { layers } => ConstraintDiagnostic::new(
+                ConstraintCode::MotionRouteInvalid,
+                ConstraintInvariant::MotionRouteAdmissible,
+                ConstraintSeverity::Error,
+                diagnostic_layer_scopes(layers),
+                self.to_string(),
+            )
+            .with_remediations(disable_bypass_remediation(
+                layers,
+                crate::diagnostics::BypassKind::Temporal,
+                base_revision,
+                5,
+                "Disable Temporal bypass on the layers coupled to Motion modulation",
+            )),
+            Self::Resource(error) => resource_diagnostic(error),
+            Self::Residual(error) => residual_diagnostic(error),
+            Self::ResidualCombinedMemoryBudget { bytes, limit }
+            | Self::MotionCombinedMemoryBudget { bytes, limit } => bounded_diagnostic(
+                ConstraintCode::ResourceLimitExceeded,
+                ConstraintInvariant::ResourceLedgerWithinCap,
+                program(),
+                ResourceKind::GpuBytes,
+                *bytes,
+                *limit,
+                self.to_string(),
+            ),
+            Self::Motion(error) => motion_diagnostic(error),
+            Self::MotionCombinedSampleBudget { samples, limit } => bounded_diagnostic(
+                ConstraintCode::ResourceLimitExceeded,
+                ConstraintInvariant::ResourceLedgerWithinCap,
+                program(),
+                ResourceKind::ShaderOperations,
+                u64::from(*samples),
+                u64::from(*limit),
+                self.to_string(),
+            ),
+            Self::Internal(_) => ConstraintDiagnostic::new(
+                ConstraintCode::InternalPlannerError,
+                ConstraintInvariant::PlannerContractHeld,
+                ConstraintSeverity::Fatal,
+                program(),
+                self.to_string(),
+            ),
+        }
+    }
+}
 
 /// One armed Symmetry Field motion slot, addressed by its permanent slot index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3110,6 +3892,42 @@ impl<'a> Planner<'a> {
         requests
     }
 
+    /// Scope-local primitive motion fields required by resolved Study ABI 1.1
+    /// programs. This is program topology, not a frame value: enable and wet
+    /// changes must not move field slots or invalidate prepared bind groups.
+    ///
+    /// Motion algorithm v1 owns only layer and master scopes. A Study hosted
+    /// by a group therefore continues to receive the interpreter's defined
+    /// absent-motion input rather than being silently rebound to some layer.
+    fn study_motion_scopes(&self) -> BTreeSet<VisualScopeId> {
+        let Some(studies) = self.input.studies else {
+            return BTreeSet::new();
+        };
+        let mut scopes = BTreeSet::new();
+        let mut collect = |scope: VisualScopeId, rack: &RuntimeVisualRack| {
+            if matches!(scope, VisualScopeId::Group(_) | VisualScopeId::Program) {
+                return;
+            }
+            let observable = rack.iter().any(|node| {
+                let RuntimeVisualNodeKind::Study(params) = node.kind else {
+                    return false;
+                };
+                params
+                    .document_digest
+                    .and_then(|digest| studies.get(&digest))
+                    .is_some_and(|entry| entry.compiled.motion_input_is_observable())
+            });
+            if observable {
+                scopes.insert(scope);
+            }
+        };
+        for (id, rack) in &self.racks {
+            collect(VisualScopeId::Layer(*id), rack);
+        }
+        collect(VisualScopeId::Master, self.input.master_rack);
+        scopes
+    }
+
     fn evaluate_motion(
         &self,
         flat_ids: &[StableLayerId],
@@ -3125,6 +3943,7 @@ impl<'a> Planner<'a> {
             && garden.amount > 0.0
             && garden.gate == RefreshGardenGate::Motion;
         let symmetry_motion = self.symmetry_motion_requests();
+        let study_motion = self.study_motion_scopes();
         let Some(input) = self.input.motion else {
             let mut diagnostics = Vec::new();
             if garden_motion_active {
@@ -3201,6 +4020,7 @@ impl<'a> Planner<'a> {
             field_slot: None,
             required_as_donor: false,
             required_as_garden_signal: false,
+            required_as_study_input: study_motion.contains(&VisualScopeId::Master),
             donor_scope: None,
             donor_field_slot: None,
             transplant_admitted: false,
@@ -3221,6 +4041,7 @@ impl<'a> Planner<'a> {
                 field_slot: None,
                 required_as_donor: false,
                 required_as_garden_signal: false,
+                required_as_study_input: study_motion.contains(&VisualScopeId::Layer(*id)),
                 donor_scope: None,
                 donor_field_slot: None,
                 transplant_admitted: false,
@@ -3463,6 +4284,7 @@ impl<'a> Planner<'a> {
                 scope.params.is_exact_zero()
                     && !scope.required_as_donor
                     && !scope.required_as_garden_signal
+                    && !scope.required_as_study_input
                     // A disabled collider is exact M4 and must not hold the
                     // plan out of LegacyExact. An enabled one always produces
                     // at least a diagnostic, so it always has something to say.
@@ -3476,6 +4298,7 @@ impl<'a> Planner<'a> {
         for scope in &mut scopes {
             let field_required = scope.required_as_donor
                 || scope.required_as_garden_signal
+                || scope.required_as_study_input
                 || !scope.params.shutter.is_exact_zero();
             if !field_required {
                 continue;
@@ -3502,6 +4325,7 @@ impl<'a> Planner<'a> {
                 codec: scope.codec,
                 required_as_donor: scope.required_as_donor,
                 required_as_garden_signal: scope.required_as_garden_signal,
+                required_as_study_input: scope.required_as_study_input,
             });
         }
         for scope in &mut scopes {
@@ -3570,6 +4394,7 @@ impl<'a> Planner<'a> {
                     codec_vectors_available: scope.codec.available,
                     required_as_donor: scope.required_as_donor,
                     required_as_garden_signal: scope.required_as_garden_signal,
+                    required_as_study_input: scope.required_as_study_input,
                 }
             })
             .collect::<Vec<_>>();
@@ -3698,6 +4523,7 @@ fn motion_scope_has_pixel_effect(scope: &EvaluatedMotionScopePlan) -> bool {
     !scope.params.is_exact_zero()
         || scope.required_as_donor
         || scope.required_as_garden_signal
+        || scope.required_as_study_input
         || scope.transplant_admitted
         || scope.collider_admitted
 }
@@ -3857,7 +4683,8 @@ fn flush_segment(
                 .document_digest
                 .and_then(|digest| studies.and_then(|library| library.get(&digest)));
             if let Some(entry) = resolved {
-                let loads = 1 + entry.compiled.history_load_count();
+                let loads =
+                    1 + entry.compiled.history_load_count() + entry.compiled.motion_load_count();
                 let limit = u32::from(
                     crate::visual_rack::node_kind_descriptor(NodeKindTag::Study)
                         .budget
@@ -5404,6 +6231,7 @@ fn motion_topology_signature(
         );
         hash = hash_value(hash, u64::from(scope.transplant_admitted));
         hash = hash_value(hash, u64::from(scope.collider_admitted));
+        hash = hash_value(hash, u64::from(scope.required_as_study_input));
         hash = hash_value(hash, u64::from(scope.params.collider.enabled));
         hash = hash_value(hash, u64::from(scope.params.collider.mode.code()));
         hash = hash_value(hash, u64::from(scope.params.collider.boundary.code()));
@@ -5418,6 +6246,7 @@ fn motion_topology_signature(
         hash = hash_value(hash, u64::from(field.grid.block_pixels));
         hash = hash_value(hash, u64::from(field.required_as_donor));
         hash = hash_value(hash, u64::from(field.required_as_garden_signal));
+        hash = hash_value(hash, u64::from(field.required_as_study_input));
         // `signature_code` is append-only: the original four keep 0-3 and the
         // six procedural kinds occupy 4-9. Contour and Chroma bind the field
         // scope's image while the pure kinds bind nothing, so a kind change
@@ -6567,6 +7396,7 @@ mod tests {
             },
             required_as_donor: false,
             required_as_garden_signal: false,
+            required_as_study_input: false,
         };
         let attachment = MotionFieldAttachment {
             scope: plan.scope,
@@ -9727,11 +10557,11 @@ mod tests {
         ));
         assert_eq!(steps[3].node_kind_tag(), Some(NodeKindTag::Study));
 
-        // The ledger re-derives from the emitted step: one pass, two
+        // The ledger re-derives from the emitted step: one pass, three
         // simultaneous bindings, the 64 + 8,192 uniform bytes.
         let resources = compiled.study_field_resources();
         assert_eq!(resources.full_frame_passes, 1);
-        assert_eq!(resources.max_sampled_textures_in_pass, 2);
+        assert_eq!(resources.max_sampled_textures_in_pass, 3);
         assert_eq!(resources.uniform_bytes, 8_256);
 
         // Without the library the same authored graph plans an inert pass —
@@ -9819,6 +10649,123 @@ mod tests {
             &heavy_library,
         )
         .expect("seven history loads plus the carrier fill the budget exactly");
+    }
+
+    /// ABI 1.1 makes the declared vector input observable, so a resolved
+    /// program is itself an honest primitive-field consumer. The admission is
+    /// program topology: it survives enable/wet changes, while an unresolved
+    /// digest and frozen ABI 1.0's dead vector load preserve the old zero-cost
+    /// motion plan.
+    #[test]
+    fn observable_study_motion_admits_an_exact_zero_scope_field() {
+        use crate::study::{StudyCapability, StudyInstruction};
+        use crate::study_eval::tests::{abi_1_1_motion_document, document, register};
+
+        let base = base(&[1], &[]);
+        let composition = legacy_composition(&[1]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let motion = [LayerMotionPlanInput {
+            stable_id: layer_id(1),
+            params: MotionParams::default(),
+            codec: MotionCodecFrameFacts {
+                available: true,
+                source_generation: 7,
+                frame_ordinal: 9,
+            },
+        }];
+
+        let mut library = crate::study_eval::StudyProgramLibrary::default();
+        let digest = library.insert(abi_1_1_motion_document()).unwrap();
+        let mut racks = legacy_racks(&[1]);
+        let node = racks[0]
+            .1
+            .push(RuntimeVisualNodeKind::Study(
+                crate::visual_rack::StudyRackParams {
+                    document_digest: Some(digest),
+                },
+            ))
+            .unwrap();
+        let evaluate =
+            |racks: &[(StableLayerId, RuntimeVisualRack)],
+             studies: Option<&crate::study_eval::StudyProgramLibrary>| {
+                let mut input = CompositionPlanInput::new(&composition, &master, racks)
+                    .with_motion(
+                        MotionParams::default(),
+                        &motion,
+                        MotionDeviceLimits::new(8_192, u64::MAX),
+                    );
+                if let Some(studies) = studies {
+                    input = input.with_studies(studies);
+                }
+                input.resource_limits.max_sampled_textures_per_shader_stage = 16;
+                EvaluatedCompositionPlan::evaluate(&base, input).unwrap()
+            };
+
+        let planned = evaluate(&racks, Some(&library));
+        let planned_advanced = advanced(planned);
+        let motion_plan = planned_advanced
+            .motion()
+            .advanced()
+            .expect("Study motion plan");
+        assert_eq!(motion_plan.resources().active_field_slots, 1);
+        assert_eq!(motion_plan.fields().len(), 1);
+        let scope = motion_plan
+            .scope(VisualScopeId::Layer(layer_id(1)))
+            .expect("layer motion scope");
+        assert!(scope.params.is_exact_zero());
+        assert!(scope.required_as_study_input);
+        assert!(!scope.required_as_donor);
+        assert!(!scope.required_as_garden_signal);
+        assert_eq!(scope.admitted_field_slot(), Some(0));
+        assert!(motion_plan.fields()[0].required_as_study_input);
+
+        // Enable/wet are values, not program topology. Slot identity stays
+        // prepared while the executor skips the inactive Study.
+        let authored = racks[0].1.get_mut(node).unwrap();
+        authored.enabled = false;
+        authored.wet = 0.0;
+        let inactive = advanced(evaluate(&racks, Some(&library)));
+        assert_eq!(
+            inactive.motion().advanced().unwrap().topology_signature(),
+            motion_plan.topology_signature()
+        );
+        assert!(
+            inactive
+                .motion()
+                .advanced()
+                .unwrap()
+                .scope(VisualScopeId::Layer(layer_id(1)))
+                .unwrap()
+                .required_as_study_input
+        );
+
+        // An unresolved digest binds the interpreter's defined absent-motion
+        // input and must not allocate a speculative field.
+        assert!(advanced(evaluate(&racks, None)).motion().is_legacy_exact());
+
+        // ABI 1.0 may carry LoadMotionVector, but has no typed route from that
+        // Vector2 to OutputColor. Keep its historical resource contract exact.
+        let mut legacy_library = crate::study_eval::StudyProgramLibrary::default();
+        let legacy_digest = legacy_library
+            .insert(document(
+                vec![StudyCapability::MotionFieldRead],
+                vec![
+                    StudyInstruction::LoadMotionVector { dst: register(0) },
+                    StudyInstruction::ConstantColor {
+                        dst: register(1),
+                        value: [0.25, 0.5, 0.75, 1.0],
+                    },
+                    StudyInstruction::OutputColor { color: register(1) },
+                ],
+            ))
+            .unwrap();
+        racks[0].1.get_mut(node).unwrap().kind =
+            RuntimeVisualNodeKind::Study(crate::visual_rack::StudyRackParams {
+                document_digest: Some(legacy_digest),
+            });
+        assert!(advanced(evaluate(&racks, Some(&legacy_library)))
+            .motion()
+            .is_legacy_exact());
     }
 
     /// The B6 corruption lift follows the Scan shape: flush before, one
@@ -10894,5 +11841,91 @@ mod tests {
             without.resources().compat8_surface_layers
         );
         assert_ne!(with.topology_signature(), without.topology_signature());
+    }
+
+    #[test]
+    fn typed_vhs_refusal_keeps_exact_layers_text_and_an_unambiguous_candidate() {
+        let error = CompositionPlanError::TemporalBypassWithNtsc {
+            layers: vec![layer_id(9), layer_id(3)],
+        };
+        let diagnostic = error.constraint_diagnostic(44);
+        assert_eq!(diagnostic.code, ConstraintCode::TemporalBypassVhsConflict);
+        assert_eq!(
+            diagnostic.invariant,
+            ConstraintInvariant::TemporalBypassCompatibleWithVhs
+        );
+        assert_eq!(
+            diagnostic.affected,
+            vec![
+                ConstraintScope::stable(ConstraintScopeKind::Layer, 9),
+                ConstraintScope::stable(ConstraintScopeKind::Layer, 3),
+            ]
+        );
+        assert_eq!(diagnostic.text, error.to_string());
+        assert_eq!(diagnostic.remediations.len(), 2);
+        assert!(diagnostic
+            .remediations
+            .iter()
+            .all(|candidate| candidate.base_revision == 44));
+        assert!(diagnostic.remediations.iter().all(|candidate| {
+            candidate.operations.len() == 1
+                && candidate.operations.iter().all(|operation| {
+                    matches!(
+                        operation,
+                        RemediationOperation::SetBypass {
+                            bypass: crate::diagnostics::BypassKind::Temporal,
+                            enabled: false,
+                            ..
+                        }
+                    )
+                })
+        }));
+        let value = serde_json::to_value(&diagnostic).unwrap();
+        assert_eq!(value["code"], "temporal_bypass_vhs_conflict");
+        assert_eq!(value["affected"][0]["stable_id"], "9");
+        assert_eq!(
+            value["remediations"][0]["operations"][0]["bypass"],
+            "temporal"
+        );
+    }
+
+    #[test]
+    fn typed_resource_refusal_exposes_the_refused_total_and_closed_delta() {
+        let error = CompositionPlanError::MotionCombinedMemoryBudget {
+            bytes: 1_025,
+            limit: 1_000,
+        };
+        let diagnostic = error.constraint_diagnostic(7);
+        assert_eq!(diagnostic.code, ConstraintCode::ResourceLimitExceeded);
+        assert_eq!(diagnostic.expected, Some(DiagnosticValue::Unsigned(1_000)));
+        assert_eq!(diagnostic.actual, Some(DiagnosticValue::Unsigned(1_025)));
+        let delta = diagnostic.resource_delta.unwrap();
+        assert_eq!(delta.resource, ResourceKind::GpuBytes);
+        assert_eq!(delta.resulting_total, 1_025);
+        assert_eq!(delta.limit, 1_000);
+        assert!(delta.exceeds_limit());
+        assert!(diagnostic.remediations.is_empty());
+    }
+
+    #[test]
+    fn typed_cycle_refusal_preserves_every_participating_stable_scope() {
+        let error = CompositionPlanError::CurrentCycle {
+            scopes: vec![
+                VisualScopeId::Layer(layer_id(17)),
+                VisualScopeId::Group(group_id(23)),
+                VisualScopeId::Master,
+            ],
+        };
+        let diagnostic = error.constraint_diagnostic(1);
+        assert_eq!(diagnostic.code, ConstraintCode::RouteCycle);
+        assert_eq!(diagnostic.invariant, ConstraintInvariant::RouteGraphAcyclic);
+        assert_eq!(
+            diagnostic.affected,
+            vec![
+                ConstraintScope::stable(ConstraintScopeKind::Layer, 17),
+                ConstraintScope::stable(ConstraintScopeKind::Group, 23),
+                ConstraintScope::singleton(ConstraintScopeKind::Master),
+            ]
+        );
     }
 }

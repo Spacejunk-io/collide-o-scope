@@ -649,22 +649,28 @@ offline export.
 ## Browser control
 
 The app opens a per-session desktop URL of the form
-`http://127.0.0.1:3030/?key=<session-token>` and serves the tokenized HTTPS
-phone panel on `:3031`. The token is required on loopback as well as the LAN,
-is exchanged for a strict HttpOnly session cookie, and is then removed from
-the visible address bar. WebSocket and mutating HTTP requests must also be
-same-origin. The REMOTE section shows the current tokenized QR code. HTTPS is
-required for iOS motion permission; a bare, stale, unauthenticated, or
-cross-origin control request receives 403.
+`http://127.0.0.1:3030/?key=<session-token>` (with `::1` handled separately)
+and serves the tokenized HTTPS phone panel on `:3031`. Plaintext 3030 is bound
+only to loopback and has no LAN fallback. The token is required on loopback as
+well as the LAN, is exchanged for listener-specific strict HttpOnly cookies
+(the LAN cookie is also `Secure`), and is then removed from the visible address
+bar. WebSocket and mutating HTTP requests must also be same-origin. The REMOTE
+section shows a QR only while LAN TLS is actually listening. HTTPS is required
+for iOS motion permission; a bare, stale, unauthenticated, or cross-origin
+control request receives 403.
 
 The native preview's **RECOVERY** strip remains useful when no browser is
-connected or the panel listener cannot bind. It reports the listener lifecycle
-separately from browser count, exposes the current tokenized **Open Panel** URL,
-and dispatches Freeze Program, Blackout, and **Revert Visuals** directly through
-the engine. It also shows the active library and provides **Choose Library** and
-**Rescan**, and it surfaces recoverable output and media-source status. The strip
-belongs only to the operator preview: it is hidden when single-monitor Output
-owns the main surface, and a dedicated output display is always clean.
+connected or a panel listener cannot bind. It reports IPv4 loopback, IPv6
+loopback, and LAN TLS independently from browser count, exposes the current
+tokenized **Open Panel** URL, and owns a bounded **Restart Panel** operation that
+joins the old generation before rebinding with a rotated token. TLS identity is
+one atomically published, user-protected certificate/key/SAN/digest generation;
+failure leaves LAN unavailable and removes the QR. The strip also dispatches
+Freeze Program, Blackout, and **Revert Visuals** directly through the engine,
+shows the active library, provides **Choose Library** and **Rescan**, and
+surfaces recoverable output and media-source status. It belongs only to the
+operator preview: it is hidden when single-monitor Output owns the main
+surface, and a dedicated output display is always clean.
 
 The panel is mobile-first below 900 px. Touch controls include pointer-safe XY
 input, layer drag-to-reorder, group resets, and double-tap/double-click reset
@@ -861,6 +867,27 @@ The exact persistence, failure, recorder, health, and StageMap contracts are in
 
 ## Precision and scale boundary
 
+<!-- BEGIN GENERATED CAPABILITY SUMMARY -->
+The authoritative, executable capability matrix is [generated here](docs/capability-registry.md).
+
+| Registry key | Windows | macOS | Linux |
+| --- | --- | --- | --- |
+| `accepted_creative_mutation_v1` | Implemented | Implemented | Implemented |
+| `study_motion_abi_1_1` | Implemented | Implemented | Implemented |
+| `proxy_browser_surface` | Implemented | Implemented | Implemented |
+| `transactional_control_listeners` | Implemented | Implemented | Implemented |
+| `correlated_engine_gpu_timing` | Implemented | Implemented | Implemented |
+| `source_descriptor_color_truth` | Implemented | Implemented | Implemented |
+| `supervised_gpu_recovery_phase_a` | Implemented | Implemented | Implemented |
+| `d3d11va_hardware_decode` | Evaluation required | Unavailable on platform | Unavailable on platform |
+| `final_program_vhs` | Implemented | Implemented | Implemented |
+| `live_recorder_audio_mux` | Deferred | Deferred | Deferred |
+| `exact_vfr_live_transport` | Deferred | Deferred | Deferred |
+| `spout_input` | Implemented | Unavailable on platform | Unavailable on platform |
+| `advanced_precision` | Implemented | Implemented | Implemented |
+| `full16_temporal_history` | Rejected by measurement | Rejected by measurement | Rejected by measurement |
+<!-- END GENERATED CAPABILITY SUMMARY -->
+
 Milestone 6 froze measurement and trust contracts rather than pretending that
 every evaluated integration shipped. `LegacyCompat8` remains the byte-exact
 compatibility path. The minimum Advanced executor uses eight straight-linear
@@ -901,14 +928,17 @@ sessions through an advisory record that can order eviction but never bypass
 a seal. Live playback observations still assess every measured video source
 and recommend a proxy from decode, upload, age, drop, and queue pressure.
 
-Study schema 1 / ABI 1.0 is a closed, at-most-1-MiB data-only SSA format with
-fixed read-only creative inputs and no native code, shader injection,
-filesystem, network, process, device, or host-mutation authority. It is not a
-general plugin ABI and its data license cannot license the host application.
-A Study document reaches the stage through the Study rack node: assigned and
-compiled in one action, content-addressed by digest, carried whole inside the
-patch's own bounded library, and executed by a fixed GPU interpreter under an
-explicit per-pixel load budget.
+Study schema 1 / ABIs 1.0 and 1.1 form a closed, at-most-1-MiB data-only SSA
+format with fixed read-only creative inputs and no native code, shader
+injection, filesystem, network, process, device, or host-mutation authority.
+ABI 1.0 remains byte-for-byte frozen; additive ABI 1.1 appends bounded vector
+component, magnitude, normalized-direction, dot-constant, and scalar-to-color
+operations so its declared motion input can reach output without coercion. It
+is not a general plugin ABI and its data license cannot license the host
+application. A Study document reaches the stage through the Study rack node:
+assigned and compiled in one action, content-addressed by digest, carried whole
+inside the patch's own bounded library, and executed by a fixed GPU interpreter
+under an explicit per-pixel load budget.
 
 Zero-copy decode, Syphon, NDI, external capture-input backends, and bounded
 mesh warping remain explicitly evidence-gated/deferred; no menu, schema,

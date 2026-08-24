@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "crate": {
+    "name": "wgpu-hal",
+    "version": "29.0.3",
+    "archive_url": "https://crates.io/api/v1/crates/wgpu-hal/29.0.3/download",
+    "archive_sha256": "31f8e1a9e7a8512f276f7c62e018c7fa8d60954303fed2e5750114332049193f"
+  },
+  "normalization": {
+    "upstream_files_intentionally_omitted": [
+      "Cargo.toml.orig"
+    ],
+    "vendor_generated_files": {
+      ".cargo-ok": "afbf9d0f3560b0fd7795e81c42a0a79ee6b6fc67e064f77826aee642cad28d91"
+    }
+  },
+  "intended_delta": {
+    "path": "src/vulkan/swapchain/native.rs",
+    "patch": "third_party/patches/wgpu-hal-29.0.3-surface-timeout.patch",
+    "patch_sha256": "0b6eae9c63d9101d04ae5ccefb9d3f7cacd60ed36d6e13ea30f4c645939f8f0a",
+    "upstream_sha256": "56a35a8604006d5fb092e4cf40e621032a91fe7ef6ca5091e4e0f8ef12d83193",
+    "vendored_sha256": "663c124c7b7716b1c4f77105364b1e95a60e96003c4434370fe156cc1e04336d",
+    "upstream_issue": "https://github.com/gfx-rs/wgpu/issues/9029"
+  }
+}

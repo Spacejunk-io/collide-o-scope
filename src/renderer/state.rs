@@ -1,5 +1,6 @@
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use winit::window::Window;
 
@@ -22,9 +23,9 @@ use crate::temporal::{
 
 use super::blend::composite_shader_source;
 use super::compositor::{
-    encode_matte_composite, encode_program_history_copy, validate_selective_matte_topology,
-    ImageRoutingGpuResources, ImageTapTexture, MatteCompositePipeline, MatteCompositeUniforms,
-    MatteResourceLimits, MatteResourcePlan,
+    encode_program_history_copy, validate_selective_matte_topology, ImageRoutingGpuResources,
+    ImageTapTexture, MatteCompositePipeline, MatteCompositeUniforms, MatteResourceLimits,
+    MatteResourcePlan,
 };
 use super::readback::{
     PreparedRgbaReadback, RecorderReadbackAdmission, RecorderReadbackAllocationSnapshot,
@@ -42,6 +43,7 @@ pub struct LiveFrameResources {
 
 struct LiveLayerResource {
     source: SourceTap,
+    source_resource_epoch: u64,
     texture_view: wgpu::TextureView,
 }
 
@@ -53,9 +55,13 @@ impl LiveFrameResources {
                 .enumerate()
                 .map(|(slot, layer)| LiveLayerResource {
                     source: SourceTap::new(layer.layer_id(), slot, layer.width, layer.height),
-                    texture_view: layer
-                        .texture
-                        .create_view(&wgpu::TextureViewDescriptor::default()),
+                    source_resource_epoch: layer.source_resource_epoch(),
+                    // Clone the layer-owned view handle.  This pins the exact
+                    // backing selected for the immutable frame without asking
+                    // the device to construct a new view every frame, and it
+                    // gives the stable bind-group cache a meaningful view
+                    // generation (the layer's resource epoch).
+                    texture_view: layer.texture_view.clone(),
                 })
                 .collect(),
         }
@@ -85,6 +91,18 @@ impl LiveFrameResources {
             ));
         }
         Ok(&resource.texture_view)
+    }
+
+    fn source_resource(&self, source: SourceTap) -> Result<(&wgpu::TextureView, u64), String> {
+        let view = self.texture_view(source)?;
+        let epoch = self.layers[source.slot].source_resource_epoch;
+        Ok((view, epoch))
+    }
+
+    fn contains_stable_id(&self, stable_id: u64) -> bool {
+        self.layers
+            .iter()
+            .any(|resource| resource.source.stable_id == stable_id)
     }
 }
 
@@ -209,6 +227,7 @@ struct TemporalBypassAudienceCandidate {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     opaque_output_bind_group: wgpu::BindGroup,
+    composite_bind_groups: [wgpu::BindGroup; 3],
     route: TemporalBypassAudienceRouteState,
 }
 
@@ -378,6 +397,7 @@ pub(crate) struct MoshInfluenceGpu {
     parity: usize,
     uniform_cursor: usize,
     valid: bool,
+    object_construction: super::core_gpu_objects::GpuObjectConstructionSnapshot,
 }
 
 impl MoshInfluencePipelines {
@@ -873,6 +893,13 @@ impl MoshInfluenceGpu {
                 parity: 0,
                 uniform_cursor: 0,
                 valid: false,
+                object_construction: super::core_gpu_objects::GpuObjectConstructionSnapshot {
+                    buffers: 2,
+                    bind_groups: 6,
+                    pipelines: 0,
+                    textures: 3,
+                    samplers: 0,
+                },
             }
         })
     }
@@ -896,6 +923,9 @@ impl MoshInfluenceGpu {
             .unwrap_or(required_capacity)
             .max(required_capacity);
         self.uniforms = MoshInfluenceUniformArena::build(device, &self.pipelines, grown_capacity)?;
+        self.object_construction.buffers = self.object_construction.buffers.saturating_add(2);
+        self.object_construction.bind_groups =
+            self.object_construction.bind_groups.saturating_add(2);
         Ok(())
     }
 
@@ -994,6 +1024,8 @@ impl MoshInfluenceGpu {
             coverage_group,
             direct_mask_groups,
         });
+        self.object_construction.bind_groups =
+            self.object_construction.bind_groups.saturating_add(3);
     }
 
     fn encode_mask(
@@ -1189,6 +1221,16 @@ impl MoshInfluenceGpu {
         mosh_influence_allocation_bytes(self.dimensions)
             .expect("validated Codec-Mosh influence dimensions")
     }
+
+    #[allow(
+        dead_code,
+        reason = "aggregated by the renderer's numeric P2b telemetry receipt"
+    )]
+    fn object_construction_snapshot(
+        &self,
+    ) -> super::core_gpu_objects::GpuObjectConstructionSnapshot {
+        self.object_construction
+    }
 }
 
 fn mosh_influence_allocation_bytes(dimensions: [u32; 2]) -> Option<u64> {
@@ -1348,6 +1390,261 @@ mod temporal_state_tests {
             renderer_owned_full_frame_texture_floor_bytes(u32::MAX, u32::MAX),
             None
         );
+    }
+
+    #[test]
+    fn p5_ping_pong_plans_zero_one_three_and_eight_layers_to_the_published_engine_slot() {
+        let frame_bytes = 1_920_u64 * 1_080 * 4;
+        for (layers, expected_initial_with_master, expected_initial_without_master) in [
+            (
+                0,
+                LogicalAccumulatorSlot::Scratch2,
+                LogicalAccumulatorSlot::Engine0,
+            ),
+            (
+                1,
+                LogicalAccumulatorSlot::Engine0,
+                LogicalAccumulatorSlot::Scratch2,
+            ),
+            (
+                3,
+                LogicalAccumulatorSlot::Engine0,
+                LogicalAccumulatorSlot::Scratch2,
+            ),
+            (
+                8,
+                LogicalAccumulatorSlot::Scratch2,
+                LogicalAccumulatorSlot::Engine0,
+            ),
+        ] {
+            for (apply_master, expected_initial) in [
+                (true, expected_initial_with_master),
+                (false, expected_initial_without_master),
+            ] {
+                let plan = LegacyAccumulatorPlan::new(layers, apply_master, 1_920, 1_080);
+                let transforms = layers as u64 + u64::from(apply_master);
+                assert_eq!(plan.initial, expected_initial);
+                assert_eq!(plan.final_slot(), LogicalAccumulatorSlot::PUBLISHED_ENGINE);
+                assert_eq!(plan.planned_work.render_passes, transforms);
+                assert_eq!(plan.planned_work.copy_passes, 0);
+                assert_eq!(plan.planned_work.copy_bytes, 0);
+                assert_eq!(plan.legacy_baseline.render_passes, transforms);
+                assert_eq!(plan.legacy_baseline.copy_passes, transforms);
+                assert_eq!(plan.legacy_baseline.copy_bytes, frame_bytes * transforms);
+            }
+        }
+    }
+
+    #[test]
+    fn p5_ping_pong_changes_only_resource_identity_not_srgb_quantization_count() {
+        for layers in [0, 1, 3, 8] {
+            let plan = LegacyAccumulatorPlan::new(layers, true, 3840, 2160);
+            assert_eq!(
+                plan.planned_work.render_passes, plan.legacy_baseline.render_passes,
+                "the exact historical shader-store count is the quantization contract"
+            );
+            let mut slot = plan.initial;
+            for _ in 0..plan.planned_work.render_passes {
+                let next = slot.alternate();
+                assert_ne!(slot, next, "one pass may not sample its attachment");
+                slot = next;
+            }
+            assert_eq!(slot, LogicalAccumulatorSlot::PUBLISHED_ENGINE);
+        }
+        assert_eq!(COMPOSITE_FORMAT, wgpu::TextureFormat::Rgba8UnormSrgb);
+    }
+
+    #[test]
+    fn p5_copy_byte_receipt_covers_720p_1080p_and_4k_at_one_three_and_eight_layers() {
+        for (width, height, frame_bytes) in [
+            (1_280, 720, 3_686_400_u64),
+            (1_920, 1_080, 8_294_400),
+            (3_840, 2_160, 33_177_600),
+        ] {
+            for layers in [1, 3, 8] {
+                let plan = LegacyAccumulatorPlan::new(layers, true, width, height);
+                let transforms = layers as u64 + 1;
+                assert_eq!(plan.planned_work.copy_passes, 0);
+                assert_eq!(plan.planned_work.copy_bytes, 0);
+                assert_eq!(plan.legacy_baseline.copy_passes, transforms);
+                assert_eq!(plan.legacy_baseline.copy_bytes, frame_bytes * transforms);
+            }
+        }
+    }
+
+    #[test]
+    fn p5_ordinary_accumulator_and_master_encode_no_full_frame_copies() {
+        let source = include_str!("state.rs");
+        let section = |start: &str, end: &str| {
+            let start = source.rfind(start).expect("P5 fixture start");
+            let tail = &source[start..];
+            let end = tail.find(end).expect("P5 fixture end");
+            &tail[..end]
+        };
+        let ordinary = section("fn render_evaluated_layers(\n", "fn render_routed_layers(");
+        let master = section(
+            "fn render_accumulator_master_pass(\n",
+            "fn render_materialized_routed_master_pass(",
+        );
+        assert!(!ordinary.contains("copy_texture_to_texture"));
+        assert!(!master.contains("copy_texture_to_texture"));
+        assert!(ordinary.contains("current_accumulator.alternate()"));
+        assert!(master.contains("current_accumulator.alternate()"));
+
+        let semantic_routed_master = section(
+            "fn render_materialized_routed_master_pass(\n",
+            "pub(crate) fn render_precomposed_temporal_bypass_overlay_engine(",
+        );
+        assert!(semantic_routed_master.contains("copy_texture_to_texture"));
+        assert!(semantic_routed_master.contains("PUBLISHED_ENGINE"));
+    }
+
+    #[test]
+    fn p5_clean_history_resolves_the_logical_accumulator_and_publication_is_proven() {
+        let source = include_str!("state.rs").replace("\r\n", "\n");
+        let resolver = source
+            .rfind("fn encode_program_history(\n")
+            .expect("logical history resolver");
+        let resolver_end = source[resolver..]
+            .find("fn preflight_temporal_bypass_overlay(")
+            .map(|offset| resolver + offset)
+            .expect("logical history resolver boundary");
+        let resolver_body = &source[resolver..resolver_end];
+        assert!(resolver_body.contains("accumulator: LogicalAccumulatorSlot"));
+        assert!(resolver_body.contains("self.logical_accumulator_texture(accumulator)"));
+
+        let render = source
+            .rfind("pub fn render_evaluated_frame(")
+            .expect("ordinary renderer entry");
+        let render_end = source[render..]
+            .find("fn render_evaluated_layers_with_conditional_master(")
+            .map(|offset| render + offset)
+            .expect("ordinary renderer boundary");
+        let render_body = &source[render..render_end];
+        assert!(
+            render_body.contains("self.encode_program_history(encoder, gpu, logical_accumulator)")
+        );
+        assert!(render_body.contains(
+            "logical_accumulator,\n            LogicalAccumulatorSlot::PUBLISHED_ENGINE"
+        ));
+    }
+
+    #[test]
+    fn p2b_arena_capacity_covers_every_admitted_exact_frame_consumer() {
+        let layers = crate::composition::MAX_COMPOSITION_LAYERS;
+        let taps = super::super::compositor::MAX_MATERIALIZED_IMAGE_TAPS as usize;
+        // Conditional local/master, one deferred Temporal-bypass prefix, one
+        // selective-VHS batch, and all materialized source taps may share the
+        // same submitted encoder. Master payloads are one reused arena slot
+        // per stage, not one slot per layer.
+        let worst_effect_slots = taps + layers + 1 + layers + 1 + layers + 1;
+        let worst_composite_slots = layers + layers;
+        assert!(CORE_EFFECT_UNIFORM_CAPACITY >= worst_effect_slots);
+        assert!(CORE_COMPOSITE_UNIFORM_CAPACITY >= worst_composite_slots);
+        assert!(CORE_MATTE_UNIFORM_CAPACITY >= layers);
+        assert_eq!(CORE_EFFECT_UNIFORM_CAPACITY, 1_104);
+        assert_eq!(CORE_COMPOSITE_UNIFORM_CAPACITY, 784);
+        assert_eq!(CORE_MATTE_UNIFORM_CAPACITY, 256);
+    }
+
+    #[test]
+    fn warmed_exact_fixture_bodies_construct_no_gpu_objects() {
+        let source = include_str!("state.rs");
+        let section = |start: &str, end: &str| {
+            let start = source.rfind(start).expect("fixture start");
+            let tail = &source[start..];
+            let end = tail.find(end).expect("fixture end");
+            &tail[..end]
+        };
+        for body in [
+            section("fn render_evaluated_layers(\n", "fn render_routed_layers("),
+            section(
+                "fn render_evaluated_layers_with_conditional_master(\n",
+                "fn render_accumulator_master_pass(",
+            ),
+            section("fn materialize_image_taps(\n", "fn encode_matte_composite("),
+            section(
+                "pub fn begin_selective_ntsc_readback(\n",
+                "pub fn map_selective_ntsc_readback(",
+            ),
+            section(
+                "fn encode_temporal_bypass_overlay_to_base(\n",
+                "fn ensure_selective_ntsc_gpu(",
+            ),
+        ] {
+            assert!(!body.contains("create_uploaded_uniform("));
+            assert!(!body.contains(".create_buffer("));
+            assert!(!body.contains(".create_bind_group("));
+            assert!(!body.contains(".create_render_pipeline("));
+            assert!(!body.contains(".create_texture("));
+            assert!(!body.contains(".create_sampler("));
+        }
+        let capture_start = source
+            .find("pub fn capture(layers: &[Layer])")
+            .expect("capture fixture start");
+        let capture_tail = &source[capture_start..];
+        let capture_end = capture_tail
+            .find("pub fn sources(")
+            .expect("capture fixture end");
+        let capture = &capture_tail[..capture_end];
+        assert!(!capture.contains(".create_view("));
+        assert!(capture.contains("layer.texture_view.clone()"));
+    }
+
+    #[test]
+    fn p2b_advanced_precomposed_cache_is_bounded_and_checks_every_backing_invalidator() {
+        assert_eq!(
+            PRECOMPOSED_BIND_GROUP_CACHE_CAPACITY,
+            crate::composition::MAX_COMPOSITION_LAYERS * 2,
+            "one stable-ID entry for each admitted layer and engine/audience base"
+        );
+
+        let state = include_str!("state.rs");
+        let start = state
+            .rfind("fn encode_precomposed_temporal_bypass_to_base(\n")
+            .expect("Advanced retained overlay encoder");
+        let tail = &state[start..];
+        let end = tail
+            .find("pub(crate) fn render_temporal_bypass_overlay_engine(")
+            .expect("Advanced retained overlay encoder boundary");
+        let warmed_body = &tail[..end];
+        assert!(warmed_body.contains(".precomposed_bind_groups("));
+        for construction in [
+            ".create_buffer(",
+            ".create_bind_group(",
+            ".create_render_pipeline(",
+            ".create_texture(",
+            ".create_sampler(",
+        ] {
+            assert!(
+                !warmed_body.contains(construction),
+                "warmed Advanced overlay encoder still contains {construction}"
+            );
+        }
+
+        let helper_start = state
+            .rfind("fn precomposed_bind_groups(\n")
+            .expect("Advanced cache resolver");
+        let helper_tail = &state[helper_start..start];
+        for invalidator in [
+            "&cached.source_texture == overlay.texture",
+            "&cached.base_texture == base_texture",
+            "cached.bypass_master_fx == overlay.bypass_master_fx",
+            "cached.master_output_slot == master_output_slot",
+            "cached.surface_generation == surface_generation",
+            "cached.renderer_generation == self.renderer_generation",
+        ] {
+            assert!(
+                helper_tail.contains(invalidator),
+                "Advanced cache omitted invalidator: {invalidator}"
+            );
+        }
+
+        let composition = include_str!("composition.rs");
+        assert!(composition.contains("texture: &surface.texture"));
+        let main = include_str!("../main.rs");
+        assert!(main.contains("stable_id: retained.stable_id"));
+        assert!(main.contains("texture: retained.texture"));
     }
 
     #[test]
@@ -1833,7 +2130,7 @@ mod temporal_state_tests {
             .find("self.preflight_temporal_bypass_overlay(resources, evaluated)?;")
             .expect("dry-overlay preflight");
         let first_render = render_body
-            .find("self.render_evaluated_layers(encoder, resources, evaluated)?;")
+            .find("let mut accumulator = self.render_evaluated_layers(")
             .expect("first direct render");
         assert!(preflight < first_render);
         assert!(render_body.contains("if isolated_temporal_overlay {\n                // Slot 0 contains only the wet partition here."));
@@ -2872,7 +3169,7 @@ mod temporal_state_tests {
             });
             pass.set_pipeline(&effects_pipeline);
             pass.set_bind_group(0, &effects_textures, &[]);
-            pass.set_bind_group(1, &effects_uniforms, &[]);
+            pass.set_bind_group(1, &effects_uniforms, &[0]);
             pass.draw(0..3, 0..1);
         }
         materialized
@@ -3712,22 +4009,8 @@ struct SelectiveNtscReadbackSlot {
 struct SelectiveNtscGpuState {
     scratch_textures: [wgpu::Texture; 2],
     scratch_views: [wgpu::TextureView; 2],
-    slot: SelectiveNtscReadbackSlot,
-}
-
-/// One frame's selective bindings. Keeping the uniform buffers beside their
-/// bind groups makes their lifetime explicit until command encoding finishes.
-struct SelectiveNtscLayerGpuBindings {
-    _uniform_buffer: wgpu::Buffer,
-    texture_bind_group: wgpu::BindGroup,
-    uniform_bind_group: wgpu::BindGroup,
-}
-
-struct SelectiveNtscBatchGpuBindings {
-    _master_uniform_buffer: wgpu::Buffer,
     master_texture_bind_group: wgpu::BindGroup,
-    master_uniform_bind_group: wgpu::BindGroup,
-    layers: Vec<SelectiveNtscLayerGpuBindings>,
+    slot: SelectiveNtscReadbackSlot,
 }
 
 /// Build the frozen Compat8 effects pipeline and layouts used by live Exact.
@@ -3775,8 +4058,10 @@ pub(crate) fn build_effects_pipeline(
             visibility: wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
+                has_dynamic_offset: true,
+                min_binding_size: std::num::NonZeroU64::new(
+                    std::mem::size_of::<EffectPassUniforms>() as u64,
+                ),
             },
             count: None,
         }],
@@ -4296,6 +4581,13 @@ pub(crate) fn build_opaque_output_bind_group(
             },
         ],
     })
+}
+
+/// D5's frozen live straight-alpha seam. The ordinary accumulator law proves
+/// publication into slot 0 before Temporal/display stages and the opaque
+/// audience pass; alpha exporters must resolve this identity, never slot 2.
+fn pre_opaque_straight_alpha_v1_view(views: &[wgpu::TextureView; 3]) -> &wgpu::TextureView {
+    &views[0]
 }
 
 pub(crate) fn encode_opaque_output(
@@ -4944,6 +5236,11 @@ pub(crate) fn temporal_bypass_overlay_indices(evaluated: &EvaluatedFramePlan) ->
 /// post-rack/post-layer-Motion image; the renderer owns only the late
 /// Master-bypass and opacity/blend admission over the wet audience.
 pub(crate) struct PrecomposedTemporalBypassLayer<'a> {
+    pub stable_id: crate::image_routing::StableLayerId,
+    /// Retained executor backing.  Comparing this handle, rather than a view
+    /// address or stack position, proves cache invalidation when Advanced
+    /// reallocates a layer surface under the same stable layer identity.
+    pub texture: &'a wgpu::Texture,
     pub view: &'a wgpu::TextureView,
     pub opacity: f32,
     pub blend_mode: crate::layers::BlendMode,
@@ -4971,6 +5268,93 @@ pub(crate) const fn conditional_layer_slots(bypass_master_fx: bool) -> Condition
             master_output: Some(2),
             composite_output: 1,
         }
+    }
+}
+
+/// The two retained textures which may own the straight-alpha result while
+/// the ordinary LegacyExact stack is being accumulated. Slot 1 remains the
+/// local-layer overlay, so alternating only 0/2 never introduces a read/write
+/// alias inside one composite pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogicalAccumulatorSlot {
+    Engine0,
+    Scratch2,
+}
+
+impl LogicalAccumulatorSlot {
+    const PUBLISHED_ENGINE: Self = Self::Engine0;
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Engine0 => 0,
+            Self::Scratch2 => 2,
+        }
+    }
+
+    const fn alternate(self) -> Self {
+        match self {
+            Self::Engine0 => Self::Scratch2,
+            Self::Scratch2 => Self::Engine0,
+        }
+    }
+}
+
+/// Immutable P5 decision for the ordinary layer/master topology. Choosing
+/// the initial identity from transform parity guarantees that every completed
+/// plan publishes on slot 0 without a normalization copy. The predecessor
+/// performed exactly the same shader passes and then copied every result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LegacyAccumulatorPlan {
+    initial: LogicalAccumulatorSlot,
+    composite_passes: u64,
+    master_passes: u64,
+    planned_work: super::core_gpu_objects::FullFrameWork,
+    legacy_baseline: super::core_gpu_objects::FullFrameWork,
+}
+
+impl LegacyAccumulatorPlan {
+    fn new(
+        composite_passes: usize,
+        apply_master: bool,
+        output_width: u32,
+        output_height: u32,
+    ) -> Self {
+        let composite_passes = composite_passes as u64;
+        let master_passes = u64::from(apply_master);
+        let render_passes = composite_passes.saturating_add(master_passes);
+        let initial = if render_passes % 2 == 0 {
+            LogicalAccumulatorSlot::Engine0
+        } else {
+            LogicalAccumulatorSlot::Scratch2
+        };
+        let full_frame_bytes = u64::from(output_width)
+            .saturating_mul(u64::from(output_height))
+            .saturating_mul(4);
+        Self {
+            initial,
+            composite_passes,
+            master_passes,
+            planned_work: super::core_gpu_objects::FullFrameWork {
+                render_passes,
+                copy_passes: 0,
+                copy_bytes: 0,
+            },
+            legacy_baseline: super::core_gpu_objects::FullFrameWork {
+                render_passes,
+                copy_passes: render_passes,
+                copy_bytes: full_frame_bytes.saturating_mul(render_passes),
+            },
+        }
+    }
+
+    const fn final_slot(self) -> LogicalAccumulatorSlot {
+        let mut slot = self.initial;
+        let mut remaining = self.composite_passes.saturating_add(self.master_passes);
+        while remaining > 0 {
+            slot = slot.alternate();
+            remaining -= 1;
+        }
+        slot
     }
 }
 
@@ -5029,6 +5413,72 @@ fn configure_surface_checked(
     health.error().map_or(Ok(()), Err)
 }
 
+/// Numeric-only adapter identity suitable for privacy-preserving receipts.
+/// Adapter, driver, and machine names deliberately do not cross this seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuHostFacts {
+    pub backend: wgpu::Backend,
+    pub pci_vendor_id: u32,
+    pub pci_device_id: u32,
+    pub driver_version: [u32; 4],
+    pub timestamp_query_supported: bool,
+}
+
+const CORE_EFFECT_UNIFORM_CAPACITY: usize = crate::composition::MAX_COMPOSITION_LAYERS * 4
+    + super::compositor::MAX_MATERIALIZED_IMAGE_TAPS as usize
+    + 16;
+const CORE_COMPOSITE_UNIFORM_CAPACITY: usize = crate::composition::MAX_COMPOSITION_LAYERS * 3 + 16;
+const CORE_MATTE_UNIFORM_CAPACITY: usize = crate::composition::MAX_COMPOSITION_LAYERS;
+const PRECOMPOSED_BIND_GROUP_CACHE_CAPACITY: usize = crate::composition::MAX_COMPOSITION_LAYERS * 2;
+static NEXT_RENDERER_GPU_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Default)]
+struct CoreUniformFrameCursor {
+    effect: usize,
+    composite: usize,
+    matte: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RoutedMatteDonorKey {
+    ProgramHistory,
+    AccumulatedBase,
+    MaterializedTap(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RoutedMatteBindGroupKey {
+    overlay_slot: u8,
+    donor: RoutedMatteDonorKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PrecomposedBaseRole {
+    Engine,
+    Audience,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PrecomposedBindGroupKey {
+    role: PrecomposedBaseRole,
+    stable_id: crate::image_routing::StableLayerId,
+}
+
+struct CachedPrecomposedBindGroups {
+    // Texture handles are retained deliberately.  Handle equality is wgpu's
+    // backing-resource identity and remains valid when Advanced constructs a
+    // fresh default view of the same texture; it also catches replacement of
+    // the backing under an otherwise unchanged stable layer ID.
+    source_texture: wgpu::Texture,
+    base_texture: wgpu::Texture,
+    bypass_master_fx: bool,
+    master_output_slot: usize,
+    surface_generation: u64,
+    renderer_generation: u64,
+    master_texture_group: Option<Arc<wgpu::BindGroup>>,
+    composite_texture_group: Arc<wgpu::BindGroup>,
+}
+
 pub struct Renderer {
     pub surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
@@ -5044,15 +5494,38 @@ pub struct Renderer {
     // cleanly instead of allowing wgpu's invalid-resource fallback to panic.
     gpu_health: GpuHealth,
 
+    // Optional P1 query/readback ring. Unsupported adapters retain an
+    // explicit state and request no timestamp feature; supported adapters own
+    // every timing allocation for this renderer's lifetime.
+    gpu_timing: crate::renderer::gpu_timing::GpuTiming,
+
+    // P2b: cumulative construction counters plus the two persistent Exact
+    // uniform arenas.  The queue law is explicit: Main submits the one frame
+    // encoder before the next call to `render_evaluated_frame`; wgpu queue
+    // writes and submissions share one ordered timeline.  Slots are unique
+    // within that encoder, then may be reused only after its submit has been
+    // enqueued, so an earlier GPU reader is never overwritten out of order.
+    core_gpu_objects: super::core_gpu_objects::GpuObjectConstructionCounters,
+    legacy_accumulator_work: super::core_gpu_objects::FullFrameWorkCounters,
+    effect_uniform_arena: super::core_gpu_objects::UniformArena,
+    composite_uniform_arena: super::core_gpu_objects::UniformArena,
+    matte_uniform_arena: super::core_gpu_objects::UniformArena,
+    core_uniform_cursor: RefCell<CoreUniformFrameCursor>,
+    source_effect_bind_groups: Mutex<super::core_gpu_objects::StableTextureBindGroupCache>,
+    internal_effect_bind_groups: [wgpu::BindGroup; 3],
+    internal_composite_bind_groups: [[wgpu::BindGroup; 3]; 3],
+    routed_matte_bind_groups: Mutex<BTreeMap<RoutedMatteBindGroupKey, Arc<wgpu::BindGroup>>>,
+    precomposed_bind_groups: Mutex<BTreeMap<PrecomposedBindGroupKey, CachedPrecomposedBindGroups>>,
+    renderer_generation: u64,
+    surface_generation: AtomicU64,
+
     // Effects pipeline (per-layer: applies pixelate/rgb_split/color to a single layer)
     effects_pipeline: wgpu::RenderPipeline,
     effects_bind_group_layout: wgpu::BindGroupLayout,
-    effects_uniform_layout: wgpu::BindGroupLayout,
 
     // Composite pipeline (blends overlay onto base)
     composite_pipeline: wgpu::RenderPipeline,
     composite_bind_group_layout: wgpu::BindGroupLayout,
-    composite_uniform_layout: wgpu::BindGroupLayout,
     matte_composite: MatteCompositePipeline,
     image_routing_gpu: Mutex<Option<ImageRoutingGpuResources>>,
 
@@ -5066,9 +5539,9 @@ pub struct Renderer {
     nearest_sampler: wgpu::Sampler,
 
     // Three textures for compositing:
-    // [0] = accumulated result (base)
+    // [0] = published engine accumulator (and one ping-pong identity)
     // [1] = current layer after effects (overlay)
-    // [2] = scratch during engine passes, then final opaque audience output
+    // [2] = alternate accumulator/scratch, then final opaque audience output
     pub composite_textures: [wgpu::Texture; 3],
     pub composite_views: [wgpu::TextureView; 3],
 
@@ -5245,9 +5718,11 @@ impl Renderer {
         )
         .map_err(|error| format!("unsupported renderer output dimensions: {error}"))?;
 
+        let gpu_timing_features =
+            crate::renderer::gpu_timing::GpuTiming::required_features(adapter.features());
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("Device"),
-            required_features: wgpu::Features::empty(),
+            required_features: gpu_timing_features,
             required_limits: wgpu::Limits::default(),
             ..Default::default()
         }))
@@ -5357,8 +5832,11 @@ impl Renderer {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                        has_dynamic_offset: true,
+                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<
+                            CompositeUniforms,
+                        >()
+                            as u64),
                     },
                     count: None,
                 }],
@@ -5514,7 +5992,7 @@ impl Renderer {
         let opaque_output_bind_group = build_opaque_output_bind_group(
             &device,
             &opaque_output_bind_group_layout,
-            &composite_views[0],
+            pre_opaque_straight_alpha_v1_view(&composite_views),
             &sampler,
         );
         let temporal_prepared = build_prepared_temporal_gpu_resources(
@@ -5526,6 +6004,84 @@ impl Renderer {
             &sampler,
             &feedback_view,
         );
+
+        let core_gpu_objects = super::core_gpu_objects::GpuObjectConstructionCounters::default();
+        let effect_uniform_arena = super::core_gpu_objects::UniformArena::new(
+            &device,
+            &effects_uniform_layout,
+            std::mem::size_of::<EffectPassUniforms>() as u64,
+            CORE_EFFECT_UNIFORM_CAPACITY,
+            CORE_EFFECT_UNIFORM_CAPACITY,
+            "Exact EffectPassUniforms arena",
+            &core_gpu_objects,
+        )
+        .map_err(|error| format!("Exact effects uniform arena refused: {error}"))?;
+        let composite_uniform_arena = super::core_gpu_objects::UniformArena::new(
+            &device,
+            &composite_uniform_layout,
+            std::mem::size_of::<CompositeUniforms>() as u64,
+            CORE_COMPOSITE_UNIFORM_CAPACITY,
+            CORE_COMPOSITE_UNIFORM_CAPACITY,
+            "Exact CompositeUniforms arena",
+            &core_gpu_objects,
+        )
+        .map_err(|error| format!("Exact composite uniform arena refused: {error}"))?;
+        let matte_uniform_arena = super::core_gpu_objects::UniformArena::new(
+            &device,
+            &matte_composite.uniform_layout,
+            std::mem::size_of::<MatteCompositeUniforms>() as u64,
+            CORE_MATTE_UNIFORM_CAPACITY,
+            CORE_MATTE_UNIFORM_CAPACITY,
+            "Exact MatteCompositeUniforms arena",
+            &core_gpu_objects,
+        )
+        .map_err(|error| format!("Exact matte uniform arena refused: {error}"))?;
+        let internal_effect_bind_groups = std::array::from_fn(|index| {
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Exact retained internal effects input"),
+                layout: &effects_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&composite_views[index]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&nearest_sampler),
+                    },
+                ],
+            });
+            core_gpu_objects.bind_group();
+            bind_group
+        });
+        let internal_composite_bind_groups = std::array::from_fn(|base| {
+            std::array::from_fn(|overlay| {
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Exact retained internal composite inputs"),
+                    layout: &composite_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&composite_views[base]),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&composite_views[overlay]),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&sampler),
+                        },
+                    ],
+                });
+                core_gpu_objects.bind_group();
+                bind_group
+            })
+        });
 
         let allocation_errors = [
             pollster::block_on(out_of_memory.pop()),
@@ -5553,6 +6109,25 @@ impl Renderer {
         if let Err(error) = &mosh_influence_pipelines {
             log::warn!("optional Codec-Mosh layer influence unavailable: {error}");
         }
+        // Timestamp telemetry is optional. Its fixed query/readback ring gets
+        // an isolated allocation scope so an adapter that advertises queries
+        // but refuses one of these resources degrades to explicit
+        // `unsupported` without invalidating the mandatory renderer.
+        let timing_validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let timing_internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let timing_out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let gpu_timing_candidate = crate::renderer::gpu_timing::GpuTiming::new(&device, &queue);
+        let timing_errors = [
+            pollster::block_on(timing_out_of_memory.pop()),
+            pollster::block_on(timing_internal.pop()),
+            pollster::block_on(timing_validation.pop()),
+        ];
+        let gpu_timing = if let Some(error) = timing_errors.into_iter().flatten().next() {
+            log::warn!("optional GPU timestamp telemetry unavailable: {error}");
+            crate::renderer::gpu_timing::GpuTiming::Unsupported
+        } else {
+            gpu_timing_candidate
+        };
 
         Ok(Self {
             surface,
@@ -5562,12 +6137,30 @@ impl Renderer {
             main_surface_suspended: false,
             main_needs_reconfigure: false,
             gpu_health,
+            gpu_timing,
+            core_gpu_objects,
+            legacy_accumulator_work: super::core_gpu_objects::FullFrameWorkCounters::default(),
+            effect_uniform_arena,
+            composite_uniform_arena,
+            matte_uniform_arena,
+            core_uniform_cursor: RefCell::new(CoreUniformFrameCursor::default()),
+            source_effect_bind_groups: Mutex::new(
+                super::core_gpu_objects::StableTextureBindGroupCache::new(
+                    crate::composition::MAX_COMPOSITION_LAYERS,
+                ),
+            ),
+            internal_effect_bind_groups,
+            internal_composite_bind_groups,
+            routed_matte_bind_groups: Mutex::new(BTreeMap::new()),
+            precomposed_bind_groups: Mutex::new(BTreeMap::new()),
+            renderer_generation: NEXT_RENDERER_GPU_GENERATION
+                .fetch_add(1, Ordering::Relaxed)
+                .max(1),
+            surface_generation: AtomicU64::new(1),
             effects_pipeline,
             effects_bind_group_layout,
-            effects_uniform_layout,
             composite_pipeline,
             composite_bind_group_layout,
-            composite_uniform_layout,
             matte_composite,
             image_routing_gpu: Mutex::new(None),
             opaque_output_pipeline,
@@ -5607,6 +6200,140 @@ impl Renderer {
             adapter,
             output: None,
         })
+    }
+
+    fn begin_core_gpu_frame(&self, resources: &LiveFrameResources) -> Result<(), String> {
+        *self.core_uniform_cursor.borrow_mut() = CoreUniformFrameCursor::default();
+        let mut cache = self
+            .source_effect_bind_groups
+            .lock()
+            .map_err(|_| "stable texture bind-group cache is poisoned".to_string())?;
+        cache.retain_stable_ids(|stable_id| resources.contains_stable_id(stable_id));
+        Ok(())
+    }
+
+    fn write_effect_uniform(&self, value: &EffectPassUniforms) -> Result<u32, String> {
+        let slot = {
+            let mut cursor = self.core_uniform_cursor.borrow_mut();
+            let slot = cursor.effect;
+            cursor.effect = cursor
+                .effect
+                .checked_add(1)
+                .ok_or_else(|| "Exact effects uniform arena frame cursor overflowed".to_string())?;
+            slot
+        };
+        self.effect_uniform_arena
+            .write(&self.queue, slot, value)
+            .map_err(|error| format!("Exact effects uniform arena refused frame: {error}"))
+    }
+
+    fn write_composite_uniform(&self, value: &CompositeUniforms) -> Result<u32, String> {
+        let slot = {
+            let mut cursor = self.core_uniform_cursor.borrow_mut();
+            let slot = cursor.composite;
+            cursor.composite = cursor.composite.checked_add(1).ok_or_else(|| {
+                "Exact composite uniform arena frame cursor overflowed".to_string()
+            })?;
+            slot
+        };
+        self.composite_uniform_arena
+            .write(&self.queue, slot, value)
+            .map_err(|error| format!("Exact composite uniform arena refused frame: {error}"))
+    }
+
+    fn write_matte_uniform(&self, value: &MatteCompositeUniforms) -> Result<u32, String> {
+        let slot = {
+            let mut cursor = self.core_uniform_cursor.borrow_mut();
+            let slot = cursor.matte;
+            cursor.matte = cursor
+                .matte
+                .checked_add(1)
+                .ok_or_else(|| "Exact matte uniform arena frame cursor overflowed".to_string())?;
+            slot
+        };
+        self.matte_uniform_arena
+            .write(&self.queue, slot, value)
+            .map_err(|error| format!("Exact matte uniform arena refused frame: {error}"))
+    }
+
+    fn source_effect_bind_group(
+        &self,
+        resources: &LiveFrameResources,
+        source: SourceTap,
+    ) -> Result<Arc<wgpu::BindGroup>, String> {
+        let (view, epoch) = resources.source_resource(source)?;
+        let key = super::core_gpu_objects::StableTextureViewKey {
+            stable_source_id: source.stable_id,
+            backing_view_generation: epoch,
+            raster: source.size,
+            surface_generation: self.surface_generation.load(Ordering::Relaxed),
+            renderer_generation: self.renderer_generation,
+        };
+        self.source_effect_bind_groups
+            .lock()
+            .map_err(|_| "stable texture bind-group cache is poisoned".to_string())?
+            .get_or_create_effects(
+                &self.device,
+                &self.effects_bind_group_layout,
+                &self.sampler,
+                &self.nearest_sampler,
+                view,
+                key,
+                &self.core_gpu_objects,
+            )
+    }
+
+    #[allow(
+        dead_code,
+        reason = "flight-recorder/resource-ledger integration consumes this numeric receipt"
+    )]
+    pub(crate) fn core_gpu_object_construction_snapshot(
+        &self,
+    ) -> super::core_gpu_objects::GpuObjectConstructionSnapshot {
+        self.core_gpu_objects.snapshot().saturating_add(
+            self.mosh_influence
+                .as_ref()
+                .map(MoshInfluenceGpu::object_construction_snapshot)
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Cumulative, completed-frame receipt for the P5 ordinary LegacyExact
+    /// accumulator topology. Semantic history/publication/readback copies are
+    /// intentionally outside this counter; they transfer ownership rather
+    /// than normalize an accumulator identity.
+    #[allow(
+        dead_code,
+        reason = "flight-recorder/performance evidence consumes this numeric receipt"
+    )]
+    pub(crate) fn legacy_accumulator_work_snapshot(
+        &self,
+    ) -> super::core_gpu_objects::FullFrameWorkSnapshot {
+        self.legacy_accumulator_work.snapshot()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "flight-recorder/resource-ledger integration consumes this physical byte count"
+    )]
+    pub(crate) fn core_uniform_arena_bytes(&self) -> u64 {
+        self.effect_uniform_arena
+            .byte_len()
+            .saturating_add(self.composite_uniform_arena.byte_len())
+            .saturating_add(self.matte_uniform_arena.byte_len())
+    }
+
+    #[allow(
+        dead_code,
+        reason = "flight-recorder/resource-ledger integration consumes invalidation reasons"
+    )]
+    pub(crate) fn core_texture_cache_invalidations(
+        &self,
+    ) -> Result<super::core_gpu_objects::TextureCacheInvalidationSnapshot, String> {
+        self.source_effect_bind_groups
+            .lock()
+            .map(|cache| cache.invalidations())
+            .map_err(|_| "stable texture bind-group cache is poisoned".to_string())
     }
 
     /// Open the fullscreen output window's rendering surface.
@@ -5754,6 +6481,11 @@ impl Renderer {
                 },
             ],
         });
+        self.core_gpu_objects.pipeline();
+        self.core_gpu_objects.bind_group();
+        if !suspended {
+            self.surface_generation.fetch_add(1, Ordering::Relaxed);
+        }
 
         self.output = Some(OutputTarget {
             window,
@@ -5770,6 +6502,56 @@ impl Renderer {
     /// Return the first terminal GPU/device error, if one has occurred.
     pub fn device_error(&self) -> Option<String> {
         self.gpu_health.error()
+    }
+
+    /// Process-local identity of the complete GPU resource generation. Upload
+    /// validation receipts use it to discard late errors from a retired
+    /// renderer without attributing them to replacement resources.
+    pub fn renderer_generation(&self) -> u64 {
+        self.renderer_generation
+    }
+
+    /// Fold a scoped upload OOM into the same terminal health latch as device
+    /// loss. Main already closes outputs and requests supervised recovery when
+    /// this latch is set; no second failure policy is introduced for uploads.
+    pub fn record_terminal_upload_error(&self, error: String) {
+        self.gpu_health.record(error);
+    }
+
+    pub(crate) fn begin_gpu_timing_frame(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        submission_generation: u64,
+    ) -> bool {
+        self.gpu_timing.begin_frame(encoder, submission_generation)
+    }
+
+    pub(crate) fn begin_gpu_timing_stage(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        stage: crate::renderer::gpu_timing::GpuStage,
+    ) {
+        self.gpu_timing.begin_stage(encoder, stage);
+    }
+
+    pub(crate) fn end_gpu_timing_stage(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        stage: crate::renderer::gpu_timing::GpuStage,
+    ) {
+        self.gpu_timing.end_stage(encoder, stage);
+    }
+
+    pub(crate) fn finish_gpu_timing_frame(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.gpu_timing.finish_frame(encoder);
+    }
+
+    pub(crate) fn cancel_gpu_timing_frame(&mut self) {
+        self.gpu_timing.cancel_frame();
+    }
+
+    pub(crate) fn poll_gpu_timing(&mut self) -> crate::renderer::gpu_timing::GpuTimingSnapshot {
+        self.gpu_timing.poll(&self.device)
     }
 
     /// Fail closed before issuing more GPU work after device loss. Recovering
@@ -5793,6 +6575,27 @@ impl Renderer {
                 format!("{} ({})", info.driver, info.driver_info)
             },
         )
+    }
+
+    /// Stable numeric facts for the private flight recorder and calibration
+    /// key.  Parsing keeps at most four numeric driver components; arbitrary
+    /// driver text and adapter names never enter durable evidence.
+    pub fn gpu_host_facts(&self) -> GpuHostFacts {
+        let info = self.adapter.get_info();
+        let driver_version = parse_driver_version(if info.driver_info.is_empty() {
+            &info.driver
+        } else {
+            &info.driver_info
+        });
+        GpuHostFacts {
+            backend: info.backend,
+            pci_vendor_id: info.vendor,
+            pci_device_id: info.device,
+            driver_version,
+            timestamp_query_supported: self.device.features().contains(
+                wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
+            ),
+        }
     }
 
     /// Create an additional presentation surface that is guaranteed to belong
@@ -5825,7 +6628,9 @@ impl Renderer {
         surface: &wgpu::Surface<'_>,
         config: &wgpu::SurfaceConfiguration,
     ) -> Result<(), String> {
-        configure_surface_checked(&self.device, surface, config, &self.gpu_health)
+        configure_surface_checked(&self.device, surface, config, &self.gpu_health)?;
+        self.surface_generation.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     fn ensure_temporal_bypass_audience_candidate(&self) -> Result<(), String> {
@@ -5862,10 +6667,33 @@ impl Renderer {
                     &view,
                     &self.sampler,
                 );
+                let composite_bind_groups = std::array::from_fn(|overlay_slot| {
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Retained Temporal Bypass Audience Composite Inputs"),
+                        layout: &self.composite_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &self.composite_views[overlay_slot],
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                        ],
+                    })
+                });
                 TemporalBypassAudienceCandidate {
                     texture,
                     view,
                     opaque_output_bind_group,
+                    composite_bind_groups,
                     route: TemporalBypassAudienceRouteState::default(),
                 }
             },
@@ -5873,6 +6701,11 @@ impl Renderer {
         self.ensure_device_healthy().map_err(|error| {
             format!("Temporal-bypass audience candidate allocation failed: {error}")
         })?;
+        self.core_gpu_objects.texture();
+        self.core_gpu_objects.bind_group();
+        for _ in 0..3 {
+            self.core_gpu_objects.bind_group();
+        }
         *retained = Some(candidate);
         Ok(())
     }
@@ -6348,6 +7181,7 @@ impl Renderer {
 
         if out.needs_reconfigure {
             configure_surface_checked(&self.device, &out.surface, &out.config, &self.gpu_health)?;
+            self.surface_generation.fetch_add(1, Ordering::Relaxed);
             out.needs_reconfigure = false;
         }
 
@@ -6364,6 +7198,7 @@ impl Renderer {
                     &out.config,
                     &self.gpu_health,
                 )?;
+                self.surface_generation.fetch_add(1, Ordering::Relaxed);
                 return Ok(None);
             }
             wgpu::CurrentSurfaceTexture::Lost => {
@@ -6642,6 +7477,9 @@ impl Renderer {
             0,
         )?;
         let snapshot = staging.allocation_snapshot(0);
+        for _ in 0..snapshot.buffers {
+            self.core_gpu_objects.buffer();
+        }
         *prepared = Some(PreparedRendererRecorderReadback {
             target,
             staging,
@@ -6874,6 +7712,7 @@ impl Renderer {
         }
         if self.main_needs_reconfigure {
             configure_surface_checked(&self.device, &self.surface, &self.config, &self.gpu_health)?;
+            self.surface_generation.fetch_add(1, Ordering::Relaxed);
             self.main_needs_reconfigure = false;
         }
         Ok(true)
@@ -6915,6 +7754,7 @@ impl Renderer {
         self.config.width = size.width;
         self.config.height = size.height;
         configure_surface_checked(&self.device, &surface, &self.config, &self.gpu_health)?;
+        self.surface_generation.fetch_add(1, Ordering::Relaxed);
         self.surface = surface;
         self.main_surface_suspended = false;
         self.main_needs_reconfigure = false;
@@ -6969,6 +7809,17 @@ impl Renderer {
                     "image-routing full-frame allocation",
                     || ImageRoutingGpuResources::build(&self.device, adapter_plan),
                 )?;
+                // One persistent ProgramHistory texture plus an optional tap
+                // array. Views are deliberately outside the five-object P2b
+                // counter contract.
+                self.core_gpu_objects.texture();
+                if adapter_plan.tap_layers > 0 {
+                    self.core_gpu_objects.texture();
+                }
+                self.routed_matte_bind_groups
+                    .lock()
+                    .map_err(|_| "routed matte bind-group cache is poisoned".to_string())?
+                    .clear();
                 *locked = Some(resources);
             }
             Some(resources) => {
@@ -6993,6 +7844,13 @@ impl Renderer {
                             )
                         },
                     )?;
+                    if adapter_plan.tap_layers > 0 {
+                        self.core_gpu_objects.texture();
+                    }
+                    self.routed_matte_bind_groups
+                        .lock()
+                        .map_err(|_| "routed matte bind-group cache is poisoned".to_string())?
+                        .clear();
                     resources.taps = taps;
                     resources.tap_layers = adapter_plan.tap_layers;
                 }
@@ -7037,39 +7895,8 @@ impl Renderer {
                 }
             }
             .ok_or_else(|| "image tap pass/layer alignment mismatch".to_string())?;
-            let input_view = resources.texture_view(layer.source)?;
-            let fx_buffer = create_uploaded_uniform(
-                &self.device,
-                &self.queue,
-                "Image Tap FX Uniforms",
-                pass_uniforms,
-            );
-            let texture_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Image Tap FX Input"),
-                layout: &self.effects_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(input_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
-                    },
-                ],
-            });
-            let uniform_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Image Tap FX Uniforms BG"),
-                layout: &self.effects_uniform_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: fx_buffer.as_entire_binding(),
-                }],
-            });
+            let texture_group = self.source_effect_bind_group(resources, layer.source)?;
+            let uniform_offset = self.write_effect_uniform(pass_uniforms)?;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Materialize Composition-Aligned Image Tap"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -7085,8 +7912,8 @@ impl Renderer {
                 ..Default::default()
             });
             pass.set_pipeline(&self.effects_pipeline);
-            pass.set_bind_group(0, &texture_group, &[]);
-            pass.set_bind_group(1, &uniform_group, &[]);
+            pass.set_bind_group(0, texture_group.as_ref(), &[]);
+            pass.set_bind_group(1, self.effect_uniform_arena.bind_group(), &[uniform_offset]);
             pass.draw(0..3, 0..1);
         }
         Ok(())
@@ -7095,24 +7922,86 @@ impl Renderer {
     fn encode_matte_composite(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        base: &wgpu::TextureView,
-        overlay: &wgpu::TextureView,
+        overlay_slot: usize,
         donor: &wgpu::TextureView,
+        donor_key: RoutedMatteDonorKey,
         output: &wgpu::TextureView,
         uniforms: MatteCompositeUniforms,
-    ) {
-        encode_matte_composite(
-            &self.device,
-            &self.queue,
-            encoder,
-            &self.matte_composite,
-            &self.sampler,
-            base,
-            overlay,
-            donor,
-            output,
-            uniforms,
-        );
+    ) -> Result<(), String> {
+        let overlay_slot = u8::try_from(overlay_slot)
+            .map_err(|_| "routed matte overlay slot exceeds u8".to_string())?;
+        let key = RoutedMatteBindGroupKey {
+            overlay_slot,
+            donor: donor_key,
+        };
+        let texture_group = {
+            let mut cache = self
+                .routed_matte_bind_groups
+                .lock()
+                .map_err(|_| "routed matte bind-group cache is poisoned".to_string())?;
+            if let Some(cached) = cache.get(&key) {
+                Arc::clone(cached)
+            } else {
+                let capacity = 2_usize
+                    .saturating_mul(super::compositor::MAX_MATERIALIZED_IMAGE_TAPS as usize + 2);
+                if cache.len() >= capacity {
+                    return Err(format!(
+                        "routed matte bind-group cache is full ({} admitted entries)",
+                        capacity
+                    ));
+                }
+                let bind_group =
+                    Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Retained routed matte inputs"),
+                        layout: &self.matte_composite.texture_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &self.composite_views[0],
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &self.composite_views[usize::from(overlay_slot)],
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(donor),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                        ],
+                    }));
+                self.core_gpu_objects.bind_group();
+                cache.insert(key, Arc::clone(&bind_group));
+                bind_group
+            }
+        };
+        let uniform_offset = self.write_matte_uniform(&uniforms)?;
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Routed Matte Composite Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: output,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        pass.set_pipeline(&self.matte_composite.pipeline);
+        pass.set_bind_group(0, texture_group.as_ref(), &[]);
+        pass.set_bind_group(1, self.matte_uniform_arena.bind_group(), &[uniform_offset]);
+        pass.draw(0..3, 0..1);
+        Ok(())
     }
 
     /// Copy slot 1 only at the requested stable layer's post-local boundary.
@@ -7163,19 +8052,31 @@ impl Renderer {
         })
     }
 
-    /// Render all plan-selected layers. Final result ends up in
-    /// `composite_views[0]`; authored `Layer` state is never consulted.
+    fn logical_accumulator_texture(&self, slot: LogicalAccumulatorSlot) -> &wgpu::Texture {
+        &self.composite_textures[slot.index()]
+    }
+
+    fn logical_accumulator_view(&self, slot: LogicalAccumulatorSlot) -> &wgpu::TextureView {
+        &self.composite_views[slot.index()]
+    }
+
+    /// Render all plan-selected layers into the alternate retained
+    /// accumulator on every composite pass. Authored `Layer` state is never
+    /// consulted; the returned identity is the sole source of truth for the
+    /// master pass and any clean-program consumer.
     fn render_evaluated_layers(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         resources: &LiveFrameResources,
         evaluated: &EvaluatedFramePlan,
-    ) -> Result<(), String> {
+        initial_accumulator: LogicalAccumulatorSlot,
+    ) -> Result<LogicalAccumulatorSlot, String> {
         // Render in reverse order: last layer in the vec is the bottom,
         // first layer (index 0, "Layer 1" in UI) ends up on top.
         let visible_layers =
             visible_stack_indices(evaluated.layers().iter().map(|layer| layer.visible));
         let isolated_temporal_overlay = temporal_bypass_overlay_active(evaluated);
+        let mut current_accumulator = initial_accumulator;
 
         // Visibility is a transport control, not just a compositing hint. If
         // every layer is hidden, clear the prior accumulation instead of
@@ -7184,7 +8085,7 @@ impl Renderer {
             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.composite_views[0],
+                    view: self.logical_accumulator_view(current_accumulator),
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(transparent_accumulation_clear()),
@@ -7195,7 +8096,7 @@ impl Renderer {
                 depth_stencil_attachment: None,
                 ..Default::default()
             });
-            return Ok(());
+            return Ok(current_accumulator);
         }
 
         // An all-dry stack still needs a defined empty wet input for the one
@@ -7209,7 +8110,7 @@ impl Renderer {
             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Clear Empty Temporal Wet Base"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.composite_views[0],
+                    view: self.logical_accumulator_view(current_accumulator),
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(transparent_accumulation_clear()),
@@ -7234,44 +8135,8 @@ impl Renderer {
                 continue;
             }
             let pass_uniforms = &evaluated.layer_passes()[layer_index];
-            let texture_view = resources.texture_view(layer.source)?;
-
-            // Each pass needs its own buffer because queue.write_buffer writes
-            // all execute before the encoder's render passes run on the GPU.
-            let fx_buffer = create_uploaded_uniform(
-                &self.device,
-                &self.queue,
-                "Layer FX Uniforms",
-                pass_uniforms,
-            );
-
-            let tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.effects_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
-                    },
-                ],
-            });
-
-            let uniform_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.effects_uniform_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: fx_buffer.as_entire_binding(),
-                }],
-            });
+            let tex_bg = self.source_effect_bind_group(resources, layer.source)?;
+            let fx_offset = self.write_effect_uniform(pass_uniforms)?;
 
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -7289,8 +8154,8 @@ impl Renderer {
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.effects_pipeline);
-                pass.set_bind_group(0, &tex_bg, &[]);
-                pass.set_bind_group(1, &uniform_bg, &[]);
+                pass.set_bind_group(0, tex_bg.as_ref(), &[]);
+                pass.set_bind_group(1, self.effect_uniform_arena.bind_group(), &[fx_offset]);
                 pass.draw(0..3, 0..1);
             }
             self.capture_legacy_layer_output(encoder, layer.source.stable_id)?;
@@ -7311,7 +8176,7 @@ impl Renderer {
                 encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Clear Base"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.composite_views[0],
+                        view: self.logical_accumulator_view(current_accumulator),
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(transparent_accumulation_clear()),
@@ -7324,54 +8189,22 @@ impl Renderer {
                 });
             }
             {
-                // Composite base[0] + overlay[1] → temp[2]
+                // Composite current base + overlay[1] into the other retained
+                // accumulator. Sampling and attachment identities are always
+                // distinct, so this is legal on every wgpu backend.
                 let composite_uniforms = CompositeUniforms {
                     opacity: layer.opacity,
                     blend_mode: layer.blend_mode.as_u32(),
                     _pad: [0.0; 2],
                 };
-                let comp_buffer = create_uploaded_uniform(
-                    &self.device,
-                    &self.queue,
-                    "Composite Uniforms",
-                    &composite_uniforms,
-                );
+                let composite_offset = self.write_composite_uniform(&composite_uniforms)?;
 
-                let composite_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Composite Textures BG"),
-                    layout: &self.composite_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&self.composite_views[0]),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&self.composite_views[1]),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
-                        },
-                    ],
-                });
-
-                let composite_uniform_bg =
-                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("Composite Uniform BG"),
-                        layout: &self.composite_uniform_layout,
-                        entries: &[wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: comp_buffer.as_entire_binding(),
-                        }],
-                    });
-
-                // Render composite to [2]
+                let next_accumulator = current_accumulator.alternate();
                 {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Composite Pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &self.composite_views[2],
+                            view: self.logical_accumulator_view(next_accumulator),
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -7383,35 +8216,23 @@ impl Renderer {
                         ..Default::default()
                     });
                     pass.set_pipeline(&self.composite_pipeline);
-                    pass.set_bind_group(0, &composite_tex_bg, &[]);
-                    pass.set_bind_group(1, &composite_uniform_bg, &[]);
+                    pass.set_bind_group(
+                        0,
+                        &self.internal_composite_bind_groups[current_accumulator.index()][1],
+                        &[],
+                    );
+                    pass.set_bind_group(
+                        1,
+                        self.composite_uniform_arena.bind_group(),
+                        &[composite_offset],
+                    );
                     pass.draw(0..3, 0..1);
                 }
-
-                // Copy [2] → [0] so it becomes the new accumulated base
-                encoder.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &self.composite_textures[2],
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &self.composite_textures[0],
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d {
-                        width: self.output_width,
-                        height: self.output_height,
-                        depth_or_array_layers: 1,
-                    },
-                );
+                current_accumulator = next_accumulator;
             }
             wet_stack_index += 1;
         }
-        Ok(())
+        Ok(current_accumulator)
     }
 
     fn render_routed_layers(
@@ -7440,84 +8261,22 @@ impl Renderer {
                 ..Default::default()
             });
             if path == MasterFxCompositionPath::LegacyPostComposite {
-                self.render_master_pass(encoder, evaluated.master_pass());
+                self.render_materialized_routed_master_pass(encoder, evaluated.master_pass())?;
             }
             return Ok(());
         }
 
-        let conditional_master_groups = (path == MasterFxCompositionPath::ConditionalPerLayer)
-            .then(|| {
-                let buffer = create_uploaded_uniform(
-                    &self.device,
-                    &self.queue,
-                    "Routed Conditional Master FX Uniforms",
-                    evaluated.master_pass(),
-                );
-                let texture_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Routed Conditional Master FX Input"),
-                    layout: &self.effects_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&self.composite_views[1]),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
-                        },
-                    ],
-                });
-                let uniform_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Routed Conditional Master FX Uniforms BG"),
-                    layout: &self.effects_uniform_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: buffer.as_entire_binding(),
-                    }],
-                });
-                (texture_group, uniform_group)
-            });
+        let conditional_master_offset = if path == MasterFxCompositionPath::ConditionalPerLayer {
+            Some(self.write_effect_uniform(evaluated.master_pass())?)
+        } else {
+            None
+        };
 
         for (stack_index, &layer_index) in visible_layers.iter().enumerate() {
             let layer = &evaluated.layers()[layer_index];
             let pass_uniforms = &evaluated.layer_passes()[layer_index];
-            let texture_view = resources.texture_view(layer.source)?;
-            let fx_buffer = create_uploaded_uniform(
-                &self.device,
-                &self.queue,
-                "Routed Layer FX Uniforms",
-                pass_uniforms,
-            );
-            let layer_texture_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Routed Layer FX Input"),
-                layout: &self.effects_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
-                    },
-                ],
-            });
-            let layer_uniform_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Routed Layer FX Uniforms BG"),
-                layout: &self.effects_uniform_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: fx_buffer.as_entire_binding(),
-                }],
-            });
+            let layer_texture_group = self.source_effect_bind_group(resources, layer.source)?;
+            let layer_offset = self.write_effect_uniform(pass_uniforms)?;
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Routed Layer FX Pass"),
@@ -7534,16 +8293,15 @@ impl Renderer {
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.effects_pipeline);
-                pass.set_bind_group(0, &layer_texture_group, &[]);
-                pass.set_bind_group(1, &layer_uniform_group, &[]);
+                pass.set_bind_group(0, layer_texture_group.as_ref(), &[]);
+                pass.set_bind_group(1, self.effect_uniform_arena.bind_group(), &[layer_offset]);
                 pass.draw(0..3, 0..1);
             }
             self.capture_legacy_layer_output(encoder, layer.source.stable_id)?;
 
             let mut overlay_slot = 1;
             if path == MasterFxCompositionPath::ConditionalPerLayer && !layer.bypass_master_fx {
-                let (master_texture_group, master_uniform_group) = conditional_master_groups
-                    .as_ref()
+                let master_offset = conditional_master_offset
                     .ok_or_else(|| "conditional master groups are missing".to_string())?;
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Routed Conditional Master FX Pass"),
@@ -7560,8 +8318,8 @@ impl Renderer {
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.effects_pipeline);
-                pass.set_bind_group(0, master_texture_group, &[]);
-                pass.set_bind_group(1, master_uniform_group, &[]);
+                pass.set_bind_group(0, &self.internal_effect_bind_groups[1], &[]);
+                pass.set_bind_group(1, self.effect_uniform_arena.bind_group(), &[master_offset]);
                 pass.draw(0..3, 0..1);
                 overlay_slot = 2;
             }
@@ -7589,11 +8347,11 @@ impl Renderer {
                 .get(layer_index)
                 .ok_or_else(|| "image matte/layer alignment mismatch".to_string())?;
             let mut params = matte.params;
-            let donor_view = match matte.resolved_input {
+            let (donor_view, donor_key) = match matte.resolved_input {
                 ResolvedImageInput::Disabled => {
                     params.amount = 0.0;
                     params.donor_valid = false;
-                    &gpu.history.view
+                    (&gpu.history.view, RoutedMatteDonorKey::ProgramHistory)
                 }
                 ResolvedImageInput::MaterializedTap { tap_index } => {
                     let tap = evaluated
@@ -7603,7 +8361,8 @@ impl Renderer {
                         .ok_or_else(|| {
                             format!("resolved matte refers to missing tap {tap_index}")
                         })?;
-                    gpu.taps
+                    let view = gpu
+                        .taps
                         .as_ref()
                         .and_then(|texture| texture.views.get(tap.array_layer as usize))
                         .ok_or_else(|| {
@@ -7611,16 +8370,20 @@ impl Renderer {
                                 "resolved matte tap array layer {} is missing",
                                 tap.array_layer
                             )
-                        })?
+                        })?;
+                    (view, RoutedMatteDonorKey::MaterializedTap(tap.array_layer))
                 }
-                ResolvedImageInput::AllBelow => &self.composite_views[0],
+                ResolvedImageInput::AllBelow => (
+                    &self.composite_views[0],
+                    RoutedMatteDonorKey::AccumulatedBase,
+                ),
                 ResolvedImageInput::ProgramHistory => {
                     params.donor_valid &= gpu.history_valid;
-                    &gpu.history.view
+                    (&gpu.history.view, RoutedMatteDonorKey::ProgramHistory)
                 }
                 ResolvedImageInput::Transparent => {
                     params.donor_valid = false;
-                    &gpu.history.view
+                    (&gpu.history.view, RoutedMatteDonorKey::ProgramHistory)
                 }
             };
             let output_slot = if overlay_slot == 1 { 2 } else { 1 };
@@ -7628,12 +8391,12 @@ impl Renderer {
                 MatteCompositeUniforms::new(layer.opacity, layer.blend_mode.as_u32(), params);
             self.encode_matte_composite(
                 encoder,
-                &self.composite_views[0],
-                &self.composite_views[overlay_slot],
+                overlay_slot,
                 donor_view,
+                donor_key,
                 &self.composite_views[output_slot],
                 uniforms,
-            );
+            )?;
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.composite_textures[output_slot],
@@ -7656,7 +8419,7 @@ impl Renderer {
         }
 
         if path == MasterFxCompositionPath::LegacyPostComposite {
-            self.render_master_pass(encoder, evaluated.master_pass());
+            self.render_materialized_routed_master_pass(encoder, evaluated.master_pass())?;
         }
         Ok(())
     }
@@ -7665,8 +8428,9 @@ impl Renderer {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         gpu: &mut ImageRoutingGpuResources,
+        accumulator: LogicalAccumulatorSlot,
     ) {
-        encode_program_history_copy(encoder, &self.composite_textures[0], gpu);
+        encode_program_history_copy(encoder, self.logical_accumulator_texture(accumulator), gpu);
     }
 
     /// Validate every fallible fact needed by the deferred dry prefix before
@@ -7742,6 +8506,7 @@ impl Renderer {
         if evaluated.layers().len() != evaluated.layer_pre_passes().len() {
             return Err("evaluated layer/pre-pass alignment mismatch".into());
         }
+        self.begin_core_gpu_frame(resources)?;
         let isolated_temporal_overlay = temporal_bypass_overlay_active(evaluated);
         let authored_temporal_bypass = evaluated
             .layers()
@@ -7798,28 +8563,74 @@ impl Renderer {
             self.render_routed_layers(encoder, resources, evaluated, gpu, path)?;
             // Capture after local/composite/master and before the caller's
             // temporal or NTSC stage: this is the exact clean program at N.
-            self.encode_program_history(encoder, gpu);
+            self.encode_program_history(encoder, gpu, LogicalAccumulatorSlot::PUBLISHED_ENGINE);
             return Ok(());
         }
 
-        match path {
+        let logical_accumulator = match path {
             MasterFxCompositionPath::LegacyPostComposite => {
-                // Keep this sequence exactly equivalent to the pre-bypass
-                // renderer for old patches and all-inherited performances.
-                self.render_evaluated_layers(encoder, resources, evaluated)?;
-                if !isolated_temporal_overlay || temporal_bypass_wet_layer_contributes(evaluated) {
-                    self.render_master_pass(encoder, evaluated.master_pass());
+                let composite_passes = evaluated
+                    .layers()
+                    .iter()
+                    .filter(|layer| {
+                        layer.visible && !(isolated_temporal_overlay && layer.bypass_temporal_fx)
+                    })
+                    .count();
+                let apply_master =
+                    !isolated_temporal_overlay || temporal_bypass_wet_layer_contributes(evaluated);
+                let accumulator_plan = LegacyAccumulatorPlan::new(
+                    composite_passes,
+                    apply_master,
+                    self.output_width,
+                    self.output_height,
+                );
+                debug_assert_eq!(
+                    accumulator_plan.final_slot(),
+                    LogicalAccumulatorSlot::PUBLISHED_ENGINE
+                );
+
+                let mut accumulator = self.render_evaluated_layers(
+                    encoder,
+                    resources,
+                    evaluated,
+                    accumulator_plan.initial,
+                )?;
+                if apply_master {
+                    accumulator = self.render_accumulator_master_pass(
+                        encoder,
+                        evaluated.master_pass(),
+                        accumulator,
+                    )?;
                 }
+                if accumulator != LogicalAccumulatorSlot::PUBLISHED_ENGINE {
+                    return Err(format!(
+                        "ordinary accumulator plan ended on slot {}; expected published slot 0",
+                        accumulator.index()
+                    ));
+                }
+                self.legacy_accumulator_work.record_completed(
+                    accumulator_plan.planned_work,
+                    super::core_gpu_objects::FullFrameWork {
+                        render_passes: accumulator_plan
+                            .composite_passes
+                            .saturating_add(accumulator_plan.master_passes),
+                        copy_passes: 0,
+                        copy_bytes: 0,
+                    },
+                    accumulator_plan.legacy_baseline,
+                );
+                accumulator
             }
             MasterFxCompositionPath::ConditionalPerLayer => {
                 self.render_evaluated_layers_with_conditional_master(
                     encoder, resources, evaluated,
                 )?;
+                LogicalAccumulatorSlot::PUBLISHED_ENGINE
             }
-        }
+        };
         // Once routing has ever been used, keep exactly one clean N-1 image
-        // current even through disabled frames. This copy does not alter the
-        // untouched legacy render/composite command sequence or arithmetic.
+        // current even through disabled frames. This is a semantic history
+        // publication copy; it does not normalize either accumulator.
         let mut locked = self
             .image_routing_gpu
             .lock()
@@ -7831,9 +8642,14 @@ impl Renderer {
                 // pixels when the route is later re-enabled.
                 gpu.history_valid = false;
             } else {
-                self.encode_program_history(encoder, gpu);
+                self.encode_program_history(encoder, gpu, logical_accumulator);
             }
         }
+        debug_assert_eq!(
+            logical_accumulator,
+            LogicalAccumulatorSlot::PUBLISHED_ENGINE,
+            "every downstream Exact consumer shares the published engine seam"
+        );
         Ok(())
     }
 
@@ -7855,39 +8671,9 @@ impl Renderer {
         }));
 
         // Every inherited layer reads the local-FX image from slot 1. Reuse
-        // one immutable master uniform buffer and bind groups for all of them.
-        let master_buffer = create_uploaded_uniform(
-            &self.device,
-            &self.queue,
-            "Conditional Master FX Uniforms",
-            evaluated.master_pass(),
-        );
-        let master_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Conditional Master FX Input"),
-            layout: &self.effects_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self.composite_views[1]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
-                },
-            ],
-        });
-        let master_uniform_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Conditional Master FX Uniforms BG"),
-            layout: &self.effects_uniform_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: master_buffer.as_entire_binding(),
-            }],
-        });
+        // one arena slot and the renderer-owned texture binding for all of
+        // them.
+        let master_offset = self.write_effect_uniform(evaluated.master_pass())?;
 
         let mut wet_stack_index = 0_usize;
         for (stack_index, &layer_index) in visible_layers.iter().enumerate() {
@@ -7897,39 +8683,8 @@ impl Renderer {
                 continue;
             }
             let pass_uniforms = &evaluated.layer_passes()[layer_index];
-            let texture_view = resources.texture_view(layer.source)?;
-            let fx_buffer = create_uploaded_uniform(
-                &self.device,
-                &self.queue,
-                "Conditional Layer FX Uniforms",
-                pass_uniforms,
-            );
-            let layer_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Conditional Layer FX Input"),
-                layout: &self.effects_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
-                    },
-                ],
-            });
-            let layer_uniform_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Conditional Layer FX Uniforms BG"),
-                layout: &self.effects_uniform_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: fx_buffer.as_entire_binding(),
-                }],
-            });
+            let layer_tex_bg = self.source_effect_bind_group(resources, layer.source)?;
+            let layer_offset = self.write_effect_uniform(pass_uniforms)?;
 
             // Source -> local layer FX -> slot 1.
             {
@@ -7948,8 +8703,8 @@ impl Renderer {
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.effects_pipeline);
-                pass.set_bind_group(0, &layer_tex_bg, &[]);
-                pass.set_bind_group(1, &layer_uniform_bg, &[]);
+                pass.set_bind_group(0, layer_tex_bg.as_ref(), &[]);
+                pass.set_bind_group(1, self.effect_uniform_arena.bind_group(), &[layer_offset]);
                 pass.draw(0..3, 0..1);
             }
             self.capture_legacy_layer_output(encoder, layer.source.stable_id)?;
@@ -7977,8 +8732,8 @@ impl Renderer {
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.effects_pipeline);
-                pass.set_bind_group(0, &master_tex_bg, &[]);
-                pass.set_bind_group(1, &master_uniform_bg, &[]);
+                pass.set_bind_group(0, &self.internal_effect_bind_groups[1], &[]);
+                pass.set_bind_group(1, self.effect_uniform_arena.bind_group(), &[master_offset]);
                 pass.draw(0..3, 0..1);
             }
 
@@ -8007,40 +8762,7 @@ impl Renderer {
                 blend_mode: layer.blend_mode.as_u32(),
                 _pad: [0.0; 2],
             };
-            let comp_buffer = create_uploaded_uniform(
-                &self.device,
-                &self.queue,
-                "Conditional Composite Uniforms",
-                &composite_uniforms,
-            );
-            let composite_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Conditional Composite Textures BG"),
-                layout: &self.composite_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&self.composite_views[0]),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(
-                            &self.composite_views[overlay_slot],
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
-            let composite_uniform_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Conditional Composite Uniform BG"),
-                layout: &self.composite_uniform_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: comp_buffer.as_entire_binding(),
-                }],
-            });
+            let composite_offset = self.write_composite_uniform(&composite_uniforms)?;
 
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -8058,8 +8780,16 @@ impl Renderer {
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.composite_pipeline);
-                pass.set_bind_group(0, &composite_tex_bg, &[]);
-                pass.set_bind_group(1, &composite_uniform_bg, &[]);
+                pass.set_bind_group(
+                    0,
+                    &self.internal_composite_bind_groups[0][overlay_slot],
+                    &[],
+                );
+                pass.set_bind_group(
+                    1,
+                    self.composite_uniform_arena.bind_group(),
+                    &[composite_offset],
+                );
                 pass.draw(0..3, 0..1);
             }
 
@@ -8087,54 +8817,25 @@ impl Renderer {
         Ok(())
     }
 
-    /// Apply master effects to the final composite (already in [0]).
-    /// Reads [0], applies effects → [2], copies back to [0].
-    fn render_master_pass(
+    /// Apply master effects from the logical accumulator into its alternate.
+    /// The returned identity replaces the old full-frame normalization copy.
+    fn render_accumulator_master_pass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         pass_uniforms: &EffectPassUniforms,
-    ) {
-        let fx_buffer = create_uploaded_uniform(
-            &self.device,
-            &self.queue,
-            "Master FX Uniforms",
-            pass_uniforms,
-        );
+        current_accumulator: LogicalAccumulatorSlot,
+    ) -> Result<LogicalAccumulatorSlot, String> {
+        let fx_offset = self.write_effect_uniform(pass_uniforms)?;
+        let next_accumulator = current_accumulator.alternate();
 
-        let tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Master FX Input"),
-            layout: &self.effects_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self.composite_views[0]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
-                },
-            ],
-        });
-
-        let uniform_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Master FX Uniforms BG"),
-            layout: &self.effects_uniform_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: fx_buffer.as_entire_binding(),
-            }],
-        });
-
-        // Render effects from [0] → [2]
+        // Render effects from the logical current image into the other
+        // retained accumulator. The shader and its one Rgba8UnormSrgb store
+        // are unchanged from the historical path.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Master FX Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.composite_views[2],
+                    view: self.logical_accumulator_view(next_accumulator),
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -8146,21 +8847,43 @@ impl Renderer {
                 ..Default::default()
             });
             pass.set_pipeline(&self.effects_pipeline);
-            pass.set_bind_group(0, &tex_bg, &[]);
-            pass.set_bind_group(1, &uniform_bg, &[]);
+            pass.set_bind_group(
+                0,
+                &self.internal_effect_bind_groups[current_accumulator.index()],
+                &[],
+            );
+            pass.set_bind_group(1, self.effect_uniform_arena.bind_group(), &[fx_offset]);
             pass.draw(0..3, 0..1);
         }
+        Ok(next_accumulator)
+    }
 
-        // Copy [2] → [0]
+    /// Routed mattes need all three historical slots simultaneously (base,
+    /// local/mastered overlay, destination). Until that topology owns a
+    /// fourth surface or a separately proven planner, its master result must
+    /// be materialized on the routed slot-0 contract before AllBelow/history
+    /// can observe it. This is deliberately named as a retained semantic
+    /// ownership copy and is excluded from the ordinary P5 counters.
+    fn render_materialized_routed_master_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pass_uniforms: &EffectPassUniforms,
+    ) -> Result<(), String> {
+        let rendered = self.render_accumulator_master_pass(
+            encoder,
+            pass_uniforms,
+            LogicalAccumulatorSlot::Engine0,
+        )?;
+        debug_assert_eq!(rendered, LogicalAccumulatorSlot::Scratch2);
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.composite_textures[2],
+                texture: self.logical_accumulator_texture(rendered),
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyTextureInfo {
-                texture: &self.composite_textures[0],
+                texture: self.logical_accumulator_texture(LogicalAccumulatorSlot::PUBLISHED_ENGINE),
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -8171,6 +8894,7 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
+        Ok(())
     }
 
     /// Recompose executor-retained Advanced dry layers over the straight-alpha
@@ -8186,16 +8910,18 @@ impl Renderer {
         if overlays.is_empty() {
             return Ok(false);
         }
+        *self.core_uniform_cursor.borrow_mut() = CoreUniformFrameCursor::default();
         self.encode_precomposed_temporal_bypass_to_base(
             encoder,
             overlays,
             master_pass,
+            PrecomposedBaseRole::Engine,
             &self.composite_textures[0],
             &self.composite_views[0],
             1,
             2,
             2,
-        );
+        )?;
         Ok(true)
     }
 
@@ -8211,6 +8937,7 @@ impl Renderer {
         if overlays.is_empty() {
             return Ok(false);
         }
+        *self.core_uniform_cursor.borrow_mut() = CoreUniformFrameCursor::default();
         self.ensure_temporal_bypass_audience_candidate()?;
         let mut retained = self.temporal_bypass_audience_candidate.borrow_mut();
         let candidate = retained
@@ -8241,12 +8968,13 @@ impl Renderer {
             encoder,
             overlays,
             master_pass,
+            PrecomposedBaseRole::Audience,
             &candidate.texture,
             &candidate.view,
             0,
             0,
             1,
-        );
+        )?;
         encode_opaque_output(
             encoder,
             &self.opaque_output_pipeline,
@@ -8276,55 +9004,166 @@ impl Renderer {
         Ok(true)
     }
 
+    fn prune_precomposed_bind_groups(
+        &self,
+        role: PrecomposedBaseRole,
+        overlays: &[PrecomposedTemporalBypassLayer<'_>],
+    ) -> Result<(), String> {
+        if overlays.len() > crate::composition::MAX_COMPOSITION_LAYERS {
+            return Err(format!(
+                "Advanced Temporal-bypass cache refused {} overlays; admitted maximum is {}",
+                overlays.len(),
+                crate::composition::MAX_COMPOSITION_LAYERS
+            ));
+        }
+        let mut cache = self
+            .precomposed_bind_groups
+            .lock()
+            .map_err(|_| "Advanced Temporal-bypass bind-group cache is poisoned".to_string())?;
+        cache.retain(|key, _| {
+            key.role != role
+                || overlays
+                    .iter()
+                    .any(|overlay| overlay.stable_id == key.stable_id)
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn precomposed_bind_groups(
+        &self,
+        overlay: &PrecomposedTemporalBypassLayer<'_>,
+        base_role: PrecomposedBaseRole,
+        base_texture: &wgpu::Texture,
+        base_view: &wgpu::TextureView,
+        master_output_slot: usize,
+    ) -> Result<(Option<Arc<wgpu::BindGroup>>, Arc<wgpu::BindGroup>), String> {
+        let key = PrecomposedBindGroupKey {
+            role: base_role,
+            stable_id: overlay.stable_id,
+        };
+        let surface_generation = self.surface_generation.load(Ordering::Relaxed);
+        let mut cache = self
+            .precomposed_bind_groups
+            .lock()
+            .map_err(|_| "Advanced Temporal-bypass bind-group cache is poisoned".to_string())?;
+        if let Some(cached) = cache.get(&key) {
+            if &cached.source_texture == overlay.texture
+                && &cached.base_texture == base_texture
+                && cached.bypass_master_fx == overlay.bypass_master_fx
+                && cached.master_output_slot == master_output_slot
+                && cached.surface_generation == surface_generation
+                && cached.renderer_generation == self.renderer_generation
+            {
+                return Ok((
+                    cached.master_texture_group.clone(),
+                    Arc::clone(&cached.composite_texture_group),
+                ));
+            }
+        }
+        if !cache.contains_key(&key) && cache.len() >= PRECOMPOSED_BIND_GROUP_CACHE_CAPACITY {
+            return Err(format!(
+                "Advanced Temporal-bypass cache exhausted its admitted {} entries",
+                PRECOMPOSED_BIND_GROUP_CACHE_CAPACITY
+            ));
+        }
+
+        let master_texture_group = (!overlay.bypass_master_fx).then(|| {
+            self.core_gpu_objects.bind_group();
+            Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Advanced retained Temporal Bypass Master FX Input"),
+                layout: &self.effects_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(overlay.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
+                    },
+                ],
+            }))
+        });
+        let final_overlay_view = if overlay.bypass_master_fx {
+            overlay.view
+        } else {
+            &self.composite_views[master_output_slot]
+        };
+        self.core_gpu_objects.bind_group();
+        let composite_texture_group =
+            Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Advanced retained Temporal Bypass Composite Inputs"),
+                layout: &self.composite_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(base_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(final_overlay_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            }));
+        let result = (
+            master_texture_group.clone(),
+            Arc::clone(&composite_texture_group),
+        );
+        cache.insert(
+            key,
+            CachedPrecomposedBindGroups {
+                source_texture: overlay.texture.clone(),
+                base_texture: base_texture.clone(),
+                bypass_master_fx: overlay.bypass_master_fx,
+                master_output_slot,
+                surface_generation,
+                renderer_generation: self.renderer_generation,
+                master_texture_group,
+                composite_texture_group,
+            },
+        );
+        debug_assert!(
+            cache.len() <= PRECOMPOSED_BIND_GROUP_CACHE_CAPACITY,
+            "one retained Advanced Temporal-bypass entry per admitted layer and base role"
+        );
+        Ok(result)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn encode_precomposed_temporal_bypass_to_base(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         overlays: &[PrecomposedTemporalBypassLayer<'_>],
         master_pass: &EffectPassUniforms,
+        base_role: PrecomposedBaseRole,
         base_texture: &wgpu::Texture,
         base_view: &wgpu::TextureView,
         master_output_slot: usize,
         bypass_output_slot: usize,
         inherited_output_slot: usize,
-    ) {
-        let master_buffer = create_uploaded_uniform(
-            &self.device,
-            &self.queue,
-            "Advanced Temporal Bypass Master FX Uniforms",
-            master_pass,
-        );
-        let master_uniform_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Advanced Temporal Bypass Master FX Uniforms BG"),
-            layout: &self.effects_uniform_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: master_buffer.as_entire_binding(),
-            }],
-        });
+    ) -> Result<(), String> {
+        self.prune_precomposed_bind_groups(base_role, overlays)?;
+        let master_offset = self.write_effect_uniform(master_pass)?;
         for overlay in overlays {
-            let (overlay_view, output_slot) = if overlay.bypass_master_fx {
-                (overlay.view, bypass_output_slot)
+            let (master_texture_group, composite_texture_group) = self.precomposed_bind_groups(
+                overlay,
+                base_role,
+                base_texture,
+                base_view,
+                master_output_slot,
+            )?;
+            let output_slot = if overlay.bypass_master_fx {
+                bypass_output_slot
             } else {
-                let master_texture_group =
-                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("Advanced Temporal Bypass Master FX Input"),
-                        layout: &self.effects_bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(overlay.view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(&self.sampler),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
-                            },
-                        ],
-                    });
                 {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Advanced Temporal Bypass Inherited Master FX"),
@@ -8341,53 +9180,27 @@ impl Renderer {
                         ..Default::default()
                     });
                     pass.set_pipeline(&self.effects_pipeline);
-                    pass.set_bind_group(0, &master_texture_group, &[]);
-                    pass.set_bind_group(1, &master_uniform_group, &[]);
+                    pass.set_bind_group(
+                        0,
+                        master_texture_group
+                            .as_deref()
+                            .expect("inherited Master FX has one retained input group"),
+                        &[],
+                    );
+                    pass.set_bind_group(
+                        1,
+                        self.effect_uniform_arena.bind_group(),
+                        &[master_offset],
+                    );
                     pass.draw(0..3, 0..1);
                 }
-                (
-                    &self.composite_views[master_output_slot],
-                    inherited_output_slot,
-                )
+                inherited_output_slot
             };
-            let composite_buffer = create_uploaded_uniform(
-                &self.device,
-                &self.queue,
-                "Advanced Temporal Bypass Composite Uniforms",
-                &CompositeUniforms {
-                    opacity: overlay.opacity,
-                    blend_mode: overlay.blend_mode.as_u32(),
-                    _pad: [0.0; 2],
-                },
-            );
-            let composite_texture_group =
-                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Advanced Temporal Bypass Composite Inputs"),
-                    layout: &self.composite_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(base_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(overlay_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
-                        },
-                    ],
-                });
-            let composite_uniform_group =
-                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Advanced Temporal Bypass Composite Uniforms BG"),
-                    layout: &self.composite_uniform_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: composite_buffer.as_entire_binding(),
-                    }],
-                });
+            let composite_offset = self.write_composite_uniform(&CompositeUniforms {
+                opacity: overlay.opacity,
+                blend_mode: overlay.blend_mode.as_u32(),
+                _pad: [0.0; 2],
+            })?;
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Advanced Temporal Bypass Final Composite"),
@@ -8404,8 +9217,12 @@ impl Renderer {
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.composite_pipeline);
-                pass.set_bind_group(0, &composite_texture_group, &[]);
-                pass.set_bind_group(1, &composite_uniform_group, &[]);
+                pass.set_bind_group(0, composite_texture_group.as_ref(), &[]);
+                pass.set_bind_group(
+                    1,
+                    self.composite_uniform_arena.bind_group(),
+                    &[composite_offset],
+                );
                 pass.draw(0..3, 0..1);
             }
             encoder.copy_texture_to_texture(
@@ -8428,6 +9245,7 @@ impl Renderer {
                 },
             );
         }
+        Ok(())
     }
 
     /// Reapply the dry top prefix to the straight-alpha engine image after
@@ -8446,11 +9264,11 @@ impl Renderer {
             evaluated,
             &overlay_indices,
             &self.composite_textures[0],
-            &self.composite_views[0],
+            &self.internal_composite_bind_groups[0],
             2,
             2,
             1,
-        );
+        )?;
         Ok(true)
     }
 
@@ -8500,11 +9318,11 @@ impl Renderer {
             evaluated,
             &overlay_indices,
             &candidate.texture,
-            &candidate.view,
+            &candidate.composite_bind_groups,
             0,
             0,
             1,
-        );
+        )?;
         // The composite kernel is straight-alpha, including destination-out
         // Alpha Cut. Resolve the completed candidate over black before the
         // transaction publishes it: slot 2 is an opaque audience invariant,
@@ -8548,81 +9366,19 @@ impl Renderer {
         evaluated: &EvaluatedFramePlan,
         overlay_indices: &[usize],
         base_texture: &wgpu::Texture,
-        base_view: &wgpu::TextureView,
+        composite_texture_groups: &[wgpu::BindGroup; 3],
         master_output_slot: usize,
         bypass_output_slot: usize,
         inherited_output_slot: usize,
-    ) {
-        let master_buffer = create_uploaded_uniform(
-            &self.device,
-            &self.queue,
-            "Temporal Bypass Master FX Uniforms",
-            evaluated.master_pass(),
-        );
-        let master_texture_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Temporal Bypass Master FX Input"),
-            layout: &self.effects_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self.composite_views[1]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
-                },
-            ],
-        });
-        let master_uniform_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Temporal Bypass Master FX Uniforms BG"),
-            layout: &self.effects_uniform_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: master_buffer.as_entire_binding(),
-            }],
-        });
+    ) -> Result<(), String> {
+        let master_offset = self.write_effect_uniform(evaluated.master_pass())?;
 
         for &layer_index in overlay_indices {
             let layer = &evaluated.layers()[layer_index];
-            let texture_view = resources
-                .texture_view(layer.source)
+            let layer_texture_group = self
+                .source_effect_bind_group(resources, layer.source)
                 .expect("Temporal-bypass sources were resolved by preflight");
-            let layer_buffer = create_uploaded_uniform(
-                &self.device,
-                &self.queue,
-                "Temporal Bypass Layer FX Uniforms",
-                &evaluated.layer_passes()[layer_index],
-            );
-            let layer_texture_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Temporal Bypass Layer FX Input"),
-                layout: &self.effects_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
-                    },
-                ],
-            });
-            let layer_uniform_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Temporal Bypass Layer FX Uniforms BG"),
-                layout: &self.effects_uniform_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: layer_buffer.as_entire_binding(),
-                }],
-            });
+            let layer_offset = self.write_effect_uniform(&evaluated.layer_passes()[layer_index])?;
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Temporal Bypass Layer FX Pass"),
@@ -8639,8 +9395,8 @@ impl Renderer {
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.effects_pipeline);
-                pass.set_bind_group(0, &layer_texture_group, &[]);
-                pass.set_bind_group(1, &layer_uniform_group, &[]);
+                pass.set_bind_group(0, layer_texture_group.as_ref(), &[]);
+                pass.set_bind_group(1, self.effect_uniform_arena.bind_group(), &[layer_offset]);
                 pass.draw(0..3, 0..1);
             }
 
@@ -8662,53 +9418,18 @@ impl Renderer {
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.effects_pipeline);
-                pass.set_bind_group(0, &master_texture_group, &[]);
-                pass.set_bind_group(1, &master_uniform_group, &[]);
+                pass.set_bind_group(0, &self.internal_effect_bind_groups[1], &[]);
+                pass.set_bind_group(1, self.effect_uniform_arena.bind_group(), &[master_offset]);
                 pass.draw(0..3, 0..1);
                 (master_output_slot, inherited_output_slot)
             };
             debug_assert_ne!(overlay_slot, output_slot);
 
-            let composite_buffer = create_uploaded_uniform(
-                &self.device,
-                &self.queue,
-                "Temporal Bypass Composite Uniforms",
-                &CompositeUniforms {
-                    opacity: layer.opacity,
-                    blend_mode: layer.blend_mode.as_u32(),
-                    _pad: [0.0; 2],
-                },
-            );
-            let composite_texture_group =
-                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Temporal Bypass Composite Inputs"),
-                    layout: &self.composite_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(base_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(
-                                &self.composite_views[overlay_slot],
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
-                        },
-                    ],
-                });
-            let composite_uniform_group =
-                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Temporal Bypass Composite Uniforms BG"),
-                    layout: &self.composite_uniform_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: composite_buffer.as_entire_binding(),
-                    }],
-                });
+            let composite_offset = self.write_composite_uniform(&CompositeUniforms {
+                opacity: layer.opacity,
+                blend_mode: layer.blend_mode.as_u32(),
+                _pad: [0.0; 2],
+            })?;
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Temporal Bypass Final Composite Pass"),
@@ -8725,8 +9446,12 @@ impl Renderer {
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.composite_pipeline);
-                pass.set_bind_group(0, &composite_texture_group, &[]);
-                pass.set_bind_group(1, &composite_uniform_group, &[]);
+                pass.set_bind_group(0, &composite_texture_groups[overlay_slot], &[]);
+                pass.set_bind_group(
+                    1,
+                    self.composite_uniform_arena.bind_group(),
+                    &[composite_offset],
+                );
                 pass.draw(0..3, 0..1);
             }
             encoder.copy_texture_to_texture(
@@ -8749,6 +9474,7 @@ impl Renderer {
                 },
             );
         }
+        Ok(())
     }
 
     fn selective_batch_layout(&self, layer_count: usize) -> Result<(u32, u64, u64), String> {
@@ -8785,7 +9511,7 @@ impl Renderer {
                         | wgpu::TextureUsages::TEXTURE_BINDING
                         | wgpu::TextureUsages::COPY_SRC;
                     let scratch_textures: [wgpu::Texture; 2] = std::array::from_fn(|index| {
-                        self.device.create_texture(&wgpu::TextureDescriptor {
+                        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                             label: Some(&format!("Selective NTSC Scratch {index}")),
                             size: wgpu::Extent3d {
                                 width: self.output_width,
@@ -8798,7 +9524,9 @@ impl Renderer {
                             format: COMPOSITE_FORMAT,
                             usage,
                             view_formats: &[],
-                        })
+                        });
+                        self.core_gpu_objects.texture();
+                        texture
                     });
                     let scratch_views = std::array::from_fn(|index| {
                         scratch_textures[index].create_view(&wgpu::TextureViewDescriptor::default())
@@ -8809,9 +9537,31 @@ impl Renderer {
                         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                         mapped_at_creation: false,
                     });
+                    self.core_gpu_objects.buffer();
+                    let master_texture_bind_group =
+                        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("Selective NTSC retained master FX input"),
+                            layout: &self.effects_bind_group_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(&scratch_views[0]),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
+                                },
+                            ],
+                        });
+                    self.core_gpu_objects.bind_group();
                     SelectiveNtscGpuState {
                         scratch_textures,
                         scratch_views,
+                        master_texture_bind_group,
                         slot: SelectiveNtscReadbackSlot {
                             buffer,
                             capacity: required_capacity,
@@ -8853,12 +9603,14 @@ impl Renderer {
                     current_capacity
                 ),
                 || {
-                    self.device.create_buffer(&wgpu::BufferDescriptor {
+                    let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("Selective NTSC Readback Batch"),
                         size: required_capacity,
                         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                         mapped_at_creation: false,
-                    })
+                    });
+                    self.core_gpu_objects.buffer();
+                    buffer
                 },
             )?;
             self.ensure_device_healthy()
@@ -8905,7 +9657,7 @@ impl Renderer {
             return Ok(false);
         }
 
-        let mut source_views = Vec::with_capacity(plan.layers.len());
+        let mut source_taps = Vec::with_capacity(plan.layers.len());
         let mut layer_uniforms = Vec::with_capacity(plan.layers.len());
         for planned_layer in &plan.layers {
             let source_index = evaluated
@@ -8929,7 +9681,8 @@ impl Renderer {
                     planned_layer.layer_id
                 ));
             }
-            source_views.push(resources.texture_view(layer.source)?);
+            resources.texture_view(layer.source)?;
+            source_taps.push(layer.source);
             layer_uniforms.push(evaluated.layer_passes()[source_index]);
         }
 
@@ -8937,108 +9690,18 @@ impl Renderer {
             self.selective_batch_layout(plan.layers.len())?;
         self.ensure_selective_ntsc_gpu(used_size)?;
 
+        let master_offset = self.write_effect_uniform(evaluated.master_pass())?;
+        let mut layer_offsets = Vec::with_capacity(layer_uniforms.len());
+        let mut layer_bind_groups = Vec::with_capacity(source_taps.len());
+        for (source, uniforms) in source_taps.into_iter().zip(&layer_uniforms) {
+            layer_bind_groups.push(self.source_effect_bind_group(resources, source)?);
+            layer_offsets.push(self.write_effect_uniform(uniforms)?);
+        }
         let state = self.selective_ntsc_gpu.as_ref().unwrap();
-        let bindings = create_gpu_resources_checked(
-            &self.device,
-            "selective NTSC per-batch uniform buffers and bind groups",
-            || {
-                let master_uniform_buffer = create_uploaded_uniform(
-                    &self.device,
-                    &self.queue,
-                    "Selective NTSC Master FX Uniforms",
-                    evaluated.master_pass(),
-                );
-                let master_texture_bind_group =
-                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("Selective NTSC Master FX Input"),
-                        layout: &self.effects_bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &state.scratch_views[0],
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(&self.sampler),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
-                            },
-                        ],
-                    });
-                let master_uniform_bind_group =
-                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("Selective NTSC Master FX Uniforms BG"),
-                        layout: &self.effects_uniform_layout,
-                        entries: &[wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: master_uniform_buffer.as_entire_binding(),
-                        }],
-                    });
-                let layers = source_views
-                    .iter()
-                    .zip(&layer_uniforms)
-                    .map(|(&source_view, uniforms)| {
-                        let uniform_buffer = create_uploaded_uniform(
-                            &self.device,
-                            &self.queue,
-                            "Selective NTSC Layer FX Uniforms",
-                            uniforms,
-                        );
-                        let texture_bind_group =
-                            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: Some("Selective NTSC Layer FX Input"),
-                                layout: &self.effects_bind_group_layout,
-                                entries: &[
-                                    wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: wgpu::BindingResource::TextureView(source_view),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 1,
-                                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 2,
-                                        resource: wgpu::BindingResource::Sampler(
-                                            &self.nearest_sampler,
-                                        ),
-                                    },
-                                ],
-                            });
-                        let uniform_bind_group =
-                            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: Some("Selective NTSC Layer FX Uniforms BG"),
-                                layout: &self.effects_uniform_layout,
-                                entries: &[wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: uniform_buffer.as_entire_binding(),
-                                }],
-                            });
-                        SelectiveNtscLayerGpuBindings {
-                            _uniform_buffer: uniform_buffer,
-                            texture_bind_group,
-                            uniform_bind_group,
-                        }
-                    })
-                    .collect();
-                SelectiveNtscBatchGpuBindings {
-                    _master_uniform_buffer: master_uniform_buffer,
-                    master_texture_bind_group,
-                    master_uniform_bind_group,
-                    layers,
-                }
-            },
-        )?;
-        self.ensure_device_healthy().map_err(|error| {
-            format!("selective NTSC per-batch resource allocation failed: {error}")
-        })?;
 
         for (slice_index, planned_layer) in plan.layers.iter().enumerate() {
-            let layer_bindings = &bindings.layers[slice_index];
+            let layer_bind_group = &layer_bind_groups[slice_index];
+            let layer_offset = layer_offsets[slice_index];
 
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -9056,8 +9719,8 @@ impl Renderer {
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.effects_pipeline);
-                pass.set_bind_group(0, &layer_bindings.texture_bind_group, &[]);
-                pass.set_bind_group(1, &layer_bindings.uniform_bind_group, &[]);
+                pass.set_bind_group(0, layer_bind_group.as_ref(), &[]);
+                pass.set_bind_group(1, self.effect_uniform_arena.bind_group(), &[layer_offset]);
                 pass.draw(0..3, 0..1);
             }
 
@@ -9079,8 +9742,8 @@ impl Renderer {
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.effects_pipeline);
-                pass.set_bind_group(0, &bindings.master_texture_bind_group, &[]);
-                pass.set_bind_group(1, &bindings.master_uniform_bind_group, &[]);
+                pass.set_bind_group(0, &state.master_texture_bind_group, &[]);
+                pass.set_bind_group(1, self.effect_uniform_arena.bind_group(), &[master_offset]);
                 pass.draw(0..3, 0..1);
                 1
             };
@@ -9297,6 +9960,7 @@ impl Renderer {
             self.ensure_device_healthy().map_err(|error| {
                 format!("post-mosh overlay readback buffer allocation failed: {error}")
             })?;
+            self.core_gpu_objects.buffer();
             self.post_mosh_overlay_readback = Some(PostMoshOverlayReadbackSlot {
                 buffer,
                 status: Arc::new(AtomicU8::new(SLOT_IDLE)),
@@ -9509,6 +10173,7 @@ impl Renderer {
                 self.ensure_device_healthy().map_err(|error| {
                     format!("audience NTSC/Spout readback buffer allocation failed: {error}")
                 })?;
+                self.core_gpu_objects.buffer();
                 self.readback_slots.push(ReadbackSlot {
                     buffer,
                     status: Arc::new(AtomicU8::new(SLOT_IDLE)),
@@ -9746,4 +10411,25 @@ impl Renderer {
             },
         );
     }
+}
+
+fn parse_driver_version(value: &str) -> [u32; 4] {
+    let mut parsed = [0_u32; 4];
+    let mut component = 0_usize;
+    let mut value_in_progress = false;
+    for byte in value.bytes() {
+        if byte.is_ascii_digit() && component < parsed.len() {
+            parsed[component] = parsed[component]
+                .saturating_mul(10)
+                .saturating_add(u32::from(byte - b'0'));
+            value_in_progress = true;
+        } else if value_in_progress {
+            component += 1;
+            value_in_progress = false;
+        }
+        if component >= parsed.len() {
+            break;
+        }
+    }
+    parsed
 }

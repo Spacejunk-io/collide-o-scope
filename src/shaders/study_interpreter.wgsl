@@ -17,7 +17,7 @@
 // - deterministic-random values were resolved to immediates at compile, so
 //   the GPU never hashes and randomness cannot drift between the halves.
 //
-// Two sampled textures, no sampler: every lookup is a textureLoad.
+// Three sampled textures, no sampler: every lookup is a textureLoad.
 
 struct StudyFrameUniforms {
     audio_bands0: vec4f,
@@ -31,7 +31,7 @@ struct StudyFrameUniforms {
     // node law below applies them after the interpreter output.
     wet: f32,
     blend_mode: u32,
-    _pad0: u32,
+    motion_valid: u32,
 };
 
 // One encoded instruction. words.x carries the opcode in its low 16 bits and
@@ -48,8 +48,9 @@ const STUDY_BOUND: f32 = 65504.0;
 
 @group(0) @binding(0) var carrier_tex: texture_2d<f32>;
 @group(0) @binding(1) var history_tex: texture_2d_array<f32>;
-@group(0) @binding(2) var<uniform> frame: StudyFrameUniforms;
-@group(0) @binding(3) var<uniform> program: array<StudyOp, STUDY_GPU_MAX_INSTRUCTIONS>;
+@group(0) @binding(2) var motion_tex: texture_2d<f32>;
+@group(0) @binding(3) var<uniform> frame: StudyFrameUniforms;
+@group(0) @binding(4) var<uniform> program: array<StudyOp, STUDY_GPU_MAX_INSTRUCTIONS>;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -118,7 +119,18 @@ fn hsl_to_rgb(hsl: vec3f) -> vec3f {
 // ---------------------------------------------------------------------------
 
 fn bound(value: vec4f) -> vec4f {
-    return clamp(value, vec4f(-STUDY_BOUND), vec4f(STUDY_BOUND));
+    // CPU `bound` maps each non-finite component to the neutral zero. Keep
+    // that law explicit: clamp(NaN) is not a portable sanitization contract.
+    // WGSL's portable core in the pinned wgpu/naga stack has no `isNan` or
+    // `isInf` builtin. IEEE-754 exponent bits all set identify both classes
+    // without performing arithmetic on the hostile value.
+    let exponent = bitcast<vec4u>(value) & vec4u(0x7f800000u);
+    let non_finite = exponent == vec4u(0x7f800000u);
+    return select(
+        clamp(value, vec4f(-STUDY_BOUND), vec4f(STUDY_BOUND)),
+        vec4f(0.0),
+        non_finite,
+    );
 }
 
 fn audio_band(band: u32) -> f32 {
@@ -186,6 +198,14 @@ fn study_apply_field_law(dry: vec4f, processed: vec4f) -> vec4f {
 fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     let pixel = vec2i(in.position.xy);
     let current = bound(textureLoad(carrier_tex, pixel, 0));
+    var motion = vec2f(0.0);
+    if frame.motion_valid != 0u {
+        let carrier_size = max(textureDimensions(carrier_tex), vec2u(1u));
+        let motion_size = max(textureDimensions(motion_tex), vec2u(1u));
+        let output_pixel = vec2u(max(pixel, vec2i(0)));
+        let motion_pixel = min(output_pixel * motion_size / carrier_size, motion_size - vec2u(1u));
+        motion = bound(vec4f(textureLoad(motion_tex, vec2i(motion_pixel), 0).xy, 0.0, 0.0)).xy;
+    }
 
     var registers: array<vec4f, 64>;
     var output = vec4f(0.0);
@@ -205,10 +225,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
             case 1u: { // LoadHistoryColor { age: aux }
                 registers[dst] = bound(guarded_history(current, aux, pixel));
             }
-            case 2u: { // LoadMotionVector — ABI 1.0's dead-end lane. No
-                // opcode can carry a Vector2 to the output, so the value is
-                // unobservable by construction and this pass binds no field.
-                registers[dst] = vec4f(0.0);
+            case 2u: { // LoadMotionVector; dead-end in 1.0, usable in 1.1.
+                registers[dst] = vec4f(motion, 0.0, 0.0);
             }
             case 3u: { // LoadAudioBand { band: aux }
                 registers[dst] = vec4f(audio_band(aux));
@@ -243,6 +261,30 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
             }
             case 15u: { // OutputColor
                 output = clamp(registers[a], vec4f(0.0), vec4f(1.0));
+            }
+            case 16u: { // ABI 1.1 VectorX
+                registers[dst] = vec4f(bound(registers[a]).x);
+            }
+            case 17u: { // ABI 1.1 VectorY
+                registers[dst] = vec4f(bound(registers[a]).y);
+            }
+            case 18u: { // ABI 1.1 VectorMagnitude
+                registers[dst] = vec4f(bound(vec4f(length(registers[a].xy))).x);
+            }
+            case 19u: { // ABI 1.1 VectorNormalizedDirection
+                let magnitude = length(registers[a].xy);
+                var direction = vec2f(0.0);
+                if magnitude > 0.0 {
+                    direction = registers[a].xy / magnitude;
+                }
+                registers[dst] = bound(vec4f(direction, 0.0, 0.0));
+            }
+            case 20u: { // ABI 1.1 VectorDotConstant
+                registers[dst] = vec4f(bound(vec4f(dot(registers[a].xy, op.immediate.xy))).x);
+            }
+            case 21u: { // ABI 1.1 ScalarToColor { scalar: aux }
+                let amount = clamp(registers[aux].x, 0.0, 1.0);
+                registers[dst] = bound(registers[a] + (registers[b] - registers[a]) * amount);
             }
             default: {}
         }

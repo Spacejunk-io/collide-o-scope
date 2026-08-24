@@ -498,7 +498,10 @@ impl fmt::Display for RackCompileError {
                 source[0], source[1], output[0], output[1]
             ),
             Self::TooManyPasses { requested, limit } => {
-                write!(formatter, "rack requested {requested} passes; limit is {limit}")
+                write!(
+                    formatter,
+                    "rack requested {requested} passes; limit is {limit}"
+                )
             }
             Self::DuplicateNodeId(id) => {
                 write!(formatter, "rack contains duplicate node id {}", id.get())

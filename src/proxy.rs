@@ -613,7 +613,7 @@ fn decode_sha256(value: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut result = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_nibble(pair[0])?;
         let low = hex_nibble(pair[1])?;
         result[index] = (high << 4) | low;
@@ -1075,7 +1075,10 @@ impl fmt::Display for ProxyError {
             Self::InvalidFrameRate {
                 numerator,
                 denominator,
-            } => write!(formatter, "invalid fixed proxy frame rate {numerator}/{denominator}"),
+            } => write!(
+                formatter,
+                "invalid fixed proxy frame rate {numerator}/{denominator}"
+            ),
             Self::InvalidContentIdentity => formatter.write_str(
                 "proxy source identity must be canonical lowercase SHA-256 plus non-zero bytes",
             ),
@@ -1086,9 +1089,7 @@ impl fmt::Display for ProxyError {
             Self::InvalidProbe(field) => {
                 write!(formatter, "invalid proxy source probe: {field}")
             }
-            Self::NoVideoStream => {
-                formatter.write_str("proxy source carries no video stream")
-            }
+            Self::NoVideoStream => formatter.write_str("proxy source carries no video stream"),
             Self::TooManyStreams { count, limit } => write!(
                 formatter,
                 "proxy source container reports {count} streams; limit is {limit}"
@@ -1107,10 +1108,16 @@ impl fmt::Display for ProxyError {
                 write!(formatter, "invalid proxy cache limits: {field}")
             }
             Self::CacheIndexEntries { count, limit } => {
-                write!(formatter, "proxy cache index has {count} entries; hard limit is {limit}")
+                write!(
+                    formatter,
+                    "proxy cache index has {count} entries; hard limit is {limit}"
+                )
             }
             Self::CacheEntryBytes { bytes, limit } => {
-                write!(formatter, "proxy artifact is {bytes} bytes; limit is {limit}")
+                write!(
+                    formatter,
+                    "proxy artifact is {bytes} bytes; limit is {limit}"
+                )
             }
             Self::ExistingCacheBytes { bytes, limit } => write!(
                 formatter,

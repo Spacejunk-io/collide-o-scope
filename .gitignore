@@ -1,4 +1,5 @@
 /target
+/fuzz/target
 experiments/*/target
 .DS_Store
 

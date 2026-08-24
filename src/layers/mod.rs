@@ -1,4 +1,8 @@
+use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use crate::effects::EffectUniforms;
@@ -21,8 +25,9 @@ use crate::transport::{
 };
 use crate::video::threaded::{DecoderHealth, DecoderTelemetry, ReadyFrame};
 use crate::video::{
-    decode_still_image_with_media_policy, CodecMotionFrame, CodecMotionProduct, StillImage,
-    ThreadedDecoder,
+    decode_still_image_with_media_policy, CodecMotionFrame, CodecMotionProduct,
+    DecodedImagePayload, DecodedPayloadOwner, SourceColorDescriptor, SourceConversionPolicy,
+    SourceDisplayDescriptor, StillImage, ThreadedDecoder,
 };
 use crate::visual_rack::{LegacyRackScope, RuntimeVisualRack};
 
@@ -37,6 +42,214 @@ pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "webm", "mov", "avi", "mkv"];
 pub const STILL_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp"];
 
 static NEXT_LAYER_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_UPLOAD_VALIDATION_ID: AtomicU64 = AtomicU64::new(1);
+const MAX_PENDING_UPLOAD_VALIDATIONS: usize = 2;
+const MAX_UPLOAD_VALIDATION_FAULTS: usize = 4;
+const MAX_UPLOAD_VALIDATION_TURNS: u64 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadValidationFaultKind {
+    Validation,
+    Internal,
+    OutOfMemory,
+    Deadline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UploadAttribution {
+    pub upload_id: u64,
+    pub layer_id: u64,
+    pub payload_id: u64,
+    pub source_generation: u64,
+    pub render_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadValidationFault {
+    pub attribution: UploadAttribution,
+    pub kind: UploadValidationFaultKind,
+    pub message: String,
+}
+
+impl UploadValidationFault {
+    pub fn is_terminal(&self) -> bool {
+        self.kind == UploadValidationFaultKind::OutOfMemory
+    }
+
+    pub fn operator_message(&self) -> String {
+        format!(
+            "{} [upload={}, layer={}, payload={}, source_generation={}, render_generation={}, kind={:?}]",
+            self.message,
+            self.attribution.upload_id,
+            self.attribution.layer_id,
+            self.attribution.payload_id,
+            self.attribution.source_generation,
+            self.attribution.render_generation,
+            self.kind
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UploadValidationSnapshot {
+    pub submitted: u64,
+    pub completed: u64,
+    pub invalidations: u64,
+    pub faults: u64,
+    pub pending: usize,
+    pub pending_age_turns: u64,
+    pub pending_age_micros: u64,
+}
+
+#[derive(Default)]
+struct ScopedUploadErrors {
+    validation: Option<String>,
+    internal: Option<String>,
+    out_of_memory: Option<String>,
+}
+
+type UploadScopeFuture = Pin<Box<dyn Future<Output = ScopedUploadErrors> + Send + 'static>>;
+
+struct PendingUploadValidation {
+    attribution: UploadAttribution,
+    label: String,
+    dimensions: [u32; 2],
+    submitted_at: Instant,
+    submitted_turn: u64,
+    /// Retain one logical upload owner until validation resolves. The bytes
+    /// remain the same Arc allocation used by forward/cache consumers.
+    _payload: Option<DecodedImagePayload>,
+    future: UploadScopeFuture,
+}
+
+#[derive(Default)]
+struct UploadValidationEpoch {
+    pending: VecDeque<PendingUploadValidation>,
+    faults: VecDeque<UploadValidationFault>,
+    turn: u64,
+    submitted: u64,
+    completed: u64,
+    invalidations: u64,
+    fault_count: u64,
+}
+
+impl UploadValidationEpoch {
+    fn push_pending(&mut self, pending: PendingUploadValidation) -> Result<(), String> {
+        if self.pending.len() >= MAX_PENDING_UPLOAD_VALIDATIONS {
+            let snapshot = self.snapshot(Instant::now());
+            return Err(format!(
+                "upload validation queue is full ({}/{}; oldest {} turns / {} us)",
+                snapshot.pending,
+                MAX_PENDING_UPLOAD_VALIDATIONS,
+                snapshot.pending_age_turns,
+                snapshot.pending_age_micros
+            ));
+        }
+        self.submitted = self.submitted.saturating_add(1);
+        self.pending.push_back(pending);
+        Ok(())
+    }
+
+    fn poll(&mut self, current_render_generation: u64) {
+        self.turn = self.turn.saturating_add(1);
+        let mut retained = VecDeque::with_capacity(self.pending.len());
+        while let Some(mut pending) = self.pending.pop_front() {
+            if pending.attribution.render_generation != current_render_generation {
+                self.invalidations = self.invalidations.saturating_add(1);
+                continue;
+            }
+            let waker = futures::task::noop_waker_ref();
+            let mut context = Context::from_waker(waker);
+            match pending.future.as_mut().poll(&mut context) {
+                Poll::Ready(errors) => {
+                    self.completed = self.completed.saturating_add(1);
+                    self.record_scoped_errors(&pending, errors);
+                }
+                Poll::Pending
+                    if self.turn.saturating_sub(pending.submitted_turn)
+                        >= MAX_UPLOAD_VALIDATION_TURNS =>
+                {
+                    self.record_fault(UploadValidationFault {
+                        attribution: pending.attribution,
+                        kind: UploadValidationFaultKind::Deadline,
+                        message: format!(
+                            "{} upload validation did not resolve within {} event-loop turns",
+                            pending.label, MAX_UPLOAD_VALIDATION_TURNS
+                        ),
+                    });
+                }
+                Poll::Pending => retained.push_back(pending),
+            }
+        }
+        self.pending = retained;
+    }
+
+    fn record_scoped_errors(
+        &mut self,
+        pending: &PendingUploadValidation,
+        errors: ScopedUploadErrors,
+    ) {
+        let ordered = [
+            (UploadValidationFaultKind::OutOfMemory, errors.out_of_memory),
+            (UploadValidationFaultKind::Internal, errors.internal),
+            (UploadValidationFaultKind::Validation, errors.validation),
+        ];
+        for (kind, error) in ordered {
+            if let Some(error) = error {
+                self.record_fault(UploadValidationFault {
+                    attribution: pending.attribution,
+                    kind,
+                    message: format!(
+                        "could not validate {} upload at {}x{}: {error}",
+                        pending.label, pending.dimensions[0], pending.dimensions[1]
+                    ),
+                });
+            }
+        }
+    }
+
+    fn record_fault(&mut self, fault: UploadValidationFault) {
+        self.fault_count = self.fault_count.saturating_add(1);
+        if self.faults.len() == MAX_UPLOAD_VALIDATION_FAULTS {
+            self.invalidations = self.invalidations.saturating_add(1);
+            // Never evict the only signal that activates the terminal OOM
+            // law merely because validation/internal detail filled the small
+            // status queue. Prefer dropping the oldest nonterminal detail; an
+            // all-OOM queue already contains a sufficient terminal signal.
+            if let Some(index) = self.faults.iter().position(|queued| !queued.is_terminal()) {
+                self.faults.remove(index);
+            } else {
+                return;
+            }
+        }
+        self.faults.push_back(fault);
+    }
+
+    fn take_fault(&mut self) -> Option<UploadValidationFault> {
+        self.faults.pop_front()
+    }
+
+    fn snapshot(&self, now: Instant) -> UploadValidationSnapshot {
+        let oldest = self.pending.front();
+        UploadValidationSnapshot {
+            submitted: self.submitted,
+            completed: self.completed,
+            invalidations: self.invalidations,
+            faults: self.fault_count,
+            pending: self.pending.len(),
+            pending_age_turns: oldest.map_or(0, |pending| {
+                self.turn.saturating_sub(pending.submitted_turn)
+            }),
+            pending_age_micros: oldest.map_or(0, |pending| {
+                u64::try_from(
+                    now.saturating_duration_since(pending.submitted_at)
+                        .as_micros(),
+                )
+                .unwrap_or(u64::MAX)
+            }),
+        }
+    }
+}
 
 /// The one clamp law for the three layer transport scalars, shared by the
 /// live `set_layer_param` applier and the B9 export replay so an offline
@@ -291,6 +504,10 @@ impl BlendMode {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one long-lived source is owned per stable layer; boxing only the decoder would add a second allocation/indirection to every video layer and change its established retirement ownership"
+)]
 pub enum LayerSource {
     Video(ThreadedDecoder),
     Still(StillImage),
@@ -340,6 +557,7 @@ pub(crate) struct LayerSourceActivation {
     source_error: String,
     source_frame_initialized: bool,
     codec_motion: Option<CodecMotionProduct>,
+    upload_validation: UploadValidationEpoch,
 }
 
 /// Ownership returned when an already-live source is displaced by a prepared
@@ -357,6 +575,14 @@ impl LayerSourceActivation {
         self.preload_bytes
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_upload_attribution(&self) -> Option<UploadAttribution> {
+        self.upload_validation
+            .pending
+            .front()
+            .map(|pending| pending.attribution)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn stage(
         device: &wgpu::Device,
@@ -369,11 +595,16 @@ impl LayerSourceActivation {
         height: u32,
         source_fps: f32,
         preload_bytes: u64,
-        first_rgba: &[u8],
+        first_rgba: &DecodedImagePayload,
+        layer_id: u64,
+        source_generation: u64,
+        render_generation: u64,
     ) -> Result<Self, String> {
         let (texture, texture_view) =
             create_layer_texture(device, width, height, "Prepared Layer Texture")?;
-        write_layer_texture_checked(
+        let mut upload_validation = UploadValidationEpoch::default();
+        enqueue_layer_texture_upload(
+            &mut upload_validation,
             device,
             queue,
             &texture,
@@ -381,6 +612,9 @@ impl LayerSourceActivation {
             width,
             height,
             "Prepared Layer Texture",
+            layer_id,
+            source_generation,
+            render_generation,
         )?;
         Ok(Self {
             source_path,
@@ -403,6 +637,7 @@ impl LayerSourceActivation {
             source_error: String::new(),
             source_frame_initialized: true,
             codec_motion: None,
+            upload_validation,
         })
     }
 }
@@ -521,6 +756,7 @@ pub struct Layer {
     /// Decoder metadata committed with the exact RGBA upload currently held
     /// by `texture`. Runtime-only: patches and prepared authoring never see it.
     codec_motion: Option<CodecMotionProduct>,
+    upload_validation: UploadValidationEpoch,
     /// Conservative CPU/GPU working-set charge used while this source is an
     /// inactive prepared slot. Active sources are deliberately outside that
     /// evictable ledger, but the exact charge follows ownership on a swap.
@@ -656,6 +892,7 @@ impl Layer {
             source_error: String::new(),
             source_frame_initialized: false,
             codec_motion: None,
+            upload_validation: UploadValidationEpoch::default(),
             source_preload_bytes,
             speed: 1.0,
             fps,
@@ -742,6 +979,7 @@ impl Layer {
             source_error: String::new(),
             source_frame_initialized: false,
             codec_motion: None,
+            upload_validation: UploadValidationEpoch::default(),
             source_preload_bytes,
             speed: 1.0,
             // A still has no source cadence. Retaining the conventional value
@@ -787,7 +1025,7 @@ impl Layer {
             .working_set_bytes;
         let (texture, texture_view) =
             create_layer_texture(device, width, height, "Spout Layer Texture")?;
-        write_layer_texture_checked(
+        write_layer_texture_startup_checked(
             device,
             queue,
             &texture,
@@ -840,6 +1078,7 @@ impl Layer {
             source_error: String::new(),
             source_frame_initialized: false,
             codec_motion: None,
+            upload_validation: UploadValidationEpoch::default(),
             source_preload_bytes,
             speed: 1.0,
             fps: 30.0,
@@ -916,6 +1155,7 @@ impl Layer {
             // texture must not be sampled as content.
             source_frame_initialized: false,
             codec_motion: None,
+            upload_validation: UploadValidationEpoch::default(),
             source_preload_bytes,
             speed: 1.0,
             fps: 30.0,
@@ -992,6 +1232,7 @@ impl Layer {
             source_error: String::new(),
             source_frame_initialized: false,
             codec_motion: None,
+            upload_validation: UploadValidationEpoch::default(),
             source_preload_bytes,
             speed: 1.0,
             fps: 30.0,
@@ -1000,6 +1241,33 @@ impl Layer {
 
     pub fn source_kind(&self) -> &'static str {
         self.source.kind()
+    }
+
+    /// Fixed-size source declarations and the actual decode/conversion law.
+    /// Procedural/live producers have no file descriptor and remain explicitly
+    /// unspecified instead of inheriting a neighbouring layer's facts.
+    pub fn source_descriptors(
+        &self,
+    ) -> (
+        SourceColorDescriptor,
+        SourceDisplayDescriptor,
+        SourceConversionPolicy,
+    ) {
+        match &self.source {
+            LayerSource::Video(decoder) => (
+                decoder.source_color_descriptor(),
+                decoder.source_display_descriptor(),
+                decoder.conversion_policy(),
+            ),
+            LayerSource::Still(image) => (
+                image.source_color_descriptor(),
+                image.source_display_descriptor(),
+                image.conversion_policy(),
+            ),
+            LayerSource::Spout(_) | LayerSource::Pattern(_) | LayerSource::TextPage(_) => {
+                Default::default()
+            }
+        }
     }
 
     /// Authored pattern-synth values, present only on a pattern layer.
@@ -1319,6 +1587,7 @@ impl Layer {
             source_error,
             source_frame_initialized,
             codec_motion,
+            upload_validation,
         } = activation;
         let displaced = LayerSourceActivation {
             source_path: std::mem::replace(&mut self.source_path, source_path),
@@ -1342,6 +1611,7 @@ impl Layer {
             source_error: std::mem::replace(&mut self.source_error, source_error),
             source_frame_initialized: self.source_frame_initialized,
             codec_motion: std::mem::replace(&mut self.codec_motion, codec_motion),
+            upload_validation: std::mem::replace(&mut self.upload_validation, upload_validation),
         };
         self.width = width;
         self.height = height;
@@ -1418,6 +1688,7 @@ impl Layer {
             source_error,
             source_frame_initialized,
             codec_motion,
+            upload_validation,
         } = activation;
         let displaced = LayerSourceActivation {
             source_path: std::mem::replace(&mut self.source_path, source_path),
@@ -1434,6 +1705,7 @@ impl Layer {
             source_error: std::mem::replace(&mut self.source_error, source_error),
             source_frame_initialized: self.source_frame_initialized,
             codec_motion: std::mem::replace(&mut self.codec_motion, codec_motion),
+            upload_validation: std::mem::replace(&mut self.upload_validation, upload_validation),
         };
         self.width = width;
         self.height = height;
@@ -1557,27 +1829,42 @@ impl Layer {
 
     pub fn restore_ready_media_frame_after_failed_upload(&mut self, frame: ReadyFrame) {
         match &mut self.source {
-            LayerSource::Still(image) => image.restore_frame_after_failed_upload(frame.rgba),
+            LayerSource::Still(image) => {
+                image.restore_frame_after_failed_upload(frame.rgba.into_vec())
+            }
             // Keep the exact still-image retry law: the page waits for the
             // next successful upload rather than re-rastering.
             LayerSource::TextPage(state) if state.pending_frame.is_none() => {
-                state.pending_frame = Some(frame.rgba);
+                state.pending_frame = Some(frame.rgba.into_vec());
             }
             _ => {}
         }
     }
 
-    /// Upload one decoded/still product and commit its codec metadata only
-    /// after the matching RGBA write succeeds. On error the caller retains the
-    /// complete frame for existing still-image retry behavior.
+    /// Enqueue one decoded/still product and retain its immutable pixels until
+    /// the matching validation epoch completes. Completed GPU faults are
+    /// harvested once at the start of the next event-loop turn.
     pub fn upload_ready_media_frame(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        render_generation: u64,
         frame: &mut ReadyFrame,
     ) -> Result<(), String> {
         let upload_started = Instant::now();
-        let upload_result = self.upload_frame(device, queue, &frame.rgba);
+        let upload_result = enqueue_layer_texture_upload(
+            &mut self.upload_validation,
+            device,
+            queue,
+            &self.texture,
+            &frame.rgba,
+            self.width,
+            self.height,
+            "Layer Source Texture",
+            self.layer_id,
+            frame.source_generation,
+            render_generation,
+        );
         let upload_duration = upload_started.elapsed();
         if upload_result.is_ok() {
             if let LayerSource::Video(decoder) = &mut self.source {
@@ -1594,13 +1881,32 @@ impl Layer {
         Ok(())
     }
 
+    /// Drain already-popped GPU scopes without waiting. Main drives one
+    /// device `Poll` per event-loop turn before this call; this method only
+    /// polls ready futures and attributes any result to its original upload.
+    pub fn poll_upload_validation(
+        &mut self,
+        render_generation: u64,
+    ) -> Option<UploadValidationFault> {
+        self.upload_validation.poll(render_generation);
+        self.upload_validation.take_fault()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Stage Health consumes this bounded metric in the P4 landing"
+    )]
+    pub fn upload_validation_snapshot(&self) -> UploadValidationSnapshot {
+        self.upload_validation.snapshot(Instant::now())
+    }
+
     /// Compatibility name retained for existing render-loop callers. It now
     /// harvests either supported file source; new call sites should use the
     /// accurately named `take_ready_media_frame` wrapper above.
     #[allow(dead_code)]
     pub fn take_ready_video_frame(&mut self) -> Result<Option<Vec<u8>>, String> {
         self.take_ready_media_frame()
-            .map(|ready| ready.map(|frame| frame.rgba))
+            .map(|ready| ready.map(|frame| frame.rgba.into_vec()))
     }
 
     /// Stable video decoder health for state snapshots.
@@ -1677,6 +1983,7 @@ impl Layer {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        render_generation: u64,
         frame: SpoutFrame,
     ) -> Result<(), String> {
         if !matches!(self.source, LayerSource::Spout(_)) {
@@ -1716,18 +2023,23 @@ impl Layer {
             return Err(error);
         }
 
+        let pixels = DecodedImagePayload::from_owned_rgba(frame.pixels);
         if frame.width != self.width || frame.height != self.height {
             let (texture, texture_view) =
                 create_layer_texture(device, frame.width, frame.height, "Spout Layer Texture")
                     .inspect_err(|error| self.source_error.clone_from(error))?;
-            if let Err(error) = write_layer_texture_checked(
+            if let Err(error) = enqueue_layer_texture_upload(
+                &mut self.upload_validation,
                 device,
                 queue,
                 &texture,
-                &frame.pixels,
+                &pixels,
                 frame.width,
                 frame.height,
                 "Spout Layer Texture",
+                self.layer_id,
+                0,
+                render_generation,
             ) {
                 self.source_error.clone_from(&error);
                 return Err(error);
@@ -1743,13 +2055,13 @@ impl Layer {
             // Spout uses the same four-RGBA-buffer conservative planning
             // multiplier as its admission plan. The frame length is already
             // validated above, so this conversion is exact and bounded.
-            self.source_preload_bytes = u64::try_from(frame.pixels.len())
+            self.source_preload_bytes = u64::try_from(pixels.len())
                 .unwrap_or(u64::MAX)
                 .saturating_mul(4);
             self.source_error.clear();
             return Ok(());
         }
-        self.upload_frame(device, queue, &frame.pixels)
+        self.upload_payload(device, queue, render_generation, &pixels)
     }
 
     /// Compatibility seam retained for callers that reset legacy pacing on a
@@ -1762,13 +2074,17 @@ impl Layer {
     /// Timestamped compatibility form; see [`Self::reset_transport_timing`].
     pub(crate) fn reset_transport_timing_at(&mut self, _now: Instant) {}
 
+    #[allow(
+        dead_code,
+        reason = "compatibility seam for offline/test RGBA producers"
+    )]
     pub fn upload_frame(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         rgba_data: &[u8],
     ) -> Result<(), String> {
-        match write_layer_texture_checked(
+        write_layer_texture_startup_checked(
             device,
             queue,
             &self.texture,
@@ -1776,6 +2092,32 @@ impl Layer {
             self.width,
             self.height,
             "Layer Source Texture",
+        )?;
+        self.source_frame_initialized = true;
+        self.codec_motion = None;
+        self.source_error.clear();
+        Ok(())
+    }
+
+    fn upload_payload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        render_generation: u64,
+        payload: &DecodedImagePayload,
+    ) -> Result<(), String> {
+        match enqueue_layer_texture_upload(
+            &mut self.upload_validation,
+            device,
+            queue,
+            &self.texture,
+            payload,
+            self.width,
+            self.height,
+            "Layer Source Texture",
+            self.layer_id,
+            0,
+            render_generation,
         ) {
             Ok(()) => {
                 self.source_frame_initialized = true;
@@ -1793,7 +2135,7 @@ impl Layer {
     }
 }
 
-fn write_layer_texture_checked(
+fn write_layer_texture_startup_checked(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
@@ -1851,6 +2193,100 @@ fn write_layer_texture_checked(
     } else {
         Ok(())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_layer_texture_upload(
+    epoch: &mut UploadValidationEpoch,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    payload: &DecodedImagePayload,
+    width: u32,
+    height: u32,
+    label: &str,
+    layer_id: u64,
+    source_generation: u64,
+    render_generation: u64,
+) -> Result<(), String> {
+    let expected = checked_upload_len(width, height, label)?;
+    if payload.len() != expected {
+        return Err(format!(
+            "{label} upload has {} bytes; expected {expected} for {width}x{height}",
+            payload.len()
+        ));
+    }
+    if epoch.pending.len() >= MAX_PENDING_UPLOAD_VALIDATIONS {
+        let snapshot = epoch.snapshot(Instant::now());
+        return Err(format!(
+            "{label} upload validation queue is full ({}/{}; oldest {} turns / {} us)",
+            snapshot.pending,
+            MAX_PENDING_UPLOAD_VALIDATIONS,
+            snapshot.pending_age_turns,
+            snapshot.pending_age_micros
+        ));
+    }
+
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        payload.as_slice(),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let out_of_memory = out_of_memory.pop();
+    let internal = internal.pop();
+    let validation = validation.pop();
+    let future: UploadScopeFuture = Box::pin(async move {
+        let (out_of_memory, internal, validation) =
+            futures::join!(out_of_memory, internal, validation);
+        ScopedUploadErrors {
+            validation: validation.map(|error| error.to_string()),
+            internal: internal.map(|error| error.to_string()),
+            out_of_memory: out_of_memory.map(|error| error.to_string()),
+        }
+    });
+    let attribution = UploadAttribution {
+        upload_id: NEXT_UPLOAD_VALIDATION_ID
+            .fetch_add(1, Ordering::Relaxed)
+            .max(1),
+        layer_id,
+        payload_id: payload.identity(),
+        source_generation,
+        render_generation,
+    };
+    epoch.push_pending(PendingUploadValidation {
+        attribution,
+        label: label.to_owned(),
+        dimensions: [width, height],
+        submitted_at: Instant::now(),
+        submitted_turn: epoch.turn,
+        _payload: Some(payload.share_as(DecodedPayloadOwner::Upload)),
+        future,
+    })
+}
+
+fn checked_upload_len(width: u32, height: u32, label: &str) -> Result<usize, String> {
+    u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| format!("{label} upload dimensions overflow for {width}x{height}"))
 }
 
 fn layer_texture_upload_error(
@@ -2031,7 +2467,7 @@ mod tests {
         is_video_file, layer_texture_upload_error, reset_layer_motion,
         source_reference_for_persistence, spout_sender_from_source_path,
         take_matching_codec_motion, validate_source_texture_dimensions,
-        write_layer_texture_checked, BlendMode,
+        write_layer_texture_startup_checked, BlendMode,
     };
     use crate::transport::{
         ClipTransportConfig, ClipTransportState, EndBehavior, NormalizedTime, PlaybackDirection,
@@ -2266,7 +2702,7 @@ mod tests {
 
         fn ready(source_generation: u64, motion_generation: u64) -> ReadyFrame {
             ReadyFrame {
-                rgba: vec![0; 16 * 16 * 4],
+                rgba: crate::video::DecodedImagePayload::from_owned_rgba(vec![0; 16 * 16 * 4]),
                 codec_motion: Some(
                     CodecMotionFrame {
                         source_dimensions: [16, 16],
@@ -2354,7 +2790,7 @@ mod tests {
         let (texture, _view) =
             create_layer_texture(&device, 1, 1, "Layer Upload Scope Test").unwrap();
 
-        let error = write_layer_texture_checked(
+        let error = write_layer_texture_startup_checked(
             &device,
             &queue,
             &texture,
@@ -2365,7 +2801,7 @@ mod tests {
         )
         .expect_err("extent wider than the texture must be recoverable");
         assert!(error.contains("Layer Upload Scope Test"));
-        assert!(write_layer_texture_checked(
+        assert!(write_layer_texture_startup_checked(
             &device,
             &queue,
             &texture,
@@ -2375,6 +2811,176 @@ mod tests {
             "Layer Upload Scope Test",
         )
         .is_ok());
+    }
+
+    fn injected_validation(
+        upload_id: u64,
+        render_generation: u64,
+        future: super::UploadScopeFuture,
+    ) -> super::PendingUploadValidation {
+        super::PendingUploadValidation {
+            attribution: super::UploadAttribution {
+                upload_id,
+                layer_id: 11,
+                payload_id: 22,
+                source_generation: 33,
+                render_generation,
+            },
+            label: "Injected Layer".to_string(),
+            dimensions: [2, 2],
+            submitted_at: std::time::Instant::now(),
+            submitted_turn: 0,
+            _payload: None,
+            future,
+        }
+    }
+
+    #[test]
+    fn upload_validation_queue_is_bounded_and_reports_pending_age() {
+        let mut epoch = super::UploadValidationEpoch::default();
+        for upload_id in 1..=super::MAX_PENDING_UPLOAD_VALIDATIONS as u64 {
+            epoch
+                .push_pending(injected_validation(
+                    upload_id,
+                    7,
+                    Box::pin(futures::future::pending()),
+                ))
+                .unwrap();
+        }
+        epoch.poll(7);
+        let snapshot = epoch.snapshot(std::time::Instant::now());
+        assert_eq!(snapshot.pending, super::MAX_PENDING_UPLOAD_VALIDATIONS);
+        assert_eq!(snapshot.pending_age_turns, 1);
+        let error = epoch
+            .push_pending(injected_validation(
+                99,
+                7,
+                Box::pin(futures::future::pending()),
+            ))
+            .unwrap_err();
+        assert!(error.contains("queue is full"));
+        assert_eq!(epoch.pending.len(), super::MAX_PENDING_UPLOAD_VALIDATIONS);
+    }
+
+    #[test]
+    fn upload_faults_keep_exact_attribution_and_oom_is_terminal() {
+        let mut epoch = super::UploadValidationEpoch::default();
+        epoch
+            .push_pending(injected_validation(
+                41,
+                7,
+                Box::pin(futures::future::ready(super::ScopedUploadErrors {
+                    validation: Some("bad layout".to_string()),
+                    internal: Some("backend fault".to_string()),
+                    out_of_memory: Some("allocation pressure".to_string()),
+                })),
+            ))
+            .unwrap();
+        epoch.poll(7);
+        let faults = std::iter::from_fn(|| epoch.take_fault()).collect::<Vec<_>>();
+        assert_eq!(faults.len(), 3);
+        assert_eq!(faults[0].attribution.upload_id, 41);
+        assert_eq!(faults[0].attribution.layer_id, 11);
+        assert_eq!(faults[0].attribution.payload_id, 22);
+        assert_eq!(faults[0].attribution.source_generation, 33);
+        assert_eq!(faults[0].attribution.render_generation, 7);
+        assert_eq!(
+            faults[0].kind,
+            super::UploadValidationFaultKind::OutOfMemory
+        );
+        assert!(faults[0].is_terminal());
+        assert_eq!(faults[1].kind, super::UploadValidationFaultKind::Internal);
+        assert_eq!(faults[2].kind, super::UploadValidationFaultKind::Validation);
+        let operator_message = faults[0].operator_message();
+        for exact_field in [
+            "upload=41",
+            "layer=11",
+            "payload=22",
+            "source_generation=33",
+            "render_generation=7",
+            "kind=OutOfMemory",
+        ] {
+            assert!(operator_message.contains(exact_field), "{operator_message}");
+        }
+
+        let mut saturated = super::UploadValidationEpoch::default();
+        for upload_id in [50, 51] {
+            saturated
+                .push_pending(injected_validation(
+                    upload_id,
+                    7,
+                    Box::pin(futures::future::ready(super::ScopedUploadErrors {
+                        validation: Some("validation".to_string()),
+                        internal: Some("internal".to_string()),
+                        out_of_memory: Some("oom".to_string()),
+                    })),
+                ))
+                .unwrap();
+        }
+        saturated.poll(7);
+        let saturated_faults = std::iter::from_fn(|| saturated.take_fault()).collect::<Vec<_>>();
+        assert!(saturated_faults.iter().any(|fault| fault.is_terminal()));
+        assert!(saturated_faults.len() <= super::MAX_UPLOAD_VALIDATION_FAULTS);
+    }
+
+    #[test]
+    fn stale_validation_is_invalidated_and_pending_scope_has_fixed_deadline() {
+        let mut stale = super::UploadValidationEpoch::default();
+        stale
+            .push_pending(injected_validation(
+                1,
+                6,
+                Box::pin(futures::future::ready(super::ScopedUploadErrors {
+                    out_of_memory: Some("old renderer".to_string()),
+                    ..super::ScopedUploadErrors::default()
+                })),
+            ))
+            .unwrap();
+        stale.poll(7);
+        assert!(stale.take_fault().is_none());
+        assert_eq!(stale.snapshot(std::time::Instant::now()).invalidations, 1);
+
+        let mut stuck = super::UploadValidationEpoch::default();
+        stuck
+            .push_pending(injected_validation(
+                2,
+                7,
+                Box::pin(futures::future::pending()),
+            ))
+            .unwrap();
+        for _ in 0..super::MAX_UPLOAD_VALIDATION_TURNS {
+            stuck.poll(7);
+        }
+        let fault = stuck.take_fault().expect("fixed-turn deadline fault");
+        assert_eq!(fault.attribution.upload_id, 2);
+        assert_eq!(fault.kind, super::UploadValidationFaultKind::Deadline);
+        assert_eq!(stuck.pending.len(), 0);
+    }
+
+    #[test]
+    fn selected_upload_path_contains_no_blocking_wait_or_device_poll() {
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
+        let start = source
+            .find("fn enqueue_layer_texture_upload(")
+            .expect("selected upload function");
+        let end = source[start..]
+            .find("fn checked_upload_len(")
+            .map(|offset| start + offset)
+            .expect("selected upload function boundary");
+        let body = &source[start..end];
+        assert!(!body.contains("block_on"));
+        assert!(!body.contains("device.poll"));
+        assert!(!body.contains("wait_indefinitely"));
+        assert!(!body.contains("Maintain::Wait"));
+
+        let main = include_str!("../main.rs").replace("\r\n", "\n");
+        assert!(main.contains("if fault.is_terminal()"));
+        assert!(main.contains("renderer.record_terminal_upload_error(error)"));
+        let renderer = include_str!("../renderer/state.rs").replace("\r\n", "\n");
+        let terminal = renderer
+            .find("pub fn record_terminal_upload_error")
+            .expect("terminal upload failure bridge");
+        assert!(renderer[terminal..].contains("self.gpu_health.record(error)"));
     }
 
     #[test]

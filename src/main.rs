@@ -8,23 +8,31 @@
 #![allow(clippy::chunks_exact_to_as_chunks)]
 #![allow(clippy::map_or_identity)]
 
+mod action_correlation;
 mod audio;
 mod block_dct;
+mod build_identity;
 mod codec_mosh;
 mod composition;
 mod control_help;
 mod controller_profile;
+mod creative_mutation;
+mod diagnostics;
 mod display_physics;
+mod durable_file;
 mod effects;
 mod evaluated_frame;
 mod filter_avalanche;
+mod flight_recorder;
 mod gesture;
 mod gesture_canvas;
+mod gpu_recovery;
 mod history;
 mod host_paths;
 mod image_routing;
 mod input;
 mod layers;
+mod library_index;
 mod media_safety;
 mod media_source;
 mod midi;
@@ -52,6 +60,12 @@ mod recovery_journal;
 mod render_export;
 mod renderer;
 mod scan_processor;
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "RFC D3 core precedes its operator UI wiring")
+)]
+mod show_bundle;
+mod source_transition;
 mod spatial;
 mod spout_in;
 mod spout_out;
@@ -155,6 +169,8 @@ fn resolve_advanced_temporal_bypass_overlays<'a>(
             })?;
         if layer.visible && (layer.opacity > 0.0 || !layer.opacity.is_finite()) {
             overlays.push(renderer::state::PrecomposedTemporalBypassLayer {
+                stable_id: retained.stable_id,
+                texture: retained.texture,
                 view: retained.view,
                 opacity: layer.opacity,
                 blend_mode: layer.blend_mode,
@@ -214,7 +230,9 @@ fn render_planned_temporal_bypass_overlay(
     }
 }
 use visual_rack::{LegacyRackScope, RuntimeVisualRack};
-use web::state::{ControlServerInfo, ControlServerStatus, WebState};
+use web::state::{ControlListenerStatus, ControlServerInfo, WebState};
+
+const CONTROL_SERVER_PORT: u16 = 3030;
 
 const TARGET_FPS: u64 = 30;
 // Conservative one-frame budget for assessment only. The event loop itself is
@@ -227,6 +245,10 @@ const FALLBACK_OUTPUT_HEIGHT: u32 = 720;
 const STAGE_PROGRAM_SOURCE: renderer::stage_map::StageProgramSourceId =
     renderer::stage_map::StageProgramSourceId::new(0);
 const MAX_STAGE_RUNTIME_STATUS_BYTES: usize = 4096;
+/// Winit does not expose a portable monitor-added/removed event. Window moves
+/// and scale changes provide the platform fast path; this bounded fallback is
+/// the fail-safe for a projector plugged in while no application window moves.
+const MONITOR_INVENTORY_SLOW_REFRESH: Duration = Duration::from_secs(10);
 
 const fn renderer_recovery_output(width: u32, height: u32) -> Option<(u32, u32)> {
     if width == FALLBACK_OUTPUT_WIDTH && height == FALLBACK_OUTPUT_HEIGHT {
@@ -242,12 +264,96 @@ enum OutputWindowCommand {
     Toggle,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct OutputRequestOutcome {
+    display_changed: bool,
+    window_changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputDisplayAdmission {
+    Current,
+    StaleGeneration,
+    MissingDisplay,
+}
+
+const fn classify_output_display_request(
+    requested_generation: Option<u64>,
+    current_generation: u64,
+    display_exists: bool,
+) -> OutputDisplayAdmission {
+    if !monitor_inventory_generation_is_current(requested_generation, current_generation) {
+        OutputDisplayAdmission::StaleGeneration
+    } else if !display_exists {
+        OutputDisplayAdmission::MissingDisplay
+    } else {
+        OutputDisplayAdmission::Current
+    }
+}
+
 /// A live winit handle paired with the browser-safe description of the same
 /// physical display. The identifier is intentionally session-local: Main
 /// resolves it against a freshly enumerated inventory before moving Output.
+#[derive(Clone)]
 struct OutputDisplayEntry {
     snapshot: web::state::OutputDisplaySnapshot,
     monitor: MonitorHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MonitorInventoryRefreshReason {
+    Startup,
+    PlatformTopologyEvent,
+    OutputMigration,
+    ExplicitStageMapRescan,
+    SlowFallback,
+}
+
+/// One bounded, generation-stamped owner for physical monitor discovery.
+///
+/// `MonitorHandle`s are refreshed only at an admitted invalidation boundary;
+/// ordinary frames borrow this retained vector and never ask the OS to
+/// enumerate displays or allocate a replacement inventory.
+struct MonitorInventoryCache {
+    monitors: Vec<MonitorHandle>,
+    entries: Vec<OutputDisplayEntry>,
+    signature: Vec<String>,
+    generation: u64,
+    scans: u64,
+    last_refresh: Option<Instant>,
+    pending_reason: Option<MonitorInventoryRefreshReason>,
+    last_reason: MonitorInventoryRefreshReason,
+}
+
+impl Default for MonitorInventoryCache {
+    fn default() -> Self {
+        Self {
+            monitors: Vec::new(),
+            entries: Vec::new(),
+            signature: Vec::new(),
+            generation: 0,
+            scans: 0,
+            last_refresh: None,
+            pending_reason: Some(MonitorInventoryRefreshReason::Startup),
+            last_reason: MonitorInventoryRefreshReason::Startup,
+        }
+    }
+}
+
+impl MonitorInventoryCache {
+    fn invalidate(&mut self, reason: MonitorInventoryRefreshReason) {
+        self.pending_reason = Some(reason);
+    }
+
+    fn due_reason(&self, now: Instant) -> Option<MonitorInventoryRefreshReason> {
+        self.pending_reason.or_else(|| {
+            self.last_refresh
+                .is_none_or(|last| {
+                    now.saturating_duration_since(last) >= MONITOR_INVENTORY_SLOW_REFRESH
+                })
+                .then_some(MonitorInventoryRefreshReason::SlowFallback)
+        })
+    }
 }
 
 /// One venue-authored monitor endpoint. It is deliberately independent from
@@ -349,6 +455,13 @@ fn output_display_id(signature: &str, ordinal: usize) -> String {
     )
 }
 
+const fn monitor_inventory_generation_is_current(requested: Option<u64>, current: u64) -> bool {
+    match requested {
+        Some(requested) => requested == current,
+        None => true,
+    }
+}
+
 fn output_display_entries(
     mut monitors: Vec<MonitorHandle>,
     main_monitor: Option<&MonitorHandle>,
@@ -413,6 +526,40 @@ fn output_display_entries(
             }
         })
         .collect()
+}
+
+impl MonitorInventoryCache {
+    /// Publish one OS enumeration transaction. The externally visible
+    /// generation changes only when topology/editor placement changes, so a
+    /// no-op fallback scan cannot make an otherwise current browser command
+    /// stale. Handles are still replaced on every admitted scan.
+    fn publish_scan(
+        &mut self,
+        monitors: Vec<MonitorHandle>,
+        main_monitor: Option<&MonitorHandle>,
+        now: Instant,
+        reason: MonitorInventoryRefreshReason,
+    ) -> bool {
+        let signature = stage_monitor_inventory_signature(&monitors);
+        let entries = output_display_entries(monitors.clone(), main_monitor);
+        let snapshots_changed = self
+            .entries
+            .iter()
+            .map(|entry| &entry.snapshot)
+            .ne(entries.iter().map(|entry| &entry.snapshot));
+        let changed = self.generation == 0 || self.signature != signature || snapshots_changed;
+        if changed {
+            self.generation = self.generation.saturating_add(1).max(1);
+        }
+        self.monitors = monitors;
+        self.entries = entries;
+        self.signature = signature;
+        self.scans = self.scans.saturating_add(1);
+        self.last_refresh = Some(now);
+        self.pending_reason = None;
+        self.last_reason = reason;
+        changed
+    }
 }
 
 fn acquire_stage_monitor_surfaces(
@@ -511,6 +658,181 @@ enum WebActionBatchDisposition {
     MasterVisualReset,
 }
 
+/// Process-local result of one ingress identity reaching the live applier.
+/// Batch ownership and correlation lifecycle are deliberately orthogonal: a
+/// refused action can still leave the remainder of its drained batch intact,
+/// while an accepted snapshot can supersede later actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionLifecycleOutcome {
+    Applied,
+    Coalesced,
+    Refused,
+    Quantized,
+}
+
+/// Actual admission result from the bounded library-index worker. Folder
+/// equality describes the admitted command; it never substitutes for whether
+/// the worker accepted the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibraryScanAdmission {
+    Refused,
+    Admitted { folder_changed: bool },
+}
+
+impl LibraryScanAdmission {
+    const fn admitted(self) -> bool {
+        matches!(self, Self::Admitted { .. })
+    }
+
+    const fn lifecycle(self) -> ActionLifecycleOutcome {
+        match self {
+            Self::Refused => ActionLifecycleOutcome::Refused,
+            Self::Admitted {
+                folder_changed: true,
+            } => ActionLifecycleOutcome::Applied,
+            Self::Admitted {
+                folder_changed: false,
+            } => ActionLifecycleOutcome::Coalesced,
+        }
+    }
+}
+
+fn merge_action_lifecycle(
+    lifecycle: ActionLifecycleOutcome,
+    accepted_applied: &mut bool,
+    accepted_coalesced: &mut bool,
+) {
+    match lifecycle {
+        ActionLifecycleOutcome::Applied => *accepted_applied = true,
+        ActionLifecycleOutcome::Coalesced => *accepted_coalesced = true,
+        ActionLifecycleOutcome::Refused | ActionLifecycleOutcome::Quantized => {}
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebActionDispatchOutcome {
+    batch: WebActionBatchDisposition,
+    lifecycle: ActionLifecycleOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AutomationControlOutcome {
+    normalized: f32,
+    lifecycle: ActionLifecycleOutcome,
+}
+
+impl AutomationControlOutcome {
+    fn from_change(normalized: f32, changed: bool) -> Self {
+        Self {
+            normalized,
+            lifecycle: if changed {
+                ActionLifecycleOutcome::Applied
+            } else {
+                ActionLifecycleOutcome::Refused
+            },
+        }
+    }
+}
+
+impl WebActionDispatchOutcome {
+    fn applied(batch: WebActionBatchDisposition) -> Self {
+        Self {
+            batch,
+            lifecycle: ActionLifecycleOutcome::Applied,
+        }
+    }
+
+    fn refused(batch: WebActionBatchDisposition) -> Self {
+        Self {
+            batch,
+            lifecycle: ActionLifecycleOutcome::Refused,
+        }
+    }
+
+    fn coalesced(batch: WebActionBatchDisposition) -> Self {
+        Self {
+            batch,
+            lifecycle: ActionLifecycleOutcome::Coalesced,
+        }
+    }
+
+    fn quantized() -> Self {
+        Self {
+            batch: WebActionBatchDisposition::Continue,
+            lifecycle: ActionLifecycleOutcome::Quantized,
+        }
+    }
+
+    fn from_acceptance(batch: WebActionBatchDisposition, accepted: bool) -> Self {
+        if accepted {
+            Self::applied(batch)
+        } else {
+            Self::refused(batch)
+        }
+    }
+}
+
+/// Immutable correlation facts copied from the evaluated frame. Internal GPU
+/// submissions cannot consume this latch: only a completed, device-live
+/// presentation to at least one real audience surface may publish it, once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AudienceActionSubmissionLatch {
+    highest_applied_sequence: u64,
+    submission_generation: u64,
+    submitted_at: Option<Instant>,
+    recorded: bool,
+}
+
+impl AudienceActionSubmissionLatch {
+    const fn new(highest_applied_sequence: u64, submission_generation: u64) -> Self {
+        Self {
+            highest_applied_sequence,
+            submission_generation,
+            submitted_at: None,
+            recorded: false,
+        }
+    }
+
+    /// Capture the CPU instant at the exact final queue-submit call that owns
+    /// at least one real audience target. Internal/editor-only submissions do
+    /// not populate the latch, and repeated submits cannot move the metric.
+    fn capture_audience_submit(
+        &mut self,
+        accepted_audience_submit: bool,
+        submitted_at: Instant,
+    ) -> bool {
+        if self.recorded
+            || self.submitted_at.is_some()
+            || !accepted_audience_submit
+            || self.highest_applied_sequence == 0
+        {
+            return false;
+        }
+        self.submitted_at = Some(submitted_at);
+        true
+    }
+
+    fn record_presented(
+        &mut self,
+        web_state: &WebState,
+        accepted_audience_presented: bool,
+    ) -> bool {
+        if self.recorded || !accepted_audience_presented || self.highest_applied_sequence == 0 {
+            return false;
+        }
+        let Some(submitted_at) = self.submitted_at else {
+            return false;
+        };
+        web_state.record_action_submission(
+            self.highest_applied_sequence,
+            self.submission_generation,
+            submitted_at,
+        );
+        self.recorded = true;
+        true
+    }
+}
+
 /// The raw value carrier one recordable action holds, before the address law
 /// quantizes it. JSON-valued actions are interpreted under the address's
 /// declared law, so one carrier serves every family.
@@ -543,15 +865,6 @@ impl PerformanceActionValue {
             _ => None,
         }
     }
-}
-
-/// One recordable edit staged at the dispatch seam, waiting for the
-/// frame-acceptance gate to stamp its tick and commit it.
-#[derive(Debug, Clone)]
-struct PendingPerformanceEdit {
-    control: performance_track::PerformanceControl,
-    law: performance_track::PerformanceValueLaw,
-    raw: performance_track::PerformanceRawValue,
 }
 
 /// One compiled replay entry: either a ready-to-dispatch action, or a named
@@ -588,7 +901,7 @@ fn commit_performance_frame_fields(
     recording: bool,
     take: &mut performance_track::PerformanceTake,
     clock: &mut performance_track::PerformanceClock,
-    pending: &mut Vec<PendingPerformanceEdit>,
+    pending: &mut Vec<creative_mutation::AcceptedCreativeMutation>,
     playback: &mut Option<PerformancePlayback>,
     checksum: &mut String,
     status: &mut String,
@@ -599,7 +912,8 @@ fn commit_performance_frame_fields(
         let tick = clock.reference_tick_u32();
         let mut take_changed = false;
         for edit in pending.drain(..) {
-            match take.record_accepted(tick, edit.control, edit.law, &edit.raw) {
+            let (control, law, raw) = edit.into_v1_parts();
+            match take.record_accepted(tick, control, law, &raw) {
                 Ok(true) => take_changed = true,
                 Ok(false) => {
                     take_changed = true;
@@ -857,10 +1171,289 @@ fn stage_health_gpu_budget(
     (used, limit)
 }
 
+/// Reconcile the renderer-owned P2b uniform arenas with the accepted creative
+/// allocation. Legacy Exact intentionally reports zero creative-plan bytes,
+/// so the arena payload must be added here rather than hidden in that plan.
+fn creative_gpu_bytes_with_core_arenas(
+    accepted_creative_bytes: Option<u64>,
+    core_uniform_arena_bytes: u64,
+) -> Option<u64> {
+    accepted_creative_bytes.map(|creative| creative.saturating_add(core_uniform_arena_bytes))
+}
+
 fn duration_micros_u32(duration: Option<Duration>) -> u32 {
     duration.map_or(0, |duration| {
         duration.as_micros().min(u128::from(u32::MAX)) as u32
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FlightVerifiedContentIdentity {
+    sha256: [u8; 32],
+    byte_len: u64,
+}
+
+fn flight_verified_content_identity(reference: &str) -> Option<FlightVerifiedContentIdentity> {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let encoded = reference.strip_prefix(media_source::CONTENT_SHA256_PREFIX)?;
+    let (hex, length) = encoded.split_once('/')?;
+    if hex.len() != 64 || length.contains('/') {
+        return None;
+    }
+    let mut sha256 = [0_u8; 32];
+    for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+        sha256[index] = nibble(pair[0])?.checked_shl(4)? | nibble(pair[1])?;
+    }
+    Some(FlightVerifiedContentIdentity {
+        sha256,
+        byte_len: length.parse().ok()?,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FlightSourceIdentityFact {
+    stable_layer_id: u64,
+    source_kind: &'static str,
+    verified_content_identity: Option<FlightVerifiedContentIdentity>,
+    /// Session-local opaque witness for an unverified logical source. It is
+    /// advanced only by active-source commits, never by proxy backing swaps,
+    /// resize epochs, or raw host-path content.
+    unverified_change_witness: Option<u64>,
+}
+
+fn flight_source_identity_fact(
+    stable_layer_id: u64,
+    source_kind: &'static str,
+    source_reference: &str,
+    unverified_change_witness: u64,
+) -> FlightSourceIdentityFact {
+    let verified_content_identity = flight_verified_content_identity(source_reference);
+    FlightSourceIdentityFact {
+        stable_layer_id,
+        source_kind,
+        verified_content_identity,
+        unverified_change_witness: verified_content_identity
+            .is_none()
+            .then_some(unverified_change_witness),
+    }
+}
+
+/// Transient, process-local comparison key used only at logical source commit
+/// boundaries. Exact references may contain host paths, so this type has no
+/// Debug/serde/hash implementation and never enters recorder state. Sorting
+/// by stable ID makes stack order irrelevant.
+#[derive(PartialEq, Eq)]
+struct TransientLogicalSourceIdentity {
+    stable_layer_id: u64,
+    source_kind: &'static str,
+    exact_reference: String,
+}
+
+fn transient_logical_source_set<'a>(
+    sources: impl IntoIterator<Item = (u64, &'static str, &'a str)>,
+) -> Vec<TransientLogicalSourceIdentity> {
+    let mut sources = sources
+        .into_iter()
+        .map(
+            |(stable_layer_id, source_kind, exact_reference)| TransientLogicalSourceIdentity {
+                stable_layer_id,
+                source_kind,
+                exact_reference: exact_reference.to_owned(),
+            },
+        )
+        .collect::<Vec<_>>();
+    sources.sort_unstable_by_key(|source| source.stable_layer_id);
+    sources
+}
+
+fn transient_layer_source_set(layers: &[Layer]) -> Vec<TransientLogicalSourceIdentity> {
+    transient_logical_source_set(layers.iter().map(|layer| {
+        (
+            layer.layer_id(),
+            layer.source_kind(),
+            layer.source_reference_for_persistence(),
+        )
+    }))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FlightSourceSignature {
+    stable_layer_id: u64,
+    source_kind: &'static str,
+    verified_content_identity: Option<FlightVerifiedContentIdentity>,
+    unverified_change_witness: Option<u64>,
+}
+
+#[derive(Default)]
+struct FlightSourceDigestCache {
+    accepted_signature: Vec<FlightSourceSignature>,
+    observed_signature: Vec<FlightSourceSignature>,
+    digest: Option<flight_recorder::Digest32>,
+    rebuilds: u64,
+}
+
+impl FlightSourceDigestCache {
+    fn resolve(
+        &mut self,
+        signature: impl IntoIterator<Item = FlightSourceSignature>,
+        rebuild: impl FnOnce() -> flight_recorder::Digest32,
+    ) -> flight_recorder::Digest32 {
+        self.observed_signature.clear();
+        self.observed_signature.extend(signature);
+        self.observed_signature
+            .sort_unstable_by_key(|source| source.stable_layer_id);
+        if self.digest.is_none() || self.observed_signature != self.accepted_signature {
+            self.digest = Some(rebuild());
+            std::mem::swap(&mut self.accepted_signature, &mut self.observed_signature);
+            self.rebuilds = self.rebuilds.wrapping_add(1).max(1);
+        }
+        self.observed_signature.clear();
+        self.digest
+            .expect("a source digest is installed on first resolve")
+    }
+}
+
+/// Refresh only the source half of an already-cached flight-recorder content
+/// fact. The authored-world/plan fingerprint is deliberately retained byte
+/// for byte; only an actual source signature change rebuilds the bounded
+/// source digest and advances the publication generation.
+fn refresh_cached_flight_source_identity(
+    cache: &mut FlightSourceDigestCache,
+    cached: &mut Option<flight_recorder::ContentIdentityFact>,
+    generation: &mut u64,
+    source_count: u16,
+    signature: impl IntoIterator<Item = FlightSourceSignature>,
+    rebuild: impl FnOnce() -> flight_recorder::Digest32,
+) -> bool {
+    let Some(cached) = cached.as_mut() else {
+        return false;
+    };
+    let source_set_digest = cache.resolve(signature, rebuild);
+    if cached.source_set_digest == source_set_digest && cached.source_count == source_count {
+        return false;
+    }
+    cached.source_set_digest = source_set_digest;
+    cached.source_count = source_count;
+    *generation = generation.wrapping_add(1).max(1);
+    true
+}
+
+fn advance_unverified_source_change_witness(witness: &mut u64, logical_source_changed: bool) {
+    if logical_source_changed {
+        *witness = witness.wrapping_add(1).max(1);
+    }
+}
+
+/// Hash a bounded, order-independent set of already-retained source identity
+/// facts. This runs only at an authored commit/startup seam: it performs no
+/// filesystem read or YAML capture, and only the resulting digest enters the
+/// recorder. Sorting by stable ID keeps layer reordering from masquerading as
+/// source replacement.
+fn flight_source_set_digest(
+    facts: impl IntoIterator<Item = FlightSourceIdentityFact>,
+) -> flight_recorder::Digest32 {
+    use sha2::{Digest as _, Sha256};
+
+    let mut facts = facts.into_iter().collect::<Vec<_>>();
+    facts.sort_unstable_by_key(|fact| fact.stable_layer_id);
+    let mut hasher = Sha256::new();
+    hasher.update(b"collide-o-scope/flight-source-set/v2\0");
+    hasher.update((facts.len() as u64).to_le_bytes());
+    for fact in facts {
+        hasher.update(fact.stable_layer_id.to_le_bytes());
+        hasher.update((fact.source_kind.len() as u64).to_le_bytes());
+        hasher.update(fact.source_kind.as_bytes());
+        if let Some(identity) = fact.verified_content_identity {
+            hasher.update([1]);
+            hasher.update(identity.byte_len.to_le_bytes());
+            hasher.update(identity.sha256);
+        } else {
+            // Legacy/unverified paths are deliberately a closed fallback: the
+            // path itself never enters even a guessable recorder digest. The
+            // opaque witness changes only when Main commits another logical
+            // active source, so backing-only epochs remain stable.
+            hasher.update([0]);
+            hasher.update(
+                fact.unverified_change_witness
+                    .expect("an unverified source carries an opaque change witness")
+                    .to_le_bytes(),
+            );
+        }
+    }
+    flight_recorder::Digest32(hasher.finalize().into())
+}
+
+/// Collapse the newest-only video decoder mailboxes into one bounded recorder
+/// fact. The aggregate deliberately exposes only numeric worker health; source
+/// names, paths, and decoder diagnostics never cross the flight-recorder API.
+fn flight_video_decode_worker_fact(
+    samples: impl IntoIterator<Item = (bool, Option<video::threaded::DecoderTelemetry>)>,
+) -> flight_recorder::WorkerFact {
+    let mut workers = 0_u16;
+    let mut observed_telemetry = false;
+    let mut failed = false;
+    let mut queue_depth = 0_u16;
+    let mut completed_jobs = 0_u64;
+    let mut dropped_jobs = 0_u64;
+
+    for (hard_failed, telemetry) in samples {
+        workers = workers.saturating_add(1);
+        failed |= hard_failed;
+        let Some(telemetry) = telemetry else {
+            continue;
+        };
+        observed_telemetry = true;
+        queue_depth = queue_depth
+            .saturating_add(u16::from(telemetry.pending_command_depth))
+            .saturating_add(u16::from(telemetry.pending_frames));
+        completed_jobs = completed_jobs.saturating_add(telemetry.accepted_uploads);
+        dropped_jobs = dropped_jobs
+            .saturating_add(telemetry.command_drops)
+            .saturating_add(telemetry.frame_drops)
+            .saturating_add(telemetry.command_overwrites)
+            .saturating_add(telemetry.frame_overwrites)
+            .saturating_add(telemetry.stale_commands)
+            .saturating_add(telemetry.superseded_decode_attempts)
+            .saturating_add(telemetry.stale_completed_frames)
+            .saturating_add(telemetry.failed_decode_attempts);
+    }
+
+    // Each decoder has exactly one newest-command slot and one newest-frame
+    // slot. Saturation keeps the recorder schema bounded even on hostile input.
+    let queue_capacity = workers.saturating_mul(2);
+    let state = if workers == 0 {
+        flight_recorder::WorkerState::Stopped
+    } else if failed {
+        flight_recorder::WorkerState::Failed
+    } else if !observed_telemetry {
+        flight_recorder::WorkerState::Starting
+    } else if queue_capacity > 0 && queue_depth >= queue_capacity {
+        flight_recorder::WorkerState::Backpressured
+    } else if queue_depth > 0 {
+        flight_recorder::WorkerState::Busy
+    } else {
+        flight_recorder::WorkerState::Ready
+    };
+
+    flight_recorder::WorkerFact {
+        worker: flight_recorder::WorkerKind::VideoDecode,
+        state,
+        queue_depth,
+        queue_capacity,
+        completed_jobs,
+        dropped_jobs,
+        // Decoder retirement/replacement is separately supervised, but that
+        // supervisor does not expose a stable restart counter at this seam.
+        restart_count: 0,
+    }
 }
 
 /// Whether the decode path may claim hardware or zero-copy activity. The
@@ -873,11 +1466,11 @@ fn duration_micros_u32(duration: Option<Duration>) -> u32 {
 fn decode_activity_claims() -> (bool, bool) {
     let hardware_available = matches!(
         precision::scale_capability_decision(precision::ScaleCapability::HardwareDecode),
-        precision::CapabilityDecision::Available
+        precision::CapabilityDecision::Implemented
     );
     let zero_copy_available = matches!(
         precision::scale_capability_decision(precision::ScaleCapability::ZeroCopyDecode),
-        precision::CapabilityDecision::Available
+        precision::CapabilityDecision::Implemented
     );
     // Activity additionally requires a runtime signal from the (absent)
     // backend, so availability alone still reports inactive.
@@ -1125,6 +1718,7 @@ enum NativeRecoveryAction {
     SetProgramFrozen(bool),
     SetBlackout(bool),
     RevertVisualProgram,
+    RestartControlServer,
     RescanLibrary,
     ChooseLibrary,
 }
@@ -1205,6 +1799,44 @@ struct NativeGestureSample {
     position: [f32; 2],
 }
 
+/// Consume one already-minted ingress envelope, apply its payload, and only
+/// then publish the unchanged identity to correlation. Keeping this ordering
+/// in one helper prevents adapters from accidentally measuring dispatch
+/// rather than completed application or minting a replacement identity.
+fn apply_envelope_then_record<S, T, R>(
+    state: &mut S,
+    envelope: action_correlation::ActionEnvelope<T>,
+    apply: impl FnOnce(&mut S, T) -> (R, ActionLifecycleOutcome),
+    record_applied: impl FnOnce(&mut S, action_correlation::ActionIdentity),
+    record_terminal: impl FnOnce(
+        &mut S,
+        action_correlation::ActionIdentity,
+        action_correlation::ActionDisposition,
+    ),
+) -> R {
+    let identity = envelope.identity();
+    let (result, lifecycle) = apply(state, envelope.into_payload());
+    match lifecycle {
+        ActionLifecycleOutcome::Applied => record_applied(state, identity),
+        ActionLifecycleOutcome::Coalesced => record_terminal(
+            state,
+            identity,
+            action_correlation::ActionDisposition::Coalesced,
+        ),
+        ActionLifecycleOutcome::Refused => record_terminal(
+            state,
+            identity,
+            action_correlation::ActionDisposition::Refused,
+        ),
+        ActionLifecycleOutcome::Quantized => record_terminal(
+            state,
+            identity,
+            action_correlation::ActionDisposition::Quantized,
+        ),
+    }
+    result
+}
+
 /// Map a pointer position onto normalized canvas space.
 ///
 /// A degenerate rect has no canvas space to map into and yields `None` rather
@@ -1223,6 +1855,36 @@ fn normalized_pointer_position(rect: egui::Rect, pointer: egui::Pos2) -> Option<
     ])
 }
 
+fn native_editor_has_ingress_candidate(
+    editor_active: bool,
+    identity_open: bool,
+    history_gesture_open: bool,
+    events: &[egui::Event],
+) -> bool {
+    editor_active
+        && !identity_open
+        && !history_gesture_open
+        && events.iter().any(|event| {
+            matches!(event, egui::Event::PointerButton { pressed: true, .. })
+                || matches!(
+                    event,
+                    egui::Event::Key {
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    }
+                )
+        })
+}
+
+const fn native_editor_history_work_required(
+    new_ingress_identity: bool,
+    owned_identity_open: bool,
+    native_gesture_open: bool,
+) -> bool {
+    new_ingress_identity || owned_identity_open || native_gesture_open
+}
+
 /// Collect at most one native pointer edge per frame from the preview surface.
 ///
 /// egui reports a drag start, continued motion, and a release as separate
@@ -1232,7 +1894,8 @@ fn collect_native_gesture_sample(
     rect: egui::Rect,
     response: &egui::Response,
     latest_pointer: Option<egui::Pos2>,
-    samples: &mut Vec<NativeGestureSample>,
+    action_sequencer: &action_correlation::ActionSequencer,
+    samples: &mut Vec<action_correlation::ActionEnvelope<NativeGestureSample>>,
 ) {
     let phase = if response.drag_started() {
         gesture::GesturePhase::Begin
@@ -1249,7 +1912,10 @@ fn collect_native_gesture_sample(
     let Some(position) = normalized_pointer_position(rect, pointer) else {
         return;
     };
-    samples.push(NativeGestureSample { phase, position });
+    samples.push(action_sequencer.envelope(
+        action_correlation::ActionSourceClass::Native,
+        NativeGestureSample { phase, position },
+    ));
 }
 
 struct NativeRecoveryView {
@@ -1267,7 +1933,8 @@ struct NativeRecoveryView {
 fn build_native_recovery_strip(
     ctx: &egui::Context,
     view: &NativeRecoveryView,
-    actions: &mut Vec<NativeRecoveryAction>,
+    action_sequencer: &action_correlation::ActionSequencer,
+    actions: &mut Vec<action_correlation::ActionEnvelope<NativeRecoveryAction>>,
 ) {
     egui::TopBottomPanel::top("native_recovery_strip")
         .resizable(false)
@@ -1275,37 +1942,39 @@ fn build_native_recovery_strip(
             ui.horizontal_wrapped(|ui| {
                 ui.strong("RECOVERY");
 
-                let (server_text, server_color, server_error) = match &view.control_server.status {
-                    ControlServerStatus::NotStarted => (
-                        "Panel server not started".to_string(),
-                        egui::Color32::YELLOW,
-                        None,
-                    ),
-                    ControlServerStatus::Starting => (
-                        "Panel server starting".to_string(),
-                        egui::Color32::YELLOW,
-                        None,
-                    ),
-                    ControlServerStatus::Listening => (
-                        "Panel server ready".to_string(),
-                        egui::Color32::LIGHT_GREEN,
-                        None,
-                    ),
-                    ControlServerStatus::Unavailable(error) => (
-                        "Panel server unavailable".to_string(),
-                        egui::Color32::LIGHT_RED,
-                        Some(error.as_str()),
-                    ),
+                let mut listener_badge = |label: &str, status: &ControlListenerStatus| match status
+                {
+                    ControlListenerStatus::Stopped => {
+                        ui.colored_label(egui::Color32::YELLOW, format!("{label}: stopped"));
+                    }
+                    ControlListenerStatus::Starting => {
+                        ui.colored_label(egui::Color32::YELLOW, format!("{label}: starting"));
+                    }
+                    ControlListenerStatus::Listening { address } => {
+                        ui.colored_label(egui::Color32::LIGHT_GREEN, format!("{label}: {address}"));
+                    }
+                    ControlListenerStatus::Unavailable { reason } => {
+                        ui.colored_label(egui::Color32::LIGHT_RED, format!("{label}: unavailable"))
+                            .on_hover_text(reason);
+                    }
                 };
-                let status = ui.colored_label(server_color, server_text);
-                if let Some(error) = server_error {
-                    status.on_hover_text(error);
-                    ui.colored_label(egui::Color32::LIGHT_RED, format!("({error})"));
-                }
+                listener_badge("Loopback v4", &view.control_server.loopback_ipv4);
+                listener_badge("Loopback v6", &view.control_server.loopback_ipv6);
+                listener_badge("LAN TLS", &view.control_server.lan_tls);
 
-                if !view.control_server.local_url.is_empty() {
-                    ui.hyperlink_to("Open Panel", &view.control_server.local_url)
+                if let Some(local_url) = view.control_server.local_url() {
+                    ui.hyperlink_to("Open Panel", local_url.expose_to_local_ui())
                         .on_hover_text("Open the authenticated loopback control panel");
+                }
+                if ui
+                    .button("Restart Panel")
+                    .on_hover_text("Retire all listener roles, rotate authentication, and rebind")
+                    .clicked()
+                {
+                    actions.push(action_sequencer.envelope(
+                        action_correlation::ActionSourceClass::Native,
+                        NativeRecoveryAction::RestartControlServer,
+                    ));
                 }
                 ui.weak(match view.browser_connections {
                     0 => "No browser connected".to_string(),
@@ -1319,21 +1988,30 @@ fn build_native_recovery_strip(
                     .on_hover_text("Hold the complete visual program without catch-up")
                     .clicked()
                 {
-                    actions.push(NativeRecoveryAction::SetProgramFrozen(!view.program_frozen));
+                    actions.push(action_sequencer.envelope(
+                        action_correlation::ActionSourceClass::Native,
+                        NativeRecoveryAction::SetProgramFrozen(!view.program_frozen),
+                    ));
                 }
                 if ui
                     .selectable_label(view.blackout, "Blackout")
                     .on_hover_text("Cut every audience output to absolute black")
                     .clicked()
                 {
-                    actions.push(NativeRecoveryAction::SetBlackout(!view.blackout));
+                    actions.push(action_sequencer.envelope(
+                        action_correlation::ActionSourceClass::Native,
+                        NativeRecoveryAction::SetBlackout(!view.blackout),
+                    ));
                 }
                 if ui
                     .button("Revert Visuals")
                     .on_hover_text("Revert the complete master visual program")
                     .clicked()
                 {
-                    actions.push(NativeRecoveryAction::RevertVisualProgram);
+                    actions.push(action_sequencer.envelope(
+                        action_correlation::ActionSourceClass::Native,
+                        NativeRecoveryAction::RevertVisualProgram,
+                    ));
                 }
 
                 ui.separator();
@@ -1354,13 +2032,19 @@ fn build_native_recovery_strip(
                 ))
                 .on_hover_text(folder_path);
                 if ui.button("Choose Library").clicked() {
-                    actions.push(NativeRecoveryAction::ChooseLibrary);
+                    actions.push(action_sequencer.envelope(
+                        action_correlation::ActionSourceClass::Native,
+                        NativeRecoveryAction::ChooseLibrary,
+                    ));
                 }
                 if ui
                     .add_enabled(view.library_folder.is_some(), egui::Button::new("Rescan"))
                     .clicked()
                 {
-                    actions.push(NativeRecoveryAction::RescanLibrary);
+                    actions.push(action_sequencer.envelope(
+                        action_correlation::ActionSourceClass::Native,
+                        NativeRecoveryAction::RescanLibrary,
+                    ));
                 }
             });
             if !view.output_status.is_empty() || !view.media_status.is_empty() {
@@ -1428,7 +2112,11 @@ fn exit_on_renderer_device_loss(
     let Some(error) = renderer.device_error() else {
         return false;
     };
-    *output_error = format!("GPU device lost: {error}. Restart collide-o-scope.");
+    gpu_recovery::request_phase_a_restart(gpu_recovery::GpuLossPoint::Unattributed);
+    *output_error = format!(
+        "GPU device lost: {error}. Closing outputs for supervised recovery (exit {}).",
+        gpu_recovery::SUPERVISED_GPU_RESTART_EXIT_CODE
+    );
     log::error!("{output_error}");
     event_loop.exit();
     true
@@ -2509,13 +3197,13 @@ fn apply_motion_param(
                     None => {
                         return Err("motion field_source must be auto, codec_vectors, lattice, \
                                     or a procedural_* kind"
-                            .into())
+                            .into());
                     }
                 },
                 None => {
                     return Err("motion field_source must be auto, codec_vectors, lattice, \
                                 or a procedural_* kind"
-                        .into())
+                        .into());
                 }
             };
         }
@@ -2564,7 +3252,7 @@ fn apply_motion_param(
                 Some("live") => CurvedShutterQuality::Live,
                 Some("high") => CurvedShutterQuality::High,
                 _ => {
-                    return Err("motion shutter_quality must be sharp, draft, live, or high".into())
+                    return Err("motion shutter_quality must be sharp, draft, live, or high".into());
                 }
             };
         }
@@ -2594,7 +3282,7 @@ fn apply_motion_param(
                 _ => {
                     return Err(
                         "motion carrier must be transparent, black, or first_source_frame".into(),
-                    )
+                    );
                 }
             };
         }
@@ -2626,7 +3314,7 @@ fn apply_motion_param(
                     return Err(
                         "motion collider_boundary must be transparent, mirror, wrap, or hold"
                             .into(),
-                    )
+                    );
                 }
             };
         }
@@ -3045,6 +3733,51 @@ struct StagedCreativeGraph {
     composition: composition::RuntimeComposition,
 }
 
+fn preflight_constraint_failure(
+    code: diagnostics::ConstraintCode,
+    invariant: diagnostics::ConstraintInvariant,
+    affected: Vec<diagnostics::ConstraintScope>,
+    text: impl Into<String>,
+) -> diagnostics::ConstraintFailure {
+    diagnostics::ConstraintFailure::new(diagnostics::ConstraintDiagnostic::new(
+        code,
+        invariant,
+        diagnostics::ConstraintSeverity::Error,
+        affected,
+        text,
+    ))
+}
+
+fn program_constraint_scope() -> Vec<diagnostics::ConstraintScope> {
+    vec![diagnostics::ConstraintScope::singleton(
+        diagnostics::ConstraintScopeKind::Program,
+    )]
+}
+
+fn layer_constraint_scopes<'a>(
+    layers: impl IntoIterator<Item = &'a StagedLayerLook>,
+) -> Vec<diagnostics::ConstraintScope> {
+    layers
+        .into_iter()
+        .map(|layer| {
+            diagnostics::ConstraintScope::stable(
+                diagnostics::ConstraintScopeKind::Layer,
+                layer.layer_id.get(),
+            )
+        })
+        .collect()
+}
+
+fn prefixed_composition_failure(
+    prefix: &str,
+    error: evaluated_frame::evaluated_composition::CompositionPlanError,
+    base_revision: u64,
+) -> diagnostics::ConstraintFailure {
+    let mut diagnostic = error.constraint_diagnostic(base_revision);
+    diagnostic.text = format!("{prefix}: {error}");
+    diagnostics::ConstraintFailure::new(diagnostic)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CreativeCommitImpact {
     NoChange,
@@ -3174,7 +3907,7 @@ impl StagedLayerLook {
 fn validate_master_bypass_capability(
     master_rack: &RuntimeVisualRack,
     layers: &[(image_routing::StableLayerId, bool)],
-) -> Result<(), String> {
+) -> Result<(), evaluated_frame::evaluated_composition::CompositionPlanError> {
     let bypassing = layers
         .iter()
         .filter_map(|(layer_id, bypass)| bypass.then_some(*layer_id))
@@ -3190,9 +3923,11 @@ fn validate_master_bypass_capability(
             visual_rack::RuntimeVisualNodeKind::LegacyCanonical
         ) {
             if saw_global_master_step {
-                return Err(format!(
-                    "advanced master ordering cannot preserve inherited bypass for authored layers {bypassing:?}"
-                ));
+                return Err(
+                    evaluated_frame::evaluated_composition::CompositionPlanError::AmbiguousMasterBypass {
+                        layers: bypassing,
+                    },
+                );
             }
         } else {
             saw_global_master_step = true;
@@ -4452,9 +5187,9 @@ struct ManualHistoryCanonical<'a> {
 }
 
 impl ManualHistoryWorld {
-    fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+    fn canonical_bytes_for_patch(&self, patch: &patch::PatchState) -> Result<Vec<u8>, String> {
         serde_json::to_vec(&ManualHistoryCanonical {
-            patch: &self.patch,
+            patch,
             stable_layer_ids: self
                 .stable_layer_ids
                 .iter()
@@ -4467,6 +5202,23 @@ impl ManualHistoryWorld {
             controller_profile: &self.controller_profile,
         })
         .map_err(|error| format!("serialize manual history world: {error}"))
+    }
+
+    fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        self.canonical_bytes_for_patch(&self.patch)
+    }
+
+    /// The exact comparison key for the only history restore that may reuse
+    /// live source/GPU objects. Every authored byte other than the two layer
+    /// bypass bits remains covered, including stable identity/order, source,
+    /// graph, transport, documents, and the patch base directory.
+    fn canonical_bytes_with_neutral_layer_bypass(&self) -> Result<Vec<u8>, String> {
+        let mut patch = self.patch.clone();
+        for layer in &mut patch.layers {
+            layer.bypass_master_fx = false;
+            layer.bypass_temporal_fx = false;
+        }
+        self.canonical_bytes_for_patch(&patch)
     }
 }
 
@@ -4686,6 +5438,16 @@ fn controller_feedback_addresses(
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WebAuthoredRevisionInputs {
+    mutation_counter: u64,
+    layer_stack_revision: u64,
+    composition_revision: u64,
+    history_generation: u64,
+    controller_profile_revision: u64,
+    preset_revision: u64,
+}
+
 struct App {
     initial_video: Option<String>,
     window: Option<Arc<Window>>,
@@ -4703,6 +5465,11 @@ struct App {
     /// exact legacy establishes a measured zero for both advanced domains.
     accepted_creative_resource_bytes: Option<u64>,
     accepted_motion_resource_bytes: Option<u64>,
+    /// Declared Advanced-domain work from the most recently accepted frame.
+    /// Legacy exact records a measured zero for this explicitly scoped ledger.
+    accepted_creative_full_frame_passes: Option<u32>,
+    accepted_creative_texture_lookups: Option<u32>,
+    accepted_creative_surface_layers: Option<u32>,
     layers: Vec<Layer>,
     selected_layer: Option<usize>,
     /// The proxy cache, opened lazily on first use (a Y-key encode request or
@@ -4745,6 +5512,7 @@ struct App {
     composition: composition::RuntimeComposition,
     composition_revision: u64,
     composition_status: String,
+    constraint_diagnostics: std::cell::RefCell<Vec<diagnostics::ConstraintDiagnostic>>,
     master_effects: effects::EffectUniforms,
     master_rack: RuntimeVisualRack,
     /// Program-wide M4 motion authoring. Hidden field/carrier pixels remain
@@ -4767,6 +5535,11 @@ struct App {
     performance_patch_dir: Option<PathBuf>,
     library_files: Vec<PathBuf>,
     audio_library_files: Vec<PathBuf>,
+    /// One persistent newest-only directory worker. It owns enumeration and
+    /// classification; Main only polls completed immutable generations.
+    library_index_runtime: Option<library_index::LibraryIndexRuntime>,
+    /// Deterministic admission fault for correlation tests. Production has no
+    /// corresponding branch or mutable runtime flag.
     /// Host-session-only source admission policy. Patches deliberately cannot
     /// raise this boundary, and switching back to Safe affects future opens
     /// without destroying sources that already hold an Expert reservation.
@@ -4901,7 +5674,7 @@ struct App {
     /// Recordable edits staged at the dispatch seam this frame, committed only
     /// at the frame-acceptance gate — the gesture two-phase law, so a rejected
     /// or frozen frame neither consumes a tick nor records an edit.
-    pending_performance_edits: Vec<PendingPerformanceEdit>,
+    pending_performance_edits: Vec<creative_mutation::AcceptedCreativeMutation>,
     /// The replay session while playback is armed.
     performance_playback: Option<PerformancePlayback>,
     /// Guard: the record tap must never observe the replayer's own
@@ -5018,6 +5791,10 @@ struct App {
     selective_hold_spout_readback_epoch: Option<u64>,
     // Modulation matrix (BPM clock, LFOs, routings)
     mod_matrix: modulation::ModMatrix,
+    /// P2a's exact structural modulation plan. It recompiles only when the
+    /// ordered stable rack/group signature changes and retains its dense
+    /// offset allocation across accepted value-only frames.
+    stable_mod_topology_cache: modulation::StableModTopologyCache,
     // Patch morphing crossfader (A/B slots + t)
     morph: morph::Morph,
     /// B15 snapshot bank. Recall loads a slot into the Morph pair above
@@ -5056,10 +5833,11 @@ struct App {
     controller_profile_pending_initial_resolution: bool,
     controller_status: String,
     midi_events: Vec<controller_profile::ControllerEvent>,
+    midi_action_batches: Vec<action_correlation::ActionEnvelope<midi::MidiActionBatch>>,
     controller_feedback_cache: BTreeMap<controller_profile::RuntimeControlAddress, u16>,
     osc_config: osc::OscConfigDocument,
     osc: osc::OscEngine,
-    osc_events: Vec<osc::OscEvent>,
+    osc_events: Vec<action_correlation::ActionEnvelope<osc::OscEvent>>,
     osc_status: String,
     // Temporal effects (feedback trails, slit-scan)
     temporal_params: effects::params::TemporalParams,
@@ -5073,6 +5851,7 @@ struct App {
     /// Empty means Automatic. Non-empty values are opaque identifiers from the
     /// current host-session display inventory and never enter PatchState.
     output_display_id: String,
+    monitor_inventory: MonitorInventoryCache,
     output_displays: Vec<web::state::OutputDisplaySnapshot>,
     output_error: String,
     /// Separate venue document. Artistic PatchState never captures projector
@@ -5101,6 +5880,25 @@ struct App {
     stage_presenter_error: String,
     stage_output_status: String,
     stage_health_monitor: stage_health::StageHealthMonitor,
+    stage_gpu_timing: renderer::gpu_timing::GpuTimingSnapshot,
+    highest_applied_action_sequence: u64,
+    next_audience_submission_generation: u64,
+    /// Private, bounded, typed evidence writer. Tests never open the
+    /// operator's real state directory merely by constructing an App.
+    flight_recorder: Option<flight_recorder::FlightRecorder>,
+    flight_action_receipt_cursor: u64,
+    flight_last_stage_emit: Instant,
+    flight_last_calibration_emit: Instant,
+    /// Fixed-size content fact prepared at startup or a commit/checkpoint
+    /// seam. Warm telemetry only copies it; it never captures or serializes a
+    /// PatchState and never constructs a hasher.
+    flight_cached_content_identity: Option<flight_recorder::ContentIdentityFact>,
+    flight_source_digest_cache: FlightSourceDigestCache,
+    flight_unverified_source_change_witness: u64,
+    flight_content_identity_generation: u64,
+    flight_last_content_revision: u64,
+    flight_last_plan_digest: flight_recorder::Digest32,
+    flight_calibration_key: Option<flight_recorder::CalibrationKeyFact>,
     /// One bounded live recorder, still, or resample publication transaction.
     /// GPU readbacks retain the matching generation in their opaque tag.
     live_capture: Option<LiveCaptureSession>,
@@ -5111,19 +5909,39 @@ struct App {
     manual_history: history::ManualHistory<ManualHistoryWorld>,
     history_status: String,
     history_gesture_begin: Option<(history::HistoryGestureId, history::HistoryFingerprint)>,
+    /// One YAML-editor gesture owns one engine-minted Native identity from its
+    /// focus/click Begin edge through its exact history disposition. Idle UI
+    /// frames mint and publish nothing.
+    native_editor_action_identity: Option<(
+        history::HistoryGestureId,
+        action_correlation::ActionIdentity,
+    )>,
     preset_library: preset::PresetLibrary,
     preset_revision: u64,
     preset_status: String,
-    recovery_journal: Option<recovery_journal::RecoveryJournal>,
+    recovery_writer: Option<recovery_journal::RecoveryWriter>,
     recovery_status: String,
+    recovery_status_revision: u64,
     // Web control panel
     web_state: Arc<WebState>,
+    web_last_publish_at: Instant,
+    web_authored_mutation_counter: u64,
+    web_authored_revision: u64,
+    web_last_authored_inputs: WebAuthoredRevisionInputs,
+    web_last_full_authored_revision: u64,
+    web_operational_revision: u64,
+    web_telemetry_revision: u64,
+    control_server: Option<web::server::ControlServerHandle>,
     patch_collector: procedural::PatchCollector,
     patch_load_status: String,
     // Offline render export
     export_job: Option<render_export::ExportJob>,
     // Actions latched for the next four-beat downbeat.
     quantized_actions: Vec<web::state::WebAction>,
+    /// Provenance parallels `quantized_actions` without entering the wire or
+    /// serialized latch vocabulary. Legacy/test-injected entries normalize to
+    /// Browser at the next mutation boundary.
+    quantized_action_sources: Vec<action_correlation::ActionSourceClass>,
     quantized_bar: Option<i64>,
 }
 
@@ -5133,28 +5951,38 @@ impl App {
         library_folder: Option<PathBuf>,
         web_state: Arc<WebState>,
     ) -> Self {
-        let library_files = library_folder.as_ref().map(scan_folder).unwrap_or_default();
-        let audio_library_files = library_folder
-            .as_ref()
-            .map(scan_audio_folder)
-            .unwrap_or_default();
+        let library_files = Vec::new();
+        let audio_library_files = Vec::new();
         let media_safety_policy = media_safety::MediaSafetyPolicy::default();
+        web_state.set_upload_media_safety_policy(media_safety_policy.clone());
         #[cfg(not(test))]
-        let (recovery_journal, recovery_status) =
-            match recovery_journal::RecoveryJournal::open_default() {
-                Ok(journal) => {
-                    let (_, status) = web::state::recovery_snapshot_fields(journal.latest_valid());
-                    (Some(journal), status)
+        let flight_recorder = match flight_recorder::FlightRecorder::start() {
+            Ok(recorder) => Some(recorder),
+            Err(error) => {
+                log::warn!("Private flight recorder unavailable: {error}");
+                None
+            }
+        };
+        #[cfg(test)]
+        let flight_recorder = None;
+        #[cfg(not(test))]
+        let (recovery_writer, recovery_status, recovery_status_revision) =
+            match recovery_journal::RecoveryWriter::start_default() {
+                Ok(writer) => {
+                    let status = writer.status();
+                    let revision = status.revision;
+                    (Some(writer), status.line(), revision)
                 }
-                Err(error) => (None, format!("Recovery journal unavailable: {error}")),
+                Err(error) => (None, format!("Recovery writer unavailable: {error}"), 0),
             };
         // App state tests exercise recovery through explicit temporary-path
         // journals. They must never inspect or append to the operator's real
         // per-user recovery journal merely by constructing an App.
         #[cfg(test)]
-        let (recovery_journal, recovery_status) = (
+        let (recovery_writer, recovery_status, recovery_status_revision) = (
             None,
             "Recovery journal is isolated from App state tests".to_string(),
+            0,
         );
         #[cfg(not(test))]
         let preset_load = preset::load_default_preset_library();
@@ -5214,7 +6042,8 @@ impl App {
             status: controller_profile::PersistedDocumentLoadStatus::DefaultMissing,
         };
         let controller_profile = controller_load.document;
-        let mut midi = midi::MidiEngine::new();
+        let action_sequencer = web_state.action_sequencer();
+        let mut midi = midi::MidiEngine::with_action_sequencer(action_sequencer.clone());
         let controller_load_status = match controller_load.status {
             controller_profile::PersistedDocumentLoadStatus::Loaded => {
                 format!(
@@ -5234,13 +6063,22 @@ impl App {
         };
         let (mut controller_status, controller_profile_pending_initial_resolution) =
             match controller_profile.resolve_with_scenes(|_| None, |_| false) {
-                Ok(resolved) => match midi.apply_profile(resolved) {
-                    Ok(()) => (controller_load_status, false),
-                    Err(error) => (
-                        format!("{controller_load_status}; runtime unavailable: {error}"),
-                        false,
-                    ),
-                },
+                Ok(resolved) => {
+                    let result = midi.apply_profile(resolved);
+                    Self::drain_displaced_midi_action_identities(&mut midi, |identity| {
+                        web_state.record_terminal_action_identity(
+                            identity,
+                            action_correlation::ActionDisposition::Superseded,
+                        );
+                    });
+                    match result {
+                        Ok(()) => (controller_load_status, false),
+                        Err(error) => (
+                            format!("{controller_load_status}; runtime unavailable: {error}"),
+                            false,
+                        ),
+                    }
+                }
                 Err(controller_profile::ControllerProfileError::MissingLayer(position)) => (
                     format!(
                         "{controller_load_status}; waiting for initial saved layer position {}",
@@ -5287,7 +6125,7 @@ impl App {
                 osc_load.path.display()
             ),
         };
-        let mut osc = osc::OscEngine::new(osc_config.clone())
+        let mut osc = osc::OscEngine::with_action_sequencer(osc_config.clone(), action_sequencer)
             .expect("the built-in loopback OSC configuration is valid");
         let osc_status = match osc.start() {
             Ok(()) => osc_load_status,
@@ -5299,17 +6137,33 @@ impl App {
             *lf = library_folder.clone();
         }
 
-        let library_generation = web_state.begin_library_generation();
-        // Generate thumbnails on background thread
-        generate_thumbnails(
-            &library_files,
-            web_state.clone(),
-            library_generation,
-            media_safety_policy.clone(),
-            media_safety::MediaDeviceLimits::none(),
-        );
+        let mut library_index_runtime = None;
+        if let Some(folder) = library_folder.as_ref() {
+            let generation = web_state.begin_library_generation();
+            let _ = web_state.publish_library_index(
+                generation,
+                library_index::LibraryIndex::scanning(generation),
+            );
+            match library_index::LibraryIndexRuntime::new() {
+                Ok(runtime) => match runtime.request(generation, folder.clone()) {
+                    Ok(()) => library_index_runtime = Some(runtime),
+                    Err(error) => {
+                        let _ = web_state.publish_library_index(
+                            generation,
+                            library_index::LibraryIndex::error(generation, &error),
+                        );
+                    }
+                },
+                Err(error) => {
+                    let _ = web_state.publish_library_index(
+                        generation,
+                        library_index::LibraryIndex::error(generation, &error),
+                    );
+                }
+            }
+        }
 
-        Self {
+        let mut app = Self {
             initial_video,
             window: None,
             renderer: None,
@@ -5318,6 +6172,9 @@ impl App {
             motion_telemetry: Vec::new(),
             accepted_creative_resource_bytes: None,
             accepted_motion_resource_bytes: None,
+            accepted_creative_full_frame_passes: None,
+            accepted_creative_texture_lookups: None,
+            accepted_creative_surface_layers: None,
             layers: Vec::new(),
             selected_layer: None,
             proxy_store: None,
@@ -5333,6 +6190,7 @@ impl App {
                 .expect("the empty legacy composition is valid"),
             composition_revision: 1,
             composition_status: String::new(),
+            constraint_diagnostics: std::cell::RefCell::new(Vec::new()),
             master_effects: effects::EffectUniforms::default(),
             master_rack: RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master),
             master_motion: motion::MotionParams::default(),
@@ -5346,6 +6204,7 @@ impl App {
             performance_patch_dir: None,
             library_files,
             audio_library_files,
+            library_index_runtime,
             media_safety_policy,
             media_safety_status: String::new(),
             new_layer_fit: spatial::FitMode::Fit,
@@ -5441,6 +6300,7 @@ impl App {
             selective_hold_spout_barrier_epoch: None,
             selective_hold_spout_readback_epoch: None,
             mod_matrix: modulation::ModMatrix::new(),
+            stable_mod_topology_cache: modulation::StableModTopologyCache::default(),
             morph: morph::Morph::default(),
             snapshot_bank: morph::SnapshotBank::default(),
             scenes: performance::Scenes::default(),
@@ -5459,6 +6319,7 @@ impl App {
             controller_profile_pending_initial_resolution,
             controller_status,
             midi_events: Vec::with_capacity(256),
+            midi_action_batches: Vec::with_capacity(midi::MIDI_RAW_QUEUE_CAPACITY),
             controller_feedback_cache: BTreeMap::new(),
             osc_config,
             osc,
@@ -5469,6 +6330,7 @@ impl App {
             spout_enabled: false,
             output_on_main: false,
             output_display_id: String::new(),
+            monitor_inventory: MonitorInventoryCache::default(),
             output_displays: Vec::new(),
             output_error: stage_map_initial_error,
             stage_map,
@@ -5487,24 +6349,63 @@ impl App {
             stage_presenter_error: String::new(),
             stage_output_status: String::new(),
             stage_health_monitor: stage_health::StageHealthMonitor::default(),
+            stage_gpu_timing: renderer::gpu_timing::GpuTimingSnapshot::default(),
+            highest_applied_action_sequence: 0,
+            next_audience_submission_generation: 1,
+            flight_recorder,
+            flight_action_receipt_cursor: 0,
+            flight_last_stage_emit: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+            flight_last_calibration_emit: Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or_else(Instant::now),
+            flight_cached_content_identity: None,
+            flight_source_digest_cache: FlightSourceDigestCache::default(),
+            flight_unverified_source_change_witness: 1,
+            flight_content_identity_generation: 0,
+            flight_last_content_revision: 0,
+            flight_last_plan_digest: flight_recorder::Digest32::default(),
+            flight_calibration_key: None,
             live_capture: None,
             next_live_capture_generation: 1,
             recorder_snapshot: web::state::ProgramRecorderSnapshot::default(),
             manual_history: history::ManualHistory::default(),
             history_status: String::new(),
             history_gesture_begin: None,
+            native_editor_action_identity: None,
             preset_library,
             preset_revision: 1,
             preset_status,
-            recovery_journal,
+            recovery_writer,
             recovery_status,
+            recovery_status_revision,
             web_state,
+            web_last_publish_at: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+            web_authored_mutation_counter: 0,
+            web_authored_revision: 1,
+            web_last_authored_inputs: WebAuthoredRevisionInputs::default(),
+            web_last_full_authored_revision: 0,
+            web_operational_revision: 1,
+            web_telemetry_revision: 1,
+            control_server: None,
             patch_collector: procedural::PatchCollector::new(),
             patch_load_status: String::new(),
             export_job: None,
             quantized_actions: Vec::new(),
+            quantized_action_sources: Vec::new(),
             quantized_bar: None,
+        };
+        // One cold startup canonical capture seeds the recorder. Subsequent
+        // refreshes reuse the HistoryFingerprint already computed by the
+        // accepting history/recovery transaction.
+        if let Ok((_, canonical)) = app.capture_manual_history_world() {
+            let fingerprint = history::fingerprint_canonical(&canonical);
+            app.install_flight_content_identity_fingerprint(fingerprint);
         }
+        app
     }
 
     fn initialize_new_interactive_transform(&self, layer: &mut Layer) {
@@ -5595,12 +6496,30 @@ impl App {
 
     fn creative_revision_matches(&self, requested: u64) -> Result<(), String> {
         if requested == 0 || requested != self.composition_revision {
-            return Err(format!(
-                "stale composition revision {requested}; current is {}",
-                self.composition_revision
+            return Err(self.publish_revision_mismatch(
+                "composition",
+                requested,
+                self.composition_revision,
             ));
         }
         Ok(())
+    }
+
+    fn publish_revision_mismatch(&self, domain: &str, requested: u64, current: u64) -> String {
+        let text = format!("stale {domain} revision {requested}; current is {current}");
+        let diagnostic = diagnostics::ConstraintDiagnostic::new(
+            diagnostics::ConstraintCode::RevisionMismatch,
+            diagnostics::ConstraintInvariant::AuthoredRevisionCurrent,
+            diagnostics::ConstraintSeverity::Error,
+            program_constraint_scope(),
+            text.clone(),
+        )
+        .with_values(
+            diagnostics::DiagnosticValue::Unsigned(current),
+            diagnostics::DiagnosticValue::Unsigned(requested),
+        );
+        *self.constraint_diagnostics.borrow_mut() = vec![diagnostic];
+        text
     }
 
     fn creative_saved_position(
@@ -5625,7 +6544,34 @@ impl App {
         )
     }
 
-    fn preflight_creative_graph(&self, staged: &StagedCreativeGraph) -> Result<(), String> {
+    fn publish_composition_plan_failure(
+        &self,
+        prefix: &str,
+        error: &evaluated_frame::evaluated_composition::CompositionPlanError,
+    ) -> String {
+        let text = format!("{prefix}: {error}");
+        let mut diagnostic = error.constraint_diagnostic(self.composition_revision);
+        diagnostic.text.clone_from(&text);
+        *self.constraint_diagnostics.borrow_mut() = vec![diagnostic];
+        text
+    }
+
+    fn publish_gpu_plan_failure(&self, prefix: &str, error: impl std::fmt::Display) -> String {
+        let text = format!("{prefix}: {error}");
+        *self.constraint_diagnostics.borrow_mut() = vec![diagnostics::ConstraintDiagnostic::new(
+            diagnostics::ConstraintCode::GpuPlanRejected,
+            diagnostics::ConstraintInvariant::GpuPlanMatchesAcceptedPlan,
+            diagnostics::ConstraintSeverity::Fatal,
+            program_constraint_scope(),
+            text.clone(),
+        )];
+        text
+    }
+
+    fn preflight_creative_graph(
+        &self,
+        staged: &StagedCreativeGraph,
+    ) -> Result<(), diagnostics::ConstraintFailure> {
         let layers: Vec<_> = self.layers.iter().map(StagedLayerLook::capture).collect();
         self.preflight_creative_graph_with_visuals(
             staged,
@@ -6023,9 +6969,14 @@ impl App {
         &self,
         staged: &StagedCreativeGraph,
         mattes: &[image_routing::LayerMatte],
-    ) -> Result<(), String> {
+    ) -> Result<(), diagnostics::ConstraintFailure> {
         if mattes.len() != self.layers.len() {
-            return Err("creative graph does not contain exactly one matte per live layer".into());
+            return Err(preflight_constraint_failure(
+                diagnostics::ConstraintCode::RouteInvalid,
+                diagnostics::ConstraintInvariant::RouteTopologyValid,
+                program_constraint_scope(),
+                "creative graph does not contain exactly one matte per live layer",
+            ));
         }
         let mut layers: Vec<_> = self.layers.iter().map(StagedLayerLook::capture).collect();
         for (layer, matte) in layers.iter_mut().zip(mattes.iter().copied()) {
@@ -6052,7 +7003,7 @@ impl App {
         ntsc_params: &ntsc::NtscParams,
         temporal_params: &effects::params::TemporalParams,
         layers: &[StagedLayerLook],
-    ) -> Result<(), String> {
+    ) -> Result<(), diagnostics::ConstraintFailure> {
         let runtime_layers = self.layers.iter().collect::<Vec<_>>();
         self.preflight_creative_graph_with_visuals_for_layers(
             &runtime_layers,
@@ -6072,6 +7023,105 @@ impl App {
     /// `self.layers` as their prospective order, but they still need the same
     /// source dimensions, transport visibility, codec facts, device limits,
     /// and GPU-plan validation as an ordinary live edit.
+    fn remediation_pixel_order(layers: &[StagedLayerLook]) -> Vec<String> {
+        layers
+            .iter()
+            .map(|layer| {
+                format!(
+                    "layer:{}:master_{}:temporal_{}",
+                    layer.layer_id.get(),
+                    if layer.bypass_master_fx { "dry" } else { "wet" },
+                    if layer.bypass_temporal_fx {
+                        "dry"
+                    } else {
+                        "wet"
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_remediation_previews(
+        &self,
+        runtime_layers: &[&Layer],
+        mod_matrix: &modulation::ModMatrix,
+        staged: &StagedCreativeGraph,
+        master_effects: &effects::EffectUniforms,
+        master_transform: &spatial::SpatialTransform,
+        master_motion: &motion::MotionParams,
+        ntsc_params: &ntsc::NtscParams,
+        temporal_params: &effects::params::TemporalParams,
+        layers: &[StagedLayerLook],
+        diagnostic: &diagnostics::ConstraintDiagnostic,
+    ) -> Vec<diagnostics::RemediationPreview> {
+        let before_order = Self::remediation_pixel_order(layers);
+        diagnostic
+            .remediations
+            .iter()
+            .filter_map(|candidate| {
+                if candidate.base_revision != self.composition_revision
+                    || candidate.operations.is_empty()
+                {
+                    return None;
+                }
+                let mut candidate_layers = layers.to_vec();
+                let mut affected = Vec::new();
+                for operation in &candidate.operations {
+                    let diagnostics::RemediationOperation::SetBypass {
+                        scope,
+                        bypass,
+                        enabled,
+                    } = operation
+                    else {
+                        return None;
+                    };
+                    if scope.kind != diagnostics::ConstraintScopeKind::Layer {
+                        return None;
+                    }
+                    let stable_id = scope.stable_id?;
+                    let layer = candidate_layers
+                        .iter_mut()
+                        .find(|layer| layer.layer_id.get() == stable_id)?;
+                    match bypass {
+                        diagnostics::BypassKind::Master => {
+                            layer.bypass_master_fx = *enabled;
+                        }
+                        diagnostics::BypassKind::Temporal => {
+                            layer.bypass_temporal_fx = *enabled;
+                        }
+                    }
+                    affected.push(scope.clone());
+                }
+                let plan = self
+                    .preflight_creative_graph_with_visuals_for_layers_inner(
+                        runtime_layers,
+                        mod_matrix,
+                        staged,
+                        master_effects,
+                        master_transform,
+                        master_motion,
+                        ntsc_params,
+                        temporal_params,
+                        &candidate_layers,
+                    )
+                    .ok()?;
+                Some(diagnostics::RemediationPreview {
+                    candidate_id: candidate.id,
+                    base_revision: candidate.base_revision,
+                    operations: candidate.operations.clone(),
+                    consequence: diagnostics::RemediationConsequence {
+                        affected,
+                        plan: plan.remediation_consequence(),
+                        pixel_order_before: before_order.clone(),
+                        pixel_order_after: Self::remediation_pixel_order(&candidate_layers),
+                        resource_deltas: Vec::new(),
+                    },
+                })
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn preflight_creative_graph_with_visuals_for_layers(
         &self,
@@ -6084,7 +7134,67 @@ impl App {
         ntsc_params: &ntsc::NtscParams,
         temporal_params: &effects::params::TemporalParams,
         layers: &[StagedLayerLook],
-    ) -> Result<(), String> {
+    ) -> Result<(), diagnostics::ConstraintFailure> {
+        let mut result = self.preflight_creative_graph_with_visuals_for_layers_inner(
+            runtime_layers,
+            mod_matrix,
+            staged,
+            master_effects,
+            master_transform,
+            master_motion,
+            ntsc_params,
+            temporal_params,
+            layers,
+        );
+        if let Err(failure) = &mut result {
+            failure.diagnostic.remediation_previews = self.evaluate_remediation_previews(
+                runtime_layers,
+                mod_matrix,
+                staged,
+                master_effects,
+                master_transform,
+                master_motion,
+                ntsc_params,
+                temporal_params,
+                layers,
+                &failure.diagnostic,
+            );
+            let previewed = failure
+                .diagnostic
+                .remediation_previews
+                .iter()
+                .map(|preview| preview.candidate_id)
+                .collect::<std::collections::BTreeSet<_>>();
+            failure
+                .diagnostic
+                .remediations
+                .retain(|candidate| previewed.contains(&candidate.id));
+        }
+        match &result {
+            Ok(_) => self.constraint_diagnostics.borrow_mut().clear(),
+            Err(failure) => {
+                *self.constraint_diagnostics.borrow_mut() = vec![(*failure.diagnostic).clone()];
+            }
+        }
+        result.map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn preflight_creative_graph_with_visuals_for_layers_inner(
+        &self,
+        runtime_layers: &[&Layer],
+        mod_matrix: &modulation::ModMatrix,
+        staged: &StagedCreativeGraph,
+        master_effects: &effects::EffectUniforms,
+        master_transform: &spatial::SpatialTransform,
+        master_motion: &motion::MotionParams,
+        ntsc_params: &ntsc::NtscParams,
+        temporal_params: &effects::params::TemporalParams,
+        layers: &[StagedLayerLook],
+    ) -> Result<
+        evaluated_frame::evaluated_composition::EvaluatedCompositionPlan,
+        diagnostics::ConstraintFailure,
+    > {
         let live_ids = runtime_layers
             .iter()
             .map(|layer| layer.stable_layer_id())
@@ -6095,44 +7205,109 @@ impl App {
                 .zip(&live_ids)
                 .any(|(layer, expected)| layer.layer_id != *expected)
         {
-            return Err(
-                "creative visual values do not exactly align with live stable layers".into(),
-            );
+            return Err(preflight_constraint_failure(
+                diagnostics::ConstraintCode::StableIdentityMismatch,
+                diagnostics::ConstraintInvariant::StableIdentityPreserved,
+                layer_constraint_scopes(layers),
+                "creative visual values do not exactly align with live stable layers",
+            ));
         }
-        mod_matrix.validate_temporal_bypass_motion_routing(
-            layers.iter().any(|layer| layer.bypass_temporal_fx),
-        )?;
+        mod_matrix
+            .validate_temporal_bypass_motion_routing(
+                layers.iter().any(|layer| layer.bypass_temporal_fx),
+            )
+            .map_err(|error| {
+                preflight_constraint_failure(
+                    diagnostics::ConstraintCode::MotionRouteInvalid,
+                    diagnostics::ConstraintInvariant::MotionRouteAdmissible,
+                    layer_constraint_scopes(layers.iter().filter(|layer| layer.bypass_temporal_fx)),
+                    error,
+                )
+            })?;
         staged
             .composition
             .validate_for_layers(&live_ids)
-            .map_err(|error| format!("composition validation failed: {error}"))?;
+            .map_err(|error| {
+                prefixed_composition_failure(
+                    "composition validation failed",
+                    evaluated_frame::evaluated_composition::CompositionPlanError::Composition(
+                        error,
+                    ),
+                    self.composition_revision,
+                )
+            })?;
         staged
             .master_rack
             .validate_for_scope(LegacyRackScope::Master)
-            .map_err(|error| format!("master rack validation failed: {error}"))?;
+            .map_err(|error| {
+                preflight_constraint_failure(
+                    diagnostics::ConstraintCode::RackInvalid,
+                    diagnostics::ConstraintInvariant::RackTopologyValid,
+                    vec![diagnostics::ConstraintScope::singleton(
+                        diagnostics::ConstraintScopeKind::Master,
+                    )],
+                    format!("master rack validation failed: {error}"),
+                )
+            })?;
         let bypass_capabilities = layers
             .iter()
             .map(|layer| (layer.layer_id, layer.bypass_master_fx))
             .collect::<Vec<_>>();
-        validate_master_bypass_capability(&staged.master_rack, &bypass_capabilities)
-            .map_err(|error| format!("master bypass preflight failed: {error}"))?;
+        validate_master_bypass_capability(&staged.master_rack, &bypass_capabilities).map_err(
+            |error| {
+                prefixed_composition_failure(
+                    "master bypass preflight failed",
+                    error,
+                    self.composition_revision,
+                )
+            },
+        )?;
         for (layer_id, rack) in &staged.layer_racks {
             if !live_ids.contains(layer_id) {
-                return Err(format!("rack references absent layer {}", layer_id.get()));
+                return Err(preflight_constraint_failure(
+                    diagnostics::ConstraintCode::MissingStableIdentity,
+                    diagnostics::ConstraintInvariant::ReferencedIdentityExists,
+                    vec![diagnostics::ConstraintScope::stable(
+                        diagnostics::ConstraintScopeKind::Layer,
+                        layer_id.get(),
+                    )],
+                    format!("rack references absent layer {}", layer_id.get()),
+                ));
             }
             rack.validate_for_scope(LegacyRackScope::Layer)
                 .map_err(|error| {
-                    format!("layer {} rack validation failed: {error}", layer_id.get())
+                    preflight_constraint_failure(
+                        diagnostics::ConstraintCode::RackInvalid,
+                        diagnostics::ConstraintInvariant::RackTopologyValid,
+                        vec![diagnostics::ConstraintScope::stable(
+                            diagnostics::ConstraintScopeKind::Layer,
+                            layer_id.get(),
+                        )],
+                        format!("layer {} rack validation failed: {error}", layer_id.get()),
+                    )
                 })?;
         }
         if staged.layer_racks.len() != live_ids.len() {
-            return Err("creative graph does not contain exactly one rack per live layer".into());
+            return Err(preflight_constraint_failure(
+                diagnostics::ConstraintCode::MissingStableIdentity,
+                diagnostics::ConstraintInvariant::ReferencedIdentityExists,
+                layer_constraint_scopes(layers),
+                "creative graph does not contain exactly one rack per live layer",
+            ));
         }
         modulation::StableModAddressBook::from_composition(
             &staged.master_rack,
             &staged.layer_racks,
             &staged.composition,
-        )?;
+        )
+        .map_err(|error| {
+            preflight_constraint_failure(
+                diagnostics::ConstraintCode::MotionRouteInvalid,
+                diagnostics::ConstraintInvariant::MotionRouteAdmissible,
+                program_constraint_scope(),
+                error,
+            )
+        })?;
 
         // A routed Garden gate is topology even while its authored amount is
         // zero: modulation can raise `temporal_garden_amount` on a later frame
@@ -6145,10 +7320,12 @@ impl App {
                 temporal::RefreshGardenGate::Matte | temporal::RefreshGardenGate::Motion
             )
         {
-            return Err(
-                "Bypass Temporal FX requires an inline Refresh Garden gate; matte and motion gates are routed even at zero amount"
-                    .into(),
-            );
+            return Err(preflight_constraint_failure(
+                diagnostics::ConstraintCode::GardenBypassConflict,
+                diagnostics::ConstraintInvariant::GardenBypassHasInlineGate,
+                layer_constraint_scopes(layers.iter().filter(|layer| layer.bypass_temporal_fx)),
+                "Bypass Temporal FX requires an inline Refresh Garden gate; matte and motion gates are routed even at zero amount",
+            ));
         }
 
         let (width, height) = self
@@ -6257,12 +7434,22 @@ impl App {
             input.resource_limits.max_sampled_textures_per_shader_stage =
                 wgpu::Limits::default().max_sampled_textures_per_shader_stage;
         }
-        let plan = base
-            .plan_composition(input)
-            .map_err(|error| format!("creative graph preflight failed: {error}"))?;
-        renderer::composition::CompositionGpuExecutor::validate_plan(&plan)
-            .map_err(|error| format!("creative GPU preflight failed: {error}"))?;
-        Ok(())
+        let plan = base.plan_composition(input).map_err(|error| {
+            prefixed_composition_failure(
+                "creative graph preflight failed",
+                error,
+                self.composition_revision,
+            )
+        })?;
+        renderer::composition::CompositionGpuExecutor::validate_plan(&plan).map_err(|error| {
+            preflight_constraint_failure(
+                diagnostics::ConstraintCode::GpuPlanRejected,
+                diagnostics::ConstraintInvariant::GpuPlanMatchesAcceptedPlan,
+                program_constraint_scope(),
+                format!("creative GPU preflight failed: {error}"),
+            )
+        })?;
+        Ok(plan)
     }
 
     fn move_layer_storage_without_revision(&mut self, from: usize, to: usize) {
@@ -6471,7 +7658,11 @@ impl App {
 
     /// Consume every M2 creative action against stable IDs only. Each ordered
     /// edit is staged and fully planned before Morph release or live commit.
-    fn handle_creative_web_action(&mut self, action: &web::state::WebAction) -> bool {
+    fn handle_creative_web_action(
+        &mut self,
+        action: &web::state::WebAction,
+        accepted_recordable: &mut bool,
+    ) -> bool {
         use web::state::{CompositionRootSnapshot, WebAction};
         if !matches!(
             action,
@@ -7199,9 +8390,20 @@ impl App {
             Ok(())
         })();
 
-        if let Err(error) = result {
-            self.composition_status = format!("Creative edit rejected: {error}");
-            log::warn!("{}", self.composition_status);
+        match result {
+            Ok(()) => {
+                if matches!(
+                    action,
+                    WebAction::SetCompositionBusCrossfade { .. }
+                        | WebAction::SetCompositionBusMixParam { .. }
+                ) {
+                    *accepted_recordable = true;
+                }
+            }
+            Err(error) => {
+                self.composition_status = format!("Creative edit rejected: {error}");
+                log::warn!("{}", self.composition_status);
+            }
         }
         true
     }
@@ -7228,6 +8430,7 @@ impl App {
                 .collect::<Vec<_>>();
             capabilities.push((layer_id, layer.bypass_master_fx));
             validate_master_bypass_capability(&app.master_rack, &capabilities)
+                .map_err(|error| error.to_string())
         };
         // Refuse an already-obvious incompatibility before an engaged Morph
         // is touched. A second check below covers the sampled Morph world.
@@ -7264,6 +8467,7 @@ impl App {
         self.bump_composition_revision();
         self.composition_status = format!("Added layer {}", layer_id.get());
         self.invalidate_source_cut_generation();
+        self.refresh_flight_source_content_identity_cache(true);
         Ok(insertion_index)
     }
 
@@ -7390,7 +8594,7 @@ impl App {
         self.layer_stack_revision = self.layer_stack_revision.wrapping_add(1).max(1);
         // Legacy clients omitted a stack revision. Do not let one of their
         // already-latched captures bind itself to a later topology.
-        self.quantized_actions.retain(|action| {
+        self.retain_quantized_actions(|action| {
             !matches!(
                 action,
                 web::state::WebAction::MorphCapture { .. }
@@ -7675,6 +8879,7 @@ impl App {
         self.bump_composition_revision();
         self.composition_status = format!("Removed layer {}", removed_id.get());
         self.invalidate_source_cut_generation();
+        self.refresh_flight_source_content_identity_cache(true);
         Ok(invalidated_scenes)
     }
 
@@ -7809,7 +9014,7 @@ impl App {
         // Animated effects use a piece-local clock. A recalled patch therefore
         // begins at the same t=0 phase as its deterministic offline export.
         self.program_clock.reset();
-        self.quantized_actions.clear();
+        self.clear_quantized_actions();
         // Patch construction can block on multiple decoders. Do not interpret
         // that wall time as modulation spring/slew motion on the first frame
         // after the atomic commit; clock phase and current beat stay intact.
@@ -7823,7 +9028,7 @@ impl App {
         // commands accumulate against the old snapshot. Stable IDs reject
         // bundled-client stragglers, and clearing this bounded queue also
         // protects legacy positional clients at the exact commit boundary.
-        self.web_state.actions.blocking_lock().clear();
+        self.web_state.supersede_all_pending_actions();
         self.quantized_bar = Some((self.mod_matrix.current_beat / 4.0).floor() as i64);
         self.pending_temporal_events = temporal::TemporalFrameEvents::default();
         self.temporal_event_recorder.clear();
@@ -8095,19 +9300,16 @@ impl App {
         &mut self,
         before: history::HistoryCheckpoint<ManualHistoryWorld>,
     ) -> Result<history::HistoryRecordOutcome, String> {
-        let (_, canonical) = self.capture_manual_history_world()?;
+        let (world, canonical) = self.capture_manual_history_world()?;
+        let fingerprint = history::fingerprint_canonical(&canonical);
         let outcome = self
             .manual_history
-            .record_manual(
-                history::MutationOrigin::BrowserManual,
-                before,
-                history::fingerprint_canonical(&canonical),
-            )
+            .record_manual(history::MutationOrigin::BrowserManual, before, fingerprint)
             .map_err(|error| error.to_string())?;
         match outcome {
             history::HistoryRecordOutcome::Recorded => {
                 self.history_status = "Deferred slot edit committed".to_string();
-                self.append_recovery_checkpoint("deferred slot edit");
+                self.enqueue_recovery_checkpoint(world.patch, fingerprint, "deferred slot edit");
             }
             history::HistoryRecordOutcome::NoChange => {
                 self.history_status = "Deferred slot edit made no authored change".to_string();
@@ -8187,7 +9389,7 @@ impl App {
         // completely untouched. Prepared runtime has already passed the same
         // closed validation used by MidiEngine::apply_profile.
         Self::persist_controller_profile(&document)?;
-        if let Err(error) = self.midi.apply_profile(runtime) {
+        if let Err(error) = self.apply_midi_profile_with_displacement_barrier(runtime) {
             let rollback = Self::persist_controller_profile(&prior_document);
             return Err(match rollback {
                 Ok(()) => format!("install prepared controller runtime: {error}"),
@@ -8225,6 +9427,83 @@ impl App {
         Ok(())
     }
 
+    /// Restore a value-only bypass history entry without reopening otherwise
+    /// byte-identical sources. This is deliberately a closed fast path: if one
+    /// canonical authored byte other than either bypass bit differs, the
+    /// renderer-backed full-world restore remains authoritative.
+    fn restore_manual_history_bypass_only(
+        &mut self,
+        target: &ManualHistoryWorld,
+    ) -> Result<bool, String> {
+        let (current, _) = self.capture_manual_history_world()?;
+        if current.canonical_bytes_with_neutral_layer_bypass()?
+            != target.canonical_bytes_with_neutral_layer_bypass()?
+        {
+            return Ok(false);
+        }
+        if target.patch.layers.len() != self.layers.len()
+            || target.stable_layer_ids.len() != self.layers.len()
+        {
+            return Err(
+                "bypass-only history restore has a mismatched live layer identity set".to_string(),
+            );
+        }
+
+        let mut candidate_layers = self
+            .layers
+            .iter()
+            .map(StagedLayerLook::capture)
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for (((candidate, config), expected_id), live) in candidate_layers
+            .iter_mut()
+            .zip(&target.patch.layers)
+            .zip(&target.stable_layer_ids)
+            .zip(&self.layers)
+        {
+            if candidate.layer_id != *expected_id || live.stable_layer_id() != *expected_id {
+                return Err(format!(
+                    "bypass-only history restore expected stable layer {} but found {}",
+                    expected_id.get(),
+                    live.stable_layer_id().get()
+                ));
+            }
+            changed |= candidate.bypass_master_fx != config.bypass_master_fx
+                || candidate.bypass_temporal_fx != config.bypass_temporal_fx;
+            candidate.bypass_master_fx = config.bypass_master_fx;
+            candidate.bypass_temporal_fx = config.bypass_temporal_fx;
+        }
+
+        // Validate the complete final partition once. Publishing individual
+        // setters would expose an intermediate graph and could accept the first
+        // bit before refusing the second.
+        let staged = self.staged_creative_graph();
+        self.preflight_creative_graph_with_visuals(
+            &staged,
+            &self.master_effects,
+            &self.master_transform,
+            &self.master_motion,
+            &self.ntsc_params,
+            &self.temporal_params,
+            &candidate_layers,
+        )
+        .map_err(|error| format!("history bypass-only preflight failed: {error}"))?;
+
+        for (live, candidate) in self.layers.iter_mut().zip(candidate_layers) {
+            live.bypass_master_fx = candidate.bypass_master_fx;
+            live.bypass_temporal_fx = candidate.bypass_temporal_fx;
+        }
+        if changed {
+            // Master bypass also changes the LinkedDry partition. One common
+            // barrier retires every retained wet/dry pixel without rebuilding
+            // sources or issuing two resets when both bits changed.
+            self.invalidate_temporal_bypass_partition_generation();
+            self.composition_status =
+                "Restored the exact layer bypass partition from manual history".to_string();
+        }
+        Ok(true)
+    }
+
     fn restore_manual_history_world(&mut self, world: &ManualHistoryWorld) -> Result<(), String> {
         world
             .stage_map
@@ -8244,6 +9523,9 @@ impl App {
                 |_| true,
             )
             .map_err(|error| format!("resolve history controller profile: {error}"))?;
+        if self.restore_manual_history_bypass_only(world)? {
+            return Ok(());
+        }
         let prior_stage_map = self.stage_map.clone();
         let prior_presets = self.preset_library.clone();
         let prior_controller_profile = self.controller_profile.clone();
@@ -8265,7 +9547,7 @@ impl App {
                 ),
             });
         }
-        if let Err(error) = self.midi.apply_profile(resolved_controller) {
+        if let Err(error) = self.apply_midi_profile_with_displacement_barrier(resolved_controller) {
             let rollback = Self::save_manual_history_documents(
                 &prior_stage_map,
                 &prior_presets,
@@ -8289,7 +9571,8 @@ impl App {
             Some(&world.stable_layer_ids),
             world.selected_layer_id,
         ) {
-            let runtime_rollback = self.midi.apply_profile(prior_runtime_controller);
+            let runtime_rollback =
+                self.apply_midi_profile_with_displacement_barrier(prior_runtime_controller);
             let document_rollback = Self::save_manual_history_documents(
                 &prior_stage_map,
                 &prior_presets,
@@ -8332,31 +9615,61 @@ impl App {
     }
 
     fn append_recovery_checkpoint(&mut self, reason: &str) {
-        let patch = match self.try_capture_current_patch() {
-            Ok(patch) => patch,
+        let (patch, fingerprint) = match self.capture_manual_history_world() {
+            Ok((world, canonical)) => (world.patch, history::fingerprint_canonical(&canonical)),
             Err(error) => {
                 self.recovery_status = format!("Recovery checkpoint rejected: {error}");
                 return;
             }
         };
-        let Some(journal) = self.recovery_journal.as_mut() else {
+        self.enqueue_recovery_checkpoint(patch, fingerprint, reason);
+    }
+
+    /// Use a post-edit patch already captured for history/fingerprinting so
+    /// the authored world is not captured a third time on the render thread.
+    fn enqueue_recovery_checkpoint(
+        &mut self,
+        patch: patch::PatchState,
+        fingerprint: history::HistoryFingerprint,
+        reason: &str,
+    ) {
+        self.install_flight_content_identity_fingerprint(fingerprint);
+        let Some(writer) = self.recovery_writer.as_ref() else {
             if self.recovery_status.is_empty() {
-                self.recovery_status = "Recovery journal is unavailable".to_string();
+                self.recovery_status = "Recovery writer is unavailable".to_string();
             }
             return;
         };
-        match journal.append_patch(&patch) {
+        match writer.request_checkpoint(patch) {
             Ok(receipt) => {
                 self.recovery_status = format!(
-                    "Recovery checkpoint {} after {reason} ({} bytes{})",
-                    receipt.sequence,
-                    receipt.payload_bytes,
-                    if receipt.compacted { ", compacted" } else { "" }
+                    "Recovery request {} queued after {reason}; {} remains authoritative{}",
+                    receipt.request_id,
+                    receipt.durable_sequence_at_request.map_or_else(
+                        || "no durable checkpoint".to_string(),
+                        |sequence| format!("durable checkpoint {sequence}")
+                    ),
+                    receipt
+                        .superseded_request_id
+                        .map_or_else(String::new, |request| {
+                            format!("; coalesced pending request {request}")
+                        })
                 );
             }
             Err(error) => {
-                self.recovery_status = format!("Recovery checkpoint failed: {error}");
+                self.recovery_status = format!("Recovery checkpoint request rejected: {error}");
             }
+        }
+    }
+
+    fn sync_recovery_writer_status(&mut self) {
+        let Some(writer) = self.recovery_writer.as_ref() else {
+            return;
+        };
+        let status = writer.status();
+        if status.revision != self.recovery_status_revision {
+            self.recovery_status_revision = status.revision;
+            self.recovery_status = status.line();
         }
     }
 
@@ -8443,16 +9756,15 @@ impl App {
     /// Rebuild the cold presenter transaction only when its authored map,
     /// immutable Program source, monitor inventory, or target formats can have
     /// changed. Tool-only changes update preallocated uniforms below.
-    fn sync_stage_presenter(&mut self, event_loop: &ActiveEventLoop, monitors: &[MonitorHandle]) {
+    fn sync_stage_presenter(&mut self, event_loop: &ActiveEventLoop) {
         let Some(renderer) = self.renderer.as_ref() else {
             return;
         };
-        let monitor_signature = stage_monitor_inventory_signature(monitors);
         let source_size = [renderer.output_width, renderer.output_height];
         let authored_changed = self.stage_presenter_attempted_map.as_ref() != Some(&self.stage_map);
         let rebuild = authored_changed
             || self.stage_presenter_attempted_source_size != Some(source_size)
-            || self.stage_monitor_attempted_signature != monitor_signature;
+            || self.stage_monitor_attempted_signature != self.monitor_inventory.signature;
         if !rebuild {
             if let Some(presenter) = self.stage_presenter.as_mut() {
                 presenter.update_tools(&renderer.queue, &self.stage_tools);
@@ -8462,7 +9774,14 @@ impl App {
         }
         if authored_changed {
             self.stage_closed_endpoints.clear();
+            // A newly authored StageMap is also the explicit rescan boundary:
+            // the next frame revalidates selectors against a fresh OS view.
+            self.monitor_inventory
+                .invalidate(MonitorInventoryRefreshReason::ExplicitStageMapRescan);
         }
+
+        let monitor_signature = self.monitor_inventory.signature.clone();
+        let monitors = &self.monitor_inventory.monitors;
 
         let mut targets = Vec::new();
         let mut failures = BTreeMap::new();
@@ -8664,6 +9983,8 @@ impl App {
                 let window = Arc::new(window);
                 match renderer.create_output(window.clone()) {
                     Ok(()) => {
+                        self.monitor_inventory
+                            .invalidate(MonitorInventoryRefreshReason::OutputMigration);
                         self.output_error.clear();
                         log::info!("Output window opened");
                     }
@@ -8687,31 +10008,48 @@ impl App {
         self.output_on_main || self.renderer.as_ref().is_some_and(Renderer::has_output)
     }
 
-    fn live_output_display_entries(&self, event_loop: &ActiveEventLoop) -> Vec<OutputDisplayEntry> {
+    fn refresh_monitor_inventory(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        now: Instant,
+        reason: MonitorInventoryRefreshReason,
+    ) -> bool {
         let main_monitor = self
             .window
             .as_ref()
             .and_then(|window| window.current_monitor());
-        output_display_entries(
-            event_loop.available_monitors().collect(),
-            main_monitor.as_ref(),
-        )
-    }
-
-    fn refresh_output_displays(&mut self, event_loop: &ActiveEventLoop) {
         let monitors = event_loop.available_monitors().collect::<Vec<_>>();
-        self.refresh_output_displays_from_monitors(&monitors);
+        let changed =
+            self.monitor_inventory
+                .publish_scan(monitors, main_monitor.as_ref(), now, reason);
+        self.output_displays = self
+            .monitor_inventory
+            .entries
+            .iter()
+            .map(|entry| entry.snapshot.clone())
+            .collect();
+        if changed {
+            self.web_state.request_snapshot();
+        }
+        log::debug!(
+            "Monitor inventory scan {:?}: generation {}, {} displays ({} scans)",
+            reason,
+            self.monitor_inventory.generation,
+            self.monitor_inventory.monitors.len(),
+            self.monitor_inventory.scans,
+        );
+        changed
     }
 
-    fn refresh_output_displays_from_monitors(&mut self, monitors: &[MonitorHandle]) {
-        let main_monitor = self
-            .window
-            .as_ref()
-            .and_then(|window| window.current_monitor());
-        self.output_displays = output_display_entries(monitors.to_vec(), main_monitor.as_ref())
-            .into_iter()
-            .map(|entry| entry.snapshot)
-            .collect();
+    fn refresh_monitor_inventory_if_due(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        now: Instant,
+    ) -> bool {
+        let Some(reason) = self.monitor_inventory.due_reason(now) else {
+            return false;
+        };
+        self.refresh_monitor_inventory(event_loop, now, reason)
     }
 
     /// Close either form of audience Output. On one monitor this restores the
@@ -8728,6 +10066,8 @@ impl App {
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.close_output();
         }
+        self.monitor_inventory
+            .invalidate(MonitorInventoryRefreshReason::OutputMigration);
         self.output_error.clear();
         log::info!("Output window closed");
     }
@@ -8754,6 +10094,9 @@ impl App {
     /// An explicit browser selection instead resolves one opaque live-inventory
     /// ID and never silently falls back to another display.
     fn set_output_window(&mut self, event_loop: &ActiveEventLoop, enabled: bool) {
+        // Native keyboard commands can arrive before the first redraw. Admit a
+        // startup/topology scan here only when the cache policy says it is due.
+        self.refresh_monitor_inventory_if_due(event_loop, Instant::now());
         if self.output_window_open() == enabled {
             return;
         }
@@ -8766,14 +10109,14 @@ impl App {
             .window
             .as_ref()
             .and_then(|window| window.current_monitor());
-        let monitors = event_loop.available_monitors().collect::<Vec<_>>();
-        let entries = output_display_entries(monitors.clone(), main_monitor.as_ref());
 
         if !self.output_display_id.is_empty() {
-            let Some(target) = entries
-                .into_iter()
+            let Some(target) = self
+                .monitor_inventory
+                .entries
+                .iter()
                 .find(|entry| entry.snapshot.id == self.output_display_id)
-                .map(|entry| entry.monitor)
+                .map(|entry| entry.monitor.clone())
             else {
                 self.output_error =
                     "selected fullscreen display is no longer available".to_string();
@@ -8791,6 +10134,8 @@ impl App {
                 window.set_fullscreen(Some(Fullscreen::Borderless(Some(target))));
                 window.set_cursor_visible(false);
                 self.output_on_main = true;
+                self.monitor_inventory
+                    .invalidate(MonitorInventoryRefreshReason::OutputMigration);
                 self.output_error.clear();
                 log::info!("Output opened on the selected display using the main surface");
             } else {
@@ -8801,9 +10146,13 @@ impl App {
 
         // A transiently unknown main monitor is not proof that another one is
         // distinct. Fail closed to the existing surface in that case.
-        let distinct_monitor = main_monitor
-            .as_ref()
-            .and_then(|main| monitors.into_iter().find(|monitor| monitor != main));
+        let distinct_monitor = main_monitor.as_ref().and_then(|main| {
+            self.monitor_inventory
+                .monitors
+                .iter()
+                .find(|monitor| *monitor != main)
+                .cloned()
+        });
 
         if !use_dedicated_output(main_monitor.is_some(), distinct_monitor.is_some()) {
             let Some(window) = self.window.as_ref() else {
@@ -8813,6 +10162,8 @@ impl App {
             window.set_fullscreen(Some(Fullscreen::Borderless(main_monitor)));
             window.set_cursor_visible(false);
             self.output_on_main = true;
+            self.monitor_inventory
+                .invalidate(MonitorInventoryRefreshReason::OutputMigration);
             self.output_error.clear();
             log::info!("Output opened on the main window (single-monitor mode)");
             return;
@@ -8828,24 +10179,45 @@ impl App {
         &mut self,
         event_loop: &ActiveEventLoop,
         requested_display: Option<String>,
+        requested_inventory_generation: Option<u64>,
         requested_enabled: Option<bool>,
-    ) {
+    ) -> OutputRequestOutcome {
         let was_open = self.output_window_open();
+        let prior_display = self.output_display_id.clone();
+        let had_display_request = requested_display.is_some();
         let mut display_changed = false;
         if let Some(display_id) = requested_display {
             let valid = display_id.is_empty()
                 || self
-                    .live_output_display_entries(event_loop)
+                    .monitor_inventory
+                    .entries
                     .iter()
                     .any(|entry| entry.snapshot.id == display_id);
-            if !valid {
-                self.output_error =
-                    "requested fullscreen display is no longer available".to_string();
-                if requested_enabled == Some(false) {
-                    self.close_output_window();
+            match classify_output_display_request(
+                requested_inventory_generation,
+                self.monitor_inventory.generation,
+                valid,
+            ) {
+                OutputDisplayAdmission::Current => {}
+                OutputDisplayAdmission::StaleGeneration => {
+                    self.output_error = format!(
+                        "requested display inventory is stale (client generation {}, current {})",
+                        requested_inventory_generation.unwrap_or_default(),
+                        self.monitor_inventory.generation,
+                    );
+                    self.web_state.request_snapshot();
+                    return OutputRequestOutcome::default();
                 }
-                self.refresh_output_displays(event_loop);
-                return;
+                OutputDisplayAdmission::MissingDisplay => {
+                    self.output_error =
+                        "requested fullscreen display is no longer available".to_string();
+                    // Reject the entire folded request before changing either
+                    // selection or window state. A forged/missing display ID
+                    // cannot smuggle an otherwise-valid disable mutation into
+                    // a receipt that must remain Refused.
+                    self.web_state.request_snapshot();
+                    return OutputRequestOutcome::default();
+                }
             }
             if display_id != self.output_display_id {
                 if was_open {
@@ -8859,17 +10231,24 @@ impl App {
         if display_changed || requested_enabled.is_some() {
             self.set_output_window(event_loop, requested_enabled.unwrap_or(was_open));
         }
-        self.refresh_output_displays(event_loop);
+        OutputRequestOutcome {
+            display_changed: had_display_request && self.output_display_id != prior_display,
+            window_changed: requested_enabled.is_some()
+                && self.output_window_open() != was_open
+                && self.output_window_open() == requested_enabled.unwrap_or(was_open),
+        }
     }
 
     fn apply_output_window_command(
         &mut self,
         event_loop: &ActiveEventLoop,
         command: OutputWindowCommand,
-    ) {
+    ) -> bool {
+        let was_open = self.output_window_open();
         let enabled = resolve_output_window_command(self.output_window_open(), command);
         self.set_output_window(event_loop, enabled);
         self.exit_if_device_lost(event_loop);
+        self.output_window_open() != was_open && self.output_window_open() == enabled
     }
 
     /// Device loss invalidates every resource owned by this Renderer. Stop at
@@ -8879,71 +10258,359 @@ impl App {
         let Some(renderer) = self.renderer.as_ref() else {
             return false;
         };
+        if let Some(error) = renderer.device_error() {
+            self.record_flight_error(
+                flight_recorder::ErrorDomain::Device,
+                flight_recorder::ErrorCode::DeviceLost,
+                false,
+                &error,
+            );
+        }
         exit_on_renderer_device_loss(renderer, &mut self.output_error, event_loop)
     }
 
-    fn set_library_folder(&mut self, folder: PathBuf) {
-        let library_files = scan_folder(&folder);
-        let audio_library_files = scan_audio_folder(&folder);
-        let generation = self.web_state.begin_library_generation();
+    fn request_library_scan(
+        &mut self,
+        folder: PathBuf,
+        clear_media_cache: bool,
+        clear_current_entries: bool,
+    ) -> LibraryScanAdmission {
+        let folder_changed = self.library_folder.as_ref() != Some(&folder);
+        // Prove the bounded worker admission before publishing a new
+        // generation or changing the live folder/cache. A failed spawn/send
+        // is therefore a genuine Refused command, not a partially applied
+        // scan whose correlation lies about the folder mutation.
+        if self.library_index_runtime.is_none() {
+            match library_index::LibraryIndexRuntime::new() {
+                Ok(runtime) => self.library_index_runtime = Some(runtime),
+                Err(error) => {
+                    log::error!("Library index unavailable: {error}");
+                    return LibraryScanAdmission::Refused;
+                }
+            }
+        }
+        let Some(runtime) = self.library_index_runtime.as_ref() else {
+            unreachable!("library runtime was installed above")
+        };
+        let generation = match self
+            .web_state
+            .admit_library_generation(|generation| runtime.request(generation, folder.clone()))
+        {
+            Ok(generation) => generation,
+            Err(error) => {
+                log::error!("Library index request refused: {error}");
+                return LibraryScanAdmission::Refused;
+            }
+        };
+        let _ = self.web_state.publish_library_index(
+            generation,
+            library_index::LibraryIndex::scanning(generation),
+        );
 
         // Cache keys are portable basenames, so changing folders can otherwise
         // show media from the old folder when both contain `clip.mp4`. Advance
         // the generation first, then clear; old workers double-check the
         // generation while holding the cache lock and cannot repopulate it.
-        self.web_state.clear_library_media_caches();
+        if clear_media_cache {
+            self.web_state.clear_library_media_caches();
+        }
 
         if let Ok(mut lf) = self.web_state.library_folder.write() {
             *lf = Some(folder.clone());
         }
-        self.library_folder = Some(folder);
-        self.library_files = library_files;
-        self.audio_library_files = audio_library_files;
-        let device_limits =
-            self.renderer
-                .as_ref()
-                .map_or_else(media_safety::MediaDeviceLimits::none, |renderer| {
+        self.library_folder = Some(folder.clone());
+        if clear_current_entries {
+            self.library_files.clear();
+            self.audio_library_files.clear();
+        }
+
+        self.web_authored_mutation_counter =
+            self.web_authored_mutation_counter.wrapping_add(1).max(1);
+        LibraryScanAdmission::Admitted { folder_changed }
+    }
+
+    fn set_library_folder(&mut self, folder: PathBuf) -> LibraryScanAdmission {
+        self.request_library_scan(folder, true, true)
+    }
+
+    fn apply_dropped_path(&mut self, path: PathBuf) -> ActionLifecycleOutcome {
+        if path.is_dir() {
+            return self.set_library_folder(path).lifecycle();
+        }
+        if !is_supported_visual_file(&path) {
+            return ActionLifecycleOutcome::Refused;
+        }
+        let Some(path) = path.to_str() else {
+            return ActionLifecycleOutcome::Refused;
+        };
+        let path = path.to_owned();
+        if self.apply_native_manual_action("Add dropped visual layer", "layer_stack", move |app| {
+            app.add_layer(&path)
+        }) {
+            ActionLifecycleOutcome::Applied
+        } else {
+            ActionLifecycleOutcome::Refused
+        }
+    }
+
+    /// Nonblocking render-loop seam: only completed, generation-tagged data
+    /// crosses into Main. Directory iteration and metadata access stay on the
+    /// single-flight worker.
+    fn poll_library_index(&mut self) {
+        let Some(completed) = self
+            .library_index_runtime
+            .as_ref()
+            .and_then(library_index::LibraryIndexRuntime::poll)
+        else {
+            return;
+        };
+        let library_index::LibraryScanCompletion {
+            generation,
+            index,
+            visual_files,
+            audio_files,
+        } = completed;
+        if !self.web_state.library_generation_is_current(generation)
+            || !self.web_state.publish_library_index(generation, index)
+        {
+            return;
+        }
+        self.library_files = visual_files;
+        self.audio_library_files = audio_files;
+        self.web_authored_mutation_counter =
+            self.web_authored_mutation_counter.wrapping_add(1).max(1);
+
+        let thumbnail_candidates: Vec<PathBuf> = {
+            let thumbnails = self
+                .web_state
+                .thumbnails
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previews = self
+                .web_state
+                .preview_frames
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.library_files
+                .iter()
+                .take(MAX_THUMBNAIL_CANDIDATES)
+                .filter(|path| {
+                    let filename = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy())
+                        .unwrap_or_default();
+                    !thumbnails.contains_key(filename.as_ref())
+                        || (!is_still_image_file(path) && !previews.contains_key(filename.as_ref()))
+                })
+                .cloned()
+                .collect()
+        };
+        if !thumbnail_candidates.is_empty() {
+            let device_limits = self.renderer.as_ref().map_or_else(
+                media_safety::MediaDeviceLimits::none,
+                |renderer| {
                     let limits = renderer.device.limits();
                     media_safety::MediaDeviceLimits::new(
                         limits.max_texture_dimension_2d,
                         limits.max_buffer_size,
                     )
-                });
-        generate_thumbnails(
-            &self.library_files,
-            self.web_state.clone(),
-            generation,
-            self.media_safety_policy.clone(),
-            device_limits,
-        );
-    }
-
-    fn apply_native_recovery_action(&mut self, action: NativeRecoveryAction) {
-        use web::state::WebAction;
-        match action {
-            NativeRecoveryAction::SetProgramFrozen(frozen) => {
-                self.apply_native_manual_action("Set Program Freeze", "transport", move |app| {
-                    app.handle_web_action_inner_with_feedback(WebAction::SetProgramFrozen {
-                        frozen,
-                    });
-                });
-            }
-            NativeRecoveryAction::SetBlackout(enabled) => {
-                self.handle_web_action(WebAction::SetBlackout { enabled });
-            }
-            NativeRecoveryAction::RevertVisualProgram => {
-                self.apply_native_manual_action("Revert visual program", "visual_program", |app| {
-                    app.handle_web_action_inner_with_feedback(WebAction::ResetVisualProgram);
-                });
-            }
-            NativeRecoveryAction::RescanLibrary => {
-                self.handle_web_action(WebAction::RescanLibrary);
-            }
-            NativeRecoveryAction::ChooseLibrary => self.choose_library_folder(),
+                },
+            );
+            generate_thumbnails(
+                &thumbnail_candidates,
+                self.web_state.clone(),
+                generation,
+                self.media_safety_policy.clone(),
+                device_limits,
+            );
         }
     }
 
-    fn choose_library_folder(&mut self) {
+    fn apply_native_recovery_action(
+        &mut self,
+        action: NativeRecoveryAction,
+    ) -> WebActionDispatchOutcome {
+        use web::state::WebAction;
+        match action {
+            NativeRecoveryAction::SetProgramFrozen(frozen) => {
+                let accepted = self.apply_native_manual_action(
+                    "Set Program Freeze",
+                    "transport",
+                    move |app| {
+                        app.handle_web_action_inner_with_feedback_from_origin(
+                            WebAction::SetProgramFrozen { frozen },
+                            action_correlation::ActionSourceClass::Native,
+                        );
+                    },
+                );
+                WebActionDispatchOutcome::from_acceptance(
+                    WebActionBatchDisposition::Continue,
+                    accepted,
+                )
+            }
+            NativeRecoveryAction::SetBlackout(enabled) => self.handle_web_action_from_origin(
+                WebAction::SetBlackout { enabled },
+                action_correlation::ActionSourceClass::Native,
+            ),
+            NativeRecoveryAction::RevertVisualProgram => {
+                let accepted = self.apply_native_manual_action(
+                    "Revert visual program",
+                    "visual_program",
+                    |app| {
+                        app.handle_web_action_inner_with_feedback_from_origin(
+                            WebAction::ResetVisualProgram,
+                            action_correlation::ActionSourceClass::Native,
+                        );
+                    },
+                );
+                WebActionDispatchOutcome::from_acceptance(
+                    WebActionBatchDisposition::Continue,
+                    accepted,
+                )
+            }
+            NativeRecoveryAction::RestartControlServer => {
+                let accepted = self.restart_control_server();
+                WebActionDispatchOutcome {
+                    batch: WebActionBatchDisposition::Continue,
+                    lifecycle: if accepted {
+                        ActionLifecycleOutcome::Coalesced
+                    } else {
+                        ActionLifecycleOutcome::Refused
+                    },
+                }
+            }
+            NativeRecoveryAction::RescanLibrary => self.handle_web_action_from_origin(
+                WebAction::RescanLibrary,
+                action_correlation::ActionSourceClass::Native,
+            ),
+            NativeRecoveryAction::ChooseLibrary => {
+                let admission = self.choose_library_folder();
+                WebActionDispatchOutcome {
+                    batch: WebActionBatchDisposition::Continue,
+                    lifecycle: admission.lifecycle(),
+                }
+            }
+        }
+    }
+
+    fn record_applied_action_identity(&mut self, identity: action_correlation::ActionIdentity) {
+        if self
+            .web_state
+            .record_action_identity_apply(identity, Instant::now())
+        {
+            self.highest_applied_action_sequence = self
+                .highest_applied_action_sequence
+                .max(identity.sequence().get());
+        }
+    }
+
+    fn record_terminal_action_identity(
+        &mut self,
+        identity: action_correlation::ActionIdentity,
+        disposition: action_correlation::ActionDisposition,
+    ) {
+        self.web_state
+            .record_terminal_action_identity(identity, disposition);
+    }
+
+    fn record_action_identity_outcome(
+        &mut self,
+        identity: action_correlation::ActionIdentity,
+        accepted: bool,
+    ) {
+        self.record_action_lifecycle_outcome(
+            identity,
+            if accepted {
+                ActionLifecycleOutcome::Applied
+            } else {
+                ActionLifecycleOutcome::Refused
+            },
+        );
+    }
+
+    fn record_action_lifecycle_outcome(
+        &mut self,
+        identity: action_correlation::ActionIdentity,
+        lifecycle: ActionLifecycleOutcome,
+    ) {
+        match lifecycle {
+            ActionLifecycleOutcome::Applied => self.record_applied_action_identity(identity),
+            ActionLifecycleOutcome::Coalesced => self.record_terminal_action_identity(
+                identity,
+                action_correlation::ActionDisposition::Coalesced,
+            ),
+            ActionLifecycleOutcome::Refused => self.record_terminal_action_identity(
+                identity,
+                action_correlation::ActionDisposition::Refused,
+            ),
+            ActionLifecycleOutcome::Quantized => self.record_terminal_action_identity(
+                identity,
+                action_correlation::ActionDisposition::Quantized,
+            ),
+        }
+    }
+
+    fn mint_native_action_identity(&self) -> action_correlation::ActionIdentity {
+        self.web_state
+            .action_sequencer()
+            .envelope(action_correlation::ActionSourceClass::Native, ())
+            .identity()
+    }
+
+    fn apply_correlated_action<T>(
+        &mut self,
+        envelope: action_correlation::ActionEnvelope<T>,
+        apply: impl FnOnce(&mut Self, T) -> WebActionDispatchOutcome,
+    ) -> WebActionBatchDisposition {
+        apply_envelope_then_record(
+            self,
+            envelope,
+            |app, payload| {
+                let outcome = apply(app, payload);
+                (outcome.batch, outcome.lifecycle)
+            },
+            Self::record_applied_action_identity,
+            Self::record_terminal_action_identity,
+        )
+    }
+
+    fn restart_control_server(&mut self) -> bool {
+        let had_server = self.control_server.is_some();
+        if let Some(server) = self.control_server.as_mut() {
+            if let Err(error) = server.retire() {
+                self.record_flight_error(
+                    flight_recorder::ErrorDomain::WebControl,
+                    flight_recorder::ErrorCode::Timeout,
+                    true,
+                    &error.to_string(),
+                );
+                log::error!("Control panel restart refused: {error}");
+                return false;
+            }
+        }
+        self.control_server = None;
+        match web::server::restart_with_backoff(self.web_state.clone(), CONTROL_SERVER_PORT) {
+            Ok(server) => {
+                if let Some(url) = server.local_url() {
+                    let _ = open::that(url);
+                }
+                self.control_server = Some(server);
+                true
+            }
+            Err(error) => {
+                self.record_flight_error(
+                    flight_recorder::ErrorDomain::WebControl,
+                    flight_recorder::ErrorCode::Unavailable,
+                    true,
+                    &error.to_string(),
+                );
+                log::error!("Control panel restart failed: {error}");
+                had_server
+            }
+        }
+    }
+
+    fn choose_library_folder(&mut self) -> LibraryScanAdmission {
         let mut dialog = rfd::FileDialog::new().set_title("Choose media library folder");
         if let Some(folder) = self.library_folder.as_ref() {
             dialog = dialog.set_directory(folder);
@@ -8955,9 +10622,16 @@ impl App {
         let folder = dialog.pick_folder();
         self.finish_native_modal(was_program_paused, Instant::now());
 
-        if let Some(folder) = folder {
-            self.set_library_folder(folder);
-        }
+        self.apply_chosen_library_folder(folder)
+    }
+
+    fn apply_chosen_library_folder(
+        &mut self,
+        folder: Option<std::path::PathBuf>,
+    ) -> LibraryScanAdmission {
+        folder.map_or(LibraryScanAdmission::Refused, |folder| {
+            self.set_library_folder(folder)
+        })
     }
 
     /// Native dialogs are modal on the event thread. Preserve the beat that
@@ -9082,7 +10756,12 @@ impl App {
                     }
                     Some(mut frame) => {
                         layer
-                            .upload_ready_media_frame(&renderer.device, &renderer.queue, &mut frame)
+                            .upload_ready_media_frame(
+                                &renderer.device,
+                                &renderer.queue,
+                                renderer.renderer_generation(),
+                                &mut frame,
+                            )
                             .map_err(|error| {
                                 format!(
                                     "could not upload saved playhead for '{}': {error}",
@@ -9520,12 +11199,20 @@ impl App {
         self.master_paused = recalled_master_paused;
         self.media_frozen = recalled_media_frozen;
         self.mod_matrix.reset_update_timing();
+        let logical_source_changed =
+            transient_layer_source_set(&self.layers) != transient_layer_source_set(&rebuilt);
         self.layers = rebuilt;
+        // Whole-stack recall publishes a changed logical source set before
+        // controller/Scene follow-up work or any subsequent telemetry tick.
+        // An identical-source non-source history reconstruction keeps the
+        // opaque witness and source digest stable.
+        // The full authored-world fingerprint, when present, lands later at
+        // its ordinary history/recovery boundary without a hot-path recapture.
+        self.refresh_flight_source_content_identity_cache(logical_source_changed);
         if let Some(staged_controller_rebind) = staged_controller_rebind {
             self.controller_profile_pending_initial_resolution = false;
             match staged_controller_rebind.and_then(|profile| {
-                self.midi
-                    .apply_profile(profile)
+                self.apply_midi_profile_with_displacement_barrier(profile)
                     .map_err(|error| error.to_string())
             }) {
                 Ok(()) => {
@@ -9797,12 +11484,12 @@ impl App {
     /// Invalidate retained pixels/history after a bulk visual transfer without
     /// resetting piece time, modulation, source identity, or stack revision.
     fn invalidate_visual_generation_after_look(&mut self, applied: &AppliedLookScope) {
-        self.quantized_actions
-            .retain(|action| !Self::action_conflicts_with_applied_look(action, applied));
-        self.web_state
-            .actions
-            .blocking_lock()
-            .retain(|action| !Self::action_conflicts_with_applied_look(action, applied));
+        self.retain_quantized_actions(|action| {
+            !Self::action_conflicts_with_applied_look(action, applied)
+        });
+        self.web_state.retain_pending_actions(|action| {
+            !Self::action_conflicts_with_applied_look(action, applied)
+        });
         self.visual_epoch = self.visual_epoch.wrapping_add(1);
         self.ntsc_presented = None;
         self.mosh_presented = None;
@@ -10127,14 +11814,69 @@ impl App {
         }
     }
 
-    fn output_display_request(action: &web::state::WebAction) -> Option<String> {
+    fn output_display_request(action: &web::state::WebAction) -> Option<(String, Option<u64>)> {
         match action {
-            web::state::WebAction::SetOutputDisplay { display_id } => Some(display_id.clone()),
+            web::state::WebAction::SetOutputDisplay {
+                display_id,
+                inventory_generation,
+            } => Some((display_id.clone(), *inventory_generation)),
             web::state::WebAction::Quantized { inner } => Self::output_display_request(inner),
             _ => None,
         }
     }
 
+    fn output_inventory_rescan_requested(action: &web::state::WebAction) -> bool {
+        match action {
+            web::state::WebAction::RescanOutputDisplays => true,
+            web::state::WebAction::Quantized { inner } => {
+                Self::output_inventory_rescan_requested(inner)
+            }
+            _ => false,
+        }
+    }
+
+    fn retain_pending_web_actions(
+        &self,
+        pending: &mut VecDeque<action_correlation::ActionEnvelope<web::state::WebAction>>,
+        mut keep: impl FnMut(&web::state::WebAction) -> bool,
+    ) {
+        let mut retained = VecDeque::with_capacity(pending.len());
+        while let Some(action) = pending.pop_front() {
+            if keep(action.payload()) {
+                retained.push_back(action);
+            } else {
+                self.web_state.record_terminal_action(
+                    &action,
+                    action_correlation::ActionDisposition::Superseded,
+                );
+            }
+        }
+        *pending = retained;
+    }
+
+    fn apply_enveloped_web_action_batch_disposition(
+        &self,
+        pending: &mut VecDeque<action_correlation::ActionEnvelope<web::state::WebAction>>,
+        disposition: WebActionBatchDisposition,
+    ) {
+        match disposition {
+            WebActionBatchDisposition::Continue => {}
+            WebActionBatchDisposition::SnapshotCommitted => {
+                self.retain_pending_web_actions(pending, |_| false)
+            }
+            WebActionBatchDisposition::LookApplied(scope) => self
+                .retain_pending_web_actions(pending, |action| {
+                    !Self::action_conflicts_with_applied_look(action, &scope)
+                }),
+            WebActionBatchDisposition::MasterVisualReset => {
+                self.retain_pending_web_actions(pending, |action| {
+                    !Self::action_targets_master_rack(action)
+                });
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn apply_web_action_batch_disposition(
         pending: &mut VecDeque<web::state::WebAction>,
         disposition: WebActionBatchDisposition,
@@ -10181,7 +11923,7 @@ impl App {
     }
 
     fn remap_quantized_layers_after_remove(&mut self, removed: usize) {
-        self.quantized_actions.retain_mut(|action| match action {
+        self.retain_quantized_actions(|action| match action {
             web::state::WebAction::SetLayerParam {
                 index,
                 layer_id: None,
@@ -10232,6 +11974,7 @@ impl App {
     }
 
     fn remap_quantized_layers_after_move(&mut self, from: usize, to: usize) {
+        self.normalize_quantized_action_sources();
         for action in &mut self.quantized_actions {
             let index = match action {
                 web::state::WebAction::SetLayerParam {
@@ -10364,7 +12107,11 @@ impl App {
     /// Advanced executor, retain the ordered request until the next Advanced
     /// prepare boundary; a newly created executor is already cold but still
     /// consumes the request explicitly.
-    fn clear_motion_memory(&mut self) {
+    fn clear_motion_memory(&mut self) -> bool {
+        let changed = self.composition_gpu.is_some()
+            || !self.pending_motion_memory_clear
+            || !self.motion_field_cache.is_empty()
+            || !self.motion_telemetry.is_empty();
         self.motion_field_cache.clear();
         self.motion_telemetry.clear();
         self.pending_motion_memory_clear = true;
@@ -10372,6 +12119,7 @@ impl App {
             executor.clear_motion_memory();
             self.pending_motion_memory_clear = false;
         }
+        changed
     }
 
     /// Commit the exact effective morph world at the current authoritative
@@ -10387,7 +12135,7 @@ impl App {
         let baseline = StagedMorphWorld::capture_authored(self);
         let base_t = self.morph.position_at_beat(self.mod_matrix.current_beat);
         let t = (base_t + morph_offset).clamp(0.0, 1.0);
-        let mut requested_error = None;
+        let mut requested_error: Option<diagnostics::ConstraintFailure> = None;
         for (attempt_index, sample_t) in
             morph::preflight_sample_positions(t).into_iter().enumerate()
         {
@@ -10437,7 +12185,12 @@ impl App {
                     if fallback {
                         self.composition_status = format!(
                             "Morph sample {t:.4} was invalid ({}); used captured endpoint {sample_t:.1}",
-                            requested_error.as_deref().unwrap_or("creative graph rejected")
+                            requested_error
+                                .as_ref()
+                                .map_or("creative graph rejected", |error| error
+                                    .diagnostic
+                                    .text
+                                    .as_str())
                         );
                         log::warn!("{}", self.composition_status);
                     }
@@ -10455,8 +12208,11 @@ impl App {
         self.composition_status = format!(
             "Morph sample {t:.4} and both captured endpoints were rejected: {}",
             requested_error
-                .as_deref()
-                .unwrap_or("creative graph rejected")
+                .as_ref()
+                .map_or("creative graph rejected", |error| error
+                    .diagnostic
+                    .text
+                    .as_str())
         );
         log::warn!("{}", self.composition_status);
         false
@@ -12618,7 +14374,7 @@ impl App {
 
         // A previously latched master command must not resurrect state on a
         // later downbeat. Pending layer edits remain valid and are preserved.
-        self.quantized_actions.retain(|action| {
+        self.retain_quantized_actions(|action| {
             !Self::action_targets_master_rack(action)
                 && !matches!(
                     action,
@@ -12709,10 +14465,41 @@ impl App {
         self.spout.cut_to_black(width, height, self.visual_epoch);
     }
 
-    fn queue_quantized_action(
+    fn normalize_quantized_action_sources(&mut self) {
+        self.quantized_action_sources
+            .truncate(self.quantized_actions.len());
+        self.quantized_action_sources.resize(
+            self.quantized_actions.len(),
+            action_correlation::ActionSourceClass::Browser,
+        );
+    }
+
+    fn retain_quantized_actions(
+        &mut self,
+        mut keep: impl FnMut(&mut web::state::WebAction) -> bool,
+    ) {
+        self.normalize_quantized_action_sources();
+        let actions = std::mem::take(&mut self.quantized_actions);
+        let sources = std::mem::take(&mut self.quantized_action_sources);
+        for (mut action, source) in actions.into_iter().zip(sources) {
+            if keep(&mut action) {
+                self.quantized_actions.push(action);
+                self.quantized_action_sources.push(source);
+            }
+        }
+    }
+
+    fn clear_quantized_actions(&mut self) {
+        self.quantized_actions.clear();
+        self.quantized_action_sources.clear();
+    }
+
+    fn queue_quantized_action_from_source(
         &mut self,
         action: web::state::WebAction,
-    ) -> WebActionBatchDisposition {
+        source: action_correlation::ActionSourceClass,
+    ) -> WebActionDispatchOutcome {
+        self.normalize_quantized_action_sources();
         if matches!(
             action,
             web::state::WebAction::SetMotionDonor { .. }
@@ -12749,13 +14536,13 @@ impl App {
             self.composition_status =
                 "Ordered memory/event, donor, and Autopilot actions cannot be quantized"
                     .to_string();
-            return WebActionBatchDisposition::Continue;
+            return WebActionDispatchOutcome::refused(WebActionBatchDisposition::Continue);
         }
         let Some(key) = Self::quantized_action_key(&action) else {
             // Quantization is deliberately limited to non-emergency,
             // continuously expressive controls. Unknown wrappers retain
             // normal immediate behavior.
-            return self.handle_web_action(action);
+            return self.handle_web_action_from_origin(action, source);
         };
         // Capture observes every state transition before it, so it is both an
         // eligible latched command and an ordering barrier, never a value to
@@ -12779,11 +14566,29 @@ impl App {
             .flatten();
         if let Some(existing) = existing {
             self.quantized_actions.remove(existing);
+            self.quantized_action_sources.remove(existing);
             self.quantized_actions.push(action);
+            self.quantized_action_sources.push(source);
         } else if self.quantized_actions.len() < 256 {
             self.quantized_actions.push(action);
+            self.quantized_action_sources.push(source);
+        } else {
+            self.composition_status =
+                "Quantized action refused: the 256-command latch is full".to_string();
+            return WebActionDispatchOutcome::refused(WebActionBatchDisposition::Continue);
         }
-        WebActionBatchDisposition::Continue
+        WebActionDispatchOutcome::quantized()
+    }
+
+    #[cfg(test)]
+    fn queue_quantized_action(
+        &mut self,
+        action: web::state::WebAction,
+    ) -> WebActionDispatchOutcome {
+        self.queue_quantized_action_from_source(
+            action,
+            action_correlation::ActionSourceClass::Browser,
+        )
     }
 
     fn performance_resolve_context(&self) -> media_source::ResolveContext {
@@ -12846,7 +14651,7 @@ impl App {
         path
     }
 
-    fn choose_controller_profile_import(&mut self) {
+    fn choose_controller_profile_import(&mut self) -> bool {
         let mut dialog = rfd::FileDialog::new()
             .set_title("Import collide-o-scope controller profile")
             .add_filter("Controller profile JSON", &["json"]);
@@ -12859,13 +14664,13 @@ impl App {
         let path = dialog.pick_file();
         self.finish_native_modal(was_program_paused, Instant::now());
         let Some(path) = path else {
-            return;
+            return false;
         };
         let document = match controller_profile::read_controller_profile_import(&path) {
             Ok(document) => document,
             Err(error) => {
                 self.controller_status = format!("Controller profile import rejected: {error}");
-                return;
+                return false;
             }
         };
         self.apply_native_manual_action(
@@ -12873,13 +14678,17 @@ impl App {
             "controller_profile",
             move |app| {
                 if let Err(error) = app.install_controller_profile_document(document, "imported") {
+                    // The installer publishes `self.controller_profile` only
+                    // after persistence and runtime replacement both succeed.
+                    // Therefore the enclosing fingerprint transaction returns
+                    // NoChange/Refused on this error path, never a false apply.
                     app.controller_status = format!("Controller profile import rejected: {error}");
                 }
             },
-        );
+        )
     }
 
-    fn choose_controller_profile_export(&mut self) {
+    fn choose_controller_profile_export(&mut self) -> bool {
         let mut dialog = rfd::FileDialog::new()
             .set_title("Export collide-o-scope controller profile")
             .set_file_name("controller_profile.json")
@@ -12893,17 +14702,64 @@ impl App {
         let path = dialog.save_file();
         self.finish_native_modal(was_program_paused, Instant::now());
         let Some(path) = path else {
-            return;
+            return false;
         };
-        match controller_profile::save_controller_profile_atomic(&self.controller_profile, &path) {
+        self.export_controller_profile_to_path(&path)
+    }
+
+    fn export_controller_profile_to_path(&mut self, path: &std::path::Path) -> bool {
+        match controller_profile::save_controller_profile_atomic(&self.controller_profile, path) {
             Ok(()) => {
                 self.controller_status = format!(
                     "Controller profile '{}' exported",
                     self.controller_profile.name
                 );
+                true
             }
             Err(error) => {
                 self.controller_status = format!("Controller profile export failed: {error}");
+                false
+            }
+        }
+    }
+
+    fn choose_and_save_current_patch(&mut self) -> bool {
+        let (patch, fingerprint) = match self.capture_manual_history_world() {
+            Ok((world, canonical)) => (world.patch, history::fingerprint_canonical(&canonical)),
+            Err(error) => {
+                self.composition_status = format!("Complete patch save failed: {error}");
+                return false;
+            }
+        };
+        let modal_started = Instant::now();
+        let was_program_paused = self.program_transport_paused();
+        self.mod_matrix.clock.set_paused(true, modal_started);
+        let path = rfd::FileDialog::new()
+            .set_file_name("patch.yaml")
+            .add_filter("YAML", &["yaml", "yml"])
+            .save_file();
+        self.finish_native_modal(was_program_paused, Instant::now());
+        let Some(path) = path else {
+            return false;
+        };
+        self.save_current_patch_to_path(patch, fingerprint, &path)
+    }
+
+    fn save_current_patch_to_path(
+        &mut self,
+        patch: patch::PatchState,
+        fingerprint: history::HistoryFingerprint,
+        path: &std::path::Path,
+    ) -> bool {
+        match patch::editor::publish_patch_state(path, &patch) {
+            Ok(()) => {
+                self.enqueue_recovery_checkpoint(patch, fingerprint, "native patch save");
+                true
+            }
+            Err(error) => {
+                self.composition_status = format!("Complete patch save failed: {error}");
+                log::error!("{}", self.composition_status);
+                false
             }
         }
     }
@@ -13042,33 +14898,40 @@ impl App {
         Ok(())
     }
 
-    fn start_program_recording(&mut self, auto_import: bool) {
+    fn start_program_recording(&mut self, auto_import: bool) -> bool {
         let Some(path) = self.choose_capture_destination(
             "Record collide-o-scope Program",
             "collide-o-scope-recording.mp4",
             "MPEG-4 video",
             &["mp4"],
         ) else {
-            return;
+            return false;
         };
         let purpose = if auto_import {
             program_recorder::CapturePurpose::AutoImport
         } else {
             program_recorder::CapturePurpose::External
         };
-        if let Err(error) =
-            self.begin_recording_to_path(path, program_recorder::CaptureTarget::Program, purpose)
+        match self.begin_recording_to_path(path, program_recorder::CaptureTarget::Program, purpose)
         {
-            self.output_error = error;
+            Ok(()) => true,
+            Err(error) => {
+                self.output_error = error;
+                false
+            }
         }
     }
 
-    fn capture_still(&mut self, target: web::state::CaptureTargetSnapshot, auto_import: bool) {
+    fn capture_still(
+        &mut self,
+        target: web::state::CaptureTargetSnapshot,
+        auto_import: bool,
+    ) -> bool {
         let target = match self.resolve_capture_target(target) {
             Ok(target) => target,
             Err(error) => {
                 self.output_error = error;
-                return;
+                return false;
             }
         };
         let Some(path) = self.choose_capture_destination(
@@ -13077,15 +14940,19 @@ impl App {
             "PNG image",
             &["png"],
         ) else {
-            return;
+            return false;
         };
         let purpose = if auto_import {
             program_recorder::CapturePurpose::AutoImport
         } else {
             program_recorder::CapturePurpose::External
         };
-        if let Err(error) = self.begin_still_to_path(path, target, purpose) {
-            self.output_error = error;
+        match self.begin_still_to_path(path, target, purpose) {
+            Ok(()) => true,
+            Err(error) => {
+                self.output_error = error;
+                false
+            }
         }
     }
 
@@ -13094,12 +14961,12 @@ impl App {
         target: web::state::CaptureTargetSnapshot,
         destination_layer_id: String,
         activate: bool,
-    ) {
+    ) -> bool {
         let target = match self.resolve_capture_target(target) {
             Ok(target) => target,
             Err(error) => {
                 self.output_error = error;
-                return;
+                return false;
             }
         };
         let destination_layer = match parse_nonzero_decimal(&destination_layer_id)
@@ -13114,7 +14981,7 @@ impl App {
                 self.output_error = format!(
                     "resample destination layer {destination_layer_id} is absent or invalid"
                 );
-                return;
+                return false;
             }
         };
         let Some(path) = self.choose_capture_destination(
@@ -13123,13 +14990,13 @@ impl App {
             "MPEG-4 video",
             &["mp4"],
         ) else {
-            return;
+            return false;
         };
         let deferred_history = match self.deferred_performance_history("Create resample slot") {
             Ok(deferred) => deferred,
             Err(error) => {
                 self.history_status = error;
-                return;
+                return false;
             }
         };
         if let Err(error) = self.begin_recording_to_path(
@@ -13141,31 +15008,51 @@ impl App {
             },
         ) {
             self.output_error = error;
+            false
         } else if let Some(session) = self.live_capture.as_mut() {
             session.deferred_history = Some(deferred_history);
+            true
+        } else {
+            false
         }
     }
 
-    fn finish_live_capture(&mut self) {
+    fn finish_live_capture(&mut self) -> bool {
         match self.live_capture.as_mut() {
-            Some(session) if matches!(session.worker, LiveCaptureWorker::Recording(_)) => {
+            Some(session)
+                if matches!(session.worker, LiveCaptureWorker::Recording(_))
+                    && session.accepting_captures =>
+            {
                 session.request_finish();
                 self.output_error.clear();
+                true
             }
             Some(_) => {
                 self.output_error = "only a running video capture can be finished".into();
+                false
             }
-            None => self.output_error = "no live capture is active".into(),
+            None => {
+                self.output_error = "no live capture is active".into();
+                false
+            }
         }
     }
 
-    fn cancel_live_capture(&mut self) {
+    fn cancel_live_capture(&mut self) -> bool {
         match self.live_capture.as_mut() {
-            Some(session) => {
+            Some(session) if !session.cancel_requested => {
                 session.request_cancel();
                 self.output_error.clear();
+                true
             }
-            None => self.output_error = "no live capture is active".into(),
+            Some(_) => {
+                self.output_error = "live capture cancellation is already pending".into();
+                false
+            }
+            None => {
+                self.output_error = "no live capture is active".into();
+                false
+            }
         }
     }
 
@@ -13747,28 +15634,14 @@ impl App {
                         "Capture committed, but its format is not importable".into();
                     return;
                 }
-                if !self.library_files.contains(&committed_path) {
-                    self.library_files.push(committed_path.clone());
-                    self.library_files.sort();
-                }
-                let generation = self.web_state.begin_library_generation();
-                generate_thumbnails(
-                    std::slice::from_ref(&committed_path),
-                    self.web_state.clone(),
-                    generation,
-                    self.media_safety_policy.clone(),
-                    self.renderer.as_ref().map_or_else(
-                        media_safety::MediaDeviceLimits::none,
-                        |renderer| {
-                            let limits = renderer.device.limits();
-                            media_safety::MediaDeviceLimits::new(
-                                limits.max_texture_dimension_2d,
-                                limits.max_buffer_size,
-                            )
-                        },
-                    ),
-                );
-                self.output_error = "Capture committed and imported into the library".into();
+                let Some(folder) = self.library_folder.clone() else {
+                    self.output_error =
+                        "Capture committed, but no active library is available to index".into();
+                    return;
+                };
+                self.request_library_scan(folder, false, false);
+                self.output_error =
+                    "Capture committed; asynchronous library re-index queued".into();
             }
             program_recorder::CommittedCaptureIntent::NewClipSlot {
                 committed_path,
@@ -13832,18 +15705,20 @@ impl App {
         match performance_runtime::PreparationRequest::for_layer_slot_update(
             layer, desired, None, source,
         ) {
-            Ok(request) => self.submit_performance_request(
-                request,
-                vec![descriptor],
-                activate.then_some(transport::TriggerMode::Immediate),
-                !activate,
-                deferred_history,
-                format!(
-                    "committed resample {filename} as layer {} slot {}",
-                    destination_layer.get(),
-                    slot_id.get()
-                ),
-            ),
+            Ok(request) => {
+                let _ = self.submit_performance_request(
+                    request,
+                    vec![descriptor],
+                    activate.then_some(transport::TriggerMode::Immediate),
+                    !activate,
+                    deferred_history,
+                    format!(
+                        "committed resample {filename} as layer {} slot {}",
+                        destination_layer.get(),
+                        slot_id.get()
+                    ),
+                );
+            }
             Err(error) => {
                 self.source_staging_status =
                     format!("Resample committed, but ClipSlot preparation failed: {error}");
@@ -13939,12 +15814,12 @@ impl App {
         self.performance_staging = None;
     }
 
-    fn stop_autopilot_for_manual_control(&mut self, reason: &str) {
+    fn stop_autopilot_for_manual_control(&mut self, reason: &str) -> bool {
         if matches!(
             self.autopilot_scheduler.state(),
             performance::autopilot::AutopilotState::Stopped
         ) {
-            return;
+            return false;
         }
         let commands = self.autopilot_scheduler.reset();
         for command in commands {
@@ -13955,6 +15830,7 @@ impl App {
         self.performance_boundaries
             .reanchor(self.mod_matrix.current_beat);
         self.autopilot_status = format!("Autopilot stopped by {reason}");
+        true
     }
 
     fn cached_performance_position(
@@ -14004,8 +15880,8 @@ impl App {
         publish_inactive_metadata: bool,
         deferred_history: Option<DeferredPerformanceHistory>,
         status: String,
-    ) {
-        let _ = self.submit_performance_request_owned(
+    ) -> bool {
+        self.submit_performance_request_owned(
             request,
             PerformanceSubmissionIntent {
                 descriptors,
@@ -14015,7 +15891,8 @@ impl App {
                 status,
                 owner: PerformanceIntentOwner::Manual,
             },
-        );
+        )
+        .is_ok()
     }
 
     fn submit_performance_request_owned(
@@ -14090,11 +15967,10 @@ impl App {
         filename: String,
         activate: bool,
         trigger_mode: transport::TriggerMode,
-    ) {
-        self.stop_autopilot_for_manual_control("manual ClipSlot loading");
+    ) -> ActionLifecycleOutcome {
         let Some(layer_index) = self.resolve_stable_layer_id(layer_id) else {
             self.source_staging_status = format!("Layer {layer_id} is absent");
-            return;
+            return ActionLifecycleOutcome::Refused;
         };
         let Some(path) = self.library_files.iter().find(|path| {
             path.file_name()
@@ -14102,7 +15978,7 @@ impl App {
         }) else {
             self.source_staging_status =
                 format!("Source not found in the active library: {filename}");
-            return;
+            return ActionLifecycleOutcome::Refused;
         };
         let slot_id = match requested_slot {
             Some(slot_id) => slot_id,
@@ -14111,7 +15987,7 @@ impl App {
                 None => {
                     self.source_staging_status =
                         format!("Layer {layer_id} has no available non-zero ClipSlot identity");
-                    return;
+                    return ActionLifecycleOutcome::Refused;
                 }
             },
         };
@@ -14145,10 +16021,10 @@ impl App {
                         Ok(deferred) => deferred,
                         Err(error) => {
                             self.history_status = error;
-                            return;
+                            return ActionLifecycleOutcome::Refused;
                         }
                     };
-                self.submit_performance_request(
+                let admitted = self.submit_performance_request(
                     request,
                     vec![descriptor],
                     activate.then_some(trigger_mode),
@@ -14156,9 +16032,21 @@ impl App {
                     Some(deferred_history),
                     format!("{filename} as layer {layer_id} slot {}", slot_id.get()),
                 );
+                if admitted {
+                    let stopped_autopilot =
+                        self.stop_autopilot_for_manual_control("manual ClipSlot loading");
+                    if activate || stopped_autopilot {
+                        ActionLifecycleOutcome::Applied
+                    } else {
+                        ActionLifecycleOutcome::Coalesced
+                    }
+                } else {
+                    ActionLifecycleOutcome::Refused
+                }
             }
             Err(error) => {
                 self.source_staging_status = format!("Cannot prepare {filename}: {error}");
+                ActionLifecycleOutcome::Refused
             }
         }
     }
@@ -14169,8 +16057,7 @@ impl App {
         slot_id: performance::ClipSlotId,
         cue_id: Option<transport::CueId>,
         trigger_mode: transport::TriggerMode,
-    ) {
-        self.stop_autopilot_for_manual_control("manual ClipSlot activation");
+    ) -> bool {
         let layer = &self.layers[layer_index];
         let Some(slot) = layer.clip_slots.get(slot_id).cloned() else {
             self.source_staging_status = format!(
@@ -14178,7 +16065,7 @@ impl App {
                 slot_id.get(),
                 layer.layer_id()
             );
-            return;
+            return false;
         };
         let descriptor = PreparedSlotDescriptor {
             layer_id: layer.stable_layer_id(),
@@ -14189,20 +16076,27 @@ impl App {
         match performance_runtime::PreparationRequest::for_layer_slot(
             layer, slot_id, cue_id, source,
         ) {
-            Ok(request) => self.submit_performance_request(
-                request,
-                vec![descriptor],
-                Some(trigger_mode),
-                false,
-                None,
-                format!("layer {} slot {}", layer.layer_id(), slot_id.get()),
-            ),
+            Ok(request) => {
+                let admitted = self.submit_performance_request(
+                    request,
+                    vec![descriptor],
+                    Some(trigger_mode),
+                    false,
+                    None,
+                    format!("layer {} slot {}", layer.layer_id(), slot_id.get()),
+                );
+                if admitted {
+                    self.stop_autopilot_for_manual_control("manual ClipSlot activation");
+                }
+                admitted
+            }
             Err(error) => {
                 self.source_staging_status = format!(
                     "Cannot prepare layer {} slot {}: {error}",
                     layer.layer_id(),
                     slot_id.get()
                 );
+                false
             }
         }
     }
@@ -14211,12 +16105,21 @@ impl App {
         &mut self,
         scene_id: performance::SceneId,
         activate: Option<transport::TriggerMode>,
-    ) {
-        self.stop_autopilot_for_manual_control("manual Scene control");
-        if let Err(error) =
-            self.stage_scene_owned(scene_id, activate, PerformanceIntentOwner::Manual)
-        {
-            self.scene_status = error;
+    ) -> ActionLifecycleOutcome {
+        match self.stage_scene_owned(scene_id, activate, PerformanceIntentOwner::Manual) {
+            Ok(()) => {
+                let stopped_autopilot =
+                    self.stop_autopilot_for_manual_control("manual Scene control");
+                if activate.is_some() || stopped_autopilot {
+                    ActionLifecycleOutcome::Applied
+                } else {
+                    ActionLifecycleOutcome::Coalesced
+                }
+            }
+            Err(error) => {
+                self.scene_status = error;
+                ActionLifecycleOutcome::Refused
+            }
         }
     }
 
@@ -14338,10 +16241,10 @@ impl App {
         key: performance_runtime::PreparedTransactionKey,
         trigger_mode: transport::TriggerMode,
     ) -> bool {
-        self.stop_autopilot_for_manual_control("manual prepared-source activation");
         let Some(position) = self.cached_performance_position(&key) else {
             return false;
         };
+        self.stop_autopilot_for_manual_control("manual prepared-source activation");
         if let Some(cached) = self.performance_gpu_cache.remove(position) {
             self.performance_gpu_cache.push_back(cached);
         }
@@ -14416,8 +16319,16 @@ impl App {
             },
             None => None,
         };
+        let logical_sources_before = transient_layer_source_set(&self.layers);
         match cached.payload.commit(&mut self.layers, now) {
             Ok(receipt) => {
+                // Slot, Scene, and Autopilot commits can replace persisted
+                // active sources without a deferred authored-history entry.
+                // Publish their path-free source identity at this commit seam
+                // before any later telemetry snapshot can observe it.
+                let logical_source_changed =
+                    logical_sources_before != transient_layer_source_set(&self.layers);
+                self.refresh_flight_source_content_identity_cache(logical_source_changed);
                 let committed = receipt.committed_layers;
                 let uncached_displaced = receipt.uncached_displaced_slots;
                 for payload in receipt.displaced_sources {
@@ -14623,45 +16534,44 @@ impl App {
         committed_layers
     }
 
-    fn play_or_resume_autopilot(&mut self, now: Instant) {
-        use performance::autopilot::{AutopilotFault, AutopilotState};
+    fn play_or_resume_autopilot(&mut self, now: Instant) -> bool {
+        use performance::autopilot::AutopilotState;
 
         if self.autopilot_scheduler.state() == AutopilotState::Paused {
             if self.autopilot_scheduler.resume() {
                 self.performance_boundaries
                     .reanchor(self.mod_matrix.current_beat);
                 self.autopilot_status = "Autopilot resumed; waiting for a future media beat".into();
+                return true;
             }
-            return;
+            return false;
         }
 
         if self.autopilot_plan.is_empty() {
-            match self
-                .autopilot_scheduler
-                .play(&self.autopilot_plan, &self.scenes)
-            {
-                Ok(_) => unreachable!("an empty Autopilot plan cannot start"),
-                Err(failure) => {
-                    let message = failure.to_string();
-                    self.apply_autopilot_commands(failure.commands, now);
-                    self.autopilot_status = format!("Autopilot Play rejected: {message}");
-                }
-            }
-            return;
+            self.autopilot_status = "Autopilot Play rejected: plan is empty".to_string();
+            return false;
         }
 
         if let Err((scene_id, error)) = self.validate_autopilot_scene_content(&self.autopilot_plan)
         {
-            let reset = self.autopilot_scheduler.reset();
-            let mut commands = reset;
-            commands.extend(
-                self.autopilot_scheduler
-                    .fault(AutopilotFault::Reference { scene_id }),
-            );
-            self.apply_autopilot_commands(commands, now);
+            let fault = performance::autopilot::AutopilotFault::Reference { scene_id };
+            log::warn!("Autopilot Play rejected before mutation ({fault:?}): {error}");
             self.autopilot_status = error;
-            return;
+            return false;
         }
+
+        // Prove the scheduler transition on a clone before retiring a manual
+        // pending/cache transaction. A rejected or already-running Play is
+        // therefore atomic and cannot destroy work while terminalizing
+        // Refused.
+        let mut staged_scheduler = self.autopilot_scheduler.clone();
+        let commands = match staged_scheduler.play(&self.autopilot_plan, &self.scenes) {
+            Ok(commands) => commands,
+            Err(failure) => {
+                self.autopilot_status = format!("Autopilot Play rejected: {failure}");
+                return false;
+            }
+        };
 
         // Play explicitly takes the performance lane. Retire any manual
         // pending/armed transaction before the scheduler creates step 0.
@@ -14677,41 +16587,41 @@ impl App {
         self.performance_boundaries
             .reanchor(self.mod_matrix.current_beat);
 
-        match self
-            .autopilot_scheduler
-            .play(&self.autopilot_plan, &self.scenes)
-        {
-            Ok(commands) => {
-                self.autopilot_status =
-                    "Autopilot starting; first Scene waits for a future media beat".into();
-                self.apply_autopilot_commands(commands, now);
-            }
-            Err(failure) => {
-                let message = failure.to_string();
-                self.apply_autopilot_commands(failure.commands, now);
-                self.autopilot_status = format!("Autopilot Play rejected: {message}");
-            }
-        }
+        self.autopilot_scheduler = staged_scheduler;
+        self.autopilot_status =
+            "Autopilot starting; first Scene waits for a future media beat".into();
+        self.apply_autopilot_commands(commands, now);
+        true
     }
 
-    fn pause_autopilot(&mut self) {
+    fn pause_autopilot(&mut self) -> bool {
         if self.autopilot_scheduler.pause() {
             self.performance_boundaries
                 .reanchor(self.mod_matrix.current_beat);
             self.autopilot_status =
                 "Autopilot paused; preparation may finish but countdown and cuts are held".into();
+            true
         } else {
             self.autopilot_status = "Autopilot is not running".into();
+            false
         }
     }
 
-    fn reset_autopilot(&mut self) {
+    fn reset_autopilot(&mut self) -> bool {
+        if matches!(
+            self.autopilot_scheduler.state(),
+            performance::autopilot::AutopilotState::Stopped
+        ) {
+            self.autopilot_status = "Autopilot is already reset".into();
+            return false;
+        }
         let commands = self.autopilot_scheduler.reset();
         self.apply_autopilot_commands(commands, Instant::now());
         self.performance_boundaries
             .reanchor(self.mod_matrix.current_beat);
         self.autopilot_status =
             "Autopilot reset; authored plan and current visible Scene retained".into();
+        true
     }
 
     fn poll_and_release_performance(
@@ -14813,7 +16723,12 @@ impl App {
                         })
                     },
                     |renderer| {
-                        prepared.activate_gpu(&renderer.device, &renderer.queue, &self.layers)
+                        prepared.activate_gpu(
+                            &renderer.device,
+                            &renderer.queue,
+                            renderer.renderer_generation(),
+                            &self.layers,
+                        )
                     },
                 );
                 match activation {
@@ -15147,16 +17062,25 @@ impl App {
         if !crossed || self.quantized_actions.is_empty() {
             return;
         }
+        self.normalize_quantized_action_sources();
         let actions = std::mem::take(&mut self.quantized_actions);
-        for action in actions {
-            self.handle_web_action(action);
+        let sources = std::mem::take(&mut self.quantized_action_sources);
+        for (action, source) in actions.into_iter().zip(sources) {
+            // Admission already terminalized the original identity as
+            // Quantized. Release applies the retained payload/provenance and
+            // never mints or records a second action sequence.
+            self.handle_web_action_from_origin(action, source);
         }
     }
 
     /// Apply M4 authoring against a detached full visual world. If an active
     /// Morph must first be materialized, any later validation/preflight error
     /// restores both the authored world and the Morph slots exactly.
-    fn handle_motion_web_action(&mut self, action: &web::state::WebAction) -> bool {
+    fn handle_motion_web_action(
+        &mut self,
+        action: &web::state::WebAction,
+        accepted_recordable: &mut bool,
+    ) -> bool {
         use web::state::{MotionScopeSnapshot, WebAction};
         if !matches!(
             action,
@@ -15169,7 +17093,7 @@ impl App {
         }
 
         if matches!(action, WebAction::ClearMotionMemory) {
-            self.clear_motion_memory();
+            *accepted_recordable |= self.clear_motion_memory();
             self.composition_status = "Motion memory clear queued".to_string();
             return true;
         }
@@ -15402,6 +17326,9 @@ impl App {
                     materialized_temporal_partition,
                     false,
                 );
+                if matches!(action, WebAction::SetMotion { .. }) {
+                    *accepted_recordable = true;
+                }
             }
             Err(error) => {
                 baseline.install(self);
@@ -15442,8 +17369,12 @@ impl App {
                 | WebAction::ClearTemporalEventTrack
                 | WebAction::ClearTemporalMemory
                 | WebAction::ClearMotionMemory
+                | WebAction::SetMediaSafetyMode { .. }
+                | WebAction::SetBlackout { .. }
+                | WebAction::ToggleBlackout
                 | WebAction::SetOutputWindow { .. }
                 | WebAction::SetOutputDisplay { .. }
+                | WebAction::RescanOutputDisplays
                 | WebAction::ToggleOutputWindow
                 | WebAction::SetSpout { .. }
                 | WebAction::SetSpoutResolution { .. }
@@ -15469,16 +17400,31 @@ impl App {
         )
     }
 
-    fn begin_history_gesture(&mut self, raw_id: u64) {
+    fn accepted_from_manual_fingerprints(
+        manual_authored_action: bool,
+        before: Option<history::HistoryFingerprint>,
+        after: Option<history::HistoryFingerprint>,
+        fallback: bool,
+    ) -> bool {
+        if !manual_authored_action {
+            return fallback;
+        }
+        match (before, after) {
+            (Some(before), Some(after)) => before != after,
+            _ => fallback,
+        }
+    }
+
+    fn begin_history_gesture(&mut self, raw_id: u64) -> bool {
         let Some(id) = history::HistoryGestureId::new(raw_id) else {
             self.history_status = "History gesture ID must be non-zero".to_string();
-            return;
+            return false;
         };
         let checkpoint = match self.history_checkpoint("Adjust controls", "gesture") {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
                 self.history_status = format!("History gesture rejected before mutation: {error}");
-                return;
+                return false;
             }
         };
         let fingerprint = checkpoint.fingerprint();
@@ -15490,54 +17436,62 @@ impl App {
             Ok(_) => {
                 self.history_gesture_begin = Some((id, fingerprint));
                 self.history_status = format!("History gesture {} started", id.get());
+                true
             }
-            Err(error) => self.history_status = error.to_string(),
+            Err(error) => {
+                self.history_status = error.to_string();
+                false
+            }
         }
     }
 
-    fn finish_history_gesture(&mut self, raw_id: u64) {
+    fn finish_history_gesture(&mut self, raw_id: u64) -> bool {
         let Some(id) = history::HistoryGestureId::new(raw_id) else {
             self.history_status = "History gesture ID must be non-zero".to_string();
-            return;
+            return false;
         };
-        let (_, canonical) = match self.capture_manual_history_world() {
+        let (world, canonical) = match self.capture_manual_history_world() {
             Ok(captured) => captured,
             Err(error) => {
                 self.history_status = format!("History gesture could not finish: {error}");
-                return;
+                return false;
             }
         };
-        match self
-            .manual_history
-            .finish_gesture(id, history::fingerprint_canonical(&canonical))
-        {
+        let fingerprint = history::fingerprint_canonical(&canonical);
+        match self.manual_history.finish_gesture(id, fingerprint) {
             Ok(history::HistoryRecordOutcome::Recorded) => {
                 self.history_gesture_begin = None;
                 self.history_status = format!("History gesture {} committed", id.get());
-                self.append_recovery_checkpoint("manual gesture");
+                self.enqueue_recovery_checkpoint(world.patch, fingerprint, "manual gesture");
+                true
             }
             Ok(history::HistoryRecordOutcome::NoChange) => {
                 self.history_gesture_begin = None;
                 self.history_status = "History gesture made no authored change".to_string();
+                true
             }
             Ok(outcome) => {
                 self.history_gesture_begin = None;
                 self.history_status = format!("History gesture finished: {outcome:?}");
+                true
             }
-            Err(error) => self.history_status = error.to_string(),
+            Err(error) => {
+                self.history_status = error.to_string();
+                false
+            }
         }
     }
 
-    fn cancel_history_gesture(&mut self, raw_id: u64) {
+    fn cancel_history_gesture(&mut self, raw_id: u64) -> bool {
         let Some(id) = history::HistoryGestureId::new(raw_id) else {
             self.history_status = "History gesture ID must be non-zero".to_string();
-            return;
+            return false;
         };
         let current_fingerprint = match self.capture_manual_history_world() {
             Ok((_, canonical)) => history::fingerprint_canonical(&canonical),
             Err(error) => {
                 self.history_status = format!("History gesture could not cancel: {error}");
-                return;
+                return false;
             }
         };
         if self
@@ -15547,14 +17501,18 @@ impl App {
             self.history_status =
                 "A changed gesture cannot be cancelled; end it after restoring its start value"
                     .to_string();
-            return;
+            return false;
         }
         match self.manual_history.cancel_gesture(id) {
             Ok(_) => {
                 self.history_gesture_begin = None;
                 self.history_status = format!("History gesture {} cancelled", id.get());
+                true
             }
-            Err(error) => self.history_status = error.to_string(),
+            Err(error) => {
+                self.history_status = error.to_string();
+                false
+            }
         }
     }
 
@@ -15562,6 +17520,7 @@ impl App {
         &mut self,
         boundaries: Vec<patch::editor::EditorHistoryBoundary>,
         mut before_frame: Option<history::HistoryCheckpoint<ManualHistoryWorld>>,
+        mut ingress_identity: Option<action_correlation::ActionIdentity>,
     ) {
         for boundary in boundaries {
             match boundary {
@@ -15570,10 +17529,26 @@ impl App {
                     label,
                     category,
                 } => {
-                    let Some(id) = history::HistoryGestureId::new(gesture_id) else {
-                        self.history_status = "Native history gesture ID is invalid".into();
+                    let Some(identity) = ingress_identity.take() else {
+                        self.history_status =
+                            "Native editor Begin had no pre-mutation ingress identity".into();
+                        self.yaml_editor.finish_active_edit();
+                        self.yaml_editor.active = false;
                         continue;
                     };
+                    let Some(id) = history::HistoryGestureId::new(gesture_id) else {
+                        self.history_status = "Native history gesture ID is invalid".into();
+                        self.record_action_identity_outcome(identity, false);
+                        continue;
+                    };
+                    if let Some((_, displaced)) =
+                        self.native_editor_action_identity.replace((id, identity))
+                    {
+                        self.record_terminal_action_identity(
+                            displaced,
+                            action_correlation::ActionDisposition::Superseded,
+                        );
+                    }
                     let checkpoint = before_frame
                         .take()
                         .map_or_else(|| self.history_checkpoint(&label, &category), Ok);
@@ -15584,47 +17559,101 @@ impl App {
                             .map(|outcome| (outcome, fingerprint))
                             .map_err(|error| error.to_string())
                     }) {
-                        Ok((_, fingerprint)) => {
+                        Ok((history::HistoryRecordOutcome::Recorded, fingerprint)) => {
                             self.history_gesture_begin = Some((id, fingerprint));
                             self.history_status = format!("Native edit {} started", id.get());
                         }
+                        Ok((outcome, _)) => {
+                            self.history_status = format!("Native edit not opened: {outcome:?}");
+                            if let Some((_, identity)) = self.native_editor_action_identity.take() {
+                                self.record_action_identity_outcome(identity, false);
+                            }
+                        }
                         Err(error) => {
                             self.history_status = format!("Native edit rejected: {error}");
+                            if let Some((_, identity)) = self.native_editor_action_identity.take() {
+                                self.record_action_identity_outcome(identity, false);
+                            }
                         }
                     }
                 }
                 patch::editor::EditorHistoryBoundary::End { gesture_id } => {
                     let Some(id) = history::HistoryGestureId::new(gesture_id) else {
                         self.history_status = "Native history gesture ID is invalid".into();
+                        if let Some((_, identity)) = self.native_editor_action_identity.take() {
+                            self.record_action_identity_outcome(identity, false);
+                        }
                         continue;
                     };
+                    let identity = match self.native_editor_action_identity.take() {
+                        Some((open_id, identity)) if open_id == id => Some(identity),
+                        Some((_, identity)) => {
+                            self.record_action_identity_outcome(identity, false);
+                            None
+                        }
+                        None => None,
+                    };
+                    let before_fingerprint = self
+                        .history_gesture_begin
+                        .filter(|(open_id, _)| *open_id == id)
+                        .map(|(_, fingerprint)| fingerprint);
                     let after = self
                         .capture_manual_history_world()
-                        .map(|(_, canonical)| history::fingerprint_canonical(&canonical));
-                    match after.and_then(|fingerprint| {
+                        .map(|(world, canonical)| {
+                            (world.patch, history::fingerprint_canonical(&canonical))
+                        });
+                    let observed_change = after.as_ref().ok().zip(before_fingerprint).is_none_or(
+                        |((_, after_fingerprint), before_fingerprint)| {
+                            *after_fingerprint != before_fingerprint
+                        },
+                    );
+                    match after.and_then(|(patch, fingerprint)| {
                         self.manual_history
                             .finish_gesture(id, fingerprint)
+                            .map(|outcome| (outcome, patch, fingerprint))
                             .map_err(|error| error.to_string())
                     }) {
-                        Ok(history::HistoryRecordOutcome::Recorded) => {
+                        Ok((history::HistoryRecordOutcome::Recorded, patch, fingerprint)) => {
                             self.history_gesture_begin = None;
                             self.history_status = format!("Native edit {} committed", id.get());
-                            self.append_recovery_checkpoint("native edit");
+                            self.enqueue_recovery_checkpoint(patch, fingerprint, "native edit");
+                            if let Some(identity) = identity {
+                                self.record_action_identity_outcome(identity, true);
+                            }
                         }
-                        Ok(history::HistoryRecordOutcome::NoChange) => {
+                        Ok((history::HistoryRecordOutcome::NoChange, _, _)) => {
                             self.history_gesture_begin = None;
                             self.history_status = "Native edit made no authored change".into();
+                            if let Some(identity) = identity {
+                                self.record_action_identity_outcome(identity, false);
+                            }
                         }
-                        Ok(outcome) => {
+                        Ok((outcome, _, _)) => {
                             self.history_gesture_begin = None;
                             self.history_status = format!("Native edit history: {outcome:?}");
+                            if let Some(identity) = identity {
+                                self.record_action_identity_outcome(identity, observed_change);
+                            }
                         }
                         Err(error) => {
                             self.history_status = format!("Native edit could not finish: {error}");
+                            if let Some(identity) = identity {
+                                // The editor mutation preceded this secondary
+                                // capture/commit failure. Use the observed
+                                // fingerprint when available; if capture itself
+                                // failed, avoid falsely claiming Refused for an
+                                // already-published edit.
+                                self.record_action_identity_outcome(identity, observed_change);
+                            }
                         }
                     }
                 }
             }
+        }
+        if let Some(identity) = ingress_identity {
+            // A pointer press landed somewhere other than an editable value.
+            // It was still minted at native ingress, but applied no mutation.
+            self.record_action_identity_outcome(identity, false);
         }
     }
 
@@ -15653,11 +17682,16 @@ impl App {
                 return false;
             }
         };
+        let before_fingerprint = before.fingerprint();
         action(self);
-        let after_fingerprint = match self.capture_manual_history_world() {
-            Ok((_, canonical)) => history::fingerprint_canonical(&canonical),
+        let (after_patch, after_fingerprint) = match self.capture_manual_history_world() {
+            Ok((world, canonical)) => (world.patch, history::fingerprint_canonical(&canonical)),
             Err(error) => {
                 self.history_status = format!("Native action history capture failed: {error}");
+                // The live applier already ran. Without a trustworthy
+                // post-state checkpoint, claiming Refused could hide a real
+                // audience mutation; publish Applied and keep the separately
+                // named history failure.
                 return true;
             }
         };
@@ -15668,13 +17702,23 @@ impl App {
         ) {
             Ok(history::HistoryRecordOutcome::Recorded) => {
                 self.history_status = format!("{label} committed");
-                self.append_recovery_checkpoint("native manual action");
+                self.enqueue_recovery_checkpoint(
+                    after_patch,
+                    after_fingerprint,
+                    "native manual action",
+                );
+                true
             }
-            Ok(history::HistoryRecordOutcome::NoChange) => {}
-            Ok(outcome) => self.history_status = format!("Native action history: {outcome:?}"),
-            Err(error) => self.history_status = format!("Native action history failed: {error}"),
+            Ok(history::HistoryRecordOutcome::NoChange) => false,
+            Ok(outcome) => {
+                self.history_status = format!("Native action history: {outcome:?}");
+                after_fingerprint != before_fingerprint
+            }
+            Err(error) => {
+                self.history_status = format!("Native action history failed: {error}");
+                after_fingerprint != before_fingerprint
+            }
         }
-        true
     }
 
     fn apply_native_transport_flow(
@@ -15710,12 +17754,12 @@ impl App {
         }
     }
 
-    fn restore_history_direction(&mut self, redo: bool) {
+    fn restore_history_direction(&mut self, redo: bool) -> bool {
         let (current_world, current_canonical) = match self.capture_manual_history_world() {
             Ok(captured) => captured,
             Err(error) => {
                 self.history_status = format!("Undo/redo rejected before mutation: {error}");
-                return;
+                return false;
             }
         };
         let prepared = if redo {
@@ -15731,11 +17775,11 @@ impl App {
                 } else {
                     "Nothing to undo".to_string()
                 };
-                return;
+                return false;
             }
             Err(error) => {
                 self.history_status = error.to_string();
-                return;
+                return false;
             }
         };
         let token = candidate.token();
@@ -15744,7 +17788,7 @@ impl App {
             Err(error) => {
                 let _ = self.manual_history.reject_restore(token);
                 self.history_status = format!("Undo/redo reverse checkpoint rejected: {error}");
-                return;
+                return false;
             }
         };
         match self.restore_manual_history_world(candidate.target()) {
@@ -15756,14 +17800,17 @@ impl App {
                         format!("Undid {}", candidate.label())
                     };
                     self.append_recovery_checkpoint(if redo { "redo" } else { "undo" });
+                    true
                 }
                 Err(error) => {
                     self.history_status = format!("Undo/redo bookkeeping failed: {error}");
+                    false
                 }
             },
             Err(error) => {
                 let _ = self.manual_history.reject_restore(token);
                 self.history_status = format!("Undo/redo restore rejected atomically: {error}");
+                false
             }
         }
     }
@@ -16409,7 +18456,7 @@ impl App {
         origin: controller_profile::AutomationOrigin,
         address: controller_profile::RuntimeControlAddress,
         value: controller_profile::AutomationValue,
-    ) -> Result<f32, String> {
+    ) -> Result<AutomationControlOutcome, String> {
         use controller_profile::{ControlParameter as Param, RuntimeControlAddress as Address};
         use web::state::WebAction;
         let current = self.automation_current_normalized(address).unwrap_or(0.0);
@@ -16421,7 +18468,7 @@ impl App {
             // A false OSC packet is the inert release half of a pulse. MIDI
             // profiles admit only Momentary bindings for these addresses, so
             // their decoder reaches here solely on the physical rising edge.
-            return Ok(current);
+            return Ok(AutomationControlOutcome::from_change(current, false));
         }
         let bool_value = requested >= 0.5;
         let action = match address {
@@ -16438,7 +18485,7 @@ impl App {
                 // four-CC profile observes those same bytes for typed
                 // telemetry, but must not overwrite a slot after MIDI Learn
                 // has rebound it to another controller.
-                return Ok(current);
+                return Ok(AutomationControlOutcome::from_change(current, false));
             }
             Address::Master(parameter) => match parameter {
                 Param::PositionX
@@ -16526,8 +18573,8 @@ impl App {
                         Param::GestureContact => gesture::GestureControlInput::Contact(bool_value),
                         _ => unreachable!(),
                     };
-                    self.apply_gesture_control(origin, input);
-                    return Ok(requested);
+                    let changed = self.apply_gesture_control(origin, input);
+                    return Ok(AutomationControlOutcome::from_change(requested, changed));
                 }
                 // B10 bend pads: the gesture-contact law. A bound note or
                 // button drives the momentary engine surface directly, so the
@@ -16538,10 +18585,12 @@ impl App {
                 | Param::Bend4
                 | Param::Bend5
                 | Param::Bend6 => {
-                    if let Some(index) = parameter.bend_index() {
+                    let changed = parameter.bend_index().is_some_and(|index| {
+                        let changed = self.mod_matrix.bend_held[index] != bool_value;
                         self.mod_matrix.set_bend(index, bool_value);
-                    }
-                    return Ok(requested);
+                        changed
+                    });
+                    return Ok(AutomationControlOutcome::from_change(requested, changed));
                 }
                 Param::BusCrossfade => WebAction::SetCompositionBusCrossfade { value: requested },
                 Param::Paused | Param::ProgramFreeze => {
@@ -16889,10 +18938,26 @@ impl App {
                 _ => return Err("parameter is unsupported for transport automation".to_string()),
             },
         };
-        self.handle_web_action_inner(action);
-        Ok(self
-            .automation_current_normalized(address)
-            .unwrap_or(requested))
+        let source = match origin {
+            controller_profile::AutomationOrigin::Midi => {
+                action_correlation::ActionSourceClass::Midi
+            }
+            controller_profile::AutomationOrigin::Osc(_) => {
+                action_correlation::ActionSourceClass::Osc
+            }
+            controller_profile::AutomationOrigin::HostAutomation => {
+                action_correlation::ActionSourceClass::Automation
+            }
+        };
+        let lifecycle = self
+            .handle_web_action_inner_with_feedback_from_origin(action, source)
+            .lifecycle;
+        Ok(AutomationControlOutcome {
+            normalized: self
+                .automation_current_normalized(address)
+                .unwrap_or(requested),
+            lifecycle,
+        })
     }
 
     fn feedback_code(value: f32) -> u16 {
@@ -16982,7 +19047,7 @@ impl App {
         match resolved {
             Ok(profile) => {
                 self.controller_profile_pending_initial_resolution = false;
-                match self.midi.apply_profile(profile) {
+                match self.apply_midi_profile_with_displacement_barrier(profile) {
                     Ok(()) => {
                         self.controller_feedback_cache.clear();
                         self.controller_status = format!(
@@ -17009,53 +19074,165 @@ impl App {
     }
 
     fn drain_controller_events(&mut self) {
+        self.drain_displaced_controller_action_identities();
         self.midi_events.clear();
-        self.midi.drain_events(&mut self.midi_events);
-        for index in 0..self.midi_events.len() {
-            let event = self.midi_events[index];
-            match event.kind {
-                controller_profile::ControllerEventKind::Control { address, value, .. } => {
-                    match self.apply_automation_control(event.origin, address, value) {
-                        Ok(normalized) => {
-                            self.publish_controller_feedback(address, normalized, event.origin);
-                        }
-                        Err(error) => {
-                            self.controller_status = format!("MIDI control ignored: {error}")
+        self.midi_action_batches.clear();
+        self.midi
+            .drain_correlated_events(&mut self.midi_events, &mut self.midi_action_batches);
+        let mut midi_events = std::mem::take(&mut self.midi_events);
+        let mut midi_action_batches = std::mem::take(&mut self.midi_action_batches);
+        for envelope in midi_action_batches.drain(..) {
+            let identity = envelope.identity();
+            let batch = envelope.into_payload();
+            let range = batch.event_range();
+            let mut applied = self.midi.apply_correlated_compatibility(&batch);
+            let mut coalesced =
+                self.midi.apply_correlated_clock(&batch) || batch.decoder_state_changed();
+            for event in midi_events[range].iter().copied() {
+                match event.kind {
+                    controller_profile::ControllerEventKind::Control { address, value, .. } => {
+                        match self.apply_automation_control(event.origin, address, value) {
+                            Ok(outcome) => {
+                                applied |= outcome.lifecycle == ActionLifecycleOutcome::Applied;
+                                coalesced |= outcome.lifecycle == ActionLifecycleOutcome::Coalesced;
+                                self.publish_controller_feedback(
+                                    address,
+                                    outcome.normalized,
+                                    event.origin,
+                                );
+                            }
+                            Err(error) => {
+                                self.controller_status = format!("MIDI control ignored: {error}")
+                            }
                         }
                     }
-                }
-                controller_profile::ControllerEventKind::Transport(transport) => {
-                    let action = match transport {
-                        controller_profile::MidiTransportEvent::Start
-                        | controller_profile::MidiTransportEvent::Continue => {
-                            Some(web::state::WebAction::SetProgramFrozen { frozen: false })
+                    controller_profile::ControllerEventKind::Transport(transport) => {
+                        let action = match transport {
+                            controller_profile::MidiTransportEvent::Start
+                            | controller_profile::MidiTransportEvent::Continue => {
+                                Some(web::state::WebAction::SetProgramFrozen { frozen: false })
+                            }
+                            controller_profile::MidiTransportEvent::Stop => {
+                                Some(web::state::WebAction::SetProgramFrozen { frozen: true })
+                            }
+                            controller_profile::MidiTransportEvent::Clock => None,
+                        };
+                        if let Some(action) = action {
+                            let outcome = self.handle_web_action_inner_with_feedback_from_origin(
+                                action,
+                                action_correlation::ActionSourceClass::Midi,
+                            );
+                            applied |= outcome.lifecycle == ActionLifecycleOutcome::Applied;
                         }
-                        controller_profile::MidiTransportEvent::Stop => {
-                            Some(web::state::WebAction::SetProgramFrozen { frozen: true })
-                        }
-                        controller_profile::MidiTransportEvent::Clock => None,
-                    };
-                    if let Some(action) = action {
-                        self.handle_web_action_inner(action);
                     }
                 }
             }
+            if applied {
+                self.record_applied_action_identity(identity);
+            } else {
+                self.web_state.record_terminal_action_identity(
+                    identity,
+                    if coalesced {
+                        action_correlation::ActionDisposition::Coalesced
+                    } else {
+                        action_correlation::ActionDisposition::Refused
+                    },
+                );
+            }
         }
-        self.midi_events.clear();
+        midi_events.clear();
+        midi_action_batches.clear();
+        self.midi_events = midi_events;
+        self.midi_action_batches = midi_action_batches;
 
         self.osc_events.clear();
         self.osc.drain_events(&mut self.osc_events);
         for index in 0..self.osc_events.len() {
-            let event = self.osc_events[index];
+            let envelope = self.osc_events[index];
+            let event = *envelope.payload();
             match self.apply_automation_control(event.origin, event.address, event.value) {
-                Ok(normalized) => {
-                    self.publish_controller_feedback(event.address, normalized, event.origin);
+                Ok(outcome) => {
+                    self.publish_controller_feedback(
+                        event.address,
+                        outcome.normalized,
+                        event.origin,
+                    );
+                    self.record_action_lifecycle_outcome(envelope.identity(), outcome.lifecycle);
                 }
-                Err(error) => self.osc_status = format!("OSC control ignored: {error}"),
+                Err(error) => {
+                    self.web_state.record_terminal_action_identity(
+                        envelope.identity(),
+                        action_correlation::ActionDisposition::Refused,
+                    );
+                    self.osc_status = format!("OSC control ignored: {error}");
+                }
             }
         }
         self.osc_events.clear();
+        self.drain_displaced_controller_action_identities();
         self.pump_gesture_surfaces();
+    }
+
+    /// Terminalize identities retained by a protocol lifecycle barrier. The
+    /// transports own fixed-capacity FIFO displacement queues; Main owns the
+    /// shared correlation monitor and drains every returned prefix before any
+    /// new transport event can be applied.
+    fn drain_displaced_controller_action_identities(&mut self) {
+        let web_state = Arc::clone(&self.web_state);
+        Self::drain_displaced_midi_action_identities(&mut self.midi, |identity| {
+            web_state.record_terminal_action_identity(
+                identity,
+                action_correlation::ActionDisposition::Superseded,
+            );
+        });
+        let mut scratch = [None; 64];
+        loop {
+            let count = self.osc.drain_displaced_action_identities(&mut scratch);
+            if count == 0 {
+                break;
+            }
+            for identity in scratch.iter_mut().take(count).filter_map(Option::take) {
+                self.record_terminal_action_identity(
+                    identity,
+                    action_correlation::ActionDisposition::Superseded,
+                );
+            }
+        }
+    }
+
+    /// Cross the profile-replacement barrier before returning either success
+    /// or error. `MidiEngine::apply_profile` may stop/restart the transport;
+    /// identities displaced by that attempt must be terminal before callbacks
+    /// can resume against the replacement (or retained) profile.
+    fn apply_midi_profile_with_displacement_barrier(
+        &mut self,
+        profile: controller_profile::ResolvedControllerProfile,
+    ) -> Result<(), controller_profile::ControllerProfileError> {
+        let result = self.midi.apply_profile(profile);
+        let web_state = Arc::clone(&self.web_state);
+        Self::drain_displaced_midi_action_identities(&mut self.midi, |identity| {
+            web_state.record_terminal_action_identity(
+                identity,
+                action_correlation::ActionDisposition::Superseded,
+            );
+        });
+        result
+    }
+
+    fn drain_displaced_midi_action_identities(
+        midi: &mut midi::MidiEngine,
+        mut terminalize: impl FnMut(action_correlation::ActionIdentity),
+    ) {
+        let mut scratch = [None; 64];
+        loop {
+            let count = midi.drain_displaced_action_identities(&mut scratch);
+            if count == 0 {
+                break;
+            }
+            for identity in scratch.iter_mut().take(count).filter_map(Option::take) {
+                terminalize(identity);
+            }
+        }
     }
 
     /// Sample this frame's continuous-controller gesture motion.
@@ -17081,26 +19258,37 @@ impl App {
         &mut self,
         origin: controller_profile::AutomationOrigin,
         input: gesture::GestureControlInput,
-    ) {
-        let (gesture_origin, sample) = match origin {
-            controller_profile::AutomationOrigin::Osc(_) => (
-                gesture::GestureOrigin::Osc,
-                self.gesture_osc_surface.apply(input),
-            ),
+    ) -> bool {
+        let (gesture_origin, sample, changed) = match origin {
+            controller_profile::AutomationOrigin::Osc(_) => {
+                let before = self.gesture_osc_surface;
+                let sample = self.gesture_osc_surface.apply(input);
+                (
+                    gesture::GestureOrigin::Osc,
+                    sample,
+                    self.gesture_osc_surface != before,
+                )
+            }
             controller_profile::AutomationOrigin::Midi
-            | controller_profile::AutomationOrigin::HostAutomation => (
-                gesture::GestureOrigin::Midi,
-                self.gesture_midi_surface.apply(input),
-            ),
+            | controller_profile::AutomationOrigin::HostAutomation => {
+                let before = self.gesture_midi_surface;
+                let sample = self.gesture_midi_surface.apply(input);
+                (
+                    gesture::GestureOrigin::Midi,
+                    sample,
+                    self.gesture_midi_surface != before,
+                )
+            }
         };
         if let Some(raw) = sample {
             self.ingest_gesture_sample(gesture_origin, raw);
         }
+        changed
     }
 
     /// Turn one native pointer edge into a normalized sample, deriving the
     /// travelled direction from the previous point of the same stroke.
-    fn apply_native_gesture_sample(&mut self, sample: NativeGestureSample) {
+    fn apply_native_gesture_sample(&mut self, sample: NativeGestureSample) -> bool {
         let previous = match sample.phase {
             gesture::GesturePhase::Begin => {
                 self.gesture_native_stroke = Some(sample.position);
@@ -17114,7 +19302,7 @@ impl App {
                     // keeps the refusal named rather than counted.
                     self.gesture_status =
                         "Native gesture motion without an open stroke ignored".to_string();
-                    return;
+                    return false;
                 }
                 self.gesture_native_stroke = Some(sample.position);
                 previous
@@ -17134,7 +19322,7 @@ impl App {
             sample.position,
         )
         .with_direction(direction);
-        self.ingest_gesture_sample(gesture::GestureOrigin::NativePointer, raw);
+        self.ingest_gesture_sample(gesture::GestureOrigin::NativePointer, raw)
     }
 
     /// The single host-side gesture ingest. Every surface reaches the one
@@ -17147,13 +19335,13 @@ impl App {
         &mut self,
         origin: gesture::GestureOrigin,
         raw: gesture::RawGestureSample,
-    ) {
+    ) -> bool {
         let tick = self.gesture_event_recorder.reference_tick_u32();
         let event = match gesture::normalize_gesture_input(origin, raw, tick) {
             Ok(event) => event,
             Err(error) => {
                 self.gesture_status = format!("Gesture sample ignored: {error}");
-                return;
+                return false;
             }
         };
         // §4. One completed authored gesture is exactly one manual-history
@@ -17173,10 +19361,12 @@ impl App {
         // armed one may enter the replayable track. Keeping the two batches
         // separate is what makes "affects this session only" a fact rather
         // than a claim.
+        let mut accepted = false;
         if self.pending_gesture_canvas_events.len()
             < gesture_canvas::GESTURE_CANVAS_MAX_SAMPLES_PER_UPDATE
         {
             self.pending_gesture_canvas_events.push(event);
+            accepted = true;
         } else {
             self.gesture_status = format!(
                 "Gesture canvas frame reached its {}-sample cap; newer samples etch nothing this frame",
@@ -17185,7 +19375,7 @@ impl App {
         }
         if !self.gesture_recording {
             self.gesture_live_only_events = self.gesture_live_only_events.saturating_add(1);
-            return;
+            return accepted;
         }
         if self.pending_gesture_events.len() >= gesture::MAX_GESTURE_EVENTS {
             self.gesture_live_only_events = self.gesture_live_only_events.saturating_add(1);
@@ -17193,9 +19383,10 @@ impl App {
                 "Gesture batch reached its {}-event cap; newer samples remain live-only",
                 gesture::MAX_GESTURE_EVENTS
             );
-            return;
+            return accepted;
         }
         self.pending_gesture_events.push(event);
+        true
     }
 
     /// Open the one manual-history entry a beginning authored gesture owns.
@@ -17241,8 +19432,8 @@ impl App {
         if self.gesture_history_open.take() != Some(id) {
             return;
         }
-        let fingerprint = match self.capture_manual_history_world() {
-            Ok((_, canonical)) => history::fingerprint_canonical(&canonical),
+        let (patch, fingerprint) = match self.capture_manual_history_world() {
+            Ok((world, canonical)) => (world.patch, history::fingerprint_canonical(&canonical)),
             Err(error) => {
                 self.history_status = format!("Gesture history capture failed: {error}");
                 return;
@@ -17252,7 +19443,7 @@ impl App {
             Ok(history::HistoryRecordOutcome::Recorded) => {
                 self.history_gesture_begin = None;
                 self.history_status = format!("Gesture history {} committed", id.get());
-                self.append_recovery_checkpoint("gesture");
+                self.enqueue_recovery_checkpoint(patch, fingerprint, "gesture");
             }
             Ok(history::HistoryRecordOutcome::NoChange) => {
                 self.history_gesture_begin = None;
@@ -17321,7 +19512,7 @@ impl App {
     /// Apply one bounded edit set to a scope, reporting whether it authored.
     ///
     /// Every value travels as a real `SetMasterTransform` / `SetLayerTransform`
-    /// action through `handle_web_action_inner_with_feedback`. That is
+    /// action through `handle_web_action_inner_with_feedback_from_origin`. That is
     /// deliberate and load-bearing in three separate ways:
     ///
     /// * it reaches `apply_spatial_transform_edit`, the one authoring function
@@ -17340,8 +19531,8 @@ impl App {
         &mut self,
         scope: transform_gizmo::GizmoScope,
         edits: transform_gizmo::GizmoEdits,
-    ) -> bool {
-        let mut authored = false;
+    ) -> ActionLifecycleOutcome {
+        let mut lifecycle = ActionLifecycleOutcome::Refused;
         for edit in edits.iter() {
             let Some(number) = serde_json::Number::from_f64(f64::from(edit.value)) else {
                 // The edit set already sanitized every value, so a non-finite
@@ -17364,40 +19555,69 @@ impl App {
                     }
                 }
             };
-            self.handle_web_action_inner_with_feedback(action);
-            authored = true;
+            let outcome = self.handle_web_action_inner_with_feedback_from_origin(
+                action,
+                action_correlation::ActionSourceClass::Native,
+            );
+            lifecycle = match (lifecycle, outcome.lifecycle) {
+                (ActionLifecycleOutcome::Applied, _) | (_, ActionLifecycleOutcome::Applied) => {
+                    ActionLifecycleOutcome::Applied
+                }
+                (ActionLifecycleOutcome::Coalesced, _) | (_, ActionLifecycleOutcome::Coalesced) => {
+                    ActionLifecycleOutcome::Coalesced
+                }
+                (_, ActionLifecycleOutcome::Quantized) => ActionLifecycleOutcome::Quantized,
+                _ => ActionLifecycleOutcome::Refused,
+            };
         }
-        authored
+        lifecycle
     }
 
     /// Dispatch one collected pointer edge.
-    fn apply_transform_gizmo_event(&mut self, event: transform_gizmo::GizmoPointerEvent) {
+    fn apply_transform_gizmo_event(
+        &mut self,
+        event: transform_gizmo::GizmoPointerEvent,
+    ) -> ActionLifecycleOutcome {
         match event.phase {
-            transform_gizmo::GizmoPhase::Begin => self.begin_transform_gizmo_drag(event),
+            transform_gizmo::GizmoPhase::Begin => {
+                if self.begin_transform_gizmo_drag(event) {
+                    ActionLifecycleOutcome::Coalesced
+                } else {
+                    ActionLifecycleOutcome::Refused
+                }
+            }
             transform_gizmo::GizmoPhase::Move => {
                 let Some(drag) = self.transform_gizmo_drag else {
-                    return;
+                    return ActionLifecycleOutcome::Refused;
                 };
                 let edits = drag.update(event.output_uv, event.modifiers);
                 if edits.is_empty() {
-                    return;
+                    return ActionLifecycleOutcome::Refused;
                 }
-                if self.apply_transform_gizmo_edits(drag.scope(), edits) {
+                let lifecycle = self.apply_transform_gizmo_edits(drag.scope(), edits);
+                if lifecycle == ActionLifecycleOutcome::Applied {
                     if let Some(open) = self.transform_gizmo_drag.as_mut() {
                         open.mark_committed();
                     }
                 }
+                lifecycle
             }
-            transform_gizmo::GizmoPhase::End => self.end_transform_gizmo_drag(),
+            transform_gizmo::GizmoPhase::End => {
+                if self.end_transform_gizmo_drag() {
+                    ActionLifecycleOutcome::Coalesced
+                } else {
+                    ActionLifecycleOutcome::Refused
+                }
+            }
         }
     }
 
-    fn begin_transform_gizmo_drag(&mut self, event: transform_gizmo::GizmoPointerEvent) {
+    fn begin_transform_gizmo_drag(&mut self, event: transform_gizmo::GizmoPointerEvent) -> bool {
         if self.transform_gizmo_drag.is_some() {
-            return;
+            return false;
         }
         let Some(scope) = self.transform_gizmo_scope() else {
-            return;
+            return false;
         };
         let Some(frame) = self.transform_gizmo_frame(scope) else {
             // A singular or non-finite transform renders nothing, so it offers
@@ -17406,12 +19626,12 @@ impl App {
             // about what it is going to do.
             self.transform_gizmo_status =
                 "Transform gizmo unavailable: the transform is not invertible".to_string();
-            return;
+            return false;
         };
         let Some((drag, _handle)) =
             transform_gizmo::GizmoDrag::begin(scope, frame, event.output_uv)
         else {
-            return;
+            return false;
         };
         // The router is what makes a five-hundred-sample drag exactly one undo
         // entry: it opens here, and every intermediate Move is invisible to it.
@@ -17420,14 +19640,14 @@ impl App {
             gesture::GesturePhase::Begin,
             GESTURE_NATIVE_STROKE,
         ) else {
-            return;
+            return false;
         };
         let checkpoint = match self.history_checkpoint("Move transform", "transform_gizmo") {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
                 self.history_status = format!("Transform gizmo rejected before mutation: {error}");
                 let _ = self.transform_gizmo_history.abandon();
-                return;
+                return false;
             }
         };
         let fingerprint = checkpoint.fingerprint();
@@ -17443,58 +19663,64 @@ impl App {
             Ok(outcome) => {
                 self.history_status = format!("Transform gizmo history: {outcome:?}");
                 let _ = self.transform_gizmo_history.abandon();
-                return;
+                return false;
             }
             Err(error) => {
                 self.history_status = format!("Transform gizmo history could not open: {error}");
                 let _ = self.transform_gizmo_history.abandon();
-                return;
+                return false;
             }
         }
         self.transform_gizmo_drag = Some(drag);
         self.transform_gizmo_status.clear();
+        true
     }
 
-    fn end_transform_gizmo_drag(&mut self) {
+    fn end_transform_gizmo_drag(&mut self) -> bool {
         if self.transform_gizmo_drag.take().is_none() {
-            return;
+            return false;
         }
         if let history::GestureHistoryStep::Close(id) = self.transform_gizmo_history.observe(
             gesture::GestureOrigin::NativePointer,
             gesture::GesturePhase::End,
             GESTURE_NATIVE_STROKE,
         ) {
-            self.close_transform_gizmo_history(id);
+            return self.close_transform_gizmo_history(id);
         }
+        false
     }
 
-    fn close_transform_gizmo_history(&mut self, id: history::HistoryGestureId) {
+    fn close_transform_gizmo_history(&mut self, id: history::HistoryGestureId) -> bool {
         if self.transform_gizmo_history_open.take() != Some(id) {
-            return;
+            return false;
         }
-        let fingerprint = match self.capture_manual_history_world() {
-            Ok((_, canonical)) => history::fingerprint_canonical(&canonical),
+        let (patch, fingerprint) = match self.capture_manual_history_world() {
+            Ok((world, canonical)) => (world.patch, history::fingerprint_canonical(&canonical)),
             Err(error) => {
                 self.history_status = format!("Transform gizmo capture failed: {error}");
-                return;
+                return false;
             }
         };
         match self.manual_history.finish_gesture(id, fingerprint) {
             Ok(history::HistoryRecordOutcome::Recorded) => {
                 self.history_gesture_begin = None;
                 self.history_status = format!("Transform gizmo {} committed", id.get());
-                self.append_recovery_checkpoint("transform_gizmo");
+                self.enqueue_recovery_checkpoint(patch, fingerprint, "transform_gizmo");
+                true
             }
             Ok(history::HistoryRecordOutcome::NoChange) => {
                 self.history_gesture_begin = None;
                 self.history_status = "Transform gizmo made no authored change".to_string();
+                true
             }
             Ok(outcome) => {
                 self.history_gesture_begin = None;
                 self.history_status = format!("Transform gizmo history: {outcome:?}");
+                true
             }
             Err(error) => {
                 self.history_status = format!("Transform gizmo could not finish: {error}");
+                false
             }
         }
     }
@@ -17532,11 +19758,9 @@ impl App {
     /// abandoned, so nothing reaches the bounded stack. After a value has
     /// committed, a cancel would be a lie — the program already moved — so the
     /// gesture closes normally and an ordinary undo runs.
-    fn transform_gizmo_escape(&mut self) -> bool {
-        let Some(drag) = self.transform_gizmo_drag else {
-            return false;
-        };
-        match drag.cancel() {
+    fn transform_gizmo_escape(&mut self) -> Option<ActionLifecycleOutcome> {
+        let drag = self.transform_gizmo_drag?;
+        let lifecycle = match drag.cancel() {
             transform_gizmo::GizmoCancel::Restore(transform) => {
                 self.restore_transform_gizmo_scope(drag.scope(), transform);
                 self.transform_gizmo_drag = None;
@@ -17547,15 +19771,21 @@ impl App {
                     }
                 }
                 self.transform_gizmo_status = "Transform gizmo drag cancelled".to_string();
+                ActionLifecycleOutcome::Coalesced
             }
             transform_gizmo::GizmoCancel::UndoCommitted => {
-                self.end_transform_gizmo_drag();
-                self.restore_history_direction(false);
+                let closed = self.end_transform_gizmo_drag();
+                let restored = closed && self.restore_history_direction(false);
                 self.transform_gizmo_status =
                     "Transform gizmo drag committed; undid the last gesture".to_string();
+                if restored {
+                    ActionLifecycleOutcome::Applied
+                } else {
+                    ActionLifecycleOutcome::Refused
+                }
             }
-        }
-        true
+        };
+        Some(lifecycle)
     }
 
     /// Put a captured transform back through the same authoring path an edit
@@ -17577,7 +19807,10 @@ impl App {
                 }
             }
         };
-        self.handle_web_action_inner_with_feedback(action);
+        self.handle_web_action_inner_with_feedback_from_origin(
+            action,
+            action_correlation::ActionSourceClass::Native,
+        );
     }
 
     /// One keyboard nudge of the selected scope's position.
@@ -17605,9 +19838,8 @@ impl App {
             return false;
         }
         self.apply_native_manual_action("Nudge transform", "transform_gizmo", |app| {
-            app.apply_transform_gizmo_edits(scope, edits);
-        });
-        true
+            let _ = app.apply_transform_gizmo_edits(scope, edits);
+        })
     }
 
     /// Arm or disarm recording. Disarming closes nothing: a stroke that was
@@ -17724,34 +19956,54 @@ impl App {
         }
     }
 
-    /// The B9 record tap. Called at the one dispatch seam every final
-    /// application funnels through, while recording is armed and the dispatch
-    /// is not the replayer's own. A dropped batch remainder never dispatches,
-    /// so it never records; an action outside the recordable vocabulary is
-    /// silently not a take event; a recordable param with no declared law, or
-    /// a value its law cannot represent, is skipped and counted rather than
-    /// guessed.
-    fn stage_performance_edit(&mut self, action: &web::state::WebAction) {
-        let Some((control, carrier)) = self.performance_record_view(action) else {
-            return;
-        };
+    /// Prepare the process-local half of D4 admission. This resolves the
+    /// existing closed v1 address vocabulary and canonical value lattice, but
+    /// deliberately cannot manufacture an `AcceptedCreativeMutation`: only the
+    /// live applier's success path may perform that promotion.
+    fn prepare_creative_mutation(
+        &mut self,
+        source: action_correlation::ActionSourceClass,
+        action: &web::state::WebAction,
+    ) -> Option<creative_mutation::CreativeMutationCandidate> {
+        if !self.performance_recording || self.performance_replay_dispatching {
+            return None;
+        }
+        let (control, carrier) = self.performance_record_view(action)?;
         let Some(law) = Self::performance_value_law_for(&control) else {
             self.performance_unsupported_edits =
                 self.performance_unsupported_edits.saturating_add(1);
-            return;
+            return None;
         };
         let Some(raw) = carrier.raw_under(&law) else {
             self.performance_rejected_edits = self.performance_rejected_edits.saturating_add(1);
-            return;
+            return None;
         };
-        // Bounded per frame by the drain queue's own ceiling; anything past it
-        // is counted, never silently lost.
-        if self.pending_performance_edits.len() >= web::state::MAX_PENDING_ACTIONS {
+        let candidate =
+            creative_mutation::CreativeMutationCandidate::new(source, control, law, raw);
+        if candidate.is_none()
+            && creative_mutation::origin_policy(source)
+                != creative_mutation::CreativeMutationOriginPolicy::ReplayExcluded
+        {
             self.performance_rejected_edits = self.performance_rejected_edits.saturating_add(1);
-            return;
         }
-        self.pending_performance_edits
-            .push(PendingPerformanceEdit { control, law, raw });
+        candidate
+    }
+
+    /// The sole post-validation take-admission path. Duplicate delivery from
+    /// two transports in one accepted-frame interval collapses by canonical
+    /// address/law/value, while a genuinely different value keeps ordering.
+    fn stage_accepted_creative_mutation(
+        &mut self,
+        candidate: creative_mutation::CreativeMutationCandidate,
+    ) {
+        if creative_mutation::stage_accepted_mutation(
+            &mut self.pending_performance_edits,
+            candidate.accept(),
+            web::state::MAX_PENDING_ACTIONS,
+        ) == creative_mutation::StageAcceptedMutation::Full
+        {
+            self.performance_rejected_edits = self.performance_rejected_edits.saturating_add(1);
+        }
     }
 
     /// Arm or disarm performance recording. Arming starts a fresh take at
@@ -17759,15 +20011,15 @@ impl App {
     /// disarming stamps the declared length so trailing silence is part of
     /// the loop period. Recording and playback are mutually exclusive by
     /// refusal, never by silently stopping the other.
-    fn set_performance_recording(&mut self, enabled: bool) {
+    fn set_performance_recording(&mut self, enabled: bool) -> bool {
         if self.performance_recording == enabled {
-            return;
+            return false;
         }
         if enabled {
             if self.performance_playback.is_some() {
                 self.performance_status =
                     "Recording refused: performance playback is armed".to_string();
-                return;
+                return false;
             }
             self.performance_take.clear();
             self.performance_clock.reset();
@@ -17795,6 +20047,7 @@ impl App {
                 )
             };
         }
+        true
     }
 
     /// Arm, retune, or disarm performance playback. Compilation resolves every
@@ -17802,25 +20055,27 @@ impl App {
     /// the program cannot answer degrades to a named no-op rather than
     /// retargeting (the stale-ID law). While already armed, a repeated arm
     /// only updates the loop flag.
-    fn set_performance_playback(&mut self, enabled: bool, loop_playback: bool) {
+    fn set_performance_playback(&mut self, enabled: bool, loop_playback: bool) -> bool {
         if !enabled {
             if self.performance_playback.take().is_some() {
                 self.performance_status = "Performance playback disarmed".to_string();
+                return true;
             }
-            return;
+            return false;
         }
         if let Some(playback) = self.performance_playback.as_mut() {
+            let changed = playback.loop_playback != loop_playback;
             playback.loop_playback = loop_playback;
-            return;
+            return changed;
         }
         if self.performance_recording {
             self.performance_status =
                 "Playback refused: performance recording is armed".to_string();
-            return;
+            return false;
         }
         if self.performance_take.is_empty() {
             self.performance_status = "Playback refused: no take is loaded".to_string();
-            return;
+            return false;
         }
         let take = self.performance_take.clone();
         let (compiled, degraded) = self.compile_performance_playback(&take);
@@ -17838,10 +20093,20 @@ impl App {
         } else {
             format!("Replaying take; {degraded_count} control(s) degraded")
         };
+        true
     }
 
     /// Discard the loaded take and stop both transports.
-    fn clear_performance_take(&mut self) {
+    fn clear_performance_take(&mut self) -> ActionLifecycleOutcome {
+        let stopped_playback = self.performance_playback.is_some();
+        let changed = self.performance_recording
+            || stopped_playback
+            || !self.pending_performance_edits.is_empty()
+            || !self.performance_take.is_empty()
+            || self.performance_clock.reference_tick_u32() != 0
+            || self.performance_unsupported_edits != 0
+            || self.performance_rejected_edits != 0
+            || !self.performance_checksum.is_empty();
         self.performance_recording = false;
         self.performance_playback = None;
         self.pending_performance_edits.clear();
@@ -17851,6 +20116,13 @@ impl App {
         self.performance_rejected_edits = 0;
         self.performance_checksum.clear();
         self.performance_status = "Take cleared".to_string();
+        if stopped_playback {
+            ActionLifecycleOutcome::Applied
+        } else if changed {
+            ActionLifecycleOutcome::Coalesced
+        } else {
+            ActionLifecycleOutcome::Refused
+        }
     }
 
     /// Recompute the cached take digest. Empty takes publish no checksum: an
@@ -18007,7 +20279,7 @@ impl App {
     /// Dispatch every due replay event for the frame the program is about to
     /// render. The playhead tick is the address this frame will occupy if
     /// accepted — the same stamp-now/advance-at-acceptance law recording uses
-    /// — and dispatch goes through `handle_web_action_inner_with_feedback`,
+    /// — and dispatch goes through `handle_web_action_inner_with_feedback_from_origin`,
     /// the transform-gizmo delegation seam, so Morph ownership transfer and
     /// every engine refusal apply exactly as they would to a hand-made edit,
     /// while manual history records nothing.
@@ -18020,8 +20292,29 @@ impl App {
         if start != end {
             self.performance_replay_dispatching = true;
             for entry in &playback.compiled[start..end] {
-                if let CompiledPerformanceEvent::Dispatch(action) = entry {
-                    self.handle_web_action_inner_with_feedback(action.clone());
+                match entry {
+                    CompiledPerformanceEvent::Dispatch(action) => {
+                        let envelope = self.web_state.action_sequencer().envelope(
+                            action_correlation::ActionSourceClass::Replay,
+                            action.clone(),
+                        );
+                        self.apply_correlated_action(envelope, |app, action| {
+                            app.handle_web_action_inner_with_feedback_from_origin(
+                                action,
+                                action_correlation::ActionSourceClass::Replay,
+                            )
+                        });
+                    }
+                    CompiledPerformanceEvent::Degraded => {
+                        let envelope = self
+                            .web_state
+                            .action_sequencer()
+                            .envelope(action_correlation::ActionSourceClass::Replay, ());
+                        self.web_state.record_terminal_action(
+                            &envelope,
+                            action_correlation::ActionDisposition::Refused,
+                        );
+                    }
                 }
             }
             self.performance_replay_dispatching = false;
@@ -18495,10 +20788,185 @@ impl App {
         }
     }
 
-    fn handle_web_action_inner_with_feedback(
+    fn web_action_requires_full_publication(action: &web::state::WebAction) -> bool {
+        use web::state::WebAction;
+        match action {
+            // These are sampled/runtime signals represented in the live
+            // domains. Letting them invalidate the authored cache would turn
+            // a 30 Hz phone or pointer stream back into 30 Hz full JSON.
+            WebAction::Gyro { .. }
+            | WebAction::GyroStream { .. }
+            | WebAction::Pad { .. }
+            | WebAction::BendPad { .. }
+            | WebAction::GestureSample { .. }
+            | WebAction::MonitorWatch { .. } => false,
+            WebAction::Quantized { inner } => Self::web_action_requires_full_publication(inner),
+            _ => true,
+        }
+    }
+
+    fn publish_remediation_rejection(
+        &self,
+        candidate_id: diagnostics::RemediationCandidateId,
+        text: impl Into<String>,
+    ) -> String {
+        let text = text.into();
+        let diagnostic = diagnostics::ConstraintDiagnostic::new(
+            diagnostics::ConstraintCode::RemediationUnavailable,
+            diagnostics::ConstraintInvariant::RemediationPreviewCurrent,
+            diagnostics::ConstraintSeverity::Error,
+            program_constraint_scope(),
+            text.clone(),
+        )
+        .with_values(
+            diagnostics::DiagnosticValue::Text(
+                "a currently published, planner-evaluated candidate".to_owned(),
+            ),
+            diagnostics::DiagnosticValue::Unsigned(candidate_id.0),
+        );
+        *self.constraint_diagnostics.borrow_mut() = vec![diagnostic];
+        text
+    }
+
+    /// Resolve only an exact, still-published immutable preview. The browser
+    /// sends no operation payload, so it cannot invent or widen the planner's
+    /// declared diff. The returned ordinary action is dispatched inside the
+    /// caller's existing revision/history/recovery transaction.
+    fn resolve_constraint_remediation_action(
+        &mut self,
+        candidate_id: diagnostics::RemediationCandidateId,
+        composition_revision: u64,
+    ) -> Option<web::state::WebAction> {
+        if let Err(error) = self.creative_revision_matches(composition_revision) {
+            self.composition_status = error;
+            return None;
+        }
+
+        let selected = {
+            let published = self.constraint_diagnostics.borrow();
+            published.iter().find_map(|diagnostic| {
+                let candidate = diagnostic
+                    .remediations
+                    .iter()
+                    .find(|candidate| candidate.id == candidate_id)?;
+                let preview = diagnostic.remediation_previews.iter().find(|preview| {
+                    preview.candidate_id == candidate_id
+                        && preview.base_revision == candidate.base_revision
+                        && preview.operations == candidate.operations
+                })?;
+                Some((candidate.clone(), preview.clone()))
+            })
+        };
+        let Some((candidate, preview)) = selected else {
+            self.composition_status = self.publish_remediation_rejection(
+                candidate_id,
+                format!(
+                    "remediation candidate {} is not in the current planner preview",
+                    candidate_id.0
+                ),
+            );
+            return None;
+        };
+        if candidate.base_revision != composition_revision
+            || preview.base_revision != composition_revision
+        {
+            self.composition_status = self.publish_revision_mismatch(
+                "remediation",
+                composition_revision,
+                self.composition_revision,
+            );
+            return None;
+        }
+        let [diagnostics::RemediationOperation::SetBypass {
+            scope,
+            bypass,
+            enabled,
+        }] = preview.operations.as_slice()
+        else {
+            self.composition_status = self.publish_remediation_rejection(
+                candidate_id,
+                "remediation preview does not name exactly one admitted bypass edit",
+            );
+            return None;
+        };
+        if scope.kind != diagnostics::ConstraintScopeKind::Layer {
+            self.composition_status = self.publish_remediation_rejection(
+                candidate_id,
+                "remediation preview does not address one stable layer",
+            );
+            return None;
+        }
+        let Some(stable_id) = scope.stable_id else {
+            self.composition_status = self.publish_remediation_rejection(
+                candidate_id,
+                "remediation preview is missing its stable layer identity",
+            );
+            return None;
+        };
+        let Some(index) = self
+            .layers
+            .iter()
+            .position(|layer| layer.stable_layer_id().get() == stable_id)
+        else {
+            self.composition_status = self.publish_remediation_rejection(
+                candidate_id,
+                format!("remediation layer {stable_id} is no longer present"),
+            );
+            return None;
+        };
+        let param = match bypass {
+            diagnostics::BypassKind::Master => "bypass_master_fx",
+            diagnostics::BypassKind::Temporal => "bypass_temporal_fx",
+        };
+        Some(web::state::WebAction::SetLayerParam {
+            index,
+            layer_id: Some(stable_id.to_string()),
+            param: param.to_owned(),
+            value: serde_json::Value::Bool(*enabled),
+        })
+    }
+
+    /// One D4 ingress seam for browser, phone, native, MIDI, OSC, host
+    /// automation, and replay. The candidate is prepared from the exact action
+    /// the live engine sees, but is promoted and staged only when the live
+    /// applier reports acceptance.
+    fn handle_web_action_inner_with_feedback_from_origin(
         &mut self,
         action: web::state::WebAction,
-    ) -> WebActionBatchDisposition {
+        source: action_correlation::ActionSourceClass,
+    ) -> WebActionDispatchOutcome {
+        if let web::state::WebAction::Quantized { inner } = action {
+            return self.queue_quantized_action_from_source(*inner, source);
+        }
+        if let web::state::WebAction::ApplyConstraintRemediation {
+            candidate_id,
+            composition_revision,
+        } = action
+        {
+            let Some(action) =
+                self.resolve_constraint_remediation_action(candidate_id, composition_revision)
+            else {
+                return WebActionDispatchOutcome::refused(WebActionBatchDisposition::Continue);
+            };
+            return self.handle_web_action_inner_with_feedback_from_origin(action, source);
+        }
+        let requires_full_publication = Self::web_action_requires_full_publication(&action);
+        let manual_authored_action = !Self::history_action_is_performance_only(&action);
+        // Manual authored actions can cross this seam while a BrowserManual
+        // gesture is open, where the outer one-shot history wrapper is
+        // intentionally bypassed. Derive acceptance from the same canonical
+        // world on both sides so syntax-valid identical assignments are no-ops
+        // and mutations whose legacy branch forgot to set the flag are still
+        // classified Applied before D4/counter promotion.
+        let authored_before = manual_authored_action
+            .then(|| {
+                self.capture_manual_history_world()
+                    .map(|(_, canonical)| history::fingerprint_canonical(&canonical))
+            })
+            .transpose()
+            .ok()
+            .flatten();
+        let candidate = self.prepare_creative_mutation(source, &action);
         // Bypass has a detached planner/GPU admission step and may also own an
         // active Morph field. Dispatch it through one result-bearing seam so a
         // refusal is neither recorded for the next accepted frame nor allowed
@@ -18516,18 +20984,33 @@ impl App {
                 } else {
                     self.apply_layer_temporal_bypass_action(*index, layer_id, value)
                 };
-                if accepted && self.performance_recording && !self.performance_replay_dispatching {
-                    self.stage_performance_edit(&action);
+                if accepted {
+                    if requires_full_publication {
+                        self.web_authored_mutation_counter =
+                            self.web_authored_mutation_counter.saturating_add(1);
+                    }
+                    if let Some(candidate) = candidate {
+                        self.stage_accepted_creative_mutation(candidate);
+                    }
                 }
-                return WebActionBatchDisposition::Continue;
+                return WebActionDispatchOutcome::from_acceptance(
+                    WebActionBatchDisposition::Continue,
+                    accepted,
+                );
             }
         }
         if let web::state::WebAction::SetTemporal { param, value } = &action {
             if Self::temporal_edit_requires_partition_preflight(param) {
                 let address = self.feedback_address_for_web_action(&action);
                 let accepted = self.apply_temporal_partition_sensitive_action(param, value);
-                if accepted && self.performance_recording && !self.performance_replay_dispatching {
-                    self.stage_performance_edit(&action);
+                if accepted {
+                    if requires_full_publication {
+                        self.web_authored_mutation_counter =
+                            self.web_authored_mutation_counter.saturating_add(1);
+                    }
+                    if let Some(candidate) = candidate {
+                        self.stage_accepted_creative_mutation(candidate);
+                    }
                 }
                 if let Some(address) = address {
                     if let Some(normalized) = self.automation_current_normalized(address) {
@@ -18538,14 +21021,23 @@ impl App {
                         );
                     }
                 }
-                return WebActionBatchDisposition::Continue;
+                return WebActionDispatchOutcome::from_acceptance(
+                    WebActionBatchDisposition::Continue,
+                    accepted,
+                );
             }
         }
         if let web::state::WebAction::SetNtscParam { param, value } = &action {
             let address = self.feedback_address_for_web_action(&action);
             let accepted = self.apply_ntsc_param_action(param, value);
-            if accepted && self.performance_recording && !self.performance_replay_dispatching {
-                self.stage_performance_edit(&action);
+            if accepted {
+                if requires_full_publication {
+                    self.web_authored_mutation_counter =
+                        self.web_authored_mutation_counter.saturating_add(1);
+                }
+                if let Some(candidate) = candidate {
+                    self.stage_accepted_creative_mutation(candidate);
+                }
             }
             if let Some(address) = address {
                 if let Some(normalized) = self.automation_current_normalized(address) {
@@ -18556,17 +21048,36 @@ impl App {
                     );
                 }
             }
-            return WebActionBatchDisposition::Continue;
-        }
-        // The B9 record tap sits on this seam because every final application
-        // funnels through it — the drained browser batch, the downbeat
-        // release, native RECOVERY, and the transform gizmo — while the
-        // replayer's own dispatches are excluded by the guard flag.
-        if self.performance_recording && !self.performance_replay_dispatching {
-            self.stage_performance_edit(&action);
+            return WebActionDispatchOutcome::from_acceptance(
+                WebActionBatchDisposition::Continue,
+                accepted,
+            );
         }
         let address = self.feedback_address_for_web_action(&action);
-        let disposition = self.handle_web_action_inner(action);
+        let mut accepted = false;
+        let mut coalesced = false;
+        let disposition =
+            self.handle_web_action_inner_with_acceptance(action, &mut accepted, &mut coalesced);
+        let authored_after = authored_before.and_then(|_| {
+            self.capture_manual_history_world()
+                .ok()
+                .map(|(_, canonical)| history::fingerprint_canonical(&canonical))
+        });
+        accepted = Self::accepted_from_manual_fingerprints(
+            manual_authored_action,
+            authored_before,
+            authored_after,
+            accepted,
+        );
+        if accepted {
+            if requires_full_publication {
+                self.web_authored_mutation_counter =
+                    self.web_authored_mutation_counter.saturating_add(1);
+            }
+            if let Some(candidate) = candidate {
+                self.stage_accepted_creative_mutation(candidate);
+            }
+        }
         if let Some(address) = address {
             if let Some(normalized) = self.automation_current_normalized(address) {
                 self.publish_controller_feedback(
@@ -18576,46 +21087,80 @@ impl App {
                 );
             }
         }
-        disposition
+        WebActionDispatchOutcome {
+            batch: disposition,
+            lifecycle: if accepted {
+                ActionLifecycleOutcome::Applied
+            } else if coalesced {
+                ActionLifecycleOutcome::Coalesced
+            } else {
+                ActionLifecycleOutcome::Refused
+            },
+        }
     }
 
     /// Handle an action from the web UI with one manual transaction around
     /// every non-gesture authored edit. Performance triggers and automation
     /// deliberately bypass the history store.
+    #[cfg(test)]
     fn handle_web_action(&mut self, action: web::state::WebAction) -> WebActionBatchDisposition {
+        self.handle_web_action_from_origin(action, action_correlation::ActionSourceClass::Browser)
+            .batch
+    }
+
+    fn handle_web_action_from_origin(
+        &mut self,
+        action: web::state::WebAction,
+        source: action_correlation::ActionSourceClass,
+    ) -> WebActionDispatchOutcome {
         use web::state::WebAction;
         match action {
             WebAction::BeginHistoryGesture { gesture_id } => {
-                self.begin_history_gesture(gesture_id);
-                return WebActionBatchDisposition::Continue;
+                return if self.begin_history_gesture(gesture_id) {
+                    WebActionDispatchOutcome::coalesced(WebActionBatchDisposition::Continue)
+                } else {
+                    WebActionDispatchOutcome::refused(WebActionBatchDisposition::Continue)
+                };
             }
             WebAction::EndHistoryGesture { gesture_id } => {
-                self.finish_history_gesture(gesture_id);
-                return WebActionBatchDisposition::Continue;
+                return if self.finish_history_gesture(gesture_id) {
+                    WebActionDispatchOutcome::coalesced(WebActionBatchDisposition::Continue)
+                } else {
+                    WebActionDispatchOutcome::refused(WebActionBatchDisposition::Continue)
+                };
             }
             WebAction::CancelHistoryGesture { gesture_id } => {
-                self.cancel_history_gesture(gesture_id);
-                return WebActionBatchDisposition::Continue;
+                return if self.cancel_history_gesture(gesture_id) {
+                    WebActionDispatchOutcome::coalesced(WebActionBatchDisposition::Continue)
+                } else {
+                    WebActionDispatchOutcome::refused(WebActionBatchDisposition::Continue)
+                };
             }
             WebAction::UndoManual => {
-                self.restore_history_direction(false);
-                return WebActionBatchDisposition::Continue;
+                let accepted = self.restore_history_direction(false);
+                return WebActionDispatchOutcome::from_acceptance(
+                    WebActionBatchDisposition::Continue,
+                    accepted,
+                );
             }
             WebAction::RedoManual => {
-                self.restore_history_direction(true);
-                return WebActionBatchDisposition::Continue;
+                let accepted = self.restore_history_direction(true);
+                return WebActionDispatchOutcome::from_acceptance(
+                    WebActionBatchDisposition::Continue,
+                    accepted,
+                );
             }
             _ => {}
         }
 
         if Self::history_action_is_performance_only(&action) {
-            return self.handle_web_action_inner_with_feedback(action);
+            return self.handle_web_action_inner_with_feedback_from_origin(action, source);
         }
         match self.manual_history.open_gesture() {
             Some((_, history::MutationOrigin::BrowserManual)) => {
                 // Absolute browser values inside the owned gesture remain
                 // coalescible and become one manual history entry at End.
-                return self.handle_web_action_inner_with_feedback(action);
+                return self.handle_web_action_inner_with_feedback_from_origin(action, source);
             }
             Some((id, history::MutationOrigin::NativeManual)) => {
                 // Do not let a remote editor silently fold authored values
@@ -18624,7 +21169,7 @@ impl App {
                     "Browser edit rejected while native history gesture {} is active",
                     id.get()
                 );
-                return WebActionBatchDisposition::Continue;
+                return WebActionDispatchOutcome::refused(WebActionBatchDisposition::Continue);
             }
             Some((id, origin)) => {
                 self.history_status = format!(
@@ -18632,7 +21177,7 @@ impl App {
                     origin,
                     id.get()
                 );
-                return WebActionBatchDisposition::Continue;
+                return WebActionDispatchOutcome::refused(WebActionBatchDisposition::Continue);
             }
             None => {}
         }
@@ -18641,42 +21186,66 @@ impl App {
             Err(error) => {
                 self.history_status = format!("Manual edit rejected before mutation: {error}");
                 self.composition_status.clone_from(&self.history_status);
-                return WebActionBatchDisposition::Continue;
+                return WebActionDispatchOutcome::refused(WebActionBatchDisposition::Continue);
             }
         };
-        let disposition = self.handle_web_action_inner_with_feedback(action);
-        let after_fingerprint = match self.capture_manual_history_world() {
-            Ok((_, canonical)) => history::fingerprint_canonical(&canonical),
+        let before_fingerprint = before.fingerprint();
+        let inner_outcome = self.handle_web_action_inner_with_feedback_from_origin(action, source);
+        let (after_patch, after_fingerprint) = match self.capture_manual_history_world() {
+            Ok((world, canonical)) => (world.patch, history::fingerprint_canonical(&canonical)),
             Err(error) => {
                 self.history_status = format!("Manual edit history capture failed: {error}");
-                return disposition;
+                // The live applier has already classified the command. A
+                // secondary history-capture failure must not relabel an
+                // accepted mutation as Refused.
+                return inner_outcome;
             }
         };
-        match self.manual_history.record_manual(
+        let lifecycle = match self.manual_history.record_manual(
             history::MutationOrigin::BrowserManual,
             before,
             after_fingerprint,
         ) {
             Ok(history::HistoryRecordOutcome::Recorded) => {
                 self.history_status = "Manual edit committed".to_string();
-                self.append_recovery_checkpoint("manual edit");
+                self.enqueue_recovery_checkpoint(after_patch, after_fingerprint, "manual edit");
+                ActionLifecycleOutcome::Applied
             }
-            Ok(history::HistoryRecordOutcome::NoChange) => {}
-            Ok(outcome) => self.history_status = format!("Manual edit history: {outcome:?}"),
-            Err(error) => self.history_status = format!("Manual edit history failed: {error}"),
+            Ok(history::HistoryRecordOutcome::NoChange) => ActionLifecycleOutcome::Refused,
+            Ok(outcome) => {
+                self.history_status = format!("Manual edit history: {outcome:?}");
+                if after_fingerprint != before_fingerprint {
+                    ActionLifecycleOutcome::Applied
+                } else {
+                    inner_outcome.lifecycle
+                }
+            }
+            Err(error) => {
+                self.history_status = format!("Manual edit history failed: {error}");
+                if after_fingerprint != before_fingerprint {
+                    ActionLifecycleOutcome::Applied
+                } else {
+                    inner_outcome.lifecycle
+                }
+            }
+        };
+        WebActionDispatchOutcome {
+            batch: inner_outcome.batch,
+            lifecycle,
         }
-        disposition
     }
 
-    fn handle_web_action_inner(
+    fn handle_web_action_inner_with_acceptance(
         &mut self,
         action: web::state::WebAction,
+        accepted_recordable: &mut bool,
+        accepted_coalesced: &mut bool,
     ) -> WebActionBatchDisposition {
         use web::state::WebAction;
-        if self.handle_creative_web_action(&action) {
+        if self.handle_creative_web_action(&action, accepted_recordable) {
             return WebActionBatchDisposition::Continue;
         }
-        if self.handle_motion_web_action(&action) {
+        if self.handle_motion_web_action(&action, accepted_recordable) {
             return WebActionBatchDisposition::Continue;
         }
         if let WebAction::SetLayerParam {
@@ -18687,22 +21256,24 @@ impl App {
         } = &action
         {
             if matches!(param.as_str(), "bypass_master_fx" | "bypass_temporal_fx") {
-                if param == "bypass_master_fx" {
-                    self.apply_layer_master_bypass_action(*index, layer_id, value);
+                let accepted = if param == "bypass_master_fx" {
+                    self.apply_layer_master_bypass_action(*index, layer_id, value)
                 } else {
-                    self.apply_layer_temporal_bypass_action(*index, layer_id, value);
-                }
+                    self.apply_layer_temporal_bypass_action(*index, layer_id, value)
+                };
+                *accepted_recordable |= accepted;
                 return WebActionBatchDisposition::Continue;
             }
         }
         if let WebAction::SetTemporal { param, value } = &action {
             if Self::temporal_edit_requires_partition_preflight(param) {
-                self.apply_temporal_partition_sensitive_action(param, value);
+                *accepted_recordable |=
+                    self.apply_temporal_partition_sensitive_action(param, value);
                 return WebActionBatchDisposition::Continue;
             }
         }
         if let WebAction::SetNtscParam { param, value } = &action {
-            self.apply_ntsc_param_action(param, value);
+            *accepted_recordable |= self.apply_ntsc_param_action(param, value);
             return WebActionBatchDisposition::Continue;
         }
         if self.manual_action_targets_active_morph(&action)
@@ -18712,7 +21283,17 @@ impl App {
         }
         let mut disposition = WebActionBatchDisposition::Continue;
         match action {
-            WebAction::Quantized { inner } => return self.queue_quantized_action(*inner),
+            WebAction::Quantized { inner } => {
+                return self
+                    .queue_quantized_action_from_source(
+                        *inner,
+                        action_correlation::ActionSourceClass::Automation,
+                    )
+                    .batch;
+            }
+            WebAction::ApplyConstraintRemediation { .. } => {
+                unreachable!("constraint remediation is resolved before ordinary dispatch")
+            }
             WebAction::OpenPatchSnapshot => {
                 if self.choose_snapshot_patch() {
                     disposition = WebActionBatchDisposition::SnapshotCommitted;
@@ -18728,8 +21309,11 @@ impl App {
                     let result = self
                         .patch_collector
                         .try_submit(patch, PathBuf::from("patches"));
-                    if result == procedural::CaptureSubmit::Busy {
-                        log::warn!("Patch capture queue is busy; capture was not enqueued");
+                    match result {
+                        procedural::CaptureSubmit::Queued => *accepted_coalesced = true,
+                        procedural::CaptureSubmit::Busy => {
+                            log::warn!("Patch capture queue is busy; capture was not enqueued");
+                        }
                     }
                 }
                 Err(error) => {
@@ -18738,12 +21322,17 @@ impl App {
                 }
             },
             WebAction::SetParam { param, value } => {
+                let valid = Self::valid_effect_edit(&param, &value);
+                let before = self.master_effects;
                 let mut snap = web::state::EffectsSnapshot::from_uniforms(&self.master_effects);
                 snap.apply_param(&param, &value);
                 snap.apply_to_uniforms(&mut self.master_effects);
+                *accepted_recordable |= valid
+                    && bytemuck::bytes_of(&before) != bytemuck::bytes_of(&self.master_effects);
             }
             WebAction::SetMasterTransform { param, value } => {
-                Self::apply_spatial_transform_edit(&mut self.master_transform, &param, &value);
+                *accepted_recordable |=
+                    Self::apply_spatial_transform_edit(&mut self.master_transform, &param, &value);
             }
             WebAction::ResetMasterTransform => {
                 self.master_transform = spatial::SpatialTransform::default();
@@ -18773,7 +21362,14 @@ impl App {
                 activate,
                 trigger_mode,
             } => {
-                self.stage_clip_slot_update(&layer_id, slot_id, filename, activate, trigger_mode);
+                let lifecycle = self.stage_clip_slot_update(
+                    &layer_id,
+                    slot_id,
+                    filename,
+                    activate,
+                    trigger_mode,
+                );
+                merge_action_lifecycle(lifecycle, accepted_recordable, accepted_coalesced);
             }
             WebAction::RemoveClipSlot { layer_id, slot_id } => {
                 if let Some(index) = self.resolve_stable_layer_id(&layer_id) {
@@ -18812,11 +21408,12 @@ impl App {
                         layer_id: stable_id,
                         slot_id,
                     };
-                    if !self.cached_direct_slot_matches(stable_id, slot_id, None)
-                        || !self.arm_performance_activation(key, trigger_mode)
-                    {
-                        self.stage_existing_clip_slot(index, slot_id, None, trigger_mode);
-                    }
+                    let admitted = if self.cached_direct_slot_matches(stable_id, slot_id, None) {
+                        self.arm_performance_activation(key, trigger_mode)
+                    } else {
+                        self.stage_existing_clip_slot(index, slot_id, None, trigger_mode)
+                    };
+                    *accepted_recordable |= admitted;
                 } else {
                     self.source_staging_status = format!("Layer {layer_id} is absent");
                 }
@@ -18899,23 +21496,28 @@ impl App {
                             .is_some()
                     {
                         self.layers[index].request_transport_cue(cue_id);
+                        *accepted_recordable = true;
                     } else {
                         let stable_id = self.layers[index].stable_layer_id();
                         let key = performance_runtime::PreparedTransactionKey::LayerSlot {
                             layer_id: stable_id,
                             slot_id,
                         };
-                        if !self.cached_direct_slot_matches(stable_id, slot_id, Some(cue_id))
-                            || !self
-                                .arm_performance_activation(key, transport::TriggerMode::Immediate)
-                        {
-                            self.stage_existing_clip_slot(
-                                index,
-                                slot_id,
-                                Some(cue_id),
-                                transport::TriggerMode::Immediate,
-                            );
-                        }
+                        let admitted =
+                            if self.cached_direct_slot_matches(stable_id, slot_id, Some(cue_id)) {
+                                self.arm_performance_activation(
+                                    key,
+                                    transport::TriggerMode::Immediate,
+                                )
+                            } else {
+                                self.stage_existing_clip_slot(
+                                    index,
+                                    slot_id,
+                                    Some(cue_id),
+                                    transport::TriggerMode::Immediate,
+                                )
+                            };
+                        *accepted_recordable |= admitted;
                     }
                 }
             }
@@ -18925,14 +21527,18 @@ impl App {
                 position,
             } => {
                 if let Some(index) = self.resolve_stable_layer_id(&layer_id) {
-                    if self.layers[index].clip_slots.get(slot_id).is_some() {
-                        self.clear_performance_transactions();
-                    }
                     let layer = &mut self.layers[index];
                     if let Some(slot) = layer.clip_slots.get_mut(slot_id) {
+                        let changed = slot.saved_playhead != position;
                         slot.saved_playhead = position;
                         if layer.active_clip_slot == slot_id {
                             layer.request_transport_seek(position);
+                            *accepted_recordable = true;
+                        } else {
+                            *accepted_recordable |= changed;
+                        }
+                        if *accepted_recordable {
+                            self.clear_performance_transactions();
                         }
                     }
                 }
@@ -18966,6 +21572,7 @@ impl App {
                                     slot.saved_playhead = position;
                                 }
                                 layer.request_transport_seek(position);
+                                *accepted_recordable = true;
                                 self.source_staging_status = format!(
                                     "Sought layer {} slot {} to {:.3} source seconds",
                                     layer.layer_id(),
@@ -18987,12 +21594,17 @@ impl App {
                 }
             }
             WebAction::PrepareScene { scene_id } => {
-                self.stop_autopilot_for_manual_control("manual Scene preparation");
                 let key = performance_runtime::PreparedTransactionKey::Scene(scene_id);
                 if self.cached_performance_position(&key).is_some() {
                     self.scene_status = format!("Scene {} is GPU-ready", scene_id.get());
+                    if self.stop_autopilot_for_manual_control("manual Scene preparation") {
+                        *accepted_recordable = true;
+                    } else {
+                        *accepted_coalesced = true;
+                    }
                 } else {
-                    self.stage_scene(scene_id, None);
+                    let lifecycle = self.stage_scene(scene_id, None);
+                    merge_action_lifecycle(lifecycle, accepted_recordable, accepted_coalesced);
                 }
             }
             WebAction::CaptureScene {
@@ -19035,9 +21647,9 @@ impl App {
                     return disposition;
                 };
                 let key = performance_runtime::PreparedTransactionKey::Scene(scene_id);
-                if !self.arm_performance_activation(key, mode) {
-                    self.stage_scene(scene_id, Some(mode));
-                }
+                let accepted = self.arm_performance_activation(key, mode)
+                    || self.stage_scene(scene_id, Some(mode)) == ActionLifecycleOutcome::Applied;
+                *accepted_recordable |= accepted;
             }
             WebAction::ReplaceAutopilotPlan { plan } => {
                 let commands = self.autopilot_scheduler.reset();
@@ -19059,9 +21671,15 @@ impl App {
                     ),
                 };
             }
-            WebAction::AutopilotPlay => self.play_or_resume_autopilot(Instant::now()),
-            WebAction::AutopilotPause => self.pause_autopilot(),
-            WebAction::AutopilotReset => self.reset_autopilot(),
+            WebAction::AutopilotPlay => {
+                *accepted_recordable |= self.play_or_resume_autopilot(Instant::now());
+            }
+            WebAction::AutopilotPause => {
+                *accepted_recordable |= self.pause_autopilot();
+            }
+            WebAction::AutopilotReset => {
+                *accepted_recordable |= self.reset_autopilot();
+            }
             WebAction::AddSpoutLayer { sender } => self.add_spout_layer(&sender),
             WebAction::RemoveLayer { index, layer_id } => {
                 if let Some(index) = self.resolve_layer_index(index, &layer_id) {
@@ -19137,6 +21755,7 @@ impl App {
             } => {
                 if let Some(index) = self.resolve_layer_index(index, &layer_id) {
                     self.layers[index].visible = visible;
+                    *accepted_recordable = true;
                 }
             }
             WebAction::SetLayerPaused {
@@ -19221,17 +21840,25 @@ impl App {
                 }
             }
             WebAction::SetMasterPaused { paused } => {
+                let changed = self.master_paused != paused;
                 self.set_master_paused(paused);
+                *accepted_recordable |= changed;
             }
             WebAction::SetProgramFrozen { frozen } => {
+                let changed = self.master_paused != frozen;
                 self.set_master_paused(frozen);
+                *accepted_recordable |= changed;
             }
             WebAction::SetMediaFrozen { frozen } => {
+                let changed = self.media_frozen != frozen;
                 self.set_media_frozen(frozen);
+                *accepted_recordable |= changed;
             }
             WebAction::SetMediaSafetyMode { mode } => {
+                let changed = self.media_safety_policy.mode() != mode;
                 match self.media_safety_policy.set_mode(mode) {
                     Ok(()) => {
+                        *accepted_coalesced |= changed;
                         self.media_safety_status = match mode {
                             media_safety::MediaSafetyMode::Safe => {
                                 "Safe media mode enabled for future source opens".to_string()
@@ -19324,7 +21951,11 @@ impl App {
                     }
                 }
             }
-            WebAction::SetBlackout { enabled } => self.set_blackout(enabled),
+            WebAction::SetBlackout { enabled } => {
+                let changed = self.blackout != enabled;
+                self.set_blackout(enabled);
+                *accepted_recordable |= changed;
+            }
             // `reset_fx` predates the enriched visual program. Keep its wire
             // contract exact for older remotes: direct master uniforms only.
             WebAction::ResetFx => self.master_effects.reset(),
@@ -19441,6 +22072,7 @@ impl App {
             }
             WebAction::TapTempo => {
                 self.mod_matrix.clock.tap(Instant::now());
+                *accepted_recordable = true;
             }
             WebAction::SetBpm { value } => {
                 self.mod_matrix.clock.set_bpm_at(value, Instant::now());
@@ -19524,7 +22156,13 @@ impl App {
                 self.mod_matrix.reset_performance_sources();
             }
             WebAction::BendPad { index, held } => {
+                let changed = self
+                    .mod_matrix
+                    .bend_held
+                    .get(index)
+                    .is_some_and(|current| *current != held);
                 self.mod_matrix.set_bend(index, held);
+                *accepted_recordable |= changed;
             }
             WebAction::AddRouting => {
                 self.mod_matrix.add_routing();
@@ -19698,6 +22336,7 @@ impl App {
                         .publish_controller_profile_export(&self.controller_profile)
                     {
                         Ok(()) => {
+                            *accepted_coalesced = true;
                             self.controller_status = format!(
                                 "Controller profile '{}' prepared for browser export",
                                 self.controller_profile.name
@@ -19712,12 +22351,19 @@ impl App {
             },
             WebAction::Gyro { alpha, beta, gamma } => {
                 // DeviceOrientation degrees → unipolar 0..1 (0.5 = level).
+                let before = self.mod_matrix.gyro_raw;
                 self.mod_matrix.set_gyro_degrees(alpha, beta, gamma);
+                *accepted_recordable |= self.mod_matrix.gyro_raw != before;
             }
             // The web server consumes this connection-scoped declaration.
             // Keep a no-op arm for direct/legacy action injection.
             WebAction::GyroStream { .. } => {}
-            WebAction::GyroCalibrate => self.mod_matrix.calibrate_gyro(),
+            WebAction::GyroCalibrate => {
+                let before = (self.mod_matrix.gyro_config, self.mod_matrix.gyro);
+                self.mod_matrix.calibrate_gyro();
+                *accepted_recordable |=
+                    (self.mod_matrix.gyro_config, self.mod_matrix.gyro) != before;
+            }
             WebAction::SetGyroConfig { axis, param, value } => {
                 let axis_index = match axis.as_str() {
                     "yaw" => Some(0),
@@ -19749,7 +22395,11 @@ impl App {
                     self.mod_matrix.recompute_gyro();
                 }
             }
-            WebAction::Pad { x, y, active } => self.mod_matrix.set_pad(x, y, active),
+            WebAction::Pad { x, y, active } => {
+                let before = (self.mod_matrix.pad, self.mod_matrix.pad_active);
+                self.mod_matrix.set_pad(x, y, active);
+                *accepted_recordable |= (self.mod_matrix.pad, self.mod_matrix.pad_active) != before;
+            }
             WebAction::GestureSample {
                 stroke,
                 phase,
@@ -19783,8 +22433,9 @@ impl App {
                 }
             }
             WebAction::SetGestureCanvas { param, value } => {
-                if let Err(error) = self.set_gesture_canvas_param(&param, &value) {
-                    self.gesture_status = error;
+                match self.set_gesture_canvas_param(&param, &value) {
+                    Ok(()) => *accepted_recordable = true,
+                    Err(error) => self.gesture_status = error,
                 }
             }
             WebAction::SetPerformanceRecording {
@@ -19792,7 +22443,7 @@ impl App {
                 layer_stack_revision,
             } => {
                 if layer_stack_revision == self.layer_stack_revision {
-                    self.set_performance_recording(enabled);
+                    *accepted_coalesced |= self.set_performance_recording(enabled);
                 } else {
                     self.performance_status = format!(
                         "Performance recording control rejected: stale stack revision {layer_stack_revision}; current is {}",
@@ -19807,7 +22458,7 @@ impl App {
                 layer_stack_revision,
             } => {
                 if layer_stack_revision == self.layer_stack_revision {
-                    self.set_performance_playback(enabled, loop_playback);
+                    *accepted_recordable |= self.set_performance_playback(enabled, loop_playback);
                 } else {
                     self.performance_status = format!(
                         "Performance playback control rejected: stale stack revision {layer_stack_revision}; current is {}",
@@ -19816,9 +22467,11 @@ impl App {
                     log::warn!("{}", self.performance_status);
                 }
             }
-            WebAction::ClearPerformanceTake => {
-                self.clear_performance_take();
-            }
+            WebAction::ClearPerformanceTake => match self.clear_performance_take() {
+                ActionLifecycleOutcome::Applied => *accepted_recordable = true,
+                ActionLifecycleOutcome::Coalesced => *accepted_coalesced = true,
+                ActionLifecycleOutcome::Refused | ActionLifecycleOutcome::Quantized => {}
+            },
             WebAction::SetPadConfig { axis, param, value } => match param.as_str() {
                 "spring_enabled" => {
                     if let Some(enabled) = value.as_bool() {
@@ -19862,6 +22515,7 @@ impl App {
             },
             WebAction::SetOutputWindow { .. }
             | WebAction::SetOutputDisplay { .. }
+            | WebAction::RescanOutputDisplays
             | WebAction::ToggleOutputWindow => {
                 // Handled in the action drain loop, which has the event
                 // loop needed for window creation. Never reaches here.
@@ -19998,10 +22652,13 @@ impl App {
                 self.morph.clear();
             }
             WebAction::SetMorph { value } => {
-                self.morph.set_position(value);
-                // Manual performance edits remain responsive while program
-                // time is held; only automatic glide/clock motion is frozen.
-                self.materialize_morph_at_current_beat();
+                if value.is_finite() {
+                    self.morph.set_position(value);
+                    // Manual performance edits remain responsive while program
+                    // time is held; only automatic glide/clock motion is frozen.
+                    self.materialize_morph_at_current_beat();
+                    *accepted_recordable = true;
+                }
             }
             WebAction::SetMorphLaw { law } => {
                 match law.as_str() {
@@ -20022,66 +22679,17 @@ impl App {
             }
             WebAction::ToggleBlackout => {
                 self.toggle_blackout();
+                *accepted_recordable = true;
             }
             WebAction::RescanLibrary => {
                 if let Some(folder) = self.library_folder.clone() {
-                    self.library_files = scan_folder(&folder);
-                    self.audio_library_files = scan_audio_folder(&folder);
-                    // A rescan supersedes any scan still in flight. The shared
-                    // helper gate makes this a global single-flight handoff:
-                    // the replacement waits until stale children are reaped.
-                    let generation = self.web_state.begin_library_generation();
-                    // Decode only entries whose convenience cache is not yet
-                    // complete. Videos may have a thumbnail but still be
-                    // waiting for their hover strip when the barrier arrives.
-                    let new_files: Vec<PathBuf> = self
-                        .library_files
-                        .iter()
-                        .filter(|p| {
-                            let name = p
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            let thumbnail_cached = self
-                                .web_state
-                                .thumbnails
-                                .read()
-                                .map(|c| c.contains_key(&name))
-                                .unwrap_or(false);
-                            let preview_cached = self
-                                .web_state
-                                .preview_frames
-                                .read()
-                                .map(|c| c.contains_key(&name))
-                                .unwrap_or(false);
-                            !thumbnail_cached
-                                || (!is_still_image_file(p.as_path()) && !preview_cached)
-                        })
-                        .cloned()
-                        .collect();
-                    if !new_files.is_empty() {
-                        log::info!("Library rescan: {} new clip(s)", new_files.len());
-                        generate_thumbnails(
-                            &new_files,
-                            self.web_state.clone(),
-                            generation,
-                            self.media_safety_policy.clone(),
-                            self.renderer.as_ref().map_or_else(
-                                media_safety::MediaDeviceLimits::none,
-                                |renderer| {
-                                    let limits = renderer.device.limits();
-                                    media_safety::MediaDeviceLimits::new(
-                                        limits.max_texture_dimension_2d,
-                                        limits.max_buffer_size,
-                                    )
-                                },
-                            ),
-                        );
-                    }
+                    *accepted_coalesced |=
+                        self.request_library_scan(folder, false, false).admitted();
                 }
             }
             WebAction::SetTemporal { param, value } => {
                 debug_assert!(!Self::temporal_edit_requires_partition_preflight(&param));
+                let accepted = Self::valid_temporal_edit(&param, &value);
                 let score_loop_driver = if param == "score_loop_driver" {
                     value.as_str().and_then(|driver| {
                         if driver == "none" {
@@ -20110,20 +22718,27 @@ impl App {
                     &value,
                     score_loop_driver,
                 );
+                *accepted_recordable |= accepted;
             }
             WebAction::ClearTemporalMemory => {
                 self.clear_temporal_memory();
                 self.composition_status = "Cleared temporal memory".to_string();
+                *accepted_recordable = true;
             }
             WebAction::TriggerCollisionScore => {
+                let before = self.pending_temporal_events.manual_events;
                 self.pending_temporal_events.manual_events =
                     self.pending_temporal_events.manual_events.saturating_add(1);
+                *accepted_recordable |= self.pending_temporal_events.manual_events != before;
             }
             WebAction::TriggerRefreshGarden => {
+                let before = self.pending_temporal_events.garden_refresh_events;
                 self.pending_temporal_events.garden_refresh_events = self
                     .pending_temporal_events
                     .garden_refresh_events
                     .saturating_add(1);
+                *accepted_recordable |=
+                    self.pending_temporal_events.garden_refresh_events != before;
             }
             WebAction::SetRefreshGardenMatteRoute {
                 layer_id,
@@ -20172,8 +22787,11 @@ impl App {
                 Err(error) => self.composition_status = error,
             },
             WebAction::ClearTemporalEventTrack => {
+                let changed =
+                    self.temporal_event_recorder != temporal::TemporalEventRecorder::default();
                 self.temporal_event_recorder.clear();
                 self.composition_status = "Cleared recorded temporal event track".to_string();
+                *accepted_coalesced |= changed;
             }
             WebAction::SetMotion { .. }
             | WebAction::SetMotionDonor { .. }
@@ -20182,32 +22800,48 @@ impl App {
                 unreachable!("motion actions are handled transactionally before this match")
             }
             WebAction::SetSpout { enabled } => {
+                let changed = self.spout_enabled != enabled;
                 self.spout_enabled = enabled;
+                *accepted_recordable |= changed;
             }
             WebAction::SetSpoutResolution { resolution } => {
                 if let Some(mode) = spout_out::SpoutResolutionMode::from_key(&resolution) {
+                    let changed = self.spout.resolution_mode() != mode;
                     self.spout.set_resolution_mode(mode);
+                    *accepted_recordable |= changed;
                 }
             }
             WebAction::StartProgramRecording { auto_import } => {
-                self.start_program_recording(auto_import);
+                *accepted_coalesced |= self.start_program_recording(auto_import);
             }
-            WebAction::FinishProgramRecording => self.finish_live_capture(),
-            WebAction::CancelProgramRecording => self.cancel_live_capture(),
+            WebAction::FinishProgramRecording => {
+                *accepted_coalesced |= self.finish_live_capture();
+            }
+            WebAction::CancelProgramRecording => {
+                *accepted_coalesced |= self.cancel_live_capture();
+            }
             WebAction::CaptureStill {
                 target,
                 auto_import,
-            } => self.capture_still(target, auto_import),
+            } => {
+                *accepted_coalesced |= self.capture_still(target, auto_import);
+            }
             WebAction::StartResample {
                 target,
                 destination_layer_id,
                 activate,
-            } => self.start_resample(target, destination_layer_id, activate),
+            } => {
+                *accepted_coalesced |= self.start_resample(target, destination_layer_id, activate);
+            }
             WebAction::SetStageHealthHud { enabled } => {
+                let changed = self.stage_tools.health_hud_enabled() != enabled;
                 self.stage_tools.set_health_hud(enabled);
+                *accepted_coalesced |= changed;
             }
             WebAction::SetMonitorBay { enabled } => {
+                let changed = self.stage_tools.monitor_bay_enabled() != enabled;
                 self.stage_tools.set_monitor_bay(enabled);
+                *accepted_coalesced |= changed;
             }
             WebAction::SetMonitorProbe { probe } => {
                 // The one shared parse table: the gate accepted the token,
@@ -20220,6 +22854,7 @@ impl App {
                             // A probe change is a new signal; the old
                             // instruments must not present as the new probe.
                             self.monitor_bay_state.clear();
+                            *accepted_coalesced = true;
                         }
                     }
                     None => {
@@ -20232,17 +22867,38 @@ impl App {
                 // the queue is a deliberate no-op.
             }
             WebAction::RequestLayerProxy { layer_id } => {
-                self.request_layer_proxy_from_browser(&layer_id);
+                *accepted_coalesced |= self.request_layer_proxy_from_browser(&layer_id);
             }
             WebAction::SetStageTestCard {
                 mode,
                 output_endpoint_id,
             } => {
+                let before = self.stage_tools.clone();
                 let endpoint = output_endpoint_id
                     .map(stage_map::OutputEndpointId::parse)
                     .transpose();
+                let endpoint = endpoint.and_then(|endpoint| {
+                    if mode != stage_map::TestCardMode::Off {
+                        let Some(selected) = endpoint.as_ref() else {
+                            return Err(stage_map::StageMapError::CalibrationEndpointRequired);
+                        };
+                        if !self.stage_map.endpoints.iter().any(|live| {
+                            live.enabled
+                                && live.id == *selected
+                                && matches!(live.binding, stage_map::OutputBinding::Monitor { .. })
+                        }) {
+                            return Err(stage_map::StageMapError::MissingEndpoint(
+                                selected.clone(),
+                            ));
+                        }
+                    }
+                    Ok(endpoint)
+                });
                 match endpoint.and_then(|endpoint| self.stage_tools.set_test_card(mode, endpoint)) {
-                    Ok(()) => self.output_error.clear(),
+                    Ok(()) => {
+                        self.output_error.clear();
+                        *accepted_recordable |= self.stage_tools != before;
+                    }
                     Err(error) => self.output_error = error.to_string(),
                 }
             }
@@ -20250,14 +22906,35 @@ impl App {
                 enabled,
                 output_endpoint_id,
             } => {
+                let before = self.stage_tools.clone();
                 let endpoint = output_endpoint_id
                     .map(stage_map::OutputEndpointId::parse)
                     .transpose();
+                let endpoint = endpoint.and_then(|endpoint| {
+                    if enabled {
+                        let Some(selected) = endpoint.as_ref() else {
+                            return Err(stage_map::StageMapError::CalibrationEndpointRequired);
+                        };
+                        if !self.stage_map.endpoints.iter().any(|live| {
+                            live.enabled
+                                && live.id == *selected
+                                && matches!(live.binding, stage_map::OutputBinding::Monitor { .. })
+                        }) {
+                            return Err(stage_map::StageMapError::MissingEndpoint(
+                                selected.clone(),
+                            ));
+                        }
+                    }
+                    Ok(endpoint)
+                });
                 match endpoint.and_then(|endpoint| {
                     self.stage_tools
                         .set_output_identification(enabled, endpoint)
                 }) {
-                    Ok(()) => self.output_error.clear(),
+                    Ok(()) => {
+                        self.output_error.clear();
+                        *accepted_recordable |= self.stage_tools != before;
+                    }
                     Err(error) => self.output_error = error.to_string(),
                 }
             }
@@ -20361,15 +23038,13 @@ impl App {
                 }
             }
             WebAction::RestoreRecoveryJournal => {
-                let candidate = self.recovery_journal.as_ref().and_then(|journal| {
-                    journal.latest_valid().latest.as_ref().map(|checkpoint| {
-                        (
-                            checkpoint.patch.clone(),
-                            journal.path().to_path_buf(),
-                            checkpoint.sequence,
-                        )
-                    })
-                });
+                // Restore sees only the last worker-verified checkpoint. An
+                // in-flight or newest-pending request has no durable sequence
+                // and is intentionally invisible here.
+                let candidate = self
+                    .recovery_writer
+                    .as_ref()
+                    .and_then(recovery_journal::RecoveryWriter::latest_checkpoint);
                 match candidate {
                     Some((patch, path, sequence)) => match self.apply_loaded_patch(patch, &path) {
                         Ok(()) => {
@@ -20385,15 +23060,25 @@ impl App {
                 }
             }
             WebAction::DiscardRecoveryJournal => {
-                if let Some(journal) = self.recovery_journal.as_mut() {
-                    match journal.discard() {
-                        Ok(()) => self.recovery_status = "Recovery journal discarded".into(),
+                if let Some(writer) = self.recovery_writer.as_ref() {
+                    match writer.request_discard() {
+                        Ok(receipt) => {
+                            self.recovery_status = format!(
+                                "Recovery discard request {} queued; {} remains authoritative until worker verification",
+                                receipt.request_id,
+                                receipt.durable_sequence_at_request.map_or_else(
+                                    || "no durable checkpoint".to_string(),
+                                    |sequence| format!("durable checkpoint {sequence}")
+                                )
+                            );
+                        }
                         Err(error) => {
-                            self.recovery_status = format!("Recovery discard failed: {error}")
+                            self.recovery_status =
+                                format!("Recovery discard request rejected: {error}");
                         }
                     }
                 } else {
-                    self.recovery_status = "Recovery journal is unavailable".into();
+                    self.recovery_status = "Recovery writer is unavailable".into();
                 }
             }
             WebAction::SetRouting {
@@ -20515,6 +23200,7 @@ impl App {
                     if matches!(param.as_str(), "speed" | "fps") {
                         self.clear_performance_transactions();
                     }
+                    let accepted = Self::layer_param_morph_control(&param, &value).is_some();
                     let layer = &mut self.layers[index];
                     match param.as_str() {
                         "opacity" => {
@@ -20602,6 +23288,7 @@ impl App {
                         }
                         _ => {}
                     }
+                    *accepted_recordable |= accepted;
                 }
             }
             WebAction::SetLayerEffect {
@@ -20612,12 +23299,15 @@ impl App {
             } => {
                 if let Some(index) = self.resolve_layer_index(index, &layer_id) {
                     let layer = &mut self.layers[index];
-                    if !Self::master_only_effect_param(&param) {
+                    if !Self::master_only_effect_param(&param)
+                        && Self::valid_effect_edit(&param, &value)
+                    {
                         let mut snapshot =
                             web::state::EffectsSnapshot::from_uniforms(&layer.effects);
                         snapshot.apply_param(&param, &value);
                         snapshot.apply_to_uniforms(&mut layer.effects);
                         layer.effects.clear_master_only_effects();
+                        *accepted_recordable = true;
                     }
                 }
             }
@@ -20634,6 +23324,7 @@ impl App {
                     if let Some(edit) = pattern_synth::PatternSynthEdit::parse(&param, &value) {
                         if let Some(params) = self.layers[index].pattern_params_mut() {
                             edit.apply(params);
+                            *accepted_recordable = true;
                         }
                     }
                 }
@@ -20673,7 +23364,7 @@ impl App {
                     .as_deref()
                     .and_then(|id| self.resolve_stable_layer_id(id))
                 {
-                    Self::apply_spatial_transform_edit(
+                    *accepted_recordable |= Self::apply_spatial_transform_edit(
                         &mut self.layers[index].transform,
                         &param,
                         &value,
@@ -20861,6 +23552,7 @@ impl App {
                         renderer.device.clone(),
                         renderer.queue.clone(),
                     ));
+                    *accepted_coalesced = true;
                     // The export owns the second of the two canvases the
                     // frozen table admits. Both are charged against the one
                     // aggregate budget here, before either is created.
@@ -20869,6 +23561,8 @@ impl App {
                 }
             }
             WebAction::CancelExport => {
+                let had_running_job = self.export_job.as_ref().is_some_and(|job| !job.is_done());
+                let had_canvas = self.export_gesture_canvas.is_some();
                 if let Some(ref job) = self.export_job {
                     job.cancel();
                 }
@@ -20878,6 +23572,7 @@ impl App {
                 self.close_export_gesture_canvas(
                     gesture_canvas::GestureCanvasResetCause::ExportCancelled,
                 );
+                *accepted_coalesced |= had_running_job || had_canvas;
             }
             WebAction::SetVisualNodeParam { .. }
             | WebAction::SetVisualNodeStudyDocument { .. }
@@ -20969,12 +23664,12 @@ impl App {
     /// The Y key: ask the worker to encode a proxy for the selected layer's
     /// verified content identity. Every refusal lands in the layer's HUD
     /// status line; nothing here blocks the render thread.
-    fn request_selected_layer_proxy(&mut self) {
+    fn request_selected_layer_proxy(&mut self) -> bool {
         let Some(index) = self.selected_layer else {
             log::info!("proxy encode request ignored: no layer is selected");
-            return;
+            return false;
         };
-        self.request_proxy_for_layer(index);
+        self.request_proxy_for_layer(index)
     }
 
     /// The browser twin of the Y key. The stable ID is authoritative with no
@@ -20982,21 +23677,21 @@ impl App {
     /// transform actions treat post-deletion edits. Everything past ID
     /// resolution is the identical shared ladder, so the browser cannot
     /// bypass a refusal the native key enforces.
-    fn request_layer_proxy_from_browser(&mut self, layer_id: &str) {
+    fn request_layer_proxy_from_browser(&mut self, layer_id: &str) -> bool {
         let Some(index) = self.resolve_stable_layer_id(layer_id) else {
             log::info!("proxy encode request ignored: layer {layer_id} is not present");
-            return;
+            return false;
         };
-        self.request_proxy_for_layer(index);
+        self.request_proxy_for_layer(index)
     }
 
     /// The one refusal ladder behind both the native Y key and the browser
     /// action. Every refusal lands in the layer's session note (HUD status
     /// line and snapshot `proxy_note`); nothing here blocks the render
     /// thread.
-    fn request_proxy_for_layer(&mut self, index: usize) {
+    fn request_proxy_for_layer(&mut self, index: usize) -> bool {
         let Some(layer) = self.layers.get(index) else {
-            return;
+            return false;
         };
         let feedback_key = Self::proxy_feedback_key_for_layer(layer);
         if !layer.is_video() {
@@ -21004,7 +23699,7 @@ impl App {
                 feedback_key,
                 "proxy encode refused: only video layers can be proxied".to_owned(),
             );
-            return;
+            return false;
         }
         if let Some(backing) = layer.proxy_backing() {
             let note = format!(
@@ -21012,7 +23707,7 @@ impl App {
                 &backing[..8.min(backing.len())]
             );
             self.note_proxy_feedback(feedback_key, note);
-            return;
+            return false;
         }
         // A layer with a retained content reference takes the verified path.
         // One without takes the mint path — the request itself verifies the
@@ -21051,7 +23746,7 @@ impl App {
                 .clone()
                 .unwrap_or_else(|| "unknown".to_owned());
             self.note_proxy_feedback(note_key, format!("proxy cache unavailable: {error}"));
-            return;
+            return false;
         };
         if self.proxy_encode_worker.is_none() {
             self.proxy_encode_worker = Some(proxy_worker::ProxyEncodeWorker::spawn(
@@ -21077,6 +23772,7 @@ impl App {
             Err(refusal) => format!("proxy encode refused: {refusal}"),
         };
         self.note_proxy_feedback(note_key, note);
+        submitted.is_ok()
     }
 
     /// The render-thread half of an identity mint: every part of the claim
@@ -21116,6 +23812,11 @@ impl App {
                 .video_telemetry()
                 .map(|telemetry| duration_micros_u32(telemetry.decode_p95_duration))
         };
+        // The worker landed a new verified source identity without an
+        // authored history commit. Refresh the already-cached source digest
+        // at this bounded commit seam so a quiet failure immediately after
+        // minting cannot emit the prior unverified fallback identity.
+        self.refresh_flight_source_content_identity_cache(false);
         if let Some(micros) = baseline {
             self.record_proxy_ab_baseline(identity.sha256.clone(), micros);
         }
@@ -21293,6 +23994,7 @@ impl App {
                     artifact_path,
                     decoder,
                     first_rgba,
+                    first_source_generation,
                     width,
                     height,
                     source_fps,
@@ -21305,6 +24007,7 @@ impl App {
                         &artifact_path,
                         decoder,
                         &first_rgba,
+                        first_source_generation,
                         width,
                         height,
                         source_fps,
@@ -21335,7 +24038,8 @@ impl App {
         candidate: proxy_worker::ProxyAdoptionCandidate,
         artifact_path: &std::path::Path,
         decoder: Box<video::ThreadedDecoder>,
-        first_rgba: &[u8],
+        first_rgba: &video::DecodedImagePayload,
+        first_source_generation: u64,
         width: u32,
         height: u32,
         source_fps: f32,
@@ -21374,6 +24078,9 @@ impl App {
             source_fps,
             preload_bytes,
             first_rgba,
+            candidate.layer_id.get(),
+            first_source_generation,
+            renderer.renderer_generation(),
         ) {
             Ok(activation) => activation,
             Err(error) => {
@@ -21481,6 +24188,475 @@ impl App {
         snapshot
     }
 
+    fn record_flight_host(&mut self, renderer: &Renderer, window: &Window) {
+        let Some(recorder) = self.flight_recorder.as_ref() else {
+            return;
+        };
+        let gpu = renderer.gpu_host_facts();
+        let backend = match gpu.backend {
+            wgpu::Backend::Vulkan => flight_recorder::GpuBackend::Vulkan,
+            wgpu::Backend::Metal => flight_recorder::GpuBackend::Metal,
+            wgpu::Backend::Dx12 => flight_recorder::GpuBackend::Dx12,
+            wgpu::Backend::Gl => flight_recorder::GpuBackend::Gl,
+            wgpu::Backend::BrowserWebGpu => flight_recorder::GpuBackend::BrowserWebGpu,
+            wgpu::Backend::Noop => flight_recorder::GpuBackend::Other,
+        };
+        let present_mode = match renderer.config.present_mode {
+            wgpu::PresentMode::Fifo => flight_recorder::PresentModeFact::Fifo,
+            wgpu::PresentMode::FifoRelaxed => flight_recorder::PresentModeFact::FifoRelaxed,
+            wgpu::PresentMode::Immediate => flight_recorder::PresentModeFact::Immediate,
+            wgpu::PresentMode::Mailbox => flight_recorder::PresentModeFact::Mailbox,
+            wgpu::PresentMode::AutoVsync => flight_recorder::PresentModeFact::AutoVsync,
+            wgpu::PresentMode::AutoNoVsync => flight_recorder::PresentModeFact::AutoNoVsync,
+        };
+        #[cfg(target_os = "windows")]
+        let os = flight_recorder::HostOs::Windows;
+        #[cfg(target_os = "macos")]
+        let os = flight_recorder::HostOs::MacOs;
+        #[cfg(target_os = "linux")]
+        let os = flight_recorder::HostOs::Linux;
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+        let os = flight_recorder::HostOs::Other;
+        #[cfg(target_arch = "x86_64")]
+        let architecture = flight_recorder::CpuArchitecture::X86_64;
+        #[cfg(target_arch = "aarch64")]
+        let architecture = flight_recorder::CpuArchitecture::Aarch64;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let architecture = flight_recorder::CpuArchitecture::Other;
+        let refresh_millihertz = window
+            .current_monitor()
+            .and_then(|monitor| monitor.refresh_rate_millihertz())
+            .unwrap_or(0);
+        let logical_cpu_count = std::thread::available_parallelism()
+            .map_or(0, std::num::NonZeroUsize::get)
+            .min(usize::from(u16::MAX)) as u16;
+        let host = flight_recorder::HostFact {
+            os,
+            // `0` is the closed-vocabulary unknown value. Querying an OS
+            // marketing string would persist unstable host text.
+            os_build: 0,
+            architecture,
+            logical_cpu_count,
+            gpu: flight_recorder::GpuFact {
+                backend,
+                pci_vendor_id: gpu.pci_vendor_id,
+                pci_device_id: gpu.pci_device_id,
+                driver_version: gpu.driver_version,
+                timestamp_query_supported: gpu.timestamp_query_supported,
+                // The legacy/output compositor is the renderer-wide base;
+                // Advanced RGBA16Float is recorded by its plan ledger.
+                precision: flight_recorder::PrecisionFact::Rgba8,
+            },
+            display: flight_recorder::DisplayFact {
+                raster_width: renderer.output_width,
+                raster_height: renderer.output_height,
+                refresh_millihertz,
+                present_mode,
+                fullscreen: window.fullscreen().is_some(),
+            },
+        };
+        self.flight_calibration_key = Some(flight_recorder::CalibrationKeyFact {
+            backend: host.gpu.backend,
+            pci_vendor_id: host.gpu.pci_vendor_id,
+            pci_device_id: host.gpu.pci_device_id,
+            driver_version: host.gpu.driver_version,
+            raster_width: host.display.raster_width,
+            raster_height: host.display.raster_height,
+            refresh_millihertz: host.display.refresh_millihertz,
+            present_mode: host.display.present_mode,
+            precision: host.gpu.precision,
+            patch_plan_digest: self.flight_last_plan_digest,
+        });
+        let _ = recorder.try_record(flight_recorder::FlightEvent::Host(host));
+    }
+
+    fn record_flight_error(
+        &self,
+        domain: flight_recorder::ErrorDomain,
+        code: flight_recorder::ErrorCode,
+        retryable: bool,
+        sensitive_detail: &str,
+    ) {
+        let Some(recorder) = self.flight_recorder.as_ref() else {
+            return;
+        };
+        let fact = flight_recorder::ErrorFact::redact(
+            domain,
+            code,
+            retryable,
+            1,
+            flight_recorder::SensitiveDiagnostic::new(
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(sensitive_detail),
+            ),
+        );
+        let _ = recorder.try_record(flight_recorder::FlightEvent::Error(fact));
+    }
+
+    /// Fixed-size cache fill from the canonical SHA-256 fingerprint the
+    /// accepting history/recovery seam already computed. Reusing that digest
+    /// avoids a second serialization/hash of the authored world. The distinct
+    /// source-set digest uses only already-retained stable IDs, source kinds,
+    /// and logical source references; it performs no path I/O and raw authored
+    /// text never enters the recorder.
+    fn install_flight_content_identity_fingerprint(
+        &mut self,
+        fingerprint: history::HistoryFingerprint,
+    ) {
+        let patch_plan_digest = flight_recorder::Digest32(fingerprint);
+        let layers = &self.layers;
+        let unverified_change_witness = self.flight_unverified_source_change_witness;
+        let source_set_digest = self.flight_source_digest_cache.resolve(
+            layers.iter().map(|layer| {
+                let fact = flight_source_identity_fact(
+                    layer.layer_id(),
+                    layer.source_kind(),
+                    layer.source_reference_for_persistence(),
+                    unverified_change_witness,
+                );
+                FlightSourceSignature {
+                    stable_layer_id: fact.stable_layer_id,
+                    source_kind: fact.source_kind,
+                    verified_content_identity: fact.verified_content_identity,
+                    unverified_change_witness: fact.unverified_change_witness,
+                }
+            }),
+            || {
+                flight_source_set_digest(layers.iter().map(|layer| {
+                    flight_source_identity_fact(
+                        layer.layer_id(),
+                        layer.source_kind(),
+                        layer.source_reference_for_persistence(),
+                        unverified_change_witness,
+                    )
+                }))
+            },
+        );
+        self.flight_cached_content_identity = Some(flight_recorder::ContentIdentityFact {
+            patch_plan_digest,
+            source_set_digest,
+            source_count: u16::try_from(self.layers.len()).unwrap_or(u16::MAX),
+        });
+        self.flight_content_identity_generation = self
+            .flight_content_identity_generation
+            .wrapping_add(1)
+            .max(1);
+    }
+
+    fn refresh_flight_source_content_identity_cache(&mut self, logical_source_changed: bool) {
+        advance_unverified_source_change_witness(
+            &mut self.flight_unverified_source_change_witness,
+            logical_source_changed,
+        );
+        let layers = &self.layers;
+        let source_count = u16::try_from(layers.len()).unwrap_or(u16::MAX);
+        let unverified_change_witness = self.flight_unverified_source_change_witness;
+        let _ = refresh_cached_flight_source_identity(
+            &mut self.flight_source_digest_cache,
+            &mut self.flight_cached_content_identity,
+            &mut self.flight_content_identity_generation,
+            source_count,
+            layers.iter().map(|layer| {
+                let fact = flight_source_identity_fact(
+                    layer.layer_id(),
+                    layer.source_kind(),
+                    layer.source_reference_for_persistence(),
+                    unverified_change_witness,
+                );
+                FlightSourceSignature {
+                    stable_layer_id: fact.stable_layer_id,
+                    source_kind: fact.source_kind,
+                    verified_content_identity: fact.verified_content_identity,
+                    unverified_change_witness: fact.unverified_change_witness,
+                }
+            }),
+            || {
+                flight_source_set_digest(layers.iter().map(|layer| {
+                    flight_source_identity_fact(
+                        layer.layer_id(),
+                        layer.source_kind(),
+                        layer.source_reference_for_persistence(),
+                        unverified_change_witness,
+                    )
+                }))
+            },
+        );
+    }
+
+    /// Warm telemetry seam: three fixed digests/count fields are copied. It
+    /// cannot capture state, serialize YAML, iterate layers, or construct a
+    /// hasher.
+    fn flight_content_identity(&self) -> Option<flight_recorder::ContentIdentityFact> {
+        self.flight_cached_content_identity
+    }
+
+    fn record_flight_telemetry(&mut self, snapshot: &stage_health::StageHealthSnapshot) {
+        let content_revision = self.flight_content_identity_generation;
+        let content = (content_revision != self.flight_last_content_revision)
+            .then(|| self.flight_content_identity())
+            .flatten();
+
+        let Some(recorder) = self.flight_recorder.as_ref() else {
+            return;
+        };
+        if let Some(content) = content {
+            self.flight_last_content_revision = content_revision;
+            self.flight_last_plan_digest = content.patch_plan_digest;
+            if let Some(key) = self.flight_calibration_key.as_mut() {
+                key.patch_plan_digest = content.patch_plan_digest;
+            }
+            let _ = recorder.try_record(flight_recorder::FlightEvent::ContentIdentity(content));
+        }
+
+        let action_receipt_cursor = self.web_state.for_each_action_receipt_after(
+            self.flight_action_receipt_cursor,
+            |receipt| {
+                let source = match receipt.source {
+                    action_correlation::ActionSourceClass::Browser => {
+                        flight_recorder::ActionSource::Browser
+                    }
+                    action_correlation::ActionSourceClass::Phone => {
+                        flight_recorder::ActionSource::Phone
+                    }
+                    action_correlation::ActionSourceClass::Native => {
+                        flight_recorder::ActionSource::Native
+                    }
+                    action_correlation::ActionSourceClass::Midi => {
+                        flight_recorder::ActionSource::Midi
+                    }
+                    action_correlation::ActionSourceClass::Osc => {
+                        flight_recorder::ActionSource::Osc
+                    }
+                    action_correlation::ActionSourceClass::Automation => {
+                        flight_recorder::ActionSource::Automation
+                    }
+                    action_correlation::ActionSourceClass::Replay => {
+                        flight_recorder::ActionSource::Replay
+                    }
+                };
+                let disposition = match receipt.disposition {
+                    action_correlation::ActionDisposition::Presented => {
+                        flight_recorder::ActionDisposition::Presented
+                    }
+                    action_correlation::ActionDisposition::Coalesced => {
+                        flight_recorder::ActionDisposition::Coalesced
+                    }
+                    action_correlation::ActionDisposition::Refused => {
+                        flight_recorder::ActionDisposition::Refused
+                    }
+                    action_correlation::ActionDisposition::Superseded => {
+                        flight_recorder::ActionDisposition::Superseded
+                    }
+                    action_correlation::ActionDisposition::Quantized => {
+                        flight_recorder::ActionDisposition::Quantized
+                    }
+                    action_correlation::ActionDisposition::NotYetPresented => {
+                        flight_recorder::ActionDisposition::NotYetPresented
+                    }
+                };
+                let _ = recorder.try_record(flight_recorder::FlightEvent::Action(
+                    flight_recorder::ActionFact {
+                        sequence: receipt.sequence.get(),
+                        source,
+                        disposition,
+                        ingress_to_apply_nanoseconds: receipt
+                            .ingress_to_apply_us
+                            .map(|value| u64::from(value).saturating_mul(1_000)),
+                        apply_to_submit_nanoseconds: receipt
+                            .apply_to_submit_us
+                            .map(|value| u64::from(value).saturating_mul(1_000)),
+                        submission_generation: receipt.submission_generation,
+                    },
+                ));
+            },
+        );
+        self.flight_action_receipt_cursor = action_receipt_cursor;
+
+        if self.flight_last_stage_emit.elapsed() < Duration::from_millis(100) {
+            return;
+        }
+        self.flight_last_stage_emit = Instant::now();
+        let video_decode_worker = flight_video_decode_worker_fact(
+            self.layers
+                .iter()
+                .filter(|layer| layer.is_video())
+                .map(|layer| {
+                    (
+                        matches!(
+                            layer.video_health(),
+                            Some(video::threaded::DecoderHealth::Failed(_))
+                        ),
+                        layer.video_telemetry(),
+                    )
+                }),
+        );
+        let _ = recorder.try_record(flight_recorder::FlightEvent::Worker(video_decode_worker));
+        let dropped_gpu = snapshot
+            .gpu_timing
+            .dropped_busy_frames
+            .saturating_add(snapshot.gpu_timing.map_failures);
+        let gpu_stages = [
+            (
+                flight_recorder::StageKind::SourcePrepare,
+                &snapshot.gpu_timing.source_prepare,
+            ),
+            (
+                flight_recorder::StageKind::CreativeComposition,
+                &snapshot.gpu_timing.creative_composition,
+            ),
+            (
+                flight_recorder::StageKind::TemporalMotion,
+                &snapshot.gpu_timing.temporal_motion,
+            ),
+            (
+                flight_recorder::StageKind::MoshVhs,
+                &snapshot.gpu_timing.mosh_vhs,
+            ),
+            (
+                flight_recorder::StageKind::AudienceResolve,
+                &snapshot.gpu_timing.audience_resolve,
+            ),
+            (
+                flight_recorder::StageKind::Submission,
+                &snapshot.gpu_timing.submission,
+            ),
+        ];
+        if snapshot.gpu_timing.supported {
+            for (stage, timing) in gpu_stages {
+                let _ = recorder.try_record(flight_recorder::FlightEvent::Stage(
+                    flight_recorder::StageFact {
+                        stage,
+                        domain: flight_recorder::TimingDomain::Gpu,
+                        sample_count: u32::from(timing.samples),
+                        p50_nanoseconds: u64::from(timing.p50_us).saturating_mul(1_000),
+                        p95_nanoseconds: u64::from(timing.p95_us).saturating_mul(1_000),
+                        p99_nanoseconds: u64::from(timing.p99_us).saturating_mul(1_000),
+                        dropped_samples: dropped_gpu,
+                        submission_generation: snapshot.gpu_timing.last_submission_generation,
+                    },
+                ));
+            }
+        }
+        let _ = recorder.try_record(flight_recorder::FlightEvent::Stage(
+            flight_recorder::StageFact {
+                stage: flight_recorder::StageKind::WholeFrame,
+                domain: flight_recorder::TimingDomain::Cpu,
+                sample_count: u32::from(snapshot.frame_samples),
+                p50_nanoseconds: u64::from(snapshot.frame_time_p50_us).saturating_mul(1_000),
+                p95_nanoseconds: u64::from(snapshot.frame_time_p95_us).saturating_mul(1_000),
+                p99_nanoseconds: u64::from(snapshot.frame_time_p99_us).saturating_mul(1_000),
+                dropped_samples: snapshot.skipped_program_ticks,
+                submission_generation: snapshot.action_timing.last_submission_generation,
+            },
+        ));
+
+        if let (Some(passes), Some(lookups), Some(surfaces)) = (
+            self.accepted_creative_full_frame_passes,
+            self.accepted_creative_texture_lookups,
+            self.accepted_creative_surface_layers,
+        ) {
+            let core_uniform_arena_bytes = self
+                .renderer
+                .as_ref()
+                .map_or(0, Renderer::core_uniform_arena_bytes);
+            let gpu_bytes = creative_gpu_bytes_with_core_arenas(
+                self.accepted_creative_resource_bytes,
+                core_uniform_arena_bytes,
+            )
+            .unwrap_or(0)
+            .saturating_add(self.accepted_motion_resource_bytes.unwrap_or(0));
+            let _ = recorder.try_record(flight_recorder::FlightEvent::ResourceLedger(
+                flight_recorder::ResourceLedgerFact {
+                    plan_digest: self.flight_last_plan_digest,
+                    full_frame_passes: u16::try_from(passes).unwrap_or(u16::MAX),
+                    texture_lookups_per_pixel: lookups,
+                    live_textures: u16::try_from(surfaces).unwrap_or(u16::MAX),
+                    // These object classes are not exposed by the immutable
+                    // plan ledger; zero is the scoped unreported value, not an
+                    // assertion that the renderer owns no buffers/bindings.
+                    live_buffers: 0,
+                    live_bind_groups: 0,
+                    gpu_bytes,
+                    cpu_bytes: snapshot.budgets.media.used.unwrap_or(0),
+                    budget_gpu_bytes: snapshot.budgets.gpu.limit.unwrap_or(0),
+                    budget_cpu_bytes: snapshot.budgets.media.limit.unwrap_or(0),
+                },
+            ));
+
+            if snapshot.gpu_timing.supported
+                && self.flight_last_calibration_emit.elapsed() >= Duration::from_secs(1)
+            {
+                self.flight_last_calibration_emit = Instant::now();
+                if let Some(mut key) = self.flight_calibration_key {
+                    key.patch_plan_digest = self.flight_last_plan_digest;
+                    key.precision = if surfaces > 0 {
+                        flight_recorder::PrecisionFact::Rgba16Float
+                    } else {
+                        flight_recorder::PrecisionFact::Rgba8
+                    };
+                    let stage_p95 = [
+                        (
+                            flight_recorder::StageKind::SourcePrepare,
+                            u64::from(snapshot.gpu_timing.source_prepare.p95_us)
+                                .saturating_mul(1_000),
+                        ),
+                        (
+                            flight_recorder::StageKind::CreativeComposition,
+                            u64::from(snapshot.gpu_timing.creative_composition.p95_us)
+                                .saturating_mul(1_000),
+                        ),
+                        (
+                            flight_recorder::StageKind::TemporalMotion,
+                            u64::from(snapshot.gpu_timing.temporal_motion.p95_us)
+                                .saturating_mul(1_000),
+                        ),
+                        (
+                            flight_recorder::StageKind::MoshVhs,
+                            u64::from(snapshot.gpu_timing.mosh_vhs.p95_us).saturating_mul(1_000),
+                        ),
+                        (
+                            flight_recorder::StageKind::AudienceResolve,
+                            u64::from(snapshot.gpu_timing.audience_resolve.p95_us)
+                                .saturating_mul(1_000),
+                        ),
+                        (
+                            flight_recorder::StageKind::Submission,
+                            u64::from(snapshot.gpu_timing.submission.p95_us).saturating_mul(1_000),
+                        ),
+                    ];
+                    let sample_count = stage_p95
+                        .iter()
+                        .zip([
+                            snapshot.gpu_timing.source_prepare.samples,
+                            snapshot.gpu_timing.creative_composition.samples,
+                            snapshot.gpu_timing.temporal_motion.samples,
+                            snapshot.gpu_timing.mosh_vhs.samples,
+                            snapshot.gpu_timing.audience_resolve.samples,
+                            snapshot.gpu_timing.submission.samples,
+                        ])
+                        .map(|(_, count)| u32::from(count))
+                        .min()
+                        .unwrap_or(0);
+                    let calibration = flight_recorder::AdapterCalibrationFact::from_p95(
+                        key,
+                        sample_count,
+                        stage_p95,
+                        u16::try_from(passes).unwrap_or(u16::MAX),
+                        lookups,
+                        gpu_bytes,
+                    );
+                    let _ = recorder.try_record(flight_recorder::FlightEvent::AdapterCalibration(
+                        calibration,
+                    ));
+                }
+            }
+        }
+    }
+
     fn stage_health_snapshot(&self) -> stage_health::StageHealthSnapshot {
         let decoder_telemetry: Vec<_> = self.layers.iter().map(Layer::video_telemetry).collect();
         let visible_layers = self
@@ -21550,6 +24726,7 @@ impl App {
             .zip(&layer_statuses)
             .zip(&decoder_telemetry)
             .map(|((layer, status), telemetry)| {
+                let (source_color, source_display, conversion_policy) = layer.source_descriptors();
                 let dropped_frames = telemetry.as_ref().map_or(0, |telemetry| {
                     telemetry
                         .frame_overwrites
@@ -21566,6 +24743,9 @@ impl App {
                         .map_or(0, |telemetry| u32::from(telemetry.pending_frames)),
                     dropped_frames,
                     status,
+                    source_color,
+                    source_display,
+                    conversion_policy,
                 }
             })
             .collect();
@@ -21622,8 +24802,14 @@ impl App {
             .renderer
             .as_ref()
             .and_then(Renderer::mosh_influence_texture_bytes);
-        let (planned_gpu_bytes, planned_gpu_limit) = stage_health_gpu_budget(
+        let accepted_creative_and_core_bytes = creative_gpu_bytes_with_core_arenas(
             self.accepted_creative_resource_bytes,
+            self.renderer
+                .as_ref()
+                .map_or(0, Renderer::core_uniform_arena_bytes),
+        );
+        let (planned_gpu_bytes, planned_gpu_limit) = stage_health_gpu_budget(
+            accepted_creative_and_core_bytes,
             self.accepted_motion_resource_bytes,
             stage_gpu_bytes,
             mosh_influence_gpu_bytes,
@@ -21636,7 +24822,8 @@ impl App {
                 total.saturating_add(payload.preload_bytes)
             });
 
-        self.stage_health_monitor
+        let mut snapshot = self
+            .stage_health_monitor
             .snapshot(stage_health::StageHealthPublishInput {
                 layers: &layer_inputs,
                 output: stage_health::StageOutputInput {
@@ -21652,6 +24839,8 @@ impl App {
                     backend: &backend,
                     device: &device,
                 },
+                gpu_timing: self.stage_gpu_timing,
+                action_timing: self.web_state.action_timing_snapshot(),
                 budgets: stage_health::StageBudgetSetInput {
                     gpu: stage_health::StageBudgetInput {
                         unit: "bytes",
@@ -21679,11 +24868,366 @@ impl App {
                     },
                 },
                 tools: &self.stage_tools,
-            })
+            });
+        if let Some(recorder) = self.flight_recorder.as_ref() {
+            let stats = recorder.stats();
+            let policy = flight_recorder::FlightRecorderConfig::default();
+            snapshot.flight_recorder = stage_health::StageFlightRecorderSnapshot {
+                enabled: true,
+                queued_events: stats.queued,
+                dropped_full: stats.dropped_full,
+                retained_rotations: 3,
+                rotation_seconds: u8::try_from(policy.rotation_period().as_secs())
+                    .unwrap_or(u8::MAX),
+                total_byte_cap: policy.total_byte_cap(),
+            };
+        }
+        snapshot.decoder_retirement = video::decoder_retirement_snapshot().into();
+        snapshot
     }
 
-    /// Push full app state to the web UI via broadcast.
-    fn push_web_state(&self) {
+    fn refresh_web_authored_revision(&mut self) {
+        let inputs = WebAuthoredRevisionInputs {
+            mutation_counter: self.web_authored_mutation_counter,
+            layer_stack_revision: self.layer_stack_revision,
+            composition_revision: self.composition_revision,
+            history_generation: self.manual_history.metrics().generation,
+            controller_profile_revision: self.controller_profile_revision,
+            preset_revision: self.preset_revision,
+        };
+        if inputs != self.web_last_authored_inputs {
+            self.web_last_authored_inputs = inputs;
+            self.web_authored_revision = self.web_authored_revision.saturating_add(1).max(1);
+        }
+    }
+
+    fn build_web_live_snapshot(&self) -> web::state::WebLiveSnapshot {
+        use web::state::{
+            AudioSnapshot, ExportMotionSnapshot, MidiSlotSnapshot, MidiSnapshot, ModSnapshot,
+            MorphSnapshot, SpoutSnapshot, TemporalSnapshot, TemporalTelemetrySnapshot,
+            WebFastTelemetrySnapshot, WebLiveSnapshot, WebOperationalSnapshot,
+        };
+
+        let (export_progress, export_error, export_status) = match self.export_job.as_ref() {
+            None => (0.0, String::new(), "idle"),
+            Some(job)
+                if !job.is_done()
+                    && job
+                        .progress
+                        .cancel
+                        .load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                (job.progress.progress_f32(), String::new(), "cancelling")
+            }
+            Some(job) if !job.is_done() => (job.progress.progress_f32(), String::new(), "running"),
+            Some(job) => {
+                let error = job.progress.error.lock().unwrap().clone();
+                if job
+                    .progress
+                    .cancelled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    (job.progress.progress_f32(), error, "cancelled")
+                } else if error.is_empty() {
+                    (1.0, error, "succeeded")
+                } else {
+                    (job.progress.progress_f32(), error, "failed")
+                }
+            }
+        };
+        let export_warnings = self
+            .export_job
+            .as_ref()
+            .map(|job| job.progress.warnings())
+            .unwrap_or_default();
+        let export_motion =
+            self.export_job
+                .as_ref()
+                .map_or_else(ExportMotionSnapshot::default, |job| {
+                    ExportMotionSnapshot::from_export(
+                        &job.progress.motion_metadata(),
+                        &export_warnings,
+                    )
+                });
+
+        let mut modulation = ModSnapshot::from_matrix(&self.mod_matrix);
+        modulation.gyro_status = self.web_state.gyro_status();
+        let audio = AudioSnapshot {
+            enabled: self.mod_matrix.audio_enabled,
+            source_kind: self.mod_matrix.audio_source_kind.clone(),
+            gain: self.mod_matrix.audio_gain,
+            level: self.mod_matrix.audio.level,
+            bass: self.mod_matrix.audio.bass,
+            mid: self.mod_matrix.audio.mid,
+            high: self.mod_matrix.audio.high,
+            onset: self.mod_matrix.audio.onset,
+            bright: self.mod_matrix.audio.bright,
+            noise: self.mod_matrix.audio.noise,
+            device: self.audio.device_name.clone(),
+            error: if self.mod_matrix.audio_source_kind == modulation::AUDIO_SOURCE_FILE {
+                self.audio_clip_error.clone()
+            } else {
+                self.audio.error.clone()
+            },
+            devices: self.audio.devices.clone(),
+            system_playback_devices: self.audio.system_playback_devices.clone(),
+            selected: self.mod_matrix.audio_device.clone(),
+            active_device: self.audio.active_device().to_string(),
+            using_fallback: self.audio.is_using_device_fallback(),
+            clip_files: self
+                .audio_library_files
+                .iter()
+                .filter_map(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .collect(),
+            clip_path: self.selected_audio_clip_name(),
+            clip_loading: self.audio_clip_loader.state() == audio::AudioClipLoadState::Loading,
+            clip_duration_secs: self
+                .audio_clip
+                .as_ref()
+                .map(|clip| clip.info().duration_secs)
+                .unwrap_or(0.0),
+            band_count: self.mod_matrix.audio_band_config.count(),
+            band_edges: self.mod_matrix.audio_band_config.crossovers().to_vec(),
+            band_ceiling_hz: self.mod_matrix.audio_band_config.ceiling_hz(),
+            bands: self.mod_matrix.audio.bands[..self.mod_matrix.audio_band_config.count()]
+                .to_vec(),
+            spectrum: if self.mod_matrix.audio_source_kind == modulation::AUDIO_SOURCE_FILE {
+                self.audio_clip_spectrum.to_vec()
+            } else {
+                self.audio.spectrum().to_vec()
+            },
+        };
+        let midi = MidiSnapshot {
+            enabled: self.mod_matrix.midi_enabled,
+            slots: (0..modulation::NUM_MIDI_SLOTS)
+                .map(|i| MidiSlotSnapshot {
+                    cc: self.mod_matrix.midi_ccs[i],
+                    value: self.mod_matrix.midi[i],
+                })
+                .collect(),
+            learning: self.mod_matrix.midi_learn,
+            clock_sync: self.mod_matrix.midi_clock_sync,
+            clock_active: self.mod_matrix.clock.is_external(),
+            clock_bpm: self.mod_matrix.clock.bpm,
+            port: self.midi.port_name.clone(),
+            error: self.midi.error.clone(),
+        };
+
+        let temporal_metrics = self
+            .composition_gpu
+            .as_ref()
+            .and_then(renderer::composition::CompositionGpuExecutor::temporal_state_metrics)
+            .or_else(|| {
+                self.renderer
+                    .as_ref()
+                    .map(renderer::Renderer::temporal_state_metrics)
+            })
+            .unwrap_or_else(|| temporal::TemporalState::default().metrics());
+        let mut temporal = TemporalSnapshot::from_params(&self.temporal_params);
+        temporal.sync_damaged = self
+            .renderer
+            .as_ref()
+            .is_some_and(renderer::Renderer::sync_latch_damaged);
+        temporal.telemetry = TemporalTelemetrySnapshot {
+            history_valid: temporal_metrics.history_valid,
+            history_capacity: temporal_metrics.history_capacity,
+            carrier_valid: temporal_metrics.carrier_valid,
+            freeze_hold_valid: temporal_metrics.freeze_hold_valid,
+            total_reference_ticks: temporal_metrics.total_reference_ticks,
+            score_state: temporal_metrics.score_state,
+            score_event_ordinal: temporal_metrics.score_event_ordinal,
+            recorded_event_points: u32::try_from(
+                self.temporal_event_recorder.track().events().len(),
+            )
+            .unwrap_or(u32::MAX),
+            event_track_truncated: self.temporal_event_recorder.track().truncated(),
+            frame_staged: temporal_metrics.frame_staged,
+            last_reset: temporal_metrics
+                .last_reset
+                .map_or_else(String::new, |cause| {
+                    match cause {
+                        temporal::TemporalResetCause::PatchGeneration => "patch_generation",
+                        temporal::TemporalResetCause::ApplyLook => "apply_look",
+                        temporal::TemporalResetCause::SourceCut => "source_cut",
+                        temporal::TemporalResetCause::Seek => "seek",
+                        temporal::TemporalResetCause::Resize => "resize",
+                        temporal::TemporalResetCause::BroadRevert => "broad_revert",
+                        temporal::TemporalResetCause::ManualClear => "manual_clear",
+                        temporal::TemporalResetCause::BypassPartition => "bypass_partition",
+                        temporal::TemporalResetCause::LoopBoundary => "loop_boundary",
+                        temporal::TemporalResetCause::Downbeat => "downbeat",
+                        temporal::TemporalResetCause::BlackoutTransition => "blackout_transition",
+                    }
+                    .to_string()
+                }),
+        };
+
+        let morph_glide = self
+            .morph
+            .glide
+            .filter(|glide| !glide.is_complete_at(self.mod_matrix.current_beat));
+        let morph_glide_remaining = morph_glide
+            .map(|glide| {
+                (glide.start_beat + glide.duration_beats - self.mod_matrix.current_beat).max(0.0)
+            })
+            .unwrap_or(0.0);
+        let morph = MorphSnapshot {
+            has_a: self.morph.a.is_some(),
+            has_b: self.morph.b.is_some(),
+            active: self.morph.active(),
+            t: self.morph.position_at_beat(self.mod_matrix.current_beat),
+            blend_law: match self.morph.blend_law {
+                morph::MorphBlendLaw::Linear => "linear",
+                morph::MorphBlendLaw::EqualPower => "equal_power",
+            }
+            .to_string(),
+            gliding: morph_glide.is_some(),
+            glide_target: morph_glide
+                .map(|glide| glide.target)
+                .unwrap_or(self.morph.t),
+            glide_duration_beats: morph_glide_remaining,
+            bank_filled: self.snapshot_bank.filled(),
+            bank_glide_beats: self.snapshot_bank.sanitized().glide_beats,
+        };
+
+        let mut master_motion = web::state::MotionSnapshot::from_params(self.master_motion);
+        master_motion.telemetry = self
+            .motion_telemetry
+            .iter()
+            .find_map(|(scope, telemetry)| {
+                (*scope == visual_rack::VisualScopeId::Master).then(|| telemetry.clone())
+            })
+            .unwrap_or_default();
+        let codec_mosh = web::state::CodecMoshLiveSnapshot {
+            active: self.temporal_params.mosh.is_active(),
+            busy: self
+                .mosh_worker
+                .as_ref()
+                .is_some_and(codec_mosh::MoshWorker::is_busy),
+            error: self
+                .mosh_worker
+                .as_ref()
+                .map(|worker| worker.error().to_string())
+                .unwrap_or_default(),
+            metrics: self.mosh_live_metrics,
+        };
+        let control_server_info = self.web_state.control_server_info();
+        let remote_url = control_server_info.lan_url.clone().unwrap_or_default();
+        let remote_status = match &control_server_info.lan_tls {
+            ControlListenerStatus::Stopped => "LAN unavailable: listener stopped".to_string(),
+            ControlListenerStatus::Starting => "LAN HTTPS starting".to_string(),
+            ControlListenerStatus::Listening { address } => {
+                format!("LAN HTTPS listening on {address}")
+            }
+            ControlListenerStatus::Unavailable { reason } => format!("LAN unavailable: {reason}"),
+        };
+        let spout_status = self.spout.status();
+
+        WebLiveSnapshot {
+            msg_type: "live".to_string(),
+            wire_version: 2,
+            authored_revision: self.web_authored_revision,
+            operational_revision: self.web_operational_revision,
+            telemetry_revision: self.web_telemetry_revision,
+            live_interval_ms: 84,
+            operational: WebOperationalSnapshot {
+                program_frozen: self.master_paused,
+                media_frozen: self.media_frozen,
+                export_progress,
+                export_error,
+                export_status: export_status.to_string(),
+                export_warnings,
+                export_motion,
+                controller_runtime: web::state::ControllerRuntimeSnapshot::from_runtime(
+                    self.controller_profile_revision,
+                    &self.controller_profile,
+                    &self.controller_status,
+                    &self.midi.runtime_snapshot(),
+                ),
+                osc_runtime: web::state::OscRuntimeSnapshot::from_runtime(
+                    &self.osc_config,
+                    &self.osc_status,
+                    &self.osc.runtime_snapshot(),
+                ),
+                spout: SpoutSnapshot {
+                    enabled: self.spout_enabled,
+                    active: spout_status.active,
+                    resolution: spout_status.resolution_mode.key().to_string(),
+                    width: spout_status.delivered_width,
+                    height: spout_status.delivered_height,
+                    error: spout_status.error,
+                },
+                recorder: self.recorder_snapshot.clone(),
+                remote_url,
+                remote_status,
+                output_window: self.output_window_open() || self.stage_surface_windows_open(),
+                output_error: self.published_output_error(),
+                output_display: self.output_display_id.clone(),
+                output_displays: self.output_displays.clone(),
+                output_display_generation: self.monitor_inventory.generation,
+                blackout: self.blackout,
+                recovery_available: self
+                    .recovery_writer
+                    .as_ref()
+                    .is_some_and(recovery_journal::RecoveryWriter::recovery_available),
+                recovery_status: self.recovery_status.clone(),
+                patch_save_status: self.patch_collector.status(),
+                patch_load_status: self.patch_load_status.clone(),
+                quantized_pending: self.quantized_actions.len(),
+                constraint_diagnostics: self.constraint_diagnostics.borrow().clone(),
+            },
+            telemetry: WebFastTelemetrySnapshot {
+                modulation,
+                audio,
+                midi,
+                temporal,
+                gesture: self.gesture_status_snapshot(),
+                performance_recorder: self.performance_status_snapshot(),
+                master_motion,
+                codec_mosh,
+                morph,
+                stage_health: self.stage_health_snapshot(),
+                monitor_bay: self.monitor_bay_snapshot(),
+            },
+        }
+    }
+
+    /// Push revisioned state to the web UI via one newest-only publication.
+    fn push_web_state(&mut self) {
+        if self.web_state.tx.receiver_count() == 0 {
+            return;
+        }
+        self.sync_recovery_writer_status();
+        let full_snapshot_requested = self.web_state.take_snapshot_request();
+        self.refresh_web_authored_revision();
+        let full_snapshot_due = full_snapshot_requested
+            || self.web_last_full_authored_revision != self.web_authored_revision;
+        // Fast meters publish at 12 Hz. A newly connected browser bypasses
+        // the cadence and receives one complete coherent snapshot at once.
+        if !full_snapshot_due && self.web_last_publish_at.elapsed() < Duration::from_micros(83_333)
+        {
+            return;
+        }
+        self.web_last_publish_at = Instant::now();
+        self.web_operational_revision = self.web_operational_revision.saturating_add(1).max(1);
+        self.web_telemetry_revision = self.web_telemetry_revision.saturating_add(1).max(1);
+        if !full_snapshot_due {
+            let live = self.build_web_live_snapshot();
+            match serde_json::to_string(&live) {
+                Ok(message) => {
+                    self.web_state.publish_serialized_telemetry(message);
+                }
+                Err(error) => {
+                    log::error!(
+                        "Web live-domain serialization failed; publication skipped: {error}"
+                    );
+                }
+            }
+            return;
+        }
         use web::state::{
             AppSnapshot, AudioSnapshot, ClipSlotSnapshot, EffectsSnapshot,
             LayerPerformanceSnapshot, LayerSnapshot, MatteSnapshot, MidiSlotSnapshot, MidiSnapshot,
@@ -21962,8 +25506,43 @@ impl App {
                 }),
         };
 
+        let control_server_info = self.web_state.control_server_info();
+        let remote_url = control_server_info.lan_url.clone().unwrap_or_default();
+        let remote_status = match &control_server_info.lan_tls {
+            ControlListenerStatus::Stopped => "LAN unavailable: listener stopped".to_string(),
+            ControlListenerStatus::Starting => "LAN HTTPS starting".to_string(),
+            ControlListenerStatus::Listening { address } => {
+                format!("LAN HTTPS listening on {address}")
+            }
+            ControlListenerStatus::Unavailable { reason } => {
+                format!("LAN unavailable: {reason}")
+            }
+        };
+
+        // P3e: the frame/full publication carries only one bounded visual
+        // page, one bounded audio page, and aggregate index truth. Additional
+        // pages/searches use the authenticated revision-checked HTTP route.
+        let published_library_index = self.web_state.library_index();
+        let library_index = published_library_index.snapshot();
+        let library = library_index
+            .current_page
+            .entries
+            .iter()
+            .map(|entry| entry.filename.clone())
+            .collect();
+        let audio_library_page = published_library_index
+            .page(library_index::LibraryPageRequest::current(
+                library_index::LibraryEntryKind::Audio,
+            ))
+            .expect("the built-in bounded audio-page request is valid");
+
         let snapshot = AppSnapshot {
             msg_type: "state".to_string(),
+            wire_version: 2,
+            authored_revision: self.web_authored_revision,
+            operational_revision: self.web_operational_revision,
+            telemetry_revision: self.web_telemetry_revision,
+            live_interval_ms: 84,
             effects: EffectsSnapshot::from_uniforms(&self.master_effects),
             master_transform: self.master_transform.sanitized(),
             master_motion: {
@@ -22169,11 +25748,9 @@ impl App {
             layer_stack_revision: self.layer_stack_revision,
             composition_revision: self.composition_revision,
             creative,
-            library: self
-                .library_files
-                .iter()
-                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-                .collect(),
+            constraint_diagnostics: self.constraint_diagnostics.borrow().clone(),
+            library,
+            library_index,
             paused: self.master_paused,
             program_frozen: self.master_paused,
             media_frozen: self.media_frozen,
@@ -22200,13 +25777,10 @@ impl App {
                 selected: self.mod_matrix.audio_device.clone(),
                 active_device: self.audio.active_device().to_string(),
                 using_fallback: self.audio.is_using_device_fallback(),
-                clip_files: self
-                    .audio_library_files
-                    .iter()
-                    .filter_map(|path| {
-                        path.file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                    })
+                clip_files: audio_library_page
+                    .entries
+                    .into_iter()
+                    .map(|entry| entry.filename)
                     .collect(),
                 clip_path: self.selected_audio_clip_name(),
                 clip_loading: self.audio_clip_loader.state() == audio::AudioClipLoadState::Loading,
@@ -22269,16 +25843,13 @@ impl App {
             recorder: self.recorder_snapshot.clone(),
             stage_health: self.stage_health_snapshot(),
             monitor_bay: self.monitor_bay_snapshot(),
-            remote_url: self
-                .web_state
-                .lan_url
-                .read()
-                .map(|s| s.clone())
-                .unwrap_or_default(),
+            remote_url,
+            remote_status,
             output_window: self.output_window_open() || self.stage_surface_windows_open(),
             legacy_output_window: self.output_window_open(),
             output_display: self.output_display_id.clone(),
             output_displays: self.output_displays.clone(),
+            output_display_generation: self.monitor_inventory.generation,
             output_error: self.published_output_error(),
             blackout: self.blackout,
             morph: MorphSnapshot {
@@ -22314,9 +25885,9 @@ impl App {
                 self.preset_status.clone(),
             ),
             recovery_available: self
-                .recovery_journal
+                .recovery_writer
                 .as_ref()
-                .is_some_and(|journal| journal.latest_valid().recovery_available()),
+                .is_some_and(recovery_journal::RecoveryWriter::recovery_available),
             recovery_status: self.recovery_status.clone(),
             patch_save_status: self.patch_collector.status(),
             patch_load_status: self.patch_load_status.clone(),
@@ -22329,48 +25900,14 @@ impl App {
         }
         match serde_json::to_string(&snapshot) {
             Ok(message) => {
-                let _ = self.web_state.tx.send(message);
+                self.web_state.publish_serialized_snapshot(message);
+                self.web_last_full_authored_revision = self.web_authored_revision;
             }
             Err(error) => {
                 log::error!("Web snapshot serialization failed; state update skipped: {error}");
             }
         }
     }
-}
-
-/// Scan a directory for supported visual files, returning a sorted list.
-fn scan_folder(folder: &PathBuf) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(folder) else {
-        return Vec::new();
-    };
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| !is_upload_reservation(p) && p.is_file() && is_supported_visual_file(p))
-        .collect();
-    files.sort();
-    files
-}
-
-fn scan_audio_folder(folder: &PathBuf) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(folder) else {
-        return Vec::new();
-    };
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            !is_upload_reservation(path) && path.is_file() && audio::is_supported_audio_file(path)
-        })
-        .collect();
-    files.sort();
-    files
-}
-
-fn is_upload_reservation(path: &std::path::Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with(".upload-"))
 }
 
 fn publish_thumbnail_if_current(
@@ -22905,6 +26442,45 @@ fn generate_thumbnails(
         .ok();
 }
 
+impl App {
+    fn close_action_ingress_for_shutdown(&mut self) {
+        // Stop every externally owned producer before draining its queues.
+        if let Some(server) = self.control_server.as_mut() {
+            if let Err(error) = server.retire() {
+                log::error!("Control server shutdown barrier failed: {error}");
+            }
+        }
+        self.control_server = None;
+        self.web_state.supersede_all_pending_actions();
+
+        if let Some((gesture, identity)) = self.native_editor_action_identity.take() {
+            let _ = self.manual_history.cancel_gesture(gesture);
+            if self
+                .history_gesture_begin
+                .is_some_and(|(open, _)| open == gesture)
+            {
+                self.history_gesture_begin = None;
+            }
+            self.record_terminal_action_identity(
+                identity,
+                action_correlation::ActionDisposition::Superseded,
+            );
+        }
+
+        self.midi.stop();
+        self.osc.stop();
+        self.drain_displaced_controller_action_identities();
+        self.web_state
+            .terminalize_all_applied_actions_not_yet_presented();
+
+        // Action receipts are emitted ahead of the telemetry cadence gate, so
+        // this final snapshot flushes every shutdown disposition before the
+        // recorder itself is dropped.
+        let snapshot = self.stage_health_snapshot();
+        self.record_flight_telemetry(&snapshot);
+    }
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -23006,6 +26582,7 @@ impl ApplicationHandler for App {
         };
 
         log::info!("Output: {}x{}", output_width, output_height);
+        self.record_flight_host(&renderer, &window);
 
         // Master effects operate in output pixels. Keep their resolution in
         // lock-step with the final renderer output, including safe recovery.
@@ -23083,6 +26660,16 @@ impl ApplicationHandler for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Winit's portable topology signal is indirect: a monitor migration or
+        // DPI transition reaches the affected window. Mark before routing the
+        // event to StageMap/Output so even an early return preserves it.
+        if matches!(
+            &event,
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. }
+        ) {
+            self.monitor_inventory
+                .invalidate(MonitorInventoryRefreshReason::PlatformTopologyEvent);
+        }
         // Every StageMap monitor is an independent host-owned surface. Consume
         // its events before legacy Output/main-window routing so a failed or
         // closed projector can never resize or close the creative UI.
@@ -23096,6 +26683,8 @@ impl ApplicationHandler for App {
         let output_window_id = self.renderer.as_ref().and_then(Renderer::output_window_id);
         if output_window_id == Some(window_id) {
             match event {
+                // The window-manager close affordance is an OS/window-only
+                // lifecycle event, not a correlated control ingress.
                 WindowEvent::CloseRequested => self.close_output_window(),
                 WindowEvent::Resized(size) => {
                     if let Some(renderer) = self.renderer.as_mut() {
@@ -23125,7 +26714,13 @@ impl ApplicationHandler for App {
                         physical_key,
                         PhysicalKey::Code(KeyCode::Escape) | PhysicalKey::Code(KeyCode::KeyO)
                     ) {
+                        let identity = self.mint_native_action_identity();
+                        let was_open = self.output_window_open();
                         self.close_output_window();
+                        self.record_action_identity_outcome(
+                            identity,
+                            was_open && !self.output_window_open(),
+                        );
                     }
                 }
                 _ => {}
@@ -23166,7 +26761,13 @@ impl ApplicationHandler for App {
                 && *state == winit::event::ElementState::Pressed
                 && is_discrete_window_key(*physical_key)
             {
+                let identity = self.mint_native_action_identity();
+                let was_open = self.output_window_open();
                 self.close_output_window();
+                self.record_action_identity_outcome(
+                    identity,
+                    was_open && !self.output_window_open(),
+                );
                 return;
             }
         }
@@ -23186,7 +26787,14 @@ impl ApplicationHandler for App {
         } = &event
         {
             if let Some(index) = input::keyboard::map_bend_key(*physical_key) {
+                let identity = self.mint_native_action_identity();
+                let changed = self
+                    .mod_matrix
+                    .bend_held
+                    .get(index)
+                    .is_some_and(|held| *held);
                 self.mod_matrix.set_bend(index, false);
+                self.record_action_identity_outcome(identity, changed);
             }
         }
 
@@ -23222,22 +26830,16 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(false) => {
                 // A window losing focus can swallow key-up events; releasing
                 // every bend pad is what keeps a momentary control momentary.
+                let identity = self.mint_native_action_identity();
+                let changed = self.mod_matrix.bend_held.iter().any(|held| *held);
                 self.mod_matrix.release_all_bends();
+                self.record_action_identity_outcome(identity, changed);
             }
 
             WindowEvent::DroppedFile(path) => {
-                if path.is_dir() {
-                    self.set_library_folder(path);
-                } else if is_supported_visual_file(&path) {
-                    if let Some(path_str) = path.to_str() {
-                        let path_owned = path_str.to_string();
-                        self.apply_native_manual_action(
-                            "Add dropped visual layer",
-                            "layer_stack",
-                            move |app| app.add_layer(&path_owned),
-                        );
-                    }
-                }
+                let identity = self.mint_native_action_identity();
+                let lifecycle = self.apply_dropped_path(path);
+                self.record_action_lifecycle_outcome(identity, lifecycle);
             }
 
             WindowEvent::KeyboardInput {
@@ -23256,7 +26858,14 @@ impl ApplicationHandler for App {
                 if !self.modifiers.control_key() {
                     if let Some(index) = input::keyboard::map_bend_key(physical_key) {
                         if state == winit::event::ElementState::Pressed {
+                            let identity = self.mint_native_action_identity();
+                            let changed = self
+                                .mod_matrix
+                                .bend_held
+                                .get(index)
+                                .is_some_and(|held| !*held);
                             self.mod_matrix.set_bend(index, true);
+                            self.record_action_identity_outcome(identity, changed);
                         }
                         return;
                     }
@@ -23265,11 +26874,22 @@ impl ApplicationHandler for App {
                 if state == winit::event::ElementState::Pressed && self.modifiers.control_key() {
                     match physical_key {
                         PhysicalKey::Code(KeyCode::KeyI) if self.modifiers.shift_key() => {
-                            self.choose_controller_profile_import();
+                            let identity = self.mint_native_action_identity();
+                            let accepted = self.choose_controller_profile_import();
+                            self.record_action_identity_outcome(identity, accepted);
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyX) if self.modifiers.shift_key() => {
-                            self.choose_controller_profile_export();
+                            let identity = self.mint_native_action_identity();
+                            let admitted = self.choose_controller_profile_export();
+                            self.record_action_lifecycle_outcome(
+                                identity,
+                                if admitted {
+                                    ActionLifecycleOutcome::Coalesced
+                                } else {
+                                    ActionLifecycleOutcome::Refused
+                                },
+                            );
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyE) => {
@@ -23280,45 +26900,28 @@ impl ApplicationHandler for App {
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyS) => {
-                            let layer_racks = self.layer_racks();
-                            match patch::editor::save_patch_with_composition_and_motion(
-                                patch::PatchMasterVisual::new(
-                                    &self.master_effects,
-                                    &self.master_transform,
-                                ),
-                                &self.master_motion,
-                                &self.layers,
-                                &self.master_rack,
-                                &layer_racks,
-                                &self.composition,
-                                &self.ntsc_params,
-                                &self.mod_matrix,
-                                &self.temporal_params,
-                                patch::PatchTransportState {
-                                    master_paused: self.master_paused,
-                                    media_frozen: self.media_frozen,
+                            let identity = self.mint_native_action_identity();
+                            let admitted = self.choose_and_save_current_patch();
+                            self.record_action_lifecycle_outcome(
+                                identity,
+                                if admitted {
+                                    ActionLifecycleOutcome::Coalesced
+                                } else {
+                                    ActionLifecycleOutcome::Refused
                                 },
-                                &self.morph,
-                                &self.scenes,
-                            ) {
-                                Ok(()) => self.append_recovery_checkpoint("native patch save"),
-                                Err(error) => {
-                                    self.composition_status =
-                                        format!("Complete patch save failed: {error}");
-                                    log::error!("{}", self.composition_status);
-                                }
-                            }
+                            );
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyO) => {
-                            if self.modifiers.shift_key() {
+                            let identity = self.mint_native_action_identity();
+                            let accepted = if self.modifiers.shift_key() {
                                 self.apply_native_manual_action(
                                     "Apply patch look",
                                     "patch_look",
                                     |app| {
                                         app.choose_and_apply_patch_look(None);
                                     },
-                                );
+                                )
                             } else {
                                 self.apply_native_manual_action(
                                     "Load patch snapshot",
@@ -23326,8 +26929,9 @@ impl ApplicationHandler for App {
                                     |app| {
                                         app.choose_snapshot_patch();
                                     },
-                                );
-                            }
+                                )
+                            };
+                            self.record_action_identity_outcome(identity, accepted);
                             return;
                         }
                         _ => {}
@@ -23346,8 +26950,13 @@ impl ApplicationHandler for App {
                 // established bindings are untouched.
                 if state == winit::event::ElementState::Pressed {
                     if matches!(physical_key, PhysicalKey::Code(KeyCode::Escape))
-                        && self.transform_gizmo_escape()
+                        && self.transform_gizmo_drag.is_some()
                     {
+                        let identity = self.mint_native_action_identity();
+                        let lifecycle = self
+                            .transform_gizmo_escape()
+                            .expect("an observed gizmo drag consumes Escape");
+                        self.record_action_lifecycle_outcome(identity, lifecycle);
                         return;
                     }
                     let nudge = match physical_key {
@@ -23366,11 +26975,14 @@ impl ApplicationHandler for App {
                         _ => None,
                     };
                     if let Some(nudge) = nudge {
+                        let identity = self.mint_native_action_identity();
                         let modifiers = transform_gizmo::GizmoModifiers {
                             shift,
                             alt: self.modifiers.alt_key(),
                         };
-                        if self.apply_transform_gizmo_nudge(nudge, modifiers) {
+                        let accepted = self.apply_transform_gizmo_nudge(nudge, modifiers);
+                        self.record_action_identity_outcome(identity, accepted);
+                        if accepted {
                             return;
                         }
                     }
@@ -23384,10 +26996,56 @@ impl ApplicationHandler for App {
                         | input::keyboard::Action::DecreasePixelate
                         | input::keyboard::Action::IncreaseRgbSplit
                         | input::keyboard::Action::DecreaseRgbSplit
-                        | input::keyboard::Action::ResetEffects
                 ) {
-                    self.apply_native_manual_action(
+                    let identity = self.mint_native_action_identity();
+                    let accepted = self.apply_native_manual_action(
                         "Adjust keyboard effects",
+                        "effects",
+                        move |app| {
+                            let Some(index) = app.selected_layer else {
+                                return;
+                            };
+                            let Some(layer) = app.layers.get(index) else {
+                                return;
+                            };
+                            // Derive the exact legacy keyboard result on a copy,
+                            // then send that absolute value through the same
+                            // typed applier browser/MIDI/OSC use. This preserves
+                            // the old pixels while making Native a real D4
+                            // provenance rather than a hidden second mutation.
+                            let mut next = layer.effects;
+                            apply_action(action, &mut next);
+                            let (param, value) = match action {
+                                input::keyboard::Action::IncreasePixelate
+                                | input::keyboard::Action::DecreasePixelate => {
+                                    ("pixelate", next.pixelate_size)
+                                }
+                                input::keyboard::Action::IncreaseRgbSplit
+                                | input::keyboard::Action::DecreaseRgbSplit => {
+                                    ("rgb_split", next.rgb_split)
+                                }
+                                _ => unreachable!("keyboard value family matched above"),
+                            };
+                            let layer_id = layer.stable_layer_id().get().to_string();
+                            app.handle_web_action_inner_with_feedback_from_origin(
+                                web::state::WebAction::SetLayerEffect {
+                                    index,
+                                    layer_id: Some(layer_id),
+                                    param: param.to_string(),
+                                    value: serde_json::json!(value),
+                                },
+                                action_correlation::ActionSourceClass::Native,
+                            );
+                        },
+                    );
+                    self.record_action_identity_outcome(identity, accepted);
+                    return;
+                }
+
+                if matches!(action, input::keyboard::Action::ResetEffects) {
+                    let identity = self.mint_native_action_identity();
+                    let accepted = self.apply_native_manual_action(
+                        "Reset keyboard effects",
                         "effects",
                         move |app| {
                             if !app.release_active_morph_for_manual_edit() {
@@ -23400,66 +27058,89 @@ impl ApplicationHandler for App {
                             }
                         },
                     );
+                    self.record_action_identity_outcome(identity, accepted);
                     return;
                 }
 
-                if let Some(idx) = self.selected_layer {
+                if matches!(action, input::keyboard::Action::None) {
+                    return;
+                }
+                // Fullscreen editor chrome and process exit are deliberately
+                // outside the audience-action vocabulary. Execute them before
+                // minting so an excluded window/process command cannot create
+                // a misleading Refused correlation receipt.
+                match action {
+                    input::keyboard::Action::ToggleFullscreen => {
+                        self.toggle_preview_fullscreen();
+                        return;
+                    }
+                    input::keyboard::Action::Quit => {
+                        if let Some(worker) = &self.proxy_encode_worker {
+                            worker.cancel_all();
+                        }
+                        if let Some(worker) = &self.proxy_adoption_worker {
+                            worker.cancel_all();
+                        }
+                        event_loop.exit();
+                        return;
+                    }
+                    _ => {}
+                }
+                let identity = self.mint_native_action_identity();
+                let accepted = if let Some(idx) = self.selected_layer {
                     if idx < self.layers.len() {
                         let flow = {
                             let layer = &mut self.layers[idx];
                             apply_action(action, &mut layer.effects)
                         };
                         match flow {
-                            ControlFlow::Quit => {
-                                if let Some(worker) = &self.proxy_encode_worker {
-                                    worker.cancel_all();
-                                }
-                                if let Some(worker) = &self.proxy_adoption_worker {
-                                    worker.cancel_all();
-                                }
-                                event_loop.exit();
-                            }
+                            ControlFlow::Quit => unreachable!("Quit was excluded before minting"),
                             ControlFlow::TogglePause | ControlFlow::ToggleMediaFreeze => {
-                                self.apply_native_transport_flow(flow, Some(idx));
+                                self.apply_native_transport_flow(flow, Some(idx))
                             }
-                            ControlFlow::ToggleFullscreen => self.toggle_preview_fullscreen(),
+                            ControlFlow::ToggleFullscreen => {
+                                unreachable!("fullscreen was excluded before minting")
+                            }
                             ControlFlow::ToggleOutputWindow => self.apply_output_window_command(
                                 event_loop,
                                 OutputWindowCommand::Toggle,
                             ),
-                            ControlFlow::ToggleBlackout => self.toggle_blackout(),
-                            ControlFlow::CreateSelectedLayerProxy => {
-                                self.request_selected_layer_proxy();
+                            ControlFlow::ToggleBlackout => {
+                                self.toggle_blackout();
+                                true
                             }
-                            ControlFlow::Continue => {}
+                            ControlFlow::CreateSelectedLayerProxy => {
+                                self.request_selected_layer_proxy()
+                            }
+                            ControlFlow::Continue => false,
                         }
+                    } else {
+                        false
                     }
                 } else {
                     let mut dummy = effects::EffectUniforms::default();
                     let flow = apply_action(action, &mut dummy);
                     match flow {
-                        ControlFlow::Quit => {
-                            if let Some(worker) = &self.proxy_encode_worker {
-                                worker.cancel_all();
-                            }
-                            if let Some(worker) = &self.proxy_adoption_worker {
-                                worker.cancel_all();
-                            }
-                            event_loop.exit();
+                        ControlFlow::Quit => unreachable!("Quit was excluded before minting"),
+                        ControlFlow::ToggleFullscreen => {
+                            unreachable!("fullscreen was excluded before minting")
                         }
-                        ControlFlow::ToggleFullscreen => self.toggle_preview_fullscreen(),
                         ControlFlow::ToggleOutputWindow => self
                             .apply_output_window_command(event_loop, OutputWindowCommand::Toggle),
-                        ControlFlow::ToggleBlackout => self.toggle_blackout(),
+                        ControlFlow::ToggleBlackout => {
+                            self.toggle_blackout();
+                            true
+                        }
                         ControlFlow::CreateSelectedLayerProxy => {
-                            self.request_selected_layer_proxy();
+                            self.request_selected_layer_proxy()
                         }
                         ControlFlow::TogglePause | ControlFlow::ToggleMediaFreeze => {
-                            self.apply_native_transport_flow(flow, None);
+                            self.apply_native_transport_flow(flow, None)
                         }
-                        _ => {}
+                        ControlFlow::Continue => false,
                     }
-                }
+                };
+                self.record_action_identity_outcome(identity, accepted);
             }
 
             WindowEvent::RedrawRequested => {
@@ -23481,6 +27162,7 @@ impl ApplicationHandler for App {
                     // publish its library/ClipSlot intent here; a new Start in
                     // this same browser batch then sees the transaction idle.
                     self.poll_live_capture();
+                    self.poll_library_index();
                     self.drain_proxy_worker_events();
                     self.drain_proxy_adoption_events();
 
@@ -23510,6 +27192,9 @@ impl ApplicationHandler for App {
                     // monitor grid into the instrument bitmaps. On the
                     // disarm edge the instruments clear once, so a later
                     // re-arm never resurrects a stale picture.
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        self.stage_gpu_timing = renderer.poll_gpu_timing();
+                    }
                     let monitor_armed = self.monitor_bay_armed();
                     if monitor_armed {
                         let harvested = self.renderer.as_mut().and_then(Renderer::poll_monitor_bay);
@@ -23522,13 +27207,11 @@ impl ApplicationHandler for App {
                     }
                     self.monitor_bay_was_armed = monitor_armed;
 
-                    // Process actions from web UI. Display inventory is live
-                    // host state, so publish and validate it at this event-loop
-                    // boundary rather than trusting a browser's prior snapshot.
-                    // StageMap and legacy Output share this one enumeration so
-                    // steady-state monitoring adds no duplicate OS query.
-                    let monitor_inventory = event_loop.available_monitors().collect::<Vec<_>>();
-                    self.refresh_output_displays_from_monitors(&monitor_inventory);
+                    // Process actions from web UI against one retained,
+                    // generation-stamped display inventory. Platform/window
+                    // invalidations refresh promptly; otherwise the slow
+                    // fallback is the only OS enumeration on this path.
+                    self.refresh_monitor_inventory_if_due(event_loop, now);
                     let mut pending_actions: VecDeque<_> = self
                         .web_state
                         .actions
@@ -23537,37 +27220,110 @@ impl ApplicationHandler for App {
                         .unwrap_or_default();
                     let mut requested_output = None;
                     let mut requested_output_display = None;
-                    while let Some(action) = pending_actions.pop_front() {
+                    let mut requested_output_display_generation = None;
+                    let mut requested_output_inventory_rescan = false;
+                    let mut requested_output_identity = None;
+                    let mut requested_output_display_identity = None;
+                    let mut requested_output_rescan_identity = None;
+                    while let Some(envelope) = pending_actions.pop_front() {
+                        let source = envelope.source();
                         // Output-window creation needs the event loop. Fold all
                         // requests in this packet batch into one final state so
                         // retries or multiple clients cannot churn swapchains
                         // several times in a single frame.
-                        if let Some(command) = Self::output_window_command(&action) {
+                        if let Some(command) = Self::output_window_command(envelope.payload()) {
+                            if let Some(identity) =
+                                requested_output_identity.replace(envelope.identity())
+                            {
+                                self.record_terminal_action_identity(
+                                    identity,
+                                    action_correlation::ActionDisposition::Superseded,
+                                );
+                            }
                             let current =
                                 requested_output.unwrap_or_else(|| self.output_window_open());
                             requested_output =
                                 Some(resolve_output_window_command(current, command));
-                        } else if let Some(display_id) = Self::output_display_request(&action) {
+                        } else if let Some((display_id, inventory_generation)) =
+                            Self::output_display_request(envelope.payload())
+                        {
+                            if let Some(identity) =
+                                requested_output_display_identity.replace(envelope.identity())
+                            {
+                                self.record_terminal_action_identity(
+                                    identity,
+                                    action_correlation::ActionDisposition::Superseded,
+                                );
+                            }
                             requested_output_display = Some(display_id);
+                            requested_output_display_generation = inventory_generation;
+                        } else if Self::output_inventory_rescan_requested(envelope.payload()) {
+                            if let Some(identity) =
+                                requested_output_rescan_identity.replace(envelope.identity())
+                            {
+                                self.record_terminal_action_identity(
+                                    identity,
+                                    action_correlation::ActionDisposition::Superseded,
+                                );
+                            }
+                            requested_output_inventory_rescan = true;
                         } else {
-                            let disposition = self.handle_web_action(action);
-                            Self::apply_web_action_batch_disposition(
+                            let disposition = self
+                                .apply_correlated_action(envelope, |app, action| {
+                                    app.handle_web_action_from_origin(action, source)
+                                });
+                            self.apply_enveloped_web_action_batch_disposition(
                                 &mut pending_actions,
                                 disposition,
                             );
+                            continue;
                         }
                     }
-                    if requested_output.is_some() || requested_output_display.is_some() {
+                    let mut output_rescan_lifecycle = ActionLifecycleOutcome::Refused;
+                    if requested_output_inventory_rescan {
+                        self.monitor_inventory
+                            .invalidate(MonitorInventoryRefreshReason::ExplicitStageMapRescan);
+                        output_rescan_lifecycle =
+                            if self.refresh_monitor_inventory_if_due(event_loop, now) {
+                                ActionLifecycleOutcome::Applied
+                            } else {
+                                // The platform monitor scan has no failure return. An
+                                // explicit scan that confirms the same topology is
+                                // a successful non-frame command, not a refusal.
+                                ActionLifecycleOutcome::Coalesced
+                            };
+                    }
+                    let output_request_pending =
+                        requested_output.is_some() || requested_output_display.is_some();
+                    let output_outcome = if output_request_pending {
                         self.apply_output_request(
                             event_loop,
                             requested_output_display,
+                            requested_output_display_generation,
                             requested_output,
+                        )
+                    } else {
+                        OutputRequestOutcome::default()
+                    };
+                    if let Some(identity) = requested_output_identity {
+                        self.record_action_identity_outcome(
+                            identity,
+                            output_outcome.window_changed,
                         );
-                        if self.exit_if_device_lost(event_loop) {
-                            return;
-                        }
                     }
-                    self.sync_stage_presenter(event_loop, &monitor_inventory);
+                    if let Some(identity) = requested_output_display_identity {
+                        self.record_action_identity_outcome(
+                            identity,
+                            output_outcome.display_changed,
+                        );
+                    }
+                    if let Some(identity) = requested_output_rescan_identity {
+                        self.record_action_lifecycle_outcome(identity, output_rescan_lifecycle);
+                    }
+                    if output_request_pending && self.exit_if_device_lost(event_loop) {
+                        return;
+                    }
+                    self.sync_stage_presenter(event_loop);
                     if self.exit_if_device_lost(event_loop) {
                         return;
                     }
@@ -23579,6 +27335,23 @@ impl ApplicationHandler for App {
                     let window = self.window.as_ref().unwrap();
                     let egui_winit = self.egui_winit.as_mut().unwrap();
                     let raw_input = egui_winit.take_egui_input(window);
+                    // Mint before egui sees the pointer/key edge that can open
+                    // an editor transaction. Once a gesture owns an identity,
+                    // later keystrokes stay inside it and idle redraws mint
+                    // nothing.
+                    let native_editor_owned_identity_open =
+                        self.native_editor_action_identity.is_some();
+                    let native_editor_gesture_open = matches!(
+                        self.manual_history.open_gesture(),
+                        Some((_, history::MutationOrigin::NativeManual))
+                    );
+                    let native_editor_ingress_identity = native_editor_has_ingress_candidate(
+                        self.yaml_editor.active,
+                        native_editor_owned_identity_open,
+                        self.manual_history.metrics().gesture_open,
+                        &raw_input.events,
+                    )
+                    .then(|| self.mint_native_action_identity());
 
                     let video_egui_texture_id = self.video_egui_texture_id;
                     let output_on_main = self.output_on_main;
@@ -23598,6 +27371,7 @@ impl ApplicationHandler for App {
                     let mut native_recovery_actions = Vec::new();
                     let mut native_gesture_samples = Vec::new();
                     let mut transform_gizmo_events = Vec::new();
+                    let native_action_sequencer = self.web_state.action_sequencer();
                     // Resolved before the closure so the gizmo reads the same
                     // authored state the rest of the frame does, and so the
                     // closure needs no borrow of `self`. A scope whose
@@ -23612,6 +27386,7 @@ impl ApplicationHandler for App {
 
                     let egui_context = self.egui_ctx.clone();
                     let stage_health_snapshot = self.stage_health_snapshot();
+                    self.record_flight_telemetry(&stage_health_snapshot);
                     // B11: resolve the bay's paint inputs before the closure
                     // (the stage-health pre-resolve law). The dirty flag is
                     // consumed here, so textures re-upload only on a fresh
@@ -23654,21 +27429,20 @@ impl ApplicationHandler for App {
                         self.manual_history.open_gesture(),
                         Some((_, history::MutationOrigin::BrowserManual))
                     );
-                    let native_history_before =
-                        if self.yaml_editor.active && !self.manual_history.metrics().gesture_open {
-                            match self.history_checkpoint("Edit patch value", "native_editor") {
-                                Ok(checkpoint) => Some(checkpoint),
-                                Err(error) => {
-                                    self.yaml_editor.finish_active_edit();
-                                    self.yaml_editor.active = false;
-                                    self.history_status =
-                                        format!("Native editor disabled before mutation: {error}");
-                                    None
-                                }
+                    let native_history_before = if native_editor_ingress_identity.is_some() {
+                        match self.history_checkpoint("Edit patch value", "native_editor") {
+                            Ok(checkpoint) => Some(checkpoint),
+                            Err(error) => {
+                                self.yaml_editor.finish_active_edit();
+                                self.yaml_editor.active = false;
+                                self.history_status =
+                                    format!("Native editor disabled before mutation: {error}");
+                                None
                             }
-                        } else {
-                            None
-                        };
+                        }
+                    } else {
+                        None
+                    };
                     let yaml_editor = &mut self.yaml_editor;
                     let layers = &mut self.layers;
                     let master_effects = &mut self.master_effects;
@@ -23678,6 +27452,7 @@ impl ApplicationHandler for App {
                             build_native_recovery_strip(
                                 ctx,
                                 &native_recovery_view,
+                                &native_action_sequencer,
                                 &mut native_recovery_actions,
                             );
                         }
@@ -23798,11 +27573,14 @@ impl ApplicationHandler for App {
                                                         (phase, output_uv)
                                                     {
                                                         transform_gizmo_events.push(
-                                                            transform_gizmo::GizmoPointerEvent {
-                                                                phase,
-                                                                output_uv,
-                                                                modifiers,
-                                                            },
+                                                            native_action_sequencer.envelope(
+                                                                action_correlation::ActionSourceClass::Native,
+                                                                transform_gizmo::GizmoPointerEvent {
+                                                                    phase,
+                                                                    output_uv,
+                                                                    modifiers,
+                                                                },
+                                                            ),
                                                         );
                                                     }
                                                 }
@@ -23823,6 +27601,7 @@ impl ApplicationHandler for App {
                                                 rect,
                                                 &gesture_response,
                                                 ui.ctx().pointer_latest_pos(),
+                                                &native_action_sequencer,
                                                 &mut native_gesture_samples,
                                             );
                                         }
@@ -23910,17 +27689,26 @@ impl ApplicationHandler for App {
                             });
                     });
 
-                    let native_history_boundaries = self.yaml_editor.take_history_boundaries();
-                    self.apply_native_history_boundaries(
-                        native_history_boundaries,
-                        native_history_before,
-                    );
+                    if native_editor_history_work_required(
+                        native_editor_ingress_identity.is_some(),
+                        native_editor_owned_identity_open,
+                        native_editor_gesture_open,
+                    ) {
+                        let native_history_boundaries = self.yaml_editor.take_history_boundaries();
+                        self.apply_native_history_boundaries(
+                            native_history_boundaries,
+                            native_history_before,
+                            native_editor_ingress_identity,
+                        );
+                    }
 
                     // Browser ingress was drained first; a physical operator's
                     // native action is therefore deterministic local-last and
                     // does not depend on the server queue or any live browser.
                     for action in native_recovery_actions {
-                        self.apply_native_recovery_action(action);
+                        self.apply_correlated_action(action, |app, action| {
+                            app.apply_native_recovery_action(action)
+                        });
                     }
                     // A native pointer stroke is performance data, not an
                     // authored one-shot: it deliberately does not take the
@@ -23929,22 +27717,30 @@ impl ApplicationHandler for App {
                     // RECOVERY strip so a physical operator's stroke lands in
                     // the same frame it was drawn in.
                     for sample in native_gesture_samples {
-                        self.apply_native_gesture_sample(sample);
+                        self.apply_correlated_action(sample, |app, sample| {
+                            WebActionDispatchOutcome::from_acceptance(
+                                WebActionBatchDisposition::Continue,
+                                app.apply_native_gesture_sample(sample),
+                            )
+                        });
                     }
                     // Same deterministic local-last boundary: browser ingress
                     // was drained first, so a physical operator's drag lands in
                     // the frame it was made in.
                     self.transform_gizmo_hover = transform_gizmo_hover_next;
                     for event in transform_gizmo_events {
-                        self.apply_transform_gizmo_event(event);
+                        self.apply_correlated_action(event, |app, event| {
+                            WebActionDispatchOutcome {
+                                batch: WebActionBatchDisposition::Continue,
+                                lifecycle: app.apply_transform_gizmo_event(event),
+                            }
+                        });
                     }
 
-                    // Controller transport is sampled before this frame's
-                    // gates and clocks, so Start/Continue/Stop and OSC Freeze
-                    // affect the same accepted program frame rather than one
-                    // frame later. MIDI Learn's raw compatibility sampler owns
-                    // the four legacy slots; typed profile events are drained
-                    // immediately after that authoritative sample.
+                    // Controller input is dequeued/applied before this frame's
+                    // gates and clocks. Raw CC compatibility state travels in
+                    // the same correlated batch, so neither legacy slots nor
+                    // MIDI Learn can mutate before their identity is applied.
                     self.resolve_pending_initial_controller_profile();
                     if self.mod_matrix.midi_enabled && !self.midi.is_running() {
                         self.midi.start();
@@ -23953,7 +27749,9 @@ impl ApplicationHandler for App {
                         }
                     } else if !self.mod_matrix.midi_enabled && self.midi.is_running() {
                         self.midi.stop();
+                        self.drain_displaced_controller_action_identities();
                     }
+                    self.drain_controller_events();
                     if let Some(slot) = self.mod_matrix.midi_learn {
                         if let Some(cc) = self.midi.take_last_cc() {
                             self.mod_matrix.midi_ccs[slot] = cc;
@@ -23964,7 +27762,6 @@ impl ApplicationHandler for App {
                     for i in 0..modulation::NUM_MIDI_SLOTS {
                         self.mod_matrix.midi[i] = self.midi.cc_value(self.mod_matrix.midi_ccs[i]);
                     }
-                    self.drain_controller_events();
                     self.sync_controller_profile_feedback();
 
                     // MIDI clock sync owns tempo and beat before the frame's
@@ -24264,7 +28061,28 @@ impl ApplicationHandler for App {
                     // never cross a seek/cue/loop discontinuity into the GPU.
                     {
                         let renderer = self.renderer.as_ref().unwrap();
+                        let render_generation = renderer.renderer_generation();
+                        // One nonblocking device progress turn drains every
+                        // layer's already-popped upload scopes. Selected-frame
+                        // uploads themselves never poll or await the device.
+                        let _ = renderer.device.poll(wgpu::PollType::Poll);
                         for layer in &mut self.layers {
+                            if let Some(fault) = layer.poll_upload_validation(render_generation) {
+                                let error = format!(
+                                    "GPU upload validation failed: {}",
+                                    fault.operator_message()
+                                );
+                                log::error!("Layer '{}' {error}", layer.filename);
+                                layer.set_media_source_error(error.clone());
+                                if fault.is_terminal() {
+                                    renderer.record_terminal_upload_error(error);
+                                }
+                                // Attribute/report this completed epoch on its
+                                // own turn. A newer successful enqueue must not
+                                // erase the exact prior fault before operators
+                                // or the terminal OOM latch can observe it.
+                                continue;
+                            }
                             let playing = gates.media_running && !layer.paused;
                             // The text page rides this same pump: its CPU raster
                             // is a pending still frame, and skipping it here left
@@ -24279,6 +28097,7 @@ impl ApplicationHandler for App {
                                     if let Err(error) = layer.upload_ready_media_frame(
                                         &renderer.device,
                                         &renderer.queue,
+                                        render_generation,
                                         &mut frame,
                                     ) {
                                         log::error!(
@@ -24308,6 +28127,9 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
+                    if self.exit_if_device_lost(event_loop) {
+                        return;
+                    }
 
                     // Harvest overwrite-style live sources before evaluation:
                     // a Spout frame may change source dimensions, and Fit/Fill
@@ -24327,9 +28149,12 @@ impl ApplicationHandler for App {
                             continue;
                         }
                         if let Some(frame) = layer.try_spout_frame() {
-                            if let Err(error) =
-                                layer.upload_spout_frame(&renderer.device, &renderer.queue, frame)
-                            {
+                            if let Err(error) = layer.upload_spout_frame(
+                                &renderer.device,
+                                &renderer.queue,
+                                renderer.renderer_generation(),
+                                frame,
+                            ) {
                                 log::error!(
                                     "Layer '{}' rejected a Spout frame: {error}",
                                     layer.filename
@@ -24348,16 +28173,16 @@ impl ApplicationHandler for App {
                         .map(|layer| (layer.stable_layer_id(), layer.rack.clone()))
                         .collect();
                     let mut evaluated_composition = self.composition.clone();
-                    match modulation::StableModAddressBook::from_composition(
+                    match self.stable_mod_topology_cache.evaluate(
+                        &self.mod_matrix,
                         &evaluated_master_rack,
                         &evaluated_layer_racks,
                         &evaluated_composition,
                     ) {
-                        Ok(address_book) => {
-                            let stable_frame = self.mod_matrix.stable_frame(&address_book);
+                        Ok(cached) => {
                             modulation::apply_stable_modulation(
-                                &address_book,
-                                &stable_frame,
+                                cached.address_book(),
+                                cached.frame(),
                                 &mut evaluated_master_rack,
                                 &mut evaluated_layer_racks,
                                 &mut evaluated_composition,
@@ -24386,6 +28211,9 @@ impl ApplicationHandler for App {
                         {
                             let (bands, beat) = self.study_frame_inputs();
                             FramePlanContext::new(frame_output_width, frame_output_height, elapsed)
+                                .with_highest_applied_action_sequence(
+                                    self.highest_applied_action_sequence,
+                                )
                                 .with_study_inputs(bands, beat)
                         },
                         MasterFrameInput {
@@ -24482,7 +28310,10 @@ impl ApplicationHandler for App {
                         match evaluated_frame.plan_composition(creative_input) {
                             Ok(plan) => Some(plan),
                             Err(error) => {
-                                let diagnostic = format!("Creative frame plan rejected: {error}");
+                                let diagnostic = self.publish_composition_plan_failure(
+                                    "Creative frame plan rejected",
+                                    &error,
+                                );
                                 if diagnostic != self.composition_status {
                                     log::error!("{diagnostic}");
                                     self.composition_status = diagnostic;
@@ -24559,8 +28390,10 @@ impl ApplicationHandler for App {
                         evaluated_creative = match evaluated_frame.plan_composition(retry_input) {
                             Ok(plan) => Some(plan),
                             Err(error) => {
-                                let diagnostic =
-                                    format!("Creative codec fallback plan rejected: {error}");
+                                let diagnostic = self.publish_composition_plan_failure(
+                                    "Creative codec fallback plan rejected",
+                                    &error,
+                                );
                                 if diagnostic != self.composition_status {
                                     log::error!("{diagnostic}");
                                     self.composition_status.clone_from(&diagnostic);
@@ -24652,8 +28485,10 @@ impl ApplicationHandler for App {
                             {
                                 Ok(plan) => Some(plan),
                                 Err(error) => {
-                                    let diagnostic =
-                                        format!("Creative cold frame plan rejected: {error}");
+                                    let diagnostic = self.publish_composition_plan_failure(
+                                        "Creative cold frame plan rejected",
+                                        &error,
+                                    );
                                     if diagnostic != self.composition_status {
                                         log::error!("{diagnostic}");
                                         self.composition_status.clone_from(&diagnostic);
@@ -24822,7 +28657,8 @@ impl ApplicationHandler for App {
                         if let Err(error) =
                             renderer::composition::CompositionGpuExecutor::validate_plan(plan)
                         {
-                            let diagnostic = format!("Creative GPU plan rejected: {error}");
+                            let diagnostic =
+                                self.publish_gpu_plan_failure("Creative GPU plan rejected", error);
                             if diagnostic != self.composition_status {
                                 log::error!("{diagnostic}");
                                 self.composition_status.clone_from(&diagnostic);
@@ -24845,9 +28681,11 @@ impl ApplicationHandler for App {
                         )
                     );
                     debug_assert!(evaluated_frame.layers().iter().enumerate().all(
-                        |(index, layer)| evaluated_frame
-                            .layer_pass_uniforms(index)
-                            .is_some_and(|pass| pass.spatial == layer.spatial)
+                        |(index, layer)| {
+                            evaluated_frame
+                                .layer_pass_uniforms(index)
+                                .is_some_and(|pass| pass.spatial == layer.spatial)
+                        }
                     ));
 
                     // Broadcast the exact transport/routing state selected for
@@ -24963,6 +28801,20 @@ impl ApplicationHandler for App {
                             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                                 label: Some("Frame Encoder"),
                             });
+                    let audience_submission_generation = self.next_audience_submission_generation;
+                    let mut audience_action_submission = AudienceActionSubmissionLatch::new(
+                        evaluated_frame.context().highest_applied_action_sequence,
+                        audience_submission_generation,
+                    );
+                    renderer.begin_gpu_timing_frame(&mut encoder, audience_submission_generation);
+                    renderer.begin_gpu_timing_stage(
+                        &mut encoder,
+                        renderer::gpu_timing::GpuStage::Submission,
+                    );
+                    renderer.begin_gpu_timing_stage(
+                        &mut encoder,
+                        renderer::gpu_timing::GpuStage::SourcePrepare,
+                    );
 
                     // B7 pattern-synth sources render first, into their own
                     // layer textures inside this same encoder, so both the
@@ -25021,6 +28873,14 @@ impl ApplicationHandler for App {
                             self.output_error = diagnostic;
                         }
                     }
+                    renderer.end_gpu_timing_stage(
+                        &mut encoder,
+                        renderer::gpu_timing::GpuStage::SourcePrepare,
+                    );
+                    renderer.begin_gpu_timing_stage(
+                        &mut encoder,
+                        renderer::gpu_timing::GpuStage::CreativeComposition,
+                    );
 
                     // Prepare and encode Advanced only into executor-owned
                     // RGBA16F surfaces plus compat slot0. Slot2 (the accepted
@@ -25266,6 +29126,20 @@ impl ApplicationHandler for App {
                     }
 
                     if !creative_safe_hold {
+                        renderer.begin_gpu_timing_stage(
+                            &mut encoder,
+                            renderer::gpu_timing::GpuStage::TemporalMotion,
+                        );
+                        if mosh_active || mod_ntsc.enabled {
+                            renderer.begin_gpu_timing_stage(
+                                &mut encoder,
+                                renderer::gpu_timing::GpuStage::MoshVhs,
+                            );
+                        }
+                        renderer.begin_gpu_timing_stage(
+                            &mut encoder,
+                            renderer::gpu_timing::GpuStage::AudienceResolve,
+                        );
                         // Snapshot the audience at the actual blackout edge before
                         // any render or absolute clear can overwrite slot2. This is
                         // path-independent: VHS/bypass controls may change while
@@ -25810,6 +29684,7 @@ impl ApplicationHandler for App {
                                     &mut self.output_error,
                                     event_loop,
                                 ) {
+                                    renderer.cancel_gpu_timing_frame();
                                     self.gesture_canvas.discard_staged();
                                     self.pending_gesture_canvas_events.clear();
                                     return;
@@ -26006,7 +29881,32 @@ impl ApplicationHandler for App {
                             capture_frame_intent = None;
                             capture_source_dropped = true;
                         }
+                        renderer.end_gpu_timing_stage(
+                            &mut encoder,
+                            renderer::gpu_timing::GpuStage::AudienceResolve,
+                        );
+                        renderer.end_gpu_timing_stage(
+                            &mut encoder,
+                            renderer::gpu_timing::GpuStage::MoshVhs,
+                        );
+                        renderer.end_gpu_timing_stage(
+                            &mut encoder,
+                            renderer::gpu_timing::GpuStage::TemporalMotion,
+                        );
+                        renderer.end_gpu_timing_stage(
+                            &mut encoder,
+                            renderer::gpu_timing::GpuStage::CreativeComposition,
+                        );
+                        renderer.end_gpu_timing_stage(
+                            &mut encoder,
+                            renderer::gpu_timing::GpuStage::Submission,
+                        );
+                        renderer.finish_gpu_timing_frame(&mut encoder);
                         renderer.queue.submit(std::iter::once(encoder.finish()));
+                        self.next_audience_submission_generation = self
+                            .next_audience_submission_generation
+                            .wrapping_add(1)
+                            .max(1);
                         if let Some((intent, reservation)) = scope_readback_to_map.take() {
                             let mapped = match intent.backend {
                                 LiveCaptureBackend::Renderer => {
@@ -26162,16 +30062,20 @@ impl ApplicationHandler for App {
                                 ) => {
                                     self.accepted_creative_resource_bytes = Some(0);
                                     self.accepted_motion_resource_bytes = Some(0);
+                                    self.accepted_creative_full_frame_passes = Some(0);
+                                    self.accepted_creative_texture_lookups = Some(0);
+                                    self.accepted_creative_surface_layers = Some(0);
                                 }
                                 Some(
                                     evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::Advanced(plan),
                                 ) => {
+                                    let resources = plan.resources();
                                     let allocated = self
                                         .composition_gpu
                                         .as_ref()
                                         .map(renderer::composition::CompositionGpuExecutor::allocation_snapshot);
                                     self.accepted_creative_resource_bytes = Some(allocated.map_or(
-                                        plan.resources().creative_bytes,
+                                        resources.creative_bytes,
                                         |snapshot| snapshot.creative_bytes,
                                     ));
                                     self.accepted_motion_resource_bytes = Some(allocated.map_or_else(
@@ -26182,6 +30086,12 @@ impl ApplicationHandler for App {
                                         },
                                         |snapshot| snapshot.motion_bytes,
                                     ));
+                                    self.accepted_creative_full_frame_passes =
+                                        Some(resources.full_frame_passes);
+                                    self.accepted_creative_texture_lookups =
+                                        Some(resources.logical_texture_lookups_per_pixel);
+                                    self.accepted_creative_surface_layers =
+                                        Some(resources.retained_surface_layers);
                                 }
                                 None => {}
                             }
@@ -26757,6 +30667,31 @@ impl ApplicationHandler for App {
                     // path-independent edge, but skip all creative, temporal,
                     // NTSC, and history advancement while the plan is invalid.
                     if creative_safe_hold {
+                        renderer.end_gpu_timing_stage(
+                            &mut encoder,
+                            renderer::gpu_timing::GpuStage::AudienceResolve,
+                        );
+                        renderer.end_gpu_timing_stage(
+                            &mut encoder,
+                            renderer::gpu_timing::GpuStage::MoshVhs,
+                        );
+                        renderer.end_gpu_timing_stage(
+                            &mut encoder,
+                            renderer::gpu_timing::GpuStage::TemporalMotion,
+                        );
+                        renderer.end_gpu_timing_stage(
+                            &mut encoder,
+                            renderer::gpu_timing::GpuStage::CreativeComposition,
+                        );
+                        renderer.end_gpu_timing_stage(
+                            &mut encoder,
+                            renderer::gpu_timing::GpuStage::Submission,
+                        );
+                        renderer.finish_gpu_timing_frame(&mut encoder);
+                        self.next_audience_submission_generation = self
+                            .next_audience_submission_generation
+                            .wrapping_add(1)
+                            .max(1);
                         if let Some(action) = blackout_audience_edge_action(
                             self.blackout,
                             self.blackout_presented,
@@ -27087,7 +31022,14 @@ impl ApplicationHandler for App {
                                 None
                             }
                         };
+                        let real_audience_presented =
+                            !stage_surface_frames.is_empty() || output_present.is_some();
+                        let audience_submitted_at = Instant::now();
                         renderer.queue.submit(std::iter::once(encoder.finish()));
+                        audience_action_submission.capture_audience_submit(
+                            temporal_frame_accepted && real_audience_presented,
+                            audience_submitted_at,
+                        );
                         present_stage_monitor_surfaces(stage_surface_frames);
                         // Once acquired, always consume a surface texture with
                         // present before honoring device loss. Dropping it
@@ -27102,6 +31044,10 @@ impl ApplicationHandler for App {
                         ) {
                             return;
                         }
+                        audience_action_submission.record_presented(
+                            &self.web_state,
+                            temporal_frame_accepted && real_audience_presented,
+                        );
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
@@ -27142,7 +31088,14 @@ impl ApplicationHandler for App {
                                     None
                                 }
                             };
+                            let real_audience_presented =
+                                !stage_surface_frames.is_empty() || output_present.is_some();
+                            let audience_submitted_at = Instant::now();
                             renderer.queue.submit(std::iter::once(encoder.finish()));
+                            audience_action_submission.capture_audience_submit(
+                                temporal_frame_accepted && real_audience_presented,
+                                audience_submitted_at,
+                            );
                             present_stage_monitor_surfaces(stage_surface_frames);
                             if let Some(texture) = output_present {
                                 texture.present();
@@ -27154,6 +31107,10 @@ impl ApplicationHandler for App {
                             ) {
                                 return;
                             }
+                            audience_action_submission.record_presented(
+                                &self.web_state,
+                                temporal_frame_accepted && real_audience_presented,
+                            );
                             let size = window.inner_size();
                             let r = self.renderer.as_mut().unwrap();
                             let repaired = match status {
@@ -27208,7 +31165,14 @@ impl ApplicationHandler for App {
                                     None
                                 }
                             };
+                            let real_audience_presented =
+                                !stage_surface_frames.is_empty() || output_present.is_some();
+                            let audience_submitted_at = Instant::now();
                             renderer.queue.submit(std::iter::once(encoder.finish()));
+                            audience_action_submission.capture_audience_submit(
+                                temporal_frame_accepted && real_audience_presented,
+                                audience_submitted_at,
+                            );
                             present_stage_monitor_surfaces(stage_surface_frames);
                             if let Some(texture) = output_present {
                                 texture.present();
@@ -27220,6 +31184,10 @@ impl ApplicationHandler for App {
                             ) {
                                 return;
                             }
+                            audience_action_submission.record_presented(
+                                &self.web_state,
+                                temporal_frame_accepted && real_audience_presented,
+                            );
                             if let Some(w) = &self.window {
                                 w.request_redraw();
                             }
@@ -27282,6 +31250,9 @@ impl ApplicationHandler for App {
                             None
                         }
                     };
+                    let real_audience_presented = self.output_on_main
+                        || !stage_surface_frames.is_empty()
+                        || output_present.is_some();
 
                     if output_device_lost {
                         // The main texture was acquired before Output reported
@@ -27291,7 +31262,12 @@ impl ApplicationHandler for App {
                         present_stage_monitor_surfaces(stage_surface_frames);
                         return;
                     }
+                    let audience_submitted_at = Instant::now();
                     renderer.queue.submit(std::iter::once(encoder.finish()));
+                    audience_action_submission.capture_audience_submit(
+                        temporal_frame_accepted && real_audience_presented,
+                        audience_submitted_at,
+                    );
                     // Both API textures must be marked consumed even when the
                     // first present or submission latches device loss.
                     surface_texture.present();
@@ -27299,7 +31275,13 @@ impl ApplicationHandler for App {
                         t.present();
                     }
                     present_stage_monitor_surfaces(stage_surface_frames);
-                    exit_on_renderer_device_loss(renderer, &mut self.output_error, event_loop);
+                    if exit_on_renderer_device_loss(renderer, &mut self.output_error, event_loop) {
+                        return;
+                    }
+                    audience_action_submission.record_presented(
+                        &self.web_state,
+                        temporal_frame_accepted && real_audience_presented,
+                    );
                 }
             }
 
@@ -27319,6 +31301,73 @@ impl ApplicationHandler for App {
         // absence of work, WaitUntil replaces the former redraw busy-spin with
         // one bounded wake at the next exact rational program deadline.
         event_loop.set_control_flow(WinitControlFlow::WaitUntil(deadline));
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.close_action_ingress_for_shutdown();
+        if let Some(writer) = self.recovery_writer.as_ref() {
+            let receipt =
+                writer.flush_with_deadline(recovery_journal::RECOVERY_WRITER_SHUTDOWN_DEADLINE);
+            if receipt.completed {
+                log::info!(
+                    "Recovery writer clean-shutdown flush completed at durable sequence {:?}",
+                    receipt.durable_sequence
+                );
+            } else {
+                self.recovery_status = format!(
+                    "Recovery flush timed out after {} ms; durable checkpoint {:?} remains authoritative (in-flight {:?}, pending {:?})",
+                    recovery_journal::RECOVERY_WRITER_SHUTDOWN_DEADLINE.as_millis(),
+                    receipt.durable_sequence,
+                    receipt
+                        .in_flight_request_id
+                        .map(recovery_journal::RecoveryRequestId::get),
+                    receipt
+                        .pending_request_id
+                        .map(recovery_journal::RecoveryRequestId::get),
+                );
+                log::warn!(
+                    "{}; worker detached without a render-thread join",
+                    self.recovery_status
+                );
+            }
+        }
+
+        // The event-loop thread waits only on the supervisor's bounded
+        // progress condition.  The dedicated reaper is the sole owner that
+        // joins decoder handles, including workers belonging to still-live
+        // layers canceled by this terminal shutdown barrier.
+        let decoder_retirement = video::drain_decoder_retirements_with_deadline(
+            video::DECODER_RETIREMENT_SHUTDOWN_DEADLINE,
+        );
+        if decoder_retirement.completed {
+            log::info!(
+                "Decoder retirement drain completed in {} ms (process total {} joined, {} panicked)",
+                decoder_retirement.elapsed.as_millis(),
+                decoder_retirement.snapshot.completed_workers,
+                decoder_retirement.snapshot.panicked_workers,
+            );
+        } else {
+            let oldest = decoder_retirement.snapshot.oldest_retiree.map(|identity| {
+                format!(
+                    "worker {} source {} generation {}",
+                    identity.worker_id,
+                    identity.source.short_hex(),
+                    identity.source_generation,
+                )
+            });
+            log::warn!(
+                "Decoder retirement timed out after {} ms: {} worker(s) stuck of {} owned; oldest {} ms ({}) — no decoder was joined on the event-loop thread",
+                decoder_retirement.elapsed.as_millis(),
+                decoder_retirement.snapshot.stuck_workers,
+                decoder_retirement.snapshot.owned_workers,
+                decoder_retirement
+                    .snapshot
+                    .oldest_retirement_age
+                    .unwrap_or_default()
+                    .as_millis(),
+                oldest.as_deref().unwrap_or("identity unavailable"),
+            );
+        }
     }
 }
 
@@ -27450,7 +31499,7 @@ fn run_generation_cli(arguments: &[String]) -> Result<Vec<PathBuf>, String> {
                 return Err(format!(
                     "unknown generate option {unknown:?}\n{}",
                     procedural_usage()
-                ))
+                ));
             }
         }
         index += 1;
@@ -27483,10 +31532,96 @@ fn run_generation_cli(arguments: &[String]) -> Result<Vec<PathBuf>, String> {
     procedural::write_patch_only(&pieces, &output_path)
 }
 
+/// Debug-only process seam used by the privileged Linux network-namespace
+/// reachability/packet test. The deterministic token enters through an
+/// environment variable, is removed immediately, and is never printed.
+#[cfg(debug_assertions)]
+fn run_p0_control_server_fixture(arguments: &[String]) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let mut port = CONTROL_SERVER_PORT;
+    let mut identity_dir = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--port" | "--identity-dir" => {
+                let flag = &arguments[index];
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or_else(|| format!("{flag} requires a value"))?;
+                if flag == "--port" {
+                    port = value.parse().map_err(|_| {
+                        "fixture port must be an unsigned 16-bit integer".to_string()
+                    })?;
+                } else {
+                    identity_dir = Some(PathBuf::from(value));
+                }
+            }
+            unknown => return Err(format!("unknown P0 fixture option {unknown:?}")),
+        }
+        index += 1;
+    }
+    let identity_dir =
+        identity_dir.ok_or_else(|| "the P0 fixture requires --identity-dir".to_string())?;
+    let token = std::env::var("COLLIDE_O_SCOPE_P0_TEST_TOKEN")
+        .map_err(|_| "the P0 fixture requires COLLIDE_O_SCOPE_P0_TEST_TOKEN".to_string())?;
+    std::env::remove_var("COLLIDE_O_SCOPE_P0_TEST_TOKEN");
+
+    let state = WebState::new()?;
+    let mut server = web::server::spawn_fixture(state, port, &identity_dir, token)?;
+    println!(
+        "P0_FIXTURE_READY loopback={} session={}",
+        server.has_loopback_listener(),
+        server.session_fingerprint()
+    );
+    std::io::stdout()
+        .flush()
+        .map_err(|error| format!("flush fixture readiness: {error}"))?;
+    let mut release = String::new();
+    std::io::stdin()
+        .read_line(&mut release)
+        .map_err(|error| format!("wait for fixture retirement: {error}"))?;
+    server.retire()
+}
+
 fn main() {
+    if !build_identity::current().digest_is_valid() {
+        eprintln!("Embedded BuildIdentity digest is invalid; refusing to start");
+        std::process::exit(70);
+    }
+    let args: Vec<String> = std::env::args().collect();
+    if args
+        .get(1)
+        .is_some_and(|argument| matches!(argument.as_str(), "--version" | "-V" | "--version-json"))
+    {
+        if args
+            .get(1)
+            .is_some_and(|argument| argument == "--version-json")
+            || args.get(2).is_some_and(|argument| argument == "--json")
+        {
+            println!("{}", build_identity::current().pretty_json());
+        } else {
+            println!("{}", build_identity::current().human_version());
+        }
+        return;
+    }
+
+    #[cfg(debug_assertions)]
+    if args
+        .get(1)
+        .is_some_and(|argument| argument == "--p0-control-server-fixture")
+    {
+        env_logger::init();
+        if let Err(error) = run_p0_control_server_fixture(&args[2..]) {
+            eprintln!("P0 control fixture failed: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
+
     env_logger::init();
 
-    let args: Vec<String> = std::env::args().collect();
     if args
         .get(1)
         .is_some_and(|arg| arg == "generate" || arg == "--generate")
@@ -27543,18 +31678,1885 @@ fn main() {
             return;
         }
     };
-    let url = web::server::spawn(web_state.clone(), 3030);
-    log::info!("Opening control panel: {}", url);
-    let _ = open::that(&url);
+    let control_server = match web::server::spawn(web_state.clone(), CONTROL_SERVER_PORT) {
+        Ok(server) => {
+            if let Some(url) = server.local_url() {
+                log::info!(
+                    "Opening loopback control panel (session {})",
+                    server.session_fingerprint()
+                );
+                let _ = open::that(url);
+            }
+            Some(server)
+        }
+        Err(error) => {
+            log::error!("Control panel server unavailable: {error}");
+            None
+        }
+    };
 
     let event_loop = EventLoop::new().unwrap();
     let mut app = App::new(initial_video, library_folder, web_state);
+    app.control_server = control_server;
     event_loop.run_app(&mut app).unwrap();
+    if let Some(point) = gpu_recovery::phase_a_restart_request() {
+        log::error!("GPU epoch retired after {point:?}; requesting one bounded supervised restart");
+        std::process::exit(gpu_recovery::SUPERVISED_GPU_RESTART_EXIT_CODE);
+    }
 }
 
 #[cfg(test)]
 mod app_state_tests {
     use super::*;
+
+    fn p1_temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "collide-o-scope-p1-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos(),
+        ))
+    }
+
+    #[test]
+    fn correlated_dispatch_applies_before_recording_without_reminting_identity() {
+        #[derive(Default)]
+        struct Probe {
+            applied: bool,
+            recorded: Option<action_correlation::ActionIdentity>,
+        }
+
+        let sequencer = action_correlation::ActionSequencer::default();
+        let ingress = Instant::now();
+        let envelope = sequencer.envelope_at(
+            action_correlation::ActionSourceClass::Native,
+            ingress,
+            41_u8,
+        );
+        let expected = envelope.identity();
+        let mut probe = Probe::default();
+        let result = apply_envelope_then_record(
+            &mut probe,
+            envelope,
+            |probe, payload| {
+                assert!(
+                    probe.recorded.is_none(),
+                    "correlation ran before application"
+                );
+                probe.applied = true;
+                (payload + 1, ActionLifecycleOutcome::Applied)
+            },
+            |probe, identity| {
+                assert!(
+                    probe.applied,
+                    "application must finish before its apply stamp"
+                );
+                probe.recorded = Some(identity);
+            },
+            |_, _, disposition| panic!("unexpected terminal disposition {disposition:?}"),
+        );
+
+        assert_eq!(result, 42);
+        assert_eq!(probe.recorded, Some(expected));
+        assert_eq!(expected.ingress(), ingress);
+        assert_eq!(expected.sequence().get(), 1);
+        assert_eq!(
+            sequencer
+                .envelope(action_correlation::ActionSourceClass::Browser, ())
+                .sequence()
+                .get(),
+            2,
+            "dispatch must not mint a replacement envelope after applying",
+        );
+    }
+
+    #[test]
+    fn lifecycle_refusals_and_noops_never_advance_the_frame_high_water() {
+        use action_correlation::{ActionDisposition, ActionSourceClass};
+        use web::state::WebAction;
+
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state.clone());
+        app.recovery_writer = None;
+        let sequencer = web_state.action_sequencer();
+
+        let stale = sequencer.envelope(
+            ActionSourceClass::Browser,
+            WebAction::SetLayerParam {
+                index: 0,
+                layer_id: Some("999".into()),
+                param: "opacity".into(),
+                value: serde_json::json!(0.5),
+            },
+        );
+        app.apply_correlated_action(stale, |app, action| {
+            app.handle_web_action_from_origin(action, ActionSourceClass::Browser)
+        });
+        let empty_undo = sequencer.envelope(ActionSourceClass::Browser, WebAction::UndoManual);
+        app.apply_correlated_action(empty_undo, |app, action| {
+            app.handle_web_action_from_origin(action, ActionSourceClass::Browser)
+        });
+        let replay_refusal = sequencer.envelope(
+            ActionSourceClass::Replay,
+            WebAction::SetParam {
+                param: "brightness".into(),
+                value: serde_json::json!("not-a-number"),
+            },
+        );
+        app.apply_correlated_action(replay_refusal, |app, action| {
+            app.handle_web_action_inner_with_feedback_from_origin(action, ActionSourceClass::Replay)
+        });
+        let native_orphan = sequencer.envelope(
+            ActionSourceClass::Native,
+            NativeGestureSample {
+                phase: gesture::GesturePhase::Move,
+                position: [0.5, 0.5],
+            },
+        );
+        app.apply_correlated_action(native_orphan, |app, sample| {
+            WebActionDispatchOutcome::from_acceptance(
+                WebActionBatchDisposition::Continue,
+                app.apply_native_gesture_sample(sample),
+            )
+        });
+
+        assert_eq!(app.highest_applied_action_sequence, 0);
+        let receipts = web_state.action_receipts_for_test();
+        assert_eq!(receipts.len(), 4);
+        assert!(receipts
+            .iter()
+            .all(|receipt| receipt.disposition == ActionDisposition::Refused));
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt.source)
+                .collect::<Vec<_>>(),
+            vec![
+                ActionSourceClass::Browser,
+                ActionSourceClass::Browser,
+                ActionSourceClass::Replay,
+                ActionSourceClass::Native,
+            ]
+        );
+
+        let applied = sequencer.envelope(
+            ActionSourceClass::Browser,
+            WebAction::SetParam {
+                param: "brightness".into(),
+                value: serde_json::json!(0.25),
+            },
+        );
+        let applied_sequence = applied.sequence().get();
+        app.apply_correlated_action(applied, |app, action| {
+            app.handle_web_action_from_origin(action, ActionSourceClass::Browser)
+        });
+        assert_eq!(app.highest_applied_action_sequence, applied_sequence);
+        let authored_counter_after_apply = app.web_authored_mutation_counter;
+
+        let noop = sequencer.envelope(
+            ActionSourceClass::Browser,
+            WebAction::SetParam {
+                param: "brightness".into(),
+                value: serde_json::json!(0.25),
+            },
+        );
+        app.apply_correlated_action(noop, |app, action| {
+            app.handle_web_action_from_origin(action, ActionSourceClass::Browser)
+        });
+        assert_eq!(app.highest_applied_action_sequence, applied_sequence);
+        assert_eq!(
+            app.web_authored_mutation_counter, authored_counter_after_apply,
+            "an outside-gesture no-op must not advance publication ownership",
+        );
+        assert_eq!(
+            web_state
+                .action_receipts_for_test()
+                .last()
+                .unwrap()
+                .disposition,
+            ActionDisposition::Refused
+        );
+
+        app.begin_history_gesture(73);
+        let gesture_noop = sequencer.envelope(
+            ActionSourceClass::Browser,
+            WebAction::SetParam {
+                param: "brightness".into(),
+                value: serde_json::json!(0.25),
+            },
+        );
+        app.apply_correlated_action(gesture_noop, |app, action| {
+            app.handle_web_action_from_origin(action, ActionSourceClass::Browser)
+        });
+        assert_eq!(app.highest_applied_action_sequence, applied_sequence);
+        assert_eq!(
+            app.web_authored_mutation_counter, authored_counter_after_apply,
+            "an inside-gesture no-op must not advance publication ownership",
+        );
+        assert_eq!(
+            web_state
+                .action_receipts_for_test()
+                .last()
+                .unwrap()
+                .disposition,
+            ActionDisposition::Refused,
+            "an identical value inside an open gesture is still a no-op",
+        );
+        app.finish_history_gesture(73);
+        assert_eq!(web_state.action_timing_snapshot().pending, 1);
+    }
+
+    #[test]
+    fn directory_drop_lifecycle_follows_worker_admission_not_path_inequality() {
+        use action_correlation::{ActionDisposition, ActionSourceClass};
+
+        let root = p1_temp_dir("directory-drop");
+        let same = root.join("same");
+        let rejected_new = root.join("new");
+        std::fs::create_dir_all(&same).unwrap();
+        std::fs::create_dir_all(&rejected_new).unwrap();
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state.clone());
+        app.library_folder = Some(same.clone());
+        *web_state.library_folder.write().unwrap() = Some(same.clone());
+        let sequencer = web_state.action_sequencer();
+
+        let same_folder = sequencer.envelope(ActionSourceClass::Native, same.clone());
+        app.apply_correlated_action(same_folder, |app, path| WebActionDispatchOutcome {
+            batch: WebActionBatchDisposition::Continue,
+            lifecycle: app.apply_dropped_path(path),
+        });
+        assert_eq!(app.highest_applied_action_sequence, 0);
+        let receipts = web_state.action_receipts_for_test();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].sequence.get(), 1);
+        assert_eq!(receipts[0].disposition, ActionDisposition::Coalesced);
+
+        let generation_after_same = web_state.library_generation();
+        let runtime = app
+            .library_index_runtime
+            .as_mut()
+            .expect("admitted scan owns a runtime");
+        runtime.shutdown_for_test();
+        runtime.seed_empty_completion_for_test(generation_after_same);
+        let failed_new = sequencer.envelope(ActionSourceClass::Native, rejected_new.clone());
+        app.apply_correlated_action(failed_new, |app, path| WebActionDispatchOutcome {
+            batch: WebActionBatchDisposition::Continue,
+            lifecycle: app.apply_dropped_path(path),
+        });
+        assert_eq!(app.highest_applied_action_sequence, 0);
+        assert_eq!(app.library_folder.as_ref(), Some(&same));
+        assert_eq!(web_state.library_generation(), generation_after_same);
+        assert_eq!(
+            app.library_index_runtime
+                .as_ref()
+                .and_then(library_index::LibraryIndexRuntime::poll)
+                .map(|completion| completion.generation),
+            Some(generation_after_same),
+            "the refused action must preserve the prior current completion",
+        );
+        assert_eq!(
+            web_state.library_folder.read().unwrap().as_ref(),
+            Some(&same),
+        );
+        let receipts = web_state.action_receipts_for_test();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[1].sequence.get(), 2);
+        assert_eq!(receipts[1].disposition, ActionDisposition::Refused);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shutdown_barrier_terminalizes_every_unresolved_identity_exactly_once() {
+        use action_correlation::{ActionDisposition, ActionSourceClass};
+
+        let web_state = WebState::new().expect("test token");
+        let sequencer = web_state.action_sequencer();
+        let queued = web_state.envelope_for_test(web::state::WebAction::SetParam {
+            param: "brightness".into(),
+            value: serde_json::json!(0.25),
+        });
+        web_state.actions.try_lock().unwrap().push(queued);
+
+        let mut app = App::new(None, None, web_state.clone());
+        let editor_identity = sequencer.envelope(ActionSourceClass::Native, ()).identity();
+        app.native_editor_action_identity =
+            Some((history::HistoryGestureId::new(91).unwrap(), editor_identity));
+        let applied_identity = sequencer
+            .envelope(ActionSourceClass::Browser, ())
+            .identity();
+        app.record_applied_action_identity(applied_identity);
+        app.midi
+            .inject_message_for_test(Instant::now(), 7, &[0xb0, 127, 64]);
+
+        app.close_action_ingress_for_shutdown();
+        assert_eq!(web_state.action_timing_snapshot().pending, 0);
+        let receipts = web_state.action_receipts_for_test();
+        assert_eq!(receipts.len(), 4);
+        assert_eq!(receipts[0].sequence.get(), 1);
+        assert_eq!(receipts[0].disposition, ActionDisposition::Superseded);
+        assert_eq!(receipts[1].sequence.get(), 2);
+        assert_eq!(receipts[1].disposition, ActionDisposition::Superseded);
+        assert_eq!(receipts[2].sequence.get(), 4);
+        assert_eq!(receipts[2].disposition, ActionDisposition::Superseded);
+        assert_eq!(receipts[3].sequence.get(), 3);
+        assert_eq!(receipts[3].disposition, ActionDisposition::NotYetPresented);
+
+        app.close_action_ingress_for_shutdown();
+        assert_eq!(web_state.action_receipts_for_test(), receipts);
+    }
+
+    #[test]
+    fn warmed_flight_content_telemetry_reads_only_the_fixed_cached_fact() {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        let cached = app
+            .flight_content_identity()
+            .expect("startup prepares one cold content fact");
+        let mut changed_world = cached.patch_plan_digest.0;
+        changed_world[0] ^= 0xff;
+        app.install_flight_content_identity_fingerprint(changed_world);
+        let non_source_edit = app.flight_content_identity().unwrap();
+        assert_ne!(non_source_edit.patch_plan_digest, cached.patch_plan_digest);
+        assert_eq!(non_source_edit.source_set_digest, cached.source_set_digest);
+        let source_rebuilds = app.flight_source_digest_cache.rebuilds;
+        let accepted_capacity = app.flight_source_digest_cache.accepted_signature.capacity();
+        let observed_capacity = app.flight_source_digest_cache.observed_signature.capacity();
+        for value in 0..1_000_u64 {
+            let mut fingerprint = non_source_edit.patch_plan_digest.0;
+            fingerprint[..8].copy_from_slice(&value.to_le_bytes());
+            app.install_flight_content_identity_fingerprint(fingerprint);
+            assert_eq!(
+                app.flight_content_identity().unwrap().source_set_digest,
+                cached.source_set_digest,
+            );
+        }
+        assert_eq!(app.flight_source_digest_cache.rebuilds, source_rebuilds);
+        assert_eq!(
+            app.flight_source_digest_cache.accepted_signature.capacity(),
+            accepted_capacity,
+        );
+        assert_eq!(
+            app.flight_source_digest_cache.observed_signature.capacity(),
+            observed_capacity,
+        );
+        let warmed = app.flight_content_identity().unwrap();
+        app.visual_epoch = app.visual_epoch.wrapping_add(10_000);
+        app.composition_revision = app.composition_revision.wrapping_add(10_000);
+        app.web_authored_mutation_counter = app.web_authored_mutation_counter.wrapping_add(10_000);
+        for _ in 0..1_000 {
+            assert_eq!(app.flight_content_identity(), Some(warmed));
+        }
+
+        let source = include_str!("main.rs");
+        let (_, enqueue) = source
+            .split_once("fn enqueue_recovery_checkpoint")
+            .expect("fixed-fingerprint recovery enqueue");
+        let (enqueue, _) = enqueue
+            .split_once("fn sync_recovery_writer_status")
+            .expect("bounded enqueue body");
+        assert!(enqueue.contains("install_flight_content_identity_fingerprint(fingerprint)"));
+        for forbidden in [
+            "try_capture_current_patch",
+            "capture_manual_history_world",
+            "fingerprint_canonical",
+            "serde_yaml",
+            "Sha256",
+        ] {
+            assert!(
+                !enqueue.contains(forbidden),
+                "recovery enqueue reintroduced {forbidden}",
+            );
+        }
+
+        let (_, installer) = source
+            .split_once("fn install_flight_content_identity_fingerprint")
+            .expect("fixed digest installer");
+        let (installer, _) = installer
+            .split_once("fn flight_content_identity(&self)")
+            .expect("cache reader follows fixed digest installer");
+        for forbidden in [
+            "try_capture_current_patch",
+            "capture_manual_history_world",
+            "fingerprint_canonical",
+            "serde_yaml",
+            "Sha256",
+            "for layer",
+        ] {
+            assert!(
+                !installer.contains(forbidden),
+                "fixed digest installer reintroduced {forbidden}",
+            );
+        }
+
+        let (_, cache_reader) = source
+            .split_once("fn flight_content_identity(&self)")
+            .expect("fixed cache reader");
+        let (cache_reader, telemetry) = cache_reader
+            .split_once("fn record_flight_telemetry")
+            .expect("telemetry follows cache reader");
+        for forbidden in [
+            "try_capture_current_patch",
+            "serde_yaml",
+            "Sha256",
+            "for layer",
+        ] {
+            assert!(
+                !cache_reader.contains(forbidden),
+                "warm cache reader reintroduced {forbidden}",
+            );
+        }
+        let (telemetry, _) = telemetry
+            .split_once("fn stage_health_snapshot")
+            .expect("bounded telemetry body");
+        for forbidden in ["try_capture_current_patch", "serde_yaml", "Sha256"] {
+            assert!(
+                !telemetry.contains(forbidden),
+                "telemetry hot path reintroduced {forbidden}",
+            );
+        }
+    }
+
+    #[test]
+    fn flight_source_digest_changes_on_source_replacement_but_not_stack_order() {
+        let first = flight_source_identity_fact(
+            7,
+            "video",
+            "cos-sha256://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/1",
+            1,
+        );
+        let second = flight_source_identity_fact(
+            9,
+            "image",
+            "cos-sha256://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/2",
+            1,
+        );
+        let baseline = flight_source_set_digest([first, second]);
+        assert_eq!(baseline, flight_source_set_digest([second, first]));
+
+        let replacement = flight_source_identity_fact(
+            7,
+            "video",
+            "cos-sha256://cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/3",
+            1,
+        );
+        let replacement_digest = flight_source_set_digest([replacement, second]);
+        assert_ne!(baseline, replacement_digest);
+
+        let hostile_a = flight_source_identity_fact(7, "video", r"C:\Users\Alice\secret-a.mov", 42);
+        let hostile_b = flight_source_identity_fact(7, "video", r"D:\venue\secret-b.mov", 42);
+        assert_eq!(
+            flight_source_set_digest([hostile_a]),
+            flight_source_set_digest([hostile_b]),
+            "unverified host paths must not influence the recorder digest",
+        );
+
+        let mut cache = FlightSourceDigestCache::default();
+        let signature = [FlightSourceSignature {
+            stable_layer_id: 7,
+            source_kind: first.source_kind,
+            verified_content_identity: first.verified_content_identity,
+            unverified_change_witness: first.unverified_change_witness,
+        }];
+        assert_eq!(cache.resolve(signature, || baseline), baseline);
+        assert_eq!(
+            cache.resolve(signature, || panic!("warm source rebuilt")),
+            baseline,
+        );
+        let accepted_capacity = cache.accepted_signature.capacity();
+        let observed_capacity = cache.observed_signature.capacity();
+        for _ in 0..1_000 {
+            assert_eq!(
+                cache.resolve(signature, || panic!("unchanged source rebuilt")),
+                baseline,
+            );
+        }
+        assert_eq!(cache.rebuilds, 1);
+        assert_eq!(cache.accepted_signature.capacity(), accepted_capacity);
+        assert_eq!(cache.observed_signature.capacity(), observed_capacity);
+        let replacement_signature = [FlightSourceSignature {
+            stable_layer_id: 7,
+            source_kind: replacement.source_kind,
+            verified_content_identity: replacement.verified_content_identity,
+            unverified_change_witness: replacement.unverified_change_witness,
+        }];
+        assert_eq!(
+            cache.resolve(replacement_signature, || replacement_digest),
+            replacement_digest,
+        );
+        assert_eq!(cache.rebuilds, 2);
+        assert_eq!(
+            cache.resolve(replacement_signature, || panic!(
+                "replacement rebuilt twice"
+            )),
+            replacement_digest,
+        );
+        assert_eq!(cache.rebuilds, 2);
+        let mut history_reconstruction_cache = FlightSourceDigestCache::default();
+        assert_eq!(
+            history_reconstruction_cache.resolve(signature, || baseline),
+            baseline,
+        );
+        assert_eq!(
+            history_reconstruction_cache.resolve(replacement_signature, || replacement_digest),
+            replacement_digest,
+            "same stable ID and epoch must still rebuild for a different verified identity",
+        );
+        assert_eq!(history_reconstruction_cache.rebuilds, 2);
+
+        let first_signature = FlightSourceSignature {
+            stable_layer_id: first.stable_layer_id,
+            source_kind: first.source_kind,
+            verified_content_identity: first.verified_content_identity,
+            unverified_change_witness: first.unverified_change_witness,
+        };
+        let second_signature = FlightSourceSignature {
+            stable_layer_id: second.stable_layer_id,
+            source_kind: second.source_kind,
+            verified_content_identity: second.verified_content_identity,
+            unverified_change_witness: second.unverified_change_witness,
+        };
+        let mut reorder_cache = FlightSourceDigestCache::default();
+        assert_eq!(
+            reorder_cache.resolve([first_signature, second_signature], || baseline),
+            baseline,
+        );
+        assert_eq!(
+            reorder_cache.resolve([second_signature, first_signature], || panic!(
+                "layer order rebuilt an order-independent source set"
+            )),
+            baseline,
+        );
+        assert_eq!(reorder_cache.rebuilds, 1);
+    }
+
+    #[test]
+    fn async_identity_mint_refreshes_source_digest_without_changing_patch_digest() {
+        let unverified = flight_source_identity_fact(7, "video", r"C:\private\camera.mov", 1);
+        let verified = flight_source_identity_fact(
+            7,
+            "video",
+            "cos-sha256://dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/4096",
+            1,
+        );
+        let unverified_digest = flight_source_set_digest([unverified]);
+        let verified_digest = flight_source_set_digest([verified]);
+        assert_ne!(unverified_digest, verified_digest);
+
+        let unverified_signature = [FlightSourceSignature {
+            stable_layer_id: 7,
+            source_kind: unverified.source_kind,
+            verified_content_identity: unverified.verified_content_identity,
+            unverified_change_witness: unverified.unverified_change_witness,
+        }];
+        let verified_signature = [FlightSourceSignature {
+            stable_layer_id: 7,
+            source_kind: verified.source_kind,
+            verified_content_identity: verified.verified_content_identity,
+            unverified_change_witness: verified.unverified_change_witness,
+        }];
+        let mut cache = FlightSourceDigestCache::default();
+        assert_eq!(
+            cache.resolve(unverified_signature, || unverified_digest),
+            unverified_digest,
+        );
+        let patch_plan_digest = flight_recorder::Digest32([0x3c; 32]);
+        let mut cached = Some(flight_recorder::ContentIdentityFact {
+            patch_plan_digest,
+            source_set_digest: unverified_digest,
+            source_count: 1,
+        });
+        let mut generation = 9;
+        assert!(refresh_cached_flight_source_identity(
+            &mut cache,
+            &mut cached,
+            &mut generation,
+            1,
+            verified_signature,
+            || verified_digest,
+        ));
+        let refreshed = cached.expect("source-only refresh keeps the cached fact");
+        assert_eq!(refreshed.patch_plan_digest, patch_plan_digest);
+        assert_eq!(refreshed.source_set_digest, verified_digest);
+        assert_eq!(generation, 10);
+        assert_eq!(cache.rebuilds, 2);
+
+        let source = include_str!("main.rs");
+        let (_, mint) = source
+            .split_once("fn install_minted_identity")
+            .expect("production mint seam");
+        let (mint, _) = mint
+            .split_once("fn study_frame_inputs")
+            .expect("bounded mint body");
+        let persisted = mint
+            .find("set_persisted_source_reference")
+            .expect("verified identity publication");
+        let refreshed = mint
+            .find("refresh_flight_source_content_identity_cache")
+            .expect("source-only flight cache refresh");
+        assert!(
+            persisted < refreshed,
+            "refresh must follow identity publication"
+        );
+    }
+
+    #[test]
+    fn opaque_unverified_witness_covers_add_remove_prepared_and_whole_stack_commits() {
+        let fact = |path: &str, witness| flight_source_identity_fact(7, "video", path, witness);
+        let signature = |fact: FlightSourceIdentityFact| {
+            [FlightSourceSignature {
+                stable_layer_id: fact.stable_layer_id,
+                source_kind: fact.source_kind,
+                verified_content_identity: fact.verified_content_identity,
+                unverified_change_witness: fact.unverified_change_witness,
+            }]
+        };
+        let empty_digest = flight_source_set_digest(std::iter::empty());
+        let first = fact(r"C:\private\first.mov", 2);
+        let prepared_replacement = fact(r"D:\venue\second.mov", 3);
+        let whole_stack_replacement = fact(r"E:\show\third.mov", 4);
+        let first_digest = flight_source_set_digest([first]);
+        let prepared_digest = flight_source_set_digest([prepared_replacement]);
+        let replacement_digest = flight_source_set_digest([whole_stack_replacement]);
+        assert_ne!(first_digest, prepared_digest);
+        assert_ne!(prepared_digest, replacement_digest);
+
+        let patch_plan_digest = flight_recorder::Digest32([0x55; 32]);
+        let mut cache = FlightSourceDigestCache::default();
+        assert_eq!(
+            cache.resolve(std::iter::empty(), || empty_digest),
+            empty_digest,
+        );
+        let mut cached = Some(flight_recorder::ContentIdentityFact {
+            patch_plan_digest,
+            source_set_digest: empty_digest,
+            source_count: 0,
+        });
+        let mut generation = 1;
+
+        // Initial empty -> one source.
+        assert!(refresh_cached_flight_source_identity(
+            &mut cache,
+            &mut cached,
+            &mut generation,
+            1,
+            signature(first),
+            || first_digest,
+        ));
+        // Prepared ClipSlot/Scene/Autopilot A -> B on the same stable layer.
+        assert!(refresh_cached_flight_source_identity(
+            &mut cache,
+            &mut cached,
+            &mut generation,
+            1,
+            signature(prepared_replacement),
+            || prepared_digest,
+        ));
+        // Remove the final source.
+        assert!(refresh_cached_flight_source_identity(
+            &mut cache,
+            &mut cached,
+            &mut generation,
+            0,
+            std::iter::empty(),
+            || empty_digest,
+        ));
+        // Whole-stack replacement from empty to another unverified source.
+        assert!(refresh_cached_flight_source_identity(
+            &mut cache,
+            &mut cached,
+            &mut generation,
+            1,
+            signature(whole_stack_replacement),
+            || replacement_digest,
+        ));
+        let refreshed = cached.expect("source-only refresh keeps the content fact");
+        assert_eq!(refreshed.patch_plan_digest, patch_plan_digest);
+        assert_eq!(refreshed.source_set_digest, replacement_digest);
+        assert_eq!(refreshed.source_count, 1);
+        assert_eq!(generation, 5);
+    }
+
+    #[test]
+    fn identical_unverified_whole_stack_history_keeps_source_identity_while_plan_changes() {
+        let before = transient_logical_source_set([
+            (7, "video", r"C:\show\same.mov"),
+            (9, "image", r"D:\show\still.png"),
+        ]);
+        let identical_rebuilt = transient_logical_source_set([
+            // Stack order is not source identity.
+            (9, "image", r"D:\show\still.png"),
+            (7, "video", r"C:\show\same.mov"),
+        ]);
+        assert!(before == identical_rebuilt);
+
+        let mut source_witness = 21;
+        advance_unverified_source_change_witness(&mut source_witness, before != identical_rebuilt);
+        assert_eq!(source_witness, 21);
+        let facts = [
+            flight_source_identity_fact(7, "video", r"C:\show\same.mov", source_witness),
+            flight_source_identity_fact(9, "image", r"D:\show\still.png", source_witness),
+        ];
+        let source_digest = flight_source_set_digest(facts);
+        let signatures = facts.map(|fact| FlightSourceSignature {
+            stable_layer_id: fact.stable_layer_id,
+            source_kind: fact.source_kind,
+            verified_content_identity: fact.verified_content_identity,
+            unverified_change_witness: fact.unverified_change_witness,
+        });
+        let mut cache = FlightSourceDigestCache::default();
+        assert_eq!(cache.resolve(signatures, || source_digest), source_digest);
+        let source_rebuilds = cache.rebuilds;
+        let old_plan_digest = flight_recorder::Digest32([1; 32]);
+        let new_plan_digest = flight_recorder::Digest32([2; 32]);
+        let mut cached = Some(flight_recorder::ContentIdentityFact {
+            patch_plan_digest: old_plan_digest,
+            source_set_digest: source_digest,
+            source_count: 2,
+        });
+        let mut source_publication_generation = 8;
+        assert!(!refresh_cached_flight_source_identity(
+            &mut cache,
+            &mut cached,
+            &mut source_publication_generation,
+            2,
+            signatures,
+            || panic!("identical logical sources rebuilt their digest"),
+        ));
+        // The ordinary history install may publish a new authored-world/plan
+        // digest, but neither the source digest nor its source-only generation
+        // changes as a side effect.
+        cached.as_mut().unwrap().patch_plan_digest = new_plan_digest;
+        assert_ne!(old_plan_digest, new_plan_digest);
+        assert_eq!(cached.as_ref().unwrap().source_set_digest, source_digest);
+        assert_eq!(source_publication_generation, 8);
+        assert_eq!(source_witness, 21);
+        assert_eq!(cache.rebuilds, source_rebuilds);
+    }
+
+    #[test]
+    fn prepared_source_equality_advances_only_for_a_different_exact_reference() {
+        let before = transient_logical_source_set([(7, "video", r"C:\show\a.mov")]);
+        let same = transient_logical_source_set([(7, "video", r"C:\show\a.mov")]);
+        let different = transient_logical_source_set([(7, "video", r"D:\show\b.mov")]);
+        assert!(before == same);
+        assert!(before != different);
+
+        let mut source_witness = 30;
+        advance_unverified_source_change_witness(&mut source_witness, before != same);
+        assert_eq!(source_witness, 30, "same-source reactivation is stable");
+        let first = flight_source_identity_fact(7, "video", r"C:\show\a.mov", source_witness);
+        let first_signature = [FlightSourceSignature {
+            stable_layer_id: first.stable_layer_id,
+            source_kind: first.source_kind,
+            verified_content_identity: first.verified_content_identity,
+            unverified_change_witness: first.unverified_change_witness,
+        }];
+        let first_digest = flight_source_set_digest([first]);
+        let mut cache = FlightSourceDigestCache::default();
+        assert_eq!(
+            cache.resolve(first_signature, || first_digest),
+            first_digest
+        );
+        let mut cached = Some(flight_recorder::ContentIdentityFact {
+            patch_plan_digest: flight_recorder::Digest32([3; 32]),
+            source_set_digest: first_digest,
+            source_count: 1,
+        });
+        let mut source_publication_generation = 4;
+        assert!(!refresh_cached_flight_source_identity(
+            &mut cache,
+            &mut cached,
+            &mut source_publication_generation,
+            1,
+            first_signature,
+            || panic!("same-source prepared activation rebuilt"),
+        ));
+        assert_eq!(source_publication_generation, 4);
+
+        advance_unverified_source_change_witness(&mut source_witness, before != different);
+        assert_eq!(source_witness, 31);
+        let replacement = flight_source_identity_fact(7, "video", r"D:\show\b.mov", source_witness);
+        let replacement_signature = [FlightSourceSignature {
+            stable_layer_id: replacement.stable_layer_id,
+            source_kind: replacement.source_kind,
+            verified_content_identity: replacement.verified_content_identity,
+            unverified_change_witness: replacement.unverified_change_witness,
+        }];
+        let replacement_digest = flight_source_set_digest([replacement]);
+        assert_ne!(first_digest, replacement_digest);
+        assert!(refresh_cached_flight_source_identity(
+            &mut cache,
+            &mut cached,
+            &mut source_publication_generation,
+            1,
+            replacement_signature,
+            || replacement_digest,
+        ));
+        assert_eq!(source_publication_generation, 5);
+        assert_eq!(
+            cached.as_ref().unwrap().source_set_digest,
+            replacement_digest
+        );
+    }
+
+    #[test]
+    fn logical_refresh_call_sites_are_local_and_backing_only_epochs_stay_stable() {
+        let fact = flight_source_identity_fact(7, "video", r"C:\private\camera.mov", 9);
+        let signature = [FlightSourceSignature {
+            stable_layer_id: fact.stable_layer_id,
+            source_kind: fact.source_kind,
+            verified_content_identity: fact.verified_content_identity,
+            unverified_change_witness: fact.unverified_change_witness,
+        }];
+        let digest = flight_source_set_digest([fact]);
+        let mut cache = FlightSourceDigestCache::default();
+        assert_eq!(cache.resolve(signature, || digest), digest);
+        let mut cached = Some(flight_recorder::ContentIdentityFact {
+            patch_plan_digest: flight_recorder::Digest32([7; 32]),
+            source_set_digest: digest,
+            source_count: 1,
+        });
+        let mut generation = 11;
+        for _backing_epoch in [1_u64, 2, 3, u64::MAX] {
+            assert!(!refresh_cached_flight_source_identity(
+                &mut cache,
+                &mut cached,
+                &mut generation,
+                1,
+                signature,
+                || panic!("backing-only epoch rebuilt the logical source digest"),
+            ));
+        }
+        assert_eq!(generation, 11);
+        assert_eq!(cache.rebuilds, 1);
+
+        let source = include_str!("main.rs");
+        for (start, end, publication) in [
+            (
+                "fn commit_new_bottom_layer",
+                "fn add_layer",
+                "self.layers.push(layer)",
+            ),
+            (
+                "fn remove_layer_transactional",
+                "fn move_layer_transactional",
+                "self.layers.remove(removed_index)",
+            ),
+        ] {
+            let (_, body) = source
+                .split_once(start)
+                .expect("logical source commit seam");
+            let (body, _) = body.split_once(end).expect("bounded logical commit body");
+            let published = body.find(publication).expect("source publication");
+            let refreshed = body
+                .rfind("refresh_flight_source_content_identity_cache(true)")
+                .expect("logical source refresh");
+            assert!(published < refreshed);
+        }
+        let (_, prepared) = source
+            .split_once("fn commit_cached_performance")
+            .expect("prepared commit seam");
+        let (prepared, _) = prepared
+            .split_once("fn validate_autopilot_scene_content")
+            .expect("bounded prepared commit body");
+        assert!(prepared.contains("let logical_sources_before = transient_layer_source_set"));
+        assert!(prepared.contains("cached.payload.commit(&mut self.layers, now)"));
+        assert!(
+            prepared.contains("logical_sources_before != transient_layer_source_set(&self.layers)")
+        );
+        assert!(prepared
+            .contains("refresh_flight_source_content_identity_cache(logical_source_changed)"));
+
+        let (_, whole_stack) = source
+            .split_once("// Patch modulation replacement")
+            .expect("whole-stack commit prelude");
+        let (whole_stack, _) = whole_stack
+            .split_once("if let Some(staged_controller_rebind)")
+            .expect("bounded whole-stack follow-up");
+        assert!(whole_stack.contains(
+            "transient_layer_source_set(&self.layers) != transient_layer_source_set(&rebuilt)"
+        ));
+        assert!(whole_stack.contains("self.layers = rebuilt"));
+        assert!(whole_stack
+            .contains("refresh_flight_source_content_identity_cache(logical_source_changed)"));
+
+        let (_, adoption) = source
+            .split_once("fn install_prepared_proxy_adoption")
+            .expect("proxy adoption seam");
+        let (adoption, _) = adoption
+            .split_once("fn proxy_layer_status")
+            .expect("bounded proxy adoption body");
+        assert!(adoption.contains("commit_adopted_proxy"));
+        assert!(!adoption.contains("refresh_flight_source_content_identity_cache"));
+        let production = source
+            .split_once("#[cfg(test)]\nmod app_state_tests")
+            .expect("production/test boundary")
+            .0;
+        assert_eq!(
+            production
+                .matches("refresh_flight_source_content_identity_cache(true)")
+                .count(),
+            2,
+            "only add/remove are unconditionally logical-source changes",
+        );
+        assert_eq!(
+            production
+                .matches("refresh_flight_source_content_identity_cache(false)")
+                .count(),
+            1,
+            "identity verification preserves the underlying logical source witness",
+        );
+        assert_eq!(
+            production
+                .matches("refresh_flight_source_content_identity_cache(logical_source_changed)",)
+                .count(),
+            2,
+            "prepared and whole-stack commits are equality-gated",
+        );
+        let (_, signature_definition) = source
+            .split_once("struct FlightSourceSignature")
+            .expect("source signature definition");
+        let (signature_definition, _) = signature_definition
+            .split_once("struct FlightSourceDigestCache")
+            .expect("bounded source signature");
+        assert!(!signature_definition.contains("source_resource_epoch"));
+    }
+
+    #[test]
+    fn manual_action_fingerprints_override_legacy_syntax_flags_for_all_assignment_families() {
+        use web::state::WebAction;
+
+        let actions = [
+            WebAction::SetLayerVisibility {
+                index: 0,
+                layer_id: Some("1".into()),
+                visible: true,
+            },
+            WebAction::SetLayerPaused {
+                index: 0,
+                layer_id: Some("1".into()),
+                paused: true,
+            },
+            WebAction::SetLayerEffect {
+                index: 0,
+                layer_id: Some("1".into()),
+                param: "brightness".into(),
+                value: serde_json::json!(0.25),
+            },
+            WebAction::SetLayerPattern {
+                index: 0,
+                layer_id: Some("1".into()),
+                param: "scale".into(),
+                value: serde_json::json!(0.25),
+            },
+            WebAction::SetMasterTransform {
+                param: "position_x".into(),
+                value: serde_json::json!(0.25),
+            },
+            WebAction::ResetMasterTransform,
+            WebAction::SetLayerTransform {
+                index: 0,
+                layer_id: Some("1".into()),
+                param: "position_x".into(),
+                value: serde_json::json!(0.25),
+            },
+            WebAction::ResetLayerTransform {
+                index: 0,
+                layer_id: Some("1".into()),
+            },
+        ];
+        let before = [7_u8; 32];
+        for action in actions {
+            assert!(!App::history_action_is_performance_only(&action));
+            assert!(
+                !App::accepted_from_manual_fingerprints(
+                    true,
+                    Some(before),
+                    Some(before),
+                    true,
+                ),
+                "{action:?} must refuse an identical canonical state even if its legacy arm says valid",
+            );
+            assert!(
+                App::accepted_from_manual_fingerprints(
+                    true,
+                    Some(before),
+                    Some([8_u8; 32]),
+                    false,
+                ),
+                "{action:?} must apply a real canonical mutation even if its legacy arm omitted the flag",
+            );
+        }
+    }
+
+    #[test]
+    fn successful_history_boundaries_are_coalesced_and_invalid_boundaries_are_refused() {
+        use action_correlation::{ActionDisposition, ActionSourceClass};
+        use web::state::WebAction;
+
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state.clone());
+        app.recovery_writer = None;
+        let sequencer = web_state.action_sequencer();
+        for (action, expected) in [
+            (
+                WebAction::BeginHistoryGesture { gesture_id: 901 },
+                ActionDisposition::Coalesced,
+            ),
+            (
+                WebAction::EndHistoryGesture { gesture_id: 901 },
+                ActionDisposition::Coalesced,
+            ),
+            (
+                WebAction::BeginHistoryGesture { gesture_id: 902 },
+                ActionDisposition::Coalesced,
+            ),
+            (
+                WebAction::CancelHistoryGesture { gesture_id: 902 },
+                ActionDisposition::Coalesced,
+            ),
+            (
+                WebAction::BeginHistoryGesture { gesture_id: 0 },
+                ActionDisposition::Refused,
+            ),
+            (
+                WebAction::EndHistoryGesture { gesture_id: 999 },
+                ActionDisposition::Refused,
+            ),
+        ] {
+            let envelope = sequencer.envelope(ActionSourceClass::Browser, action);
+            app.apply_correlated_action(envelope, |app, action| {
+                app.handle_web_action_from_origin(action, ActionSourceClass::Browser)
+            });
+            assert_eq!(
+                web_state
+                    .action_receipts_for_test()
+                    .last()
+                    .unwrap()
+                    .disposition,
+                expected,
+            );
+            assert_eq!(app.highest_applied_action_sequence, 0);
+        }
+    }
+
+    #[test]
+    fn representative_performance_actions_report_real_change_not_syntax() {
+        use web::state::WebAction;
+
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        app.recovery_writer = None;
+        let endpoint_id = stage_map::OutputEndpointId::parse("audience-1").unwrap();
+        let mut endpoint = stage_map::StageEndpoint::new(endpoint_id, "Audience", [1920, 1080]);
+        endpoint.binding = stage_map::OutputBinding::Monitor {
+            selector: "Audience monitor".into(),
+        };
+        app.stage_map.add_endpoint(endpoint).unwrap();
+        app.media_safety_policy = media_safety::MediaSafetyPolicy::for_test(
+            media_safety::MediaSafetyMode::Safe,
+            1024 * 1024 * 1024,
+        );
+        let history_depth = app.manual_history.metrics().undo_depth;
+        for (action, expected) in [
+            (WebAction::TapTempo, ActionLifecycleOutcome::Applied),
+            (
+                WebAction::BendPad {
+                    index: 0,
+                    held: true,
+                },
+                ActionLifecycleOutcome::Applied,
+            ),
+            (
+                WebAction::BendPad {
+                    index: 0,
+                    held: true,
+                },
+                ActionLifecycleOutcome::Refused,
+            ),
+            (
+                WebAction::Gyro {
+                    alpha: 30.0,
+                    beta: 10.0,
+                    gamma: -5.0,
+                },
+                ActionLifecycleOutcome::Applied,
+            ),
+            (
+                WebAction::Gyro {
+                    alpha: 30.0,
+                    beta: 10.0,
+                    gamma: -5.0,
+                },
+                ActionLifecycleOutcome::Refused,
+            ),
+            (WebAction::GyroCalibrate, ActionLifecycleOutcome::Applied),
+            (WebAction::GyroCalibrate, ActionLifecycleOutcome::Refused),
+            (
+                WebAction::Pad {
+                    x: 0.2,
+                    y: 0.8,
+                    active: true,
+                },
+                ActionLifecycleOutcome::Applied,
+            ),
+            (
+                WebAction::Pad {
+                    x: 0.2,
+                    y: 0.8,
+                    active: true,
+                },
+                ActionLifecycleOutcome::Refused,
+            ),
+            (
+                WebAction::TriggerCollisionScore,
+                ActionLifecycleOutcome::Applied,
+            ),
+            (
+                WebAction::TriggerRefreshGarden,
+                ActionLifecycleOutcome::Applied,
+            ),
+            (
+                WebAction::ClearTemporalMemory,
+                ActionLifecycleOutcome::Applied,
+            ),
+            (
+                WebAction::SetSpout { enabled: true },
+                ActionLifecycleOutcome::Applied,
+            ),
+            (
+                WebAction::SetSpout { enabled: true },
+                ActionLifecycleOutcome::Refused,
+            ),
+            (
+                WebAction::SetMediaSafetyMode {
+                    mode: media_safety::MediaSafetyMode::Expert,
+                },
+                ActionLifecycleOutcome::Coalesced,
+            ),
+            (
+                WebAction::SetMediaSafetyMode {
+                    mode: media_safety::MediaSafetyMode::Expert,
+                },
+                ActionLifecycleOutcome::Refused,
+            ),
+            (
+                WebAction::SetStageHealthHud { enabled: true },
+                ActionLifecycleOutcome::Coalesced,
+            ),
+            (
+                WebAction::SetStageHealthHud { enabled: true },
+                ActionLifecycleOutcome::Refused,
+            ),
+            (
+                WebAction::SetMonitorBay { enabled: true },
+                ActionLifecycleOutcome::Coalesced,
+            ),
+            (
+                WebAction::SetMonitorBay { enabled: true },
+                ActionLifecycleOutcome::Refused,
+            ),
+            (
+                WebAction::SetMonitorProbe {
+                    probe: "program_tap".into(),
+                },
+                ActionLifecycleOutcome::Coalesced,
+            ),
+            (
+                WebAction::SetMonitorProbe {
+                    probe: "program_tap".into(),
+                },
+                ActionLifecycleOutcome::Refused,
+            ),
+            (
+                WebAction::SetStageTestCard {
+                    mode: stage_map::TestCardMode::Grid,
+                    output_endpoint_id: Some("audience-1".into()),
+                },
+                ActionLifecycleOutcome::Applied,
+            ),
+            (
+                WebAction::SetStageTestCard {
+                    mode: stage_map::TestCardMode::Grid,
+                    output_endpoint_id: Some("audience-1".into()),
+                },
+                ActionLifecycleOutcome::Refused,
+            ),
+            (
+                WebAction::SetOutputIdentification {
+                    enabled: true,
+                    output_endpoint_id: Some("audience-1".into()),
+                },
+                ActionLifecycleOutcome::Applied,
+            ),
+            (
+                WebAction::SetOutputIdentification {
+                    enabled: true,
+                    output_endpoint_id: Some("audience-1".into()),
+                },
+                ActionLifecycleOutcome::Refused,
+            ),
+            (
+                WebAction::SetStageTestCard {
+                    mode: stage_map::TestCardMode::Grid,
+                    output_endpoint_id: Some("missing-endpoint".into()),
+                },
+                ActionLifecycleOutcome::Refused,
+            ),
+            (
+                WebAction::SetPerformanceRecording {
+                    enabled: true,
+                    layer_stack_revision: app.layer_stack_revision,
+                },
+                ActionLifecycleOutcome::Coalesced,
+            ),
+            (
+                WebAction::SetPerformanceRecording {
+                    enabled: true,
+                    layer_stack_revision: app.layer_stack_revision,
+                },
+                ActionLifecycleOutcome::Refused,
+            ),
+            (
+                WebAction::SetPerformanceRecording {
+                    enabled: false,
+                    layer_stack_revision: app.layer_stack_revision,
+                },
+                ActionLifecycleOutcome::Coalesced,
+            ),
+            (
+                WebAction::RequestLayerProxy {
+                    layer_id: "999999".into(),
+                },
+                ActionLifecycleOutcome::Refused,
+            ),
+            (WebAction::RescanLibrary, ActionLifecycleOutcome::Refused),
+        ] {
+            assert_eq!(
+                app.handle_web_action_inner_with_feedback_from_origin(
+                    action,
+                    action_correlation::ActionSourceClass::Browser,
+                )
+                .lifecycle,
+                expected,
+            );
+        }
+        app.temporal_event_recorder.record_accepted(
+            1.0 / 30.0,
+            temporal::TemporalFrameEvents {
+                manual_events: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            app.handle_web_action_inner_with_feedback_from_origin(
+                WebAction::ClearTemporalEventTrack,
+                action_correlation::ActionSourceClass::Browser,
+            )
+            .lifecycle,
+            ActionLifecycleOutcome::Coalesced,
+        );
+        assert_eq!(
+            app.handle_web_action_inner_with_feedback_from_origin(
+                WebAction::ClearTemporalEventTrack,
+                action_correlation::ActionSourceClass::Browser,
+            )
+            .lifecycle,
+            ActionLifecycleOutcome::Refused,
+        );
+        assert_eq!(app.manual_history.metrics().undo_depth, history_depth);
+    }
+
+    #[test]
+    fn quantized_lifecycle_waits_for_real_admission_and_preserves_source() {
+        use action_correlation::{ActionDisposition, ActionSourceClass};
+        use creative_mutation::CreativeMutationOrigin;
+        use web::state::WebAction;
+
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state.clone());
+        app.recovery_writer = None;
+        app.performance_recording = true;
+        let sequencer = web_state.action_sequencer();
+
+        let eligible = sequencer.envelope(
+            ActionSourceClass::Phone,
+            WebAction::Quantized {
+                inner: Box::new(WebAction::SetParam {
+                    param: "brightness".into(),
+                    value: serde_json::json!(0.4),
+                }),
+            },
+        );
+        app.apply_correlated_action(eligible, |app, action| {
+            app.handle_web_action_from_origin(action, ActionSourceClass::Phone)
+        });
+        assert_eq!(app.highest_applied_action_sequence, 0);
+        assert_eq!(app.quantized_actions.len(), 1);
+        assert_eq!(app.quantized_action_sources, vec![ActionSourceClass::Phone]);
+        assert_eq!(
+            web_state
+                .action_receipts_for_test()
+                .last()
+                .unwrap()
+                .disposition,
+            ActionDisposition::Quantized
+        );
+
+        let prohibited = sequencer.envelope(
+            ActionSourceClass::Native,
+            WebAction::Quantized {
+                inner: Box::new(WebAction::BendPad {
+                    index: 0,
+                    held: true,
+                }),
+            },
+        );
+        app.apply_correlated_action(prohibited, |app, action| {
+            app.handle_web_action_from_origin(action, ActionSourceClass::Native)
+        });
+        assert_eq!(
+            web_state
+                .action_receipts_for_test()
+                .last()
+                .unwrap()
+                .disposition,
+            ActionDisposition::Refused
+        );
+
+        app.quantized_bar = Some(0);
+        app.mod_matrix.current_beat = 4.0;
+        app.release_quantized_actions_on_downbeat();
+        assert!(app.quantized_actions.is_empty());
+        assert!(app.quantized_action_sources.is_empty());
+        assert_eq!(app.pending_performance_edits.len(), 1);
+        assert_eq!(
+            app.pending_performance_edits[0].origin(),
+            CreativeMutationOrigin::Phone
+        );
+
+        let immediate = sequencer.envelope(
+            ActionSourceClass::Phone,
+            WebAction::Quantized {
+                inner: Box::new(WebAction::SetBlackout { enabled: true }),
+            },
+        );
+        let immediate_sequence = immediate.sequence().get();
+        app.apply_correlated_action(immediate, |app, action| {
+            app.handle_web_action_from_origin(action, ActionSourceClass::Phone)
+        });
+        assert!(app.blackout);
+        assert_eq!(app.highest_applied_action_sequence, immediate_sequence);
+
+        app.clear_quantized_actions();
+        for _ in 0..256 {
+            app.quantized_actions.push(WebAction::MorphCapture {
+                slot: "a".into(),
+                stack_revision: Some(app.layer_stack_revision),
+                composition_revision: Some(app.composition_revision),
+            });
+        }
+        let over_cap = sequencer.envelope(
+            ActionSourceClass::Browser,
+            WebAction::Quantized {
+                inner: Box::new(WebAction::SetParam {
+                    param: "contrast".into(),
+                    value: serde_json::json!(0.5),
+                }),
+            },
+        );
+        let before_high_water = app.highest_applied_action_sequence;
+        app.apply_correlated_action(over_cap, |app, action| {
+            app.handle_web_action_from_origin(action, ActionSourceClass::Browser)
+        });
+        assert_eq!(app.quantized_actions.len(), 256);
+        assert_eq!(app.highest_applied_action_sequence, before_high_water);
+        assert_eq!(
+            web_state
+                .action_receipts_for_test()
+                .last()
+                .unwrap()
+                .disposition,
+            ActionDisposition::Refused
+        );
+    }
+
+    #[test]
+    fn audience_latch_uses_the_immutable_frame_sequence_and_records_once() {
+        use action_correlation::{ActionDisposition, ActionSourceClass};
+        use std::time::Duration;
+
+        let web_state = WebState::new().expect("test token");
+        let sequencer = web_state.action_sequencer();
+        let origin = Instant::now();
+        let first = sequencer.envelope_at(ActionSourceClass::Browser, origin, ());
+        assert!(web_state.record_action_apply(&first, origin + Duration::from_millis(3)));
+        let mut latch = AudienceActionSubmissionLatch::new(first.sequence().get(), 77);
+        let second = sequencer.envelope_at(
+            ActionSourceClass::Native,
+            origin + Duration::from_millis(4),
+            (),
+        );
+        assert!(web_state.record_action_apply(&second, origin + Duration::from_millis(5)));
+
+        assert!(!latch.record_presented(&web_state, true));
+        assert!(!latch.capture_audience_submit(false, origin + Duration::from_millis(7)));
+        assert!(web_state.action_receipts_for_test().is_empty());
+        let submitted_at = origin + Duration::from_millis(11);
+        assert!(latch.capture_audience_submit(true, submitted_at));
+        assert!(!latch.capture_audience_submit(true, origin + Duration::from_millis(31)));
+        assert!(!latch.record_presented(&web_state, false));
+        assert!(
+            web_state.action_receipts_for_test().is_empty(),
+            "a later audience surface failure cannot claim Presented",
+        );
+        // Confirmation deliberately happens much later. The resulting metric
+        // must stay anchored to the captured queue-submit seam (11 - 3 ms),
+        // never to this post-present confirmation time.
+        assert!(latch.record_presented(&web_state, true));
+        assert!(!latch.record_presented(&web_state, true));
+
+        let receipts = web_state.action_receipts_for_test();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].sequence, first.sequence());
+        assert_eq!(receipts[0].disposition, ActionDisposition::Presented);
+        assert_eq!(receipts[0].submission_generation, Some(77));
+        assert_eq!(receipts[0].apply_to_submit_us, Some(8_000));
+        let snapshot = web_state.action_timing_snapshot();
+        assert_eq!(snapshot.apply_to_submit.p50_us, 8_000);
+        assert_eq!(snapshot.last_presented_sequence, first.sequence().get());
+        assert_eq!(snapshot.last_submission_generation, 77);
+        assert_eq!(snapshot.pending, 1, "post-evaluation action stays pending");
+    }
+
+    #[test]
+    fn yaml_identity_is_minted_before_mutation_and_noop_is_refused() {
+        use action_correlation::{ActionDisposition, ActionSourceClass};
+        use patch::editor::EditorHistoryBoundary;
+
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state.clone());
+        app.recovery_writer = None;
+        let before = app.history_checkpoint("Native", "native_editor").unwrap();
+        let identity = app.mint_native_action_identity();
+        app.apply_native_history_boundaries(
+            vec![EditorHistoryBoundary::Begin {
+                gesture_id: 17,
+                label: "Native".into(),
+                category: "native_editor".into(),
+            }],
+            Some(before),
+            Some(identity),
+        );
+        app.master_effects.brightness = 0.75;
+        app.apply_native_history_boundaries(
+            vec![EditorHistoryBoundary::End { gesture_id: 17 }],
+            None,
+            None,
+        );
+        assert_eq!(
+            app.highest_applied_action_sequence,
+            identity.sequence().get()
+        );
+        assert_eq!(web_state.action_timing_snapshot().pending, 1);
+
+        let before = app
+            .history_checkpoint("Native noop", "native_editor")
+            .unwrap();
+        let noop = app.mint_native_action_identity();
+        app.apply_native_history_boundaries(
+            vec![EditorHistoryBoundary::Begin {
+                gesture_id: 18,
+                label: "Native noop".into(),
+                category: "native_editor".into(),
+            }],
+            Some(before),
+            Some(noop),
+        );
+        app.apply_native_history_boundaries(
+            vec![EditorHistoryBoundary::End { gesture_id: 18 }],
+            None,
+            None,
+        );
+        assert_eq!(
+            app.highest_applied_action_sequence,
+            identity.sequence().get()
+        );
+        let receipt = web_state
+            .action_receipts_for_test()
+            .last()
+            .copied()
+            .unwrap();
+        assert_eq!(receipt.sequence, noop.sequence());
+        assert_eq!(receipt.source, ActionSourceClass::Native);
+        assert_eq!(receipt.disposition, ActionDisposition::Refused);
+    }
+
+    #[test]
+    fn native_editor_keyboard_start_and_idle_frames_do_zero_spurious_work() {
+        let pointer = egui::Event::PointerButton {
+            pos: egui::pos2(8.0, 8.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        };
+        let key = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        assert!(native_editor_has_ingress_candidate(
+            true,
+            false,
+            false,
+            std::slice::from_ref(&pointer),
+        ));
+        assert!(native_editor_has_ingress_candidate(
+            true,
+            false,
+            false,
+            std::slice::from_ref(&key),
+        ));
+        assert!(
+            !native_editor_has_ingress_candidate(true, true, false, std::slice::from_ref(&key),),
+            "later keys stay inside the identity which opened the edit",
+        );
+        assert!(!native_editor_has_ingress_candidate(
+            true,
+            false,
+            true,
+            std::slice::from_ref(&key),
+        ));
+        assert!(!native_editor_has_ingress_candidate(
+            true,
+            false,
+            false,
+            &[],
+        ));
+        assert!(!native_editor_history_work_required(false, false, false));
+        assert!(native_editor_history_work_required(true, false, false));
+        assert!(native_editor_history_work_required(false, true, false));
+
+        let sequencer = action_correlation::ActionSequencer::default();
+        let idle_identity = native_editor_has_ingress_candidate(true, false, false, &[])
+            .then(|| sequencer.envelope(action_correlation::ActionSourceClass::Native, ()));
+        assert!(idle_identity.is_none());
+        assert_eq!(
+            sequencer
+                .envelope(action_correlation::ActionSourceClass::Browser, ())
+                .sequence()
+                .get(),
+            1,
+            "an idle editor frame mints no identity",
+        );
+    }
+
+    #[test]
+    fn video_decode_worker_flight_fact_is_bounded_and_reports_real_mailbox_state() {
+        use flight_recorder::{WorkerKind, WorkerState};
+
+        let stopped = flight_video_decode_worker_fact(std::iter::empty());
+        assert_eq!(stopped.worker, WorkerKind::VideoDecode);
+        assert_eq!(stopped.state, WorkerState::Stopped);
+        assert_eq!(stopped.queue_capacity, 0);
+
+        let ready = flight_video_decode_worker_fact([(
+            false,
+            Some(video::threaded::DecoderTelemetry::default()),
+        )]);
+        assert_eq!(ready.state, WorkerState::Ready);
+        assert_eq!(ready.queue_depth, 0);
+        assert_eq!(ready.queue_capacity, 2);
+
+        let busy_telemetry = video::threaded::DecoderTelemetry {
+            pending_command_depth: 1,
+            accepted_uploads: 7,
+            command_drops: 2,
+            frame_overwrites: 3,
+            stale_commands: 5,
+            failed_decode_attempts: 11,
+            ..video::threaded::DecoderTelemetry::default()
+        };
+        let busy = flight_video_decode_worker_fact([(false, Some(busy_telemetry))]);
+        assert_eq!(busy.state, WorkerState::Busy);
+        assert_eq!(busy.queue_depth, 1);
+        assert_eq!(busy.completed_jobs, 7);
+        assert_eq!(busy.dropped_jobs, 21);
+
+        let full_telemetry = video::threaded::DecoderTelemetry {
+            pending_command_depth: 1,
+            pending_frames: 1,
+            ..video::threaded::DecoderTelemetry::default()
+        };
+        let backpressured = flight_video_decode_worker_fact([(false, Some(full_telemetry))]);
+        assert_eq!(backpressured.state, WorkerState::Backpressured);
+        assert_eq!(backpressured.queue_depth, 2);
+        assert_eq!(backpressured.queue_capacity, 2);
+
+        let starting = flight_video_decode_worker_fact([(false, None)]);
+        assert_eq!(starting.state, WorkerState::Starting);
+        let failed = flight_video_decode_worker_fact([(
+            true,
+            Some(video::threaded::DecoderTelemetry::default()),
+        )]);
+        assert_eq!(failed.state, WorkerState::Failed);
+    }
+
+    #[test]
+    fn gizmo_boundaries_coalesce_and_escape_keeps_its_pre_mutation_identity() {
+        use action_correlation::{ActionDisposition, ActionSourceClass};
+
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state.clone());
+        app.recovery_writer = None;
+        app.selected_layer = None;
+        let sequencer = web_state.action_sequencer();
+        let grab = gizmo_move_handle(&app);
+
+        let begin = sequencer.envelope(
+            ActionSourceClass::Native,
+            transform_gizmo::GizmoPointerEvent {
+                phase: transform_gizmo::GizmoPhase::Begin,
+                output_uv: grab,
+                modifiers: transform_gizmo::GizmoModifiers::NONE,
+            },
+        );
+        app.apply_correlated_action(begin, |app, event| WebActionDispatchOutcome {
+            batch: WebActionBatchDisposition::Continue,
+            lifecycle: app.apply_transform_gizmo_event(event),
+        });
+        assert_eq!(
+            web_state
+                .action_receipts_for_test()
+                .last()
+                .unwrap()
+                .disposition,
+            ActionDisposition::Coalesced,
+        );
+        assert_eq!(app.highest_applied_action_sequence, 0);
+
+        let moved = sequencer.envelope(
+            ActionSourceClass::Native,
+            transform_gizmo::GizmoPointerEvent {
+                phase: transform_gizmo::GizmoPhase::Move,
+                output_uv: [grab[0] + 0.1, grab[1]],
+                modifiers: transform_gizmo::GizmoModifiers::NONE,
+            },
+        );
+        let moved_sequence = moved.sequence().get();
+        app.apply_correlated_action(moved, |app, event| WebActionDispatchOutcome {
+            batch: WebActionBatchDisposition::Continue,
+            lifecycle: app.apply_transform_gizmo_event(event),
+        });
+        assert_eq!(app.highest_applied_action_sequence, moved_sequence);
+
+        let escape_identity = app.mint_native_action_identity();
+        let escape_sequence = escape_identity.sequence().get();
+        let lifecycle = app
+            .transform_gizmo_escape()
+            .expect("the committed drag consumes Escape");
+        assert_eq!(lifecycle, ActionLifecycleOutcome::Applied);
+        app.record_action_lifecycle_outcome(escape_identity, lifecycle);
+        assert_eq!(app.highest_applied_action_sequence, escape_sequence);
+        web_state.record_action_submission(escape_sequence, 1, Instant::now());
+        let receipts = web_state.action_receipts_for_test();
+        let receipt = receipts.last().unwrap();
+        assert_eq!(receipt.sequence.get(), escape_sequence);
+        assert_eq!(receipt.source, ActionSourceClass::Native);
+        assert_eq!(receipt.disposition, ActionDisposition::Presented);
+        assert!(app.transform_gizmo_drag.is_none());
+
+        for phase in [
+            transform_gizmo::GizmoPhase::Begin,
+            transform_gizmo::GizmoPhase::End,
+        ] {
+            let boundary = sequencer.envelope(
+                ActionSourceClass::Native,
+                transform_gizmo::GizmoPointerEvent {
+                    phase,
+                    output_uv: gizmo_move_handle(&app),
+                    modifiers: transform_gizmo::GizmoModifiers::NONE,
+                },
+            );
+            app.apply_correlated_action(boundary, |app, event| WebActionDispatchOutcome {
+                batch: WebActionBatchDisposition::Continue,
+                lifecycle: app.apply_transform_gizmo_event(event),
+            });
+            assert_eq!(
+                web_state
+                    .action_receipts_for_test()
+                    .last()
+                    .unwrap()
+                    .disposition,
+                ActionDisposition::Coalesced,
+            );
+            assert_eq!(app.highest_applied_action_sequence, escape_sequence);
+        }
+    }
+
+    #[test]
+    fn stale_and_missing_disable_output_requests_and_controller_targets_are_refused() {
+        use action_correlation::{ActionDisposition, ActionSourceClass};
+        use controller_profile::{AutomationOrigin, AutomationValue, ControlParameter};
+
+        assert_eq!(
+            classify_output_display_request(Some(4), 5, true),
+            OutputDisplayAdmission::StaleGeneration
+        );
+        assert_eq!(
+            classify_output_display_request(Some(5), 5, false),
+            OutputDisplayAdmission::MissingDisplay
+        );
+        let source = include_str!("main.rs");
+        let request = source
+            .split_once("fn apply_output_request(")
+            .expect("output request applier")
+            .1
+            .split_once("fn apply_output_window_command(")
+            .expect("bounded output request body")
+            .0;
+        let missing_arm = request
+            .split_once("OutputDisplayAdmission::MissingDisplay => {")
+            .expect("missing-display refusal arm")
+            .1
+            .split_once("if display_id != self.output_display_id")
+            .expect("selection mutation follows admission")
+            .0;
+        assert!(missing_arm.contains("return OutputRequestOutcome::default()"));
+        assert!(
+            !missing_arm.contains("close_output_window"),
+            "missing display + requested disable must refuse the whole fold before closing Output",
+        );
+
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state.clone());
+        app.recovery_writer = None;
+        let missing = stable_layer(999);
+        for (source, origin) in [
+            (ActionSourceClass::Midi, AutomationOrigin::Midi),
+            (
+                ActionSourceClass::Osc,
+                AutomationOrigin::Osc(std::net::SocketAddr::from(([127, 0, 0, 1], 9000))),
+            ),
+        ] {
+            let envelope = web_state.action_sequencer().envelope(
+                source,
+                (
+                    origin,
+                    controller_profile::RuntimeControlAddress::Layer {
+                        layer_id: missing,
+                        parameter: ControlParameter::Opacity,
+                    },
+                    AutomationValue::Absolute(0.5),
+                ),
+            );
+            app.apply_correlated_action(envelope, |app, (origin, address, value)| {
+                match app.apply_automation_control(origin, address, value) {
+                    Ok(outcome) => WebActionDispatchOutcome {
+                        batch: WebActionBatchDisposition::Continue,
+                        lifecycle: outcome.lifecycle,
+                    },
+                    Err(_) => {
+                        WebActionDispatchOutcome::refused(WebActionBatchDisposition::Continue)
+                    }
+                }
+            });
+        }
+        assert_eq!(app.highest_applied_action_sequence, 0);
+        let receipts = web_state.action_receipts_for_test();
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts
+            .iter()
+            .all(|receipt| receipt.disposition == ActionDisposition::Refused));
+    }
+
+    #[test]
+    fn repeated_controller_bend_and_value_actions_do_not_advance_high_water() {
+        use action_correlation::{ActionDisposition, ActionSourceClass};
+        use controller_profile::{
+            AutomationOrigin, AutomationValue, ControlParameter, RuntimeControlAddress,
+        };
+
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state.clone());
+        app.recovery_writer = None;
+        let sequencer = web_state.action_sequencer();
+        for (address, value, expected_applied) in [
+            (
+                RuntimeControlAddress::Master(ControlParameter::Bend1),
+                AutomationValue::Gate(true),
+                true,
+            ),
+            (
+                RuntimeControlAddress::Master(ControlParameter::Bend1),
+                AutomationValue::Gate(true),
+                false,
+            ),
+            (
+                RuntimeControlAddress::Master(ControlParameter::Bend1),
+                AutomationValue::Gate(false),
+                true,
+            ),
+            (
+                RuntimeControlAddress::Master(ControlParameter::Bend1),
+                AutomationValue::Gate(false),
+                false,
+            ),
+            (
+                RuntimeControlAddress::Master(ControlParameter::Brightness),
+                AutomationValue::Absolute(0.5),
+                false,
+            ),
+            (
+                RuntimeControlAddress::Master(ControlParameter::Brightness),
+                AutomationValue::Absolute(0.75),
+                true,
+            ),
+            (
+                RuntimeControlAddress::Master(ControlParameter::Brightness),
+                AutomationValue::Absolute(0.75),
+                false,
+            ),
+        ] {
+            let before = app.highest_applied_action_sequence;
+            let envelope = sequencer.envelope(
+                ActionSourceClass::Midi,
+                (AutomationOrigin::Midi, address, value),
+            );
+            let sequence = envelope.sequence().get();
+            app.apply_correlated_action(envelope, |app, (origin, address, value)| {
+                match app.apply_automation_control(origin, address, value) {
+                    Ok(outcome) => WebActionDispatchOutcome {
+                        batch: WebActionBatchDisposition::Continue,
+                        lifecycle: outcome.lifecycle,
+                    },
+                    Err(_) => {
+                        WebActionDispatchOutcome::refused(WebActionBatchDisposition::Continue)
+                    }
+                }
+            });
+            if expected_applied {
+                assert_eq!(app.highest_applied_action_sequence, sequence);
+            } else {
+                assert_eq!(app.highest_applied_action_sequence, before);
+                assert_eq!(
+                    web_state
+                        .action_receipts_for_test()
+                        .last()
+                        .unwrap()
+                        .disposition,
+                    ActionDisposition::Refused,
+                );
+            }
+        }
+    }
 
     fn stable_layer(value: u64) -> image_routing::StableLayerId {
         image_routing::StableLayerId::new(value).unwrap()
@@ -27597,7 +33599,12 @@ mod app_state_tests {
         )
         .unwrap();
         let error = validate_master_bypass_capability(&global_then_canonical, &mixed).unwrap_err();
-        assert!(error.contains("advanced master ordering"));
+        assert_eq!(
+            error,
+            evaluated_frame::evaluated_composition::CompositionPlanError::AmbiguousMasterBypass {
+                layers: vec![stable_layer(1)],
+            }
+        );
 
         // No bypass capability means neither restriction applies.
         let inheriting = [(stable_layer(1), false), (stable_layer(2), false)];
@@ -27729,7 +33736,7 @@ mod app_state_tests {
 
         fn ready(product: CodecMotionProduct) -> ReadyFrame {
             ReadyFrame {
-                rgba: vec![255, 0, 0, 255],
+                rgba: video::DecodedImagePayload::from_owned_rgba(vec![255, 0, 0, 255]),
                 codec_motion: Some(product),
                 loops_advanced: 0,
                 source_generation: 7,
@@ -27839,7 +33846,7 @@ mod app_state_tests {
         let first = codec_product(-1);
         let first_identity = first.exact_identity().unwrap();
         layer
-            .upload_ready_media_frame(&device, &queue, &mut ready(first))
+            .upload_ready_media_frame(&device, &queue, 1, &mut ready(first))
             .unwrap();
         let mut cache = Vec::new();
         let (diagnostics, unavailable) =
@@ -27865,7 +33872,7 @@ mod app_state_tests {
             second_identity.content_sha256
         );
         layer
-            .upload_ready_media_frame(&device, &queue, &mut ready(second))
+            .upload_ready_media_frame(&device, &queue, 1, &mut ready(second))
             .unwrap();
         let (diagnostics, unavailable) =
             refresh_live_codec_motion_cache(std::slice::from_ref(&layer), motion_plan, &mut cache);
@@ -28595,6 +34602,7 @@ mod app_state_tests {
         use web::state::{CreativeScopeSnapshot, WebAction};
 
         let web_state = WebState::new().expect("test token");
+        let _web_snapshot_receiver = web_state.tx.subscribe();
         let mut app = App::new(None, None, web_state.clone());
         app.quantized_actions
             .push(WebAction::SetProgramFrozen { frozen: true });
@@ -29083,6 +35091,7 @@ mod app_state_tests {
         ));
 
         // The published snapshot carries both routes and both diagnostics.
+        let _web_snapshot_receiver = app.web_state.tx.subscribe();
         app.push_web_state();
         let published = app.web_state.app.try_read().expect("published snapshot");
         let node = published
@@ -30131,14 +36140,18 @@ mod app_state_tests {
         );
 
         app.scene_status.clear();
-        assert_eq!(
-            app.apply_automation_control(
+        let inert_release = app
+            .apply_automation_control(
                 AutomationOrigin::Osc("127.0.0.1:9001".parse().unwrap()),
                 RuntimeControlAddress::SceneTrigger { scene_id },
                 AutomationValue::Gate(false),
             )
-            .unwrap(),
-            0.0
+            .unwrap();
+        assert_eq!(inert_release.normalized, 0.0);
+        assert_eq!(
+            inert_release.lifecycle,
+            ActionLifecycleOutcome::Refused,
+            "the release half of a Scene pulse is inert, not an apply",
         );
         assert!(app.scene_status.is_empty(), "an OSC release is inert");
 
@@ -30318,7 +36331,7 @@ mod app_state_tests {
     fn saved_playhead_staging_discards_a_preloaded_zero_seed() {
         let requested_generation = 7;
         let frame = |source_generation, source_seconds| video::threaded::ReadyFrame {
-            rgba: vec![source_generation as u8; 4],
+            rgba: video::DecodedImagePayload::from_owned_rgba(vec![source_generation as u8; 4]),
             codec_motion: None,
             loops_advanced: 0,
             source_generation,
@@ -30526,6 +36539,47 @@ mod app_state_tests {
     }
 
     #[test]
+    fn monitor_inventory_policy_is_event_driven_with_a_bounded_fallback() {
+        let now = Instant::now();
+        let mut cache = MonitorInventoryCache::default();
+        assert_eq!(
+            cache.due_reason(now),
+            Some(MonitorInventoryRefreshReason::Startup)
+        );
+        cache.pending_reason = None;
+        cache.last_refresh = Some(now);
+        assert_eq!(cache.due_reason(now + Duration::from_secs(9)), None);
+        assert_eq!(
+            cache.due_reason(now + MONITOR_INVENTORY_SLOW_REFRESH),
+            Some(MonitorInventoryRefreshReason::SlowFallback)
+        );
+        cache.invalidate(MonitorInventoryRefreshReason::PlatformTopologyEvent);
+        assert_eq!(
+            cache.due_reason(now),
+            Some(MonitorInventoryRefreshReason::PlatformTopologyEvent)
+        );
+        assert!(monitor_inventory_generation_is_current(None, 7));
+        assert!(monitor_inventory_generation_is_current(Some(7), 7));
+        assert!(!monitor_inventory_generation_is_current(Some(6), 7));
+    }
+
+    #[test]
+    fn accepted_frame_path_never_enumerates_os_monitors() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("// Process actions from web UI against one retained")
+            .expect("monitor cache frame seam");
+        let end = source[start..]
+            .find("let audio_load_completed")
+            .map(|offset| start + offset)
+            .expect("end of monitor action seam");
+        let frame_seam = &source[start..end];
+        assert!(frame_seam.contains("refresh_monitor_inventory_if_due"));
+        assert!(!frame_seam.contains("available_monitors"));
+        assert!(!frame_seam.contains("collect::<Vec"));
+    }
+
+    #[test]
     fn absolute_output_commands_are_idempotent_and_legacy_toggle_is_parity() {
         assert!(resolve_output_window_command(
             false,
@@ -30660,6 +36714,16 @@ mod app_state_tests {
                     .saturating_add(renderer::state::MAX_MOSH_INFLUENCE_GPU_BYTES)
             )
         );
+        assert_eq!(
+            creative_gpu_bytes_with_core_arenas(Some(100), 24),
+            Some(124)
+        );
+        assert_eq!(
+            creative_gpu_bytes_with_core_arenas(Some(u64::MAX - 4), 8),
+            Some(u64::MAX),
+            "the physical arena reconciliation must saturate rather than wrap"
+        );
+        assert_eq!(creative_gpu_bytes_with_core_arenas(None, 24), None);
 
         let telemetry = video::threaded::DecoderTelemetry {
             consumed_frames: 90,
@@ -32543,11 +38607,12 @@ mod app_state_tests {
             ("position_x", f64::from(dragged.position[0])),
             ("position_y", f64::from(dragged.position[1])),
         ] {
-            numeric.handle_web_action_inner_with_feedback(
+            numeric.handle_web_action_inner_with_feedback_from_origin(
                 web::state::WebAction::SetMasterTransform {
                     param: param.to_string(),
                     value: serde_json::json!(value),
                 },
+                action_correlation::ActionSourceClass::Browser,
             );
         }
         assert_eq!(
@@ -32632,7 +38697,11 @@ mod app_state_tests {
         });
         assert!(app.transform_gizmo_drag.is_some());
         assert!(app.manual_history.metrics().gesture_open);
-        assert!(app.transform_gizmo_escape(), "Escape must be consumed");
+        assert_eq!(
+            app.transform_gizmo_escape(),
+            Some(ActionLifecycleOutcome::Coalesced),
+            "an unchanged open boundary is consumed without claiming a frame",
+        );
         assert!(app.transform_gizmo_drag.is_none());
         assert!(!app.manual_history.metrics().gesture_open);
         assert_eq!(app.manual_history.metrics().undo_depth, depth);
@@ -32657,7 +38726,11 @@ mod app_state_tests {
         assert!(app
             .transform_gizmo_drag
             .is_some_and(|drag| drag.has_committed()));
-        assert!(app.transform_gizmo_escape());
+        assert_eq!(
+            app.transform_gizmo_escape(),
+            Some(ActionLifecycleOutcome::Applied),
+            "undoing a committed visual drag is a real applied mutation",
+        );
         assert!(app.transform_gizmo_drag.is_none());
         assert_eq!(
             app.master_transform, untouched,
@@ -32667,7 +38740,7 @@ mod app_state_tests {
         // Outside a drag the gizmo consumes nothing, so Escape keeps every
         // other meaning it already had.
         let mut idle = gizmo_test_app();
-        assert!(!idle.transform_gizmo_escape());
+        assert_eq!(idle.transform_gizmo_escape(), None);
     }
 
     /// A topology edit mid-drag abandons the gesture instead of delivering the
@@ -32872,18 +38945,19 @@ mod app_state_tests {
     fn native_recovery_actions_are_absolute_and_work_without_a_browser() {
         let web_state = WebState::new().expect("test token");
         assert_eq!(web_state.tx.receiver_count(), 0);
-        assert_eq!(
-            web_state.control_server_info().status,
-            ControlServerStatus::NotStarted
-        );
+        let server = web_state.control_server_info();
+        assert_eq!(server.loopback_ipv4, ControlListenerStatus::Stopped);
+        assert_eq!(server.loopback_ipv6, ControlListenerStatus::Stopped);
+        assert_eq!(server.lan_tls, ControlListenerStatus::Stopped);
+        let queued = web_state.envelope_for_test(web::state::WebAction::SetParam {
+            param: "contrast".to_string(),
+            value: serde_json::json!(0.25),
+        });
         web_state
             .actions
             .try_lock()
             .expect("test action queue")
-            .push(web::state::WebAction::SetParam {
-                param: "contrast".to_string(),
-                value: serde_json::json!(0.25),
-            });
+            .push(queued);
 
         let mut app = App::new(None, None, web_state.clone());
         app.master_effects.brightness = 0.8;
@@ -32925,9 +38999,88 @@ mod app_state_tests {
     }
 
     #[test]
+    fn web_publication_is_absent_without_receivers_and_newest_only_with_one() {
+        assert!(!App::web_action_requires_full_publication(
+            &web::state::WebAction::Gyro {
+                alpha: 0.0,
+                beta: 0.0,
+                gamma: 0.0,
+            }
+        ));
+        assert!(App::web_action_requires_full_publication(
+            &web::state::WebAction::ResetFx
+        ));
+        let web_state = WebState::new().expect("web state");
+        let mut app = App::new(None, None, web_state.clone());
+        app.master_effects.brightness = 0.625;
+
+        assert_eq!(web_state.tx.receiver_count(), 0);
+        app.push_web_state();
+        assert_eq!(web_state.serialized_publications_for_test(), 0);
+
+        let mut receiver = web_state.tx.subscribe();
+        let before_generation = web_state.request_snapshot();
+        app.push_web_state();
+        assert_eq!(web_state.serialized_publications_for_test(), 1);
+        assert!(web_state.full_snapshot_generation() > before_generation);
+        assert!(receiver.has_changed().unwrap());
+        let first_wire = receiver.borrow_and_update().clone();
+        let first: web::state::AppSnapshot = serde_json::from_str(first_wire.as_ref()).unwrap();
+        assert_eq!(first.effects.brightness, 0.625);
+        assert_eq!(first.wire_version, 2);
+        let _other_receivers = [
+            web_state.tx.subscribe(),
+            web_state.tx.subscribe(),
+            web_state.tx.subscribe(),
+        ];
+        assert_eq!(web_state.tx.receiver_count(), 4);
+
+        // An unchanged authored base emits only the explicit operational and
+        // telemetry domains. The separately cached full state remains the
+        // connection base even though watch now retains this newer live value.
+        app.web_last_publish_at = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        app.push_web_state();
+        assert_eq!(web_state.serialized_publications_for_test(), 2);
+        let live_wire = receiver.borrow_and_update().clone();
+        let live: web::state::WebLiveSnapshot = serde_json::from_str(live_wire.as_ref()).unwrap();
+        assert_eq!(live.msg_type, "live");
+        assert_eq!(live.authored_revision, first.authored_revision);
+        let live_value: serde_json::Value = serde_json::from_str(live_wire.as_ref()).unwrap();
+        let live_object = live_value.as_object().unwrap();
+        assert!(!live_object.contains_key("layers"));
+        assert!(!live_object.contains_key("effects"));
+        assert_eq!(web_state.last_full_snapshot().as_ref(), first_wire.as_ref());
+
+        // A new accepted action revision bypasses the meter cadence and emits
+        // a complete authored state exactly once for all four browsers.
+        app.master_effects.brightness = 0.75;
+        app.web_authored_mutation_counter = app.web_authored_mutation_counter.saturating_add(1);
+        app.push_web_state();
+        assert_eq!(web_state.serialized_publications_for_test(), 3);
+        let revised = receiver.borrow_and_update().clone();
+        let revised: web::state::AppSnapshot = serde_json::from_str(revised.as_ref()).unwrap();
+        assert_eq!(revised.effects.brightness, 0.75);
+        assert!(revised.authored_revision > first.authored_revision);
+
+        // An explicit reconnect/full-state request also bypasses cadence even
+        // when no authored revision changed.
+        app.master_effects.brightness = 0.875;
+        app.push_web_state();
+        assert_eq!(web_state.serialized_publications_for_test(), 3);
+        web_state.request_snapshot();
+        app.push_web_state();
+        assert_eq!(web_state.serialized_publications_for_test(), 4);
+        assert!(receiver.has_changed().unwrap());
+        let latest = receiver.borrow_and_update().clone();
+        let latest: web::state::AppSnapshot = serde_json::from_str(latest.as_ref()).unwrap();
+        assert_eq!(latest.effects.brightness, 0.875);
+        assert!(!receiver.has_changed().unwrap());
+    }
+
+    #[test]
     fn native_recovery_authored_actions_record_and_undo_manual_history() {
         let mut app = App::new(None, None, WebState::new().expect("test token"));
-        app.recovery_journal = None;
+        app.recovery_writer = None;
         let initial_depth = app.manual_history.metrics().undo_depth;
 
         app.apply_native_recovery_action(NativeRecoveryAction::SetProgramFrozen(true));
@@ -33023,6 +39176,15 @@ mod app_state_tests {
             .expect("thumbnail cache")
             .insert("new-visual.png".to_string(), Vec::new());
         app.apply_native_recovery_action(NativeRecoveryAction::RescanLibrary);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.library_files.as_slice() != std::slice::from_ref(&added) {
+            app.poll_library_index();
+            assert!(
+                Instant::now() < deadline,
+                "asynchronous library scan did not publish"
+            );
+            std::thread::yield_now();
+        }
         assert_eq!(app.library_files, vec![added]);
 
         std::fs::remove_dir_all(folder).expect("remove test library");
@@ -33097,13 +39259,13 @@ mod app_state_tests {
             param: "brightness".to_string(),
             value: serde_json::json!(0.75),
         });
-        app.web_state
-            .actions
-            .blocking_lock()
-            .push(web::state::WebAction::RemoveLayer {
+        let queued = app
+            .web_state
+            .envelope_for_test(web::state::WebAction::RemoveLayer {
                 index: 0,
                 layer_id: None,
             });
+        app.web_state.actions.blocking_lock().push(queued);
         app.quantized_bar = Some(0);
         app.mod_matrix.midi_learn = Some(2);
         app.ntsc_presented = Some((7, vec![255; 4]));
@@ -33445,7 +39607,7 @@ mod app_state_tests {
         );
 
         let feedback_start = source
-            .find("fn handle_web_action_inner_with_feedback(")
+            .find("fn handle_web_action_inner_with_feedback_from_origin(")
             .expect("feedback dispatcher");
         let feedback_end = source[feedback_start..]
             .find("fn handle_web_action(")
@@ -33453,7 +39615,10 @@ mod app_state_tests {
             .expect("feedback dispatcher end");
         let feedback_body = &source[feedback_start..feedback_end];
         assert!(feedback_body.contains("apply_temporal_partition_sensitive_action(param, value)"));
-        assert!(feedback_body.contains("if accepted && self.performance_recording"));
+        assert!(feedback_body.contains("prepare_creative_mutation(source, &action)"));
+        assert!(feedback_body.contains("if accepted"));
+        assert!(feedback_body.contains("stage_accepted_creative_mutation(candidate)"));
+        assert!(!feedback_body.contains("stage_performance_edit"));
 
         assert!(source.contains("} else if spout_active && !mosh_active {"));
     }
@@ -33837,7 +40002,7 @@ mod app_state_tests {
                 }),
             },
         ];
-        app.web_state.actions.blocking_lock().extend([
+        let pending = [
             WebAction::OpenPatchLook { stack_revision: 7 },
             WebAction::SetLayerParam {
                 index: 0,
@@ -33858,7 +40023,11 @@ mod app_state_tests {
             WebAction::ResetGroup {
                 group: "key".to_string(),
             },
-        ]);
+        ]
+        .into_iter()
+        .map(|action| app.web_state.envelope_for_test(action))
+        .collect::<Vec<_>>();
+        app.web_state.actions.blocking_lock().extend(pending);
 
         app.invalidate_visual_generation_after_look(&legacy_look_scope(vec![11], false, false));
 
@@ -33887,16 +40056,16 @@ mod app_state_tests {
         let shared = app.web_state.actions.blocking_lock();
         assert_eq!(shared.len(), 3);
         assert!(matches!(
-            shared[0],
+            shared[0].payload(),
             WebAction::SetBlackout { enabled: true }
         ));
         assert!(matches!(
-            &shared[1],
+            shared[1].payload(),
             WebAction::SetLayerParam { layer_id, param, .. }
                 if layer_id.as_deref() == Some("11") && param == "fps"
         ));
         assert!(matches!(
-            &shared[2],
+            shared[2].payload(),
             WebAction::ResetGroup { group } if group == "vhs"
         ));
         assert!(App::action_conflicts_with_applied_look(
@@ -34011,7 +40180,11 @@ mod app_state_tests {
         let web_state = WebState::new().expect("test token");
         let mut app = App::new(None, None, web_state);
         app.quantized_actions = ordered.clone();
-        app.web_state.actions.blocking_lock().extend(ordered);
+        let shared_actions = ordered
+            .into_iter()
+            .map(|action| app.web_state.envelope_for_test(action))
+            .collect::<Vec<_>>();
+        app.web_state.actions.blocking_lock().extend(shared_actions);
         app.invalidate_visual_generation_after_look(&applied);
 
         assert_eq!(app.quantized_actions.len(), 4);
@@ -34026,11 +40199,11 @@ mod app_state_tests {
         let shared = app.web_state.actions.blocking_lock();
         assert_eq!(shared.len(), 4);
         assert!(matches!(
-            &shared[2],
+            shared[2].payload(),
             WebAction::SetCompositionGroupMatteParam { group_id, .. } if group_id == "8"
         ));
         assert!(matches!(
-            shared[3],
+            shared[3].payload(),
             WebAction::SetBlackout { enabled: true }
         ));
     }
@@ -34277,7 +40450,7 @@ mod app_state_tests {
         use web::state::WebAction;
 
         let mut app = App::new(None, None, WebState::new().expect("test token"));
-        app.recovery_journal = None;
+        app.recovery_writer = None;
         let initial = app.master_effects.brightness;
 
         app.handle_web_action(WebAction::BeginHistoryGesture { gesture_id: 41 });
@@ -34308,6 +40481,7 @@ mod app_state_tests {
         assert_eq!(app.manual_history.metrics().undo_depth, depth);
 
         let before_native = app.history_checkpoint("Native", "native_editor").unwrap();
+        let native_identity = app.mint_native_action_identity();
         app.apply_native_history_boundaries(
             vec![EditorHistoryBoundary::Begin {
                 gesture_id: 7,
@@ -34315,6 +40489,7 @@ mod app_state_tests {
                 category: "native_editor".into(),
             }],
             Some(before_native),
+            Some(native_identity),
         );
         let native_value = app.master_effects.brightness;
         app.handle_web_action(WebAction::SetParam {
@@ -34325,6 +40500,7 @@ mod app_state_tests {
         assert!(app.history_status.contains("native history gesture"));
         app.apply_native_history_boundaries(
             vec![EditorHistoryBoundary::End { gesture_id: 7 }],
+            None,
             None,
         );
     }
@@ -34358,7 +40534,7 @@ mod app_state_tests {
     #[test]
     fn deferred_slot_publication_uses_fresh_state_and_rejects_manual_interleaving() {
         let mut app = App::new(None, None, WebState::new().expect("test token"));
-        app.recovery_journal = None;
+        app.recovery_writer = None;
         let initial_depth = app.manual_history.metrics().undo_depth;
 
         let deferred = app
@@ -34623,7 +40799,7 @@ mod app_state_tests {
     #[test]
     fn failed_clip_slot_preparation_records_no_manual_history() {
         let mut app = App::new(None, None, WebState::new().expect("test token"));
-        app.recovery_journal = None;
+        app.recovery_writer = None;
         let initial_depth = app.manual_history.metrics().undo_depth;
         app.handle_web_action(web::state::WebAction::LoadClipIntoSlot {
             layer_id: "1".into(),
@@ -34640,7 +40816,7 @@ mod app_state_tests {
     #[test]
     fn native_space_and_m_record_and_undo_authored_transport() {
         let mut app = App::new(None, None, WebState::new().expect("test token"));
-        app.recovery_journal = None;
+        app.recovery_writer = None;
         let initial_depth = app.manual_history.metrics().undo_depth;
 
         assert!(app.apply_native_transport_flow(ControlFlow::TogglePause, None));
@@ -34675,7 +40851,35 @@ mod app_state_tests {
             .map(|offset| window + offset)
             .unwrap();
         let body = &source[window..redraw];
-        assert!(body.contains("Add dropped visual layer"));
+        let dropped = body
+            .find("WindowEvent::DroppedFile(path) => {")
+            .expect("the native file-drop ingress remains in the window event boundary");
+        let dropped_end = body[dropped..]
+            .find("WindowEvent::KeyboardInput")
+            .map(|offset| dropped + offset)
+            .expect("the file-drop arm ends before keyboard ingress");
+        let dropped_arm = &body[dropped..dropped_end];
+        let mint = dropped_arm
+            .find("mint_native_action_identity")
+            .expect("file-drop identity is minted at native ingress");
+        let apply = dropped_arm
+            .find("apply_dropped_path")
+            .expect("file drop delegates to its typed admission helper");
+        let terminal = dropped_arm
+            .find("record_action_lifecycle_outcome")
+            .expect("file drop terminalizes the helper's actual lifecycle");
+        assert!(mint < apply && apply < terminal);
+
+        let helper = source
+            .find("fn apply_dropped_path(")
+            .expect("the typed file-drop admission helper exists");
+        let helper_end = source[helper..]
+            .find("/// Nonblocking render-loop seam")
+            .map(|offset| helper + offset)
+            .expect("the file-drop helper has a stable production boundary");
+        let helper_body = &source[helper..helper_end];
+        assert!(helper_body.contains("apply_native_manual_action"));
+        assert!(helper_body.contains("Add dropped visual layer"));
         assert!(body.contains("Apply patch look"));
         assert!(body.contains("Load patch snapshot"));
         assert!(body.contains("Adjust keyboard effects"));
@@ -35964,8 +42168,14 @@ mod app_state_tests {
         let cancel = source
             .find("WebAction::CancelExport => {")
             .expect("the export cancel handler exists");
+        let cancel_end = source[cancel..]
+            .find("WebAction::SetVisualNodeParam")
+            .map(|offset| cancel + offset)
+            .expect("the export cancel arm has a stable production boundary");
+        let cancel_arm = &source[cancel..cancel_end];
         assert!(
-            source[cancel..cancel + 600].contains("GestureCanvasResetCause::ExportCancelled"),
+            cancel_arm.contains("close_export_gesture_canvas")
+                && cancel_arm.contains("GestureCanvasResetCause::ExportCancelled"),
             "a cancelled export releases its own canvas"
         );
     }
@@ -36411,6 +42621,208 @@ mod app_state_tests {
         .unwrap();
         take.finalize(0);
         take
+    }
+
+    fn d4_brightness_take(
+        source: action_correlation::ActionSourceClass,
+    ) -> performance_track::PerformanceTake {
+        use controller_profile::{
+            AutomationOrigin, AutomationValue, ControlParameter, RuntimeControlAddress,
+        };
+
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        app.set_performance_recording(true);
+        let action = web::state::WebAction::SetParam {
+            param: "brightness".to_string(),
+            value: serde_json::json!(0.25),
+        };
+        match source {
+            action_correlation::ActionSourceClass::Browser
+            | action_correlation::ActionSourceClass::Phone
+            | action_correlation::ActionSourceClass::Native => {
+                app.handle_web_action_inner_with_feedback_from_origin(action, source);
+            }
+            action_correlation::ActionSourceClass::Midi => {
+                app.apply_automation_control(
+                    AutomationOrigin::Midi,
+                    RuntimeControlAddress::Master(ControlParameter::Brightness),
+                    AutomationValue::Absolute(0.625),
+                )
+                .expect("MIDI brightness");
+            }
+            action_correlation::ActionSourceClass::Osc => {
+                app.apply_automation_control(
+                    AutomationOrigin::Osc("127.0.0.1:9000".parse().unwrap()),
+                    RuntimeControlAddress::Master(ControlParameter::Brightness),
+                    AutomationValue::Absolute(0.625),
+                )
+                .expect("OSC brightness");
+            }
+            action_correlation::ActionSourceClass::Automation => {
+                app.apply_automation_control(
+                    AutomationOrigin::HostAutomation,
+                    RuntimeControlAddress::Master(ControlParameter::Brightness),
+                    AutomationValue::Absolute(0.625),
+                )
+                .expect("host brightness");
+            }
+            action_correlation::ActionSourceClass::Replay => {
+                panic!("replay is intentionally not a live-recording fixture")
+            }
+        }
+        assert_eq!(app.pending_performance_edits.len(), 1);
+        performance_commit_frame(&mut app, 1.0 / performance_track::PERFORMANCE_REFERENCE_FPS);
+        app.set_performance_recording(false);
+        app.performance_take.clone()
+    }
+
+    #[test]
+    fn d4_all_existing_live_origins_record_the_same_v1_address_value_tick_and_hash() {
+        let baseline = d4_brightness_take(action_correlation::ActionSourceClass::Browser);
+        assert_eq!(baseline.events().len(), 1);
+        assert_eq!(baseline.events()[0].tick, 0);
+        assert_eq!(baseline.events()[0].value, 40_959);
+        for source in [
+            action_correlation::ActionSourceClass::Phone,
+            action_correlation::ActionSourceClass::Native,
+            action_correlation::ActionSourceClass::Midi,
+            action_correlation::ActionSourceClass::Osc,
+            action_correlation::ActionSourceClass::Automation,
+        ] {
+            let candidate = d4_brightness_take(source);
+            assert_eq!(candidate.addresses(), baseline.addresses());
+            assert_eq!(candidate.events(), baseline.events());
+            assert_eq!(candidate.canonical_bytes(), baseline.canonical_bytes());
+            assert_eq!(candidate.checksum_hex(), baseline.checksum_hex());
+        }
+    }
+
+    #[test]
+    fn d4_simultaneous_cross_origin_duplicate_delivery_records_once() {
+        use controller_profile::{
+            AutomationOrigin, AutomationValue, ControlParameter, RuntimeControlAddress,
+        };
+
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        app.set_performance_recording(true);
+        let action = web::state::WebAction::SetParam {
+            param: "brightness".to_string(),
+            value: serde_json::json!(0.25),
+        };
+        for source in [
+            action_correlation::ActionSourceClass::Browser,
+            action_correlation::ActionSourceClass::Phone,
+            action_correlation::ActionSourceClass::Native,
+        ] {
+            app.handle_web_action_inner_with_feedback_from_origin(action.clone(), source);
+        }
+        for origin in [
+            AutomationOrigin::Midi,
+            AutomationOrigin::Osc("127.0.0.1:9000".parse().unwrap()),
+            AutomationOrigin::HostAutomation,
+        ] {
+            app.apply_automation_control(
+                origin,
+                RuntimeControlAddress::Master(ControlParameter::Brightness),
+                AutomationValue::Absolute(0.625),
+            )
+            .expect("typed automation brightness");
+        }
+        assert_eq!(
+            app.pending_performance_edits.len(),
+            1,
+            "origin is provenance, not a second event identity"
+        );
+        assert_eq!(
+            app.pending_performance_edits[0].origin(),
+            creative_mutation::CreativeMutationOrigin::Browser,
+            "the first delivery retains bounded process-only provenance"
+        );
+        performance_commit_frame(&mut app, 1.0 / performance_track::PERFORMANCE_REFERENCE_FPS);
+        assert_eq!(app.performance_take.events().len(), 1);
+    }
+
+    #[test]
+    fn d4_refused_stale_safety_replay_and_dropped_actions_record_nothing() {
+        let web_state = WebState::new().expect("test token");
+        let dropped = web_state.envelope_for_test(web::state::WebAction::SetParam {
+            param: "brightness".to_string(),
+            value: serde_json::json!(0.75),
+        });
+        let mut app = App::new(None, None, web_state);
+        app.set_performance_recording(true);
+
+        app.handle_web_action_inner_with_feedback_from_origin(
+            web::state::WebAction::SetParam {
+                param: "brightness".to_string(),
+                value: serde_json::json!("not-a-number"),
+            },
+            action_correlation::ActionSourceClass::Browser,
+        );
+        app.handle_web_action_inner_with_feedback_from_origin(
+            web::state::WebAction::SetLayerParam {
+                index: 0,
+                layer_id: Some("999999".to_string()),
+                param: "opacity".to_string(),
+                value: serde_json::json!(0.5),
+            },
+            action_correlation::ActionSourceClass::Native,
+        );
+        app.handle_web_action_inner_with_feedback_from_origin(
+            web::state::WebAction::SetBlackout { enabled: true },
+            action_correlation::ActionSourceClass::Automation,
+        );
+        app.handle_web_action_inner_with_feedback_from_origin(
+            web::state::WebAction::SetParam {
+                param: "brightness".to_string(),
+                value: serde_json::json!(0.5),
+            },
+            action_correlation::ActionSourceClass::Replay,
+        );
+        app.handle_web_action_inner_with_feedback_from_origin(
+            web::state::WebAction::SetPerformanceRecording {
+                enabled: false,
+                layer_stack_revision: app.layer_stack_revision.saturating_add(1),
+            },
+            action_correlation::ActionSourceClass::Browser,
+        );
+        assert!(
+            app.performance_recording,
+            "stale recorder control is refused"
+        );
+
+        let mut dropped_remainder = VecDeque::from([dropped]);
+        app.apply_enveloped_web_action_batch_disposition(
+            &mut dropped_remainder,
+            WebActionBatchDisposition::SnapshotCommitted,
+        );
+        assert!(dropped_remainder.is_empty());
+        assert!(app.pending_performance_edits.is_empty());
+        performance_commit_frame(&mut app, 1.0 / performance_track::PERFORMANCE_REFERENCE_FPS);
+        assert!(app.performance_take.events().is_empty());
+        assert_eq!(app.performance_rejected_edits, 1);
+    }
+
+    #[test]
+    fn d4_native_keyboard_values_use_the_typed_seam_and_reset_stays_excluded() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("let action = map_key(physical_key, state, shift);")
+            .expect("native keyboard dispatch");
+        let end = source[start..]
+            .find("if let Some(idx) = self.selected_layer")
+            .map(|offset| start + offset)
+            .expect("legacy control-flow dispatch");
+        let body = &source[start..end];
+        assert!(body.contains("WebAction::SetLayerEffect"));
+        assert!(body.contains("ActionSourceClass::Native"));
+        assert!(body.contains("let mut next = layer.effects;"));
+        let reset = body
+            .find("Action::ResetEffects")
+            .expect("explicit reset exclusion");
+        assert!(body[reset..].contains("apply_action(action, &mut layer.effects)"));
     }
 
     #[test]
@@ -36995,6 +43407,366 @@ mod app_state_tests {
             first, second,
             "applying the same seed restarts the same trajectory"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a physical wgpu adapter"]
+    fn p10_confirmed_remediation_uses_revision_history_preflight_and_undo_transaction() {
+        struct TempRecoveryJournal(std::path::PathBuf);
+
+        impl TempRecoveryJournal {
+            fn new() -> Self {
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system time")
+                    .as_nanos();
+                Self(std::env::temp_dir().join(format!(
+                    "collide-o-scope-p10-remediation-{}-{nonce}.journal",
+                    std::process::id()
+                )))
+            }
+        }
+
+        impl Drop for TempRecoveryJournal {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        use visual_rack::{NodeId, RuntimeVisualNode, RuntimeVisualNodeKind};
+
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("GPU adapter for P10 remediation transaction");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("P10 Remediation Transaction Test"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .expect("GPU device for P10 remediation transaction");
+
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        let recovery_path = TempRecoveryJournal::new();
+        app.recovery_writer = Some(
+            recovery_journal::RecoveryWriter::start(recovery_path.0.clone())
+                .expect("isolated recovery writer"),
+        );
+        let mut layer = Layer::new_spout_with_media_policy(
+            "p10-remediation-fixture",
+            &device,
+            &queue,
+            &media_safety::MediaSafetyPolicy::safe(),
+        )
+        .expect("bounded fixture layer");
+        layer.bypass_master_fx = true;
+        let index = app
+            .commit_new_bottom_layer(layer)
+            .expect("commit fixture layer");
+        let layer_id = app.layers[index].stable_layer_id();
+        let revision = app.composition_revision;
+        let live_master_rack = app.master_rack.clone();
+        let mut refused = app.authored_creative_graph();
+        refused.master_rack = RuntimeVisualRack::try_from_parts(
+            vec![
+                RuntimeVisualNode::authored(
+                    NodeId::new(3).unwrap(),
+                    RuntimeVisualNodeKind::Transform(spatial::SpatialTransform::default()),
+                ),
+                RuntimeVisualNode::authored(
+                    NodeId::LEGACY_CANONICAL,
+                    RuntimeVisualNodeKind::LegacyCanonical,
+                ),
+                RuntimeVisualNode::authored(
+                    NodeId::LEGACY_TEMPORAL,
+                    RuntimeVisualNodeKind::LegacyTemporal,
+                ),
+            ],
+            Some(4),
+        )
+        .expect("valid but bypass-conflicting authored master rack");
+        assert_ne!(refused.master_rack, live_master_rack);
+
+        let scope = diagnostics::ConstraintScope::stable(
+            diagnostics::ConstraintScopeKind::Layer,
+            layer_id.get(),
+        );
+        let (before_world, before_canonical) = app
+            .capture_manual_history_world()
+            .expect("capture exact pre-remediation world");
+        let mut non_bypass_change = before_world.clone();
+        non_bypass_change.patch.layers[index].opacity = 0.5;
+        assert_ne!(
+            before_world
+                .canonical_bytes_with_neutral_layer_bypass()
+                .expect("normalize fixture world"),
+            non_bypass_change
+                .canonical_bytes_with_neutral_layer_bypass()
+                .expect("normalize non-bypass fixture world"),
+            "the source-reuse gate must remain closed for every non-bypass authored byte"
+        );
+        let visual_epoch = app.visual_epoch;
+        let history_before = app.manual_history.metrics();
+        let recovery_submissions_before = app
+            .recovery_writer
+            .as_ref()
+            .expect("installed recovery writer")
+            .status()
+            .submitted_requests;
+
+        let failure = app
+            .preflight_creative_graph(&refused)
+            .expect_err("authored Master bypass must refuse ambiguous rack ordering");
+        assert_eq!(
+            failure.diagnostic.code,
+            diagnostics::ConstraintCode::MasterBypassOrderViolation
+        );
+        assert_eq!(
+            failure.diagnostic.invariant,
+            diagnostics::ConstraintInvariant::DryBypassIsCanonicalPrefix
+        );
+        assert_eq!(failure.diagnostic.affected, vec![scope.clone()]);
+        assert!(failure
+            .diagnostic
+            .text
+            .contains("master bypass preflight failed"));
+
+        let diagnostic = failure.into_diagnostic();
+        assert_eq!(
+            app.constraint_diagnostics.borrow().as_slice(),
+            std::slice::from_ref(&diagnostic),
+            "ordinary preflight must publish the exact typed refusal"
+        );
+        assert_eq!(diagnostic.remediations.len(), 1);
+        assert_eq!(diagnostic.remediation_previews.len(), 1);
+        let candidate = diagnostic.remediations[0].clone();
+        let preview = diagnostic.remediation_previews[0].clone();
+        let candidate_id = candidate.id;
+        assert_eq!(candidate.base_revision, revision);
+        assert_eq!(
+            candidate.code,
+            diagnostics::RemediationCode::DisableConflictingBypass
+        );
+        assert_eq!(
+            candidate.operations,
+            vec![diagnostics::RemediationOperation::SetBypass {
+                scope: scope.clone(),
+                bypass: diagnostics::BypassKind::Master,
+                enabled: false,
+            }]
+        );
+        assert_eq!(preview.candidate_id, candidate_id);
+        assert_eq!(preview.base_revision, revision);
+        assert_eq!(preview.operations, candidate.operations);
+        assert_eq!(preview.consequence.affected, vec![scope]);
+        assert_eq!(
+            preview.consequence.plan.kind,
+            diagnostics::RemediationPlanKind::Advanced,
+            "the preview must be evaluated against the refused custom rack, not the live legacy rack"
+        );
+        assert_ne!(preview.consequence.plan.topology_signature, 0);
+        assert!(preview.consequence.plan.full_frame_passes > 0);
+        assert_eq!(
+            preview.consequence.pixel_order_before,
+            vec![format!("layer:{}:master_dry:temporal_wet", layer_id.get())]
+        );
+        assert_eq!(
+            preview.consequence.pixel_order_after,
+            vec![format!("layer:{}:master_wet:temporal_wet", layer_id.get())]
+        );
+
+        // Cancelling means declining the immutable candidate: neither the
+        // refused staged rack nor its declared one-bit diff is published.
+        let (_, cancelled_canonical) = app
+            .capture_manual_history_world()
+            .expect("capture cancelled remediation world");
+        assert_eq!(cancelled_canonical, before_canonical);
+        assert_eq!(app.master_rack, live_master_rack);
+        assert!(app.layers[index].bypass_master_fx);
+        assert_eq!(app.visual_epoch, visual_epoch);
+        assert_eq!(app.composition_revision, revision);
+        assert_eq!(app.manual_history.metrics(), history_before);
+        assert_eq!(
+            app.recovery_writer
+                .as_ref()
+                .expect("installed recovery writer")
+                .status()
+                .submitted_requests,
+            recovery_submissions_before
+        );
+
+        let stale_revision = if revision == u64::MAX {
+            revision - 1
+        } else {
+            revision + 1
+        };
+        assert!(app
+            .resolve_constraint_remediation_action(candidate_id, stale_revision)
+            .is_none());
+        assert!(app
+            .composition_status
+            .contains("stale composition revision"));
+        assert_eq!(
+            app.constraint_diagnostics.borrow()[0].code,
+            diagnostics::ConstraintCode::RevisionMismatch
+        );
+        let repeated = app
+            .preflight_creative_graph(&refused)
+            .expect_err("the same refused candidate remains ambiguous");
+        assert_eq!(repeated.diagnostic.remediations, vec![candidate.clone()]);
+        assert_eq!(
+            repeated.diagnostic.remediation_previews,
+            vec![preview.clone()]
+        );
+
+        let resolved = app
+            .resolve_constraint_remediation_action(candidate_id, revision)
+            .expect("current immutable preview resolves");
+        assert!(matches!(
+            resolved,
+            web::state::WebAction::SetLayerParam {
+                layer_id: Some(ref id),
+                ref param,
+                value: serde_json::Value::Bool(false),
+                ..
+            } if id == &layer_id.get().to_string() && param == "bypass_master_fx"
+        ));
+        assert!(app.layers[index].bypass_master_fx);
+        assert_eq!(app.master_rack, live_master_rack);
+        assert_eq!(
+            app.visual_epoch, visual_epoch,
+            "preview changed retained pixels"
+        );
+        assert_eq!(
+            app.composition_revision, revision,
+            "preview changed revision"
+        );
+        assert_eq!(app.manual_history.metrics(), history_before);
+        assert_eq!(
+            app.recovery_writer
+                .as_ref()
+                .expect("installed recovery writer")
+                .status()
+                .submitted_requests,
+            recovery_submissions_before,
+            "preview selection must not enqueue recovery"
+        );
+
+        app.handle_web_action(web::state::WebAction::ApplyConstraintRemediation {
+            candidate_id,
+            composition_revision: revision,
+        });
+        assert!(!app.layers[index].bypass_master_fx);
+        assert_eq!(
+            app.manual_history.metrics().undo_depth,
+            history_before.undo_depth + 1,
+            "confirmation must create exactly one ordinary history entry"
+        );
+        assert!(app.constraint_diagnostics.borrow().is_empty());
+        assert_eq!(app.master_rack, live_master_rack);
+        assert_eq!(
+            app.recovery_writer
+                .as_ref()
+                .expect("installed recovery writer")
+                .status()
+                .submitted_requests,
+            recovery_submissions_before + 1,
+            "ordinary confirmation must enqueue its post-edit recovery checkpoint"
+        );
+        app.preflight_creative_graph(&refused).expect(
+            "the exact refused authored rack must pass after the declared one-bit remediation",
+        );
+        assert_eq!(
+            app.master_rack, live_master_rack,
+            "successful detached retry must not publish the staged rack"
+        );
+        let (_, remediated_canonical) = app
+            .capture_manual_history_world()
+            .expect("capture exact remediated world");
+        let remediated_epoch = app.visual_epoch;
+
+        app.handle_web_action(web::state::WebAction::UndoManual);
+        assert!(
+            app.layers[index].bypass_master_fx,
+            "ordinary undo restores the exact authored bit; history='{}'; composition='{}'",
+            app.history_status, app.composition_status,
+        );
+        let (_, undone_canonical) = app
+            .capture_manual_history_world()
+            .expect("capture exact undone world");
+        assert_eq!(
+            undone_canonical, before_canonical,
+            "ordinary undo must restore the complete canonical authored world"
+        );
+        assert_eq!(
+            app.visual_epoch,
+            remediated_epoch.wrapping_add(1),
+            "the atomic bypass restore must issue exactly one retained-pixel barrier"
+        );
+        assert_eq!(app.manual_history.metrics().redo_depth, 1);
+        assert_eq!(
+            app.recovery_writer
+                .as_ref()
+                .expect("installed recovery writer")
+                .status()
+                .submitted_requests,
+            recovery_submissions_before + 2,
+            "ordinary undo must enqueue its restored world"
+        );
+
+        let undone_epoch = app.visual_epoch;
+        app.handle_web_action(web::state::WebAction::RedoManual);
+        assert!(!app.layers[index].bypass_master_fx);
+        let (_, redone_canonical) = app
+            .capture_manual_history_world()
+            .expect("capture exact redone world");
+        assert_eq!(
+            redone_canonical, remediated_canonical,
+            "ordinary redo must restore the complete canonical remediated world"
+        );
+        assert_eq!(
+            app.visual_epoch,
+            undone_epoch.wrapping_add(1),
+            "redo must issue the same single retained-pixel barrier"
+        );
+        assert_eq!(app.manual_history.metrics().redo_depth, 0);
+        assert_eq!(
+            app.manual_history.metrics().undo_depth,
+            history_before.undo_depth + 1
+        );
+        assert_eq!(
+            app.recovery_writer
+                .as_ref()
+                .expect("installed recovery writer")
+                .status()
+                .submitted_requests,
+            recovery_submissions_before + 3,
+            "ordinary redo must enqueue its restored world"
+        );
+
+        let writer = app
+            .recovery_writer
+            .take()
+            .expect("take isolated recovery writer");
+        let flush = writer.flush_with_deadline(Duration::from_secs(5));
+        assert!(
+            flush.completed,
+            "recovery writer must stop within its fixed deadline"
+        );
+        let durable_sequence = flush
+            .durable_sequence
+            .expect("the confirmed/undo/redo transaction must leave a durable checkpoint");
+        let (durable_patch, durable_path, latest_sequence) = writer
+            .latest_checkpoint()
+            .expect("latest durable remediation checkpoint");
+        assert_eq!(durable_path, recovery_path.0);
+        assert_eq!(latest_sequence, durable_sequence);
+        assert!(!durable_patch.layers[index].bypass_master_fx);
     }
 
     #[test]

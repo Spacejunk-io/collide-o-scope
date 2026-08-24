@@ -4,12 +4,17 @@
 //! layer texture. They deliberately have no transport clock: live playback and
 //! frame-indexed export therefore sample the exact same pixels on every frame.
 
-use image::{ImageFormat, ImageReader, Limits};
+use image::{ImageDecoder as _, ImageFormat, ImageReader, Limits};
 use std::path::Path;
 
 use crate::media_safety::{
     MediaAllocationPlan, MediaDeviceLimits, MediaReservation, MediaSafetyPolicy, MediaSourceKind,
     ABSOLUTE_MEDIA_MAX_EDGE,
+};
+#[cfg(test)]
+use crate::video::source_descriptor::DescriptorProvenance;
+use crate::video::source_descriptor::{
+    still_descriptors, SourceColorDescriptor, SourceConversionPolicy, SourceDisplayDescriptor,
 };
 
 /// An image decoded into the engine's source-texture representation.
@@ -19,6 +24,9 @@ pub struct DecodedStillImage {
     pub height: u32,
     /// Tightly packed, straight-alpha RGBA8 in top-to-bottom row order.
     pub rgba: Vec<u8>,
+    pub source_color_descriptor: SourceColorDescriptor,
+    pub source_display_descriptor: SourceDisplayDescriptor,
+    pub conversion_policy: SourceConversionPolicy,
     media_reservation: MediaReservation,
 }
 
@@ -37,10 +45,19 @@ impl DecodedStillImage {
             )
             .map_err(|error| error.to_string())?;
         validate_rgba_length(width, height, rgba.len())?;
+        let (mut source_color_descriptor, mut source_display_descriptor, conversion_policy) =
+            still_descriptors(width, height, image::ColorType::Rgba8, None);
+        source_color_descriptor.pixel_family.provenance = DescriptorProvenance::InferredFallback;
+        source_color_descriptor.bit_depth.provenance = DescriptorProvenance::InferredFallback;
+        source_display_descriptor.coded_dimensions.provenance =
+            DescriptorProvenance::InferredFallback;
         Ok(Self {
             width,
             height,
             rgba,
+            source_color_descriptor,
+            source_display_descriptor,
+            conversion_policy,
             media_reservation: reservation,
         })
     }
@@ -52,7 +69,12 @@ impl DecodedStillImage {
 
 impl PartialEq for DecodedStillImage {
     fn eq(&self, other: &Self) -> bool {
-        self.width == other.width && self.height == other.height && self.rgba == other.rgba
+        self.width == other.width
+            && self.height == other.height
+            && self.rgba == other.rgba
+            && self.source_color_descriptor == other.source_color_descriptor
+            && self.source_display_descriptor == other.source_display_descriptor
+            && self.conversion_policy == other.conversion_policy
     }
 }
 
@@ -62,6 +84,9 @@ impl Eq for DecodedStillImage {}
 /// Keeping this mailbox local avoids a decoder thread for immutable content.
 pub struct StillImage {
     frame: Option<Vec<u8>>,
+    source_color_descriptor: SourceColorDescriptor,
+    source_display_descriptor: SourceDisplayDescriptor,
+    conversion_policy: SourceConversionPolicy,
     _media_reservation: MediaReservation,
 }
 
@@ -69,17 +94,35 @@ impl StillImage {
     pub fn from_decoded(decoded: DecodedStillImage) -> Self {
         let DecodedStillImage {
             rgba,
+            source_color_descriptor,
+            source_display_descriptor,
+            conversion_policy,
             media_reservation,
             ..
         } = decoded;
         Self {
             frame: Some(rgba),
+            source_color_descriptor,
+            source_display_descriptor,
+            conversion_policy,
             _media_reservation: media_reservation,
         }
     }
 
     pub fn take_frame(&mut self) -> Option<Vec<u8>> {
         self.frame.take()
+    }
+
+    pub const fn source_color_descriptor(&self) -> SourceColorDescriptor {
+        self.source_color_descriptor
+    }
+
+    pub const fn source_display_descriptor(&self) -> SourceDisplayDescriptor {
+        self.source_display_descriptor
+    }
+
+    pub const fn conversion_policy(&self) -> SourceConversionPolicy {
+        self.conversion_policy
     }
 
     /// A recoverable GPU upload failure must not consume the immutable source
@@ -160,6 +203,39 @@ pub fn decode_still_image_with_media_policy(
     );
     reader.limits(limits);
 
+    // Inspect bounded header/EXIF truth without applying it to the raster.
+    // The historical byte path remains in coded orientation; display intent
+    // travels only in the normalized descriptor.
+    let (source_color_type, source_orientation) = {
+        let mut decoder = reader.into_decoder().map_err(|error| {
+            format!(
+                "cannot inspect still-image metadata for {} within safety limits: {error}",
+                path.display()
+            )
+        })?;
+        let color_type = decoder.color_type();
+        let orientation = decoder
+            .exif_metadata()
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(image::metadata::Orientation::from_exif_chunk);
+        (color_type, orientation)
+    };
+
+    // Metadata inspection consumes the reader. Reopen with the identical
+    // bounds; the dimension equality below rejects a replacement race.
+    let mut reader = open_reader(path)?;
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(edge_limit);
+    limits.max_image_height = Some(edge_limit);
+    limits.max_alloc = Some(
+        media_plan
+            .still_decoder_allocation_limit()
+            .map_err(|error| format!("still image {} rejected: {error}", path.display()))?,
+    );
+    reader.limits(limits);
+
     let image = reader.decode().map_err(|error| {
         format!(
             "cannot decode still image {} within safety limits: {error}",
@@ -178,10 +254,16 @@ pub fn decode_still_image_with_media_policy(
     validate_rgba_length(width, height, rgba.len())
         .map_err(|error| format!("still image {} rejected: {error}", path.display()))?;
 
+    let (source_color_descriptor, source_display_descriptor, conversion_policy) =
+        still_descriptors(width, height, source_color_type, source_orientation);
+
     Ok(DecodedStillImage {
         width,
         height,
         rgba,
+        source_color_descriptor,
+        source_display_descriptor,
+        conversion_policy,
         media_reservation,
     })
 }
@@ -248,7 +330,7 @@ fn is_supported_format(format: ImageFormat) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{decode_still_image, DecodedStillImage, StillImage};
-    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
+    use image::{DynamicImage, ImageBuffer, ImageEncoder as _, ImageFormat, Rgba};
     use std::io::Cursor;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -277,6 +359,19 @@ mod tests {
         bytes.into_inner()
     }
 
+    fn minimal_exif_orientation(value: u8) -> Vec<u8> {
+        vec![
+            b'I', b'I', 42, 0, // little-endian TIFF header
+            8, 0, 0, 0, // first IFD offset
+            1, 0, // one directory entry
+            0x12, 0x01, // orientation tag
+            3, 0, // SHORT
+            1, 0, 0, 0, // one value
+            value, 0, 0, 0, // inline SHORT + padding
+            0, 0, 0, 0, // no next IFD
+        ]
+    }
+
     #[test]
     fn png_decodes_once_to_exact_straight_alpha_rgba() {
         let path = unique_temp_path("png");
@@ -299,6 +394,40 @@ mod tests {
         source.restore_frame_after_failed_upload(frame);
         assert_eq!(source.take_frame(), Some(vec![10, 20, 30, 40]));
         assert_eq!(source.take_frame(), None);
+    }
+
+    #[test]
+    fn jpeg_exif_orientation_is_normalized_without_rotating_legacy_pixels() {
+        let path = unique_temp_path("jpg");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(file, 100);
+        encoder
+            .set_exif_metadata(minimal_exif_orientation(6))
+            .unwrap();
+        encoder
+            .write_image(
+                &[255, 0, 0, 0, 255, 0],
+                2,
+                1,
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+
+        let decoded = decode_still_image(&path, Some(8192)).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!((decoded.width, decoded.height), (2, 1));
+        assert_eq!(
+            decoded.source_display_descriptor.orientation.value,
+            crate::video::NormalizedOrientation::Rotate90
+        );
+        assert_eq!(
+            decoded.source_display_descriptor.orientation.provenance,
+            crate::video::DescriptorProvenance::StillExifDeclared
+        );
+        assert_eq!(
+            decoded.source_display_descriptor.display_dimensions.value,
+            crate::video::PixelDimensions::new(1, 2)
+        );
     }
 
     #[test]

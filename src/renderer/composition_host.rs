@@ -3090,7 +3090,7 @@ mod tests {
         let mut pass = begin_replace_pass(encoder, "M6 Compat8 production effects", target);
         pass.set_pipeline(&fixture.pipeline);
         pass.set_bind_group(0, &fixture.texture_group, &[]);
-        pass.set_bind_group(1, &fixture.uniform_group, &[]);
+        pass.set_bind_group(1, &fixture.uniform_group, &[0]);
         pass.draw(0..3, 0..1);
     }
 

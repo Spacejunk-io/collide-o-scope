@@ -276,7 +276,7 @@ impl AudioClip {
                 Err(error) => {
                     return Err(format!(
                         "cannot read audio packets from {display_path}: {error}"
-                    ))
+                    ));
                 }
             }
             if packet.stream() != stream_index {
@@ -427,7 +427,7 @@ fn receive_decoded(
             Err(error) => {
                 return Err(format!(
                     "audio decoder failed while reading {path}: {error}"
-                ))
+                ));
             }
         }
     }

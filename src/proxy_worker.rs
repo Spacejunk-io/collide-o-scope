@@ -32,7 +32,8 @@ use crate::proxy::{
     ProxyCachePlan, ProxyError, ProxyFrameTimingLaw, ProxyInputPlan, ProxySettings,
     ProxySourceProbe,
 };
-use crate::video::{SeedSelectError, ThreadedDecoder};
+use crate::video::{DecodedImagePayload, SeedSelectError, ThreadedDecoder};
+use crate::video::{SourceColorDescriptor, SourceDisplayDescriptor};
 
 /// Poll cadence for the encode child. The deadline is absolute and checked
 /// first each iteration, so this only bounds reaction latency.
@@ -636,6 +637,20 @@ pub fn default_proxy_cache_root() -> PathBuf {
 /// Probe the source container's bounded metadata and report which stream the
 /// `best(Type::Video)` law selects, so the encode maps that exact stream.
 pub fn probe_proxy_source(path: &Path) -> Result<(ProxySourceProbe, usize), ProxyWorkerError> {
+    probe_proxy_source_with_descriptors(path).map(|(probe, index, _, _)| (probe, index))
+}
+
+fn probe_proxy_source_with_descriptors(
+    path: &Path,
+) -> Result<
+    (
+        ProxySourceProbe,
+        usize,
+        SourceColorDescriptor,
+        SourceDisplayDescriptor,
+    ),
+    ProxyWorkerError,
+> {
     ffmpeg_next::init().map_err(|error| ProxyWorkerError::Probe(error.to_string()))?;
     let input = ffmpeg_next::format::input(&path)
         .map_err(|error| ProxyWorkerError::Probe(error.to_string()))?;
@@ -661,6 +676,8 @@ pub fn probe_proxy_source(path: &Path) -> Result<(ProxySourceProbe, usize), Prox
         .video()
         .map_err(|error| ProxyWorkerError::Probe(error.to_string()))?;
     let duration_micros = u64::try_from(input.duration()).unwrap_or(0);
+    let (source_color, source_display) =
+        crate::video::source_descriptor::descriptors_from_ffmpeg(&best, &decoder);
     Ok((
         ProxySourceProbe {
             container_streams,
@@ -671,6 +688,8 @@ pub fn probe_proxy_source(path: &Path) -> Result<(ProxySourceProbe, usize), Prox
             duration_micros,
         },
         best_index,
+        source_color,
+        source_display,
     ))
 }
 
@@ -902,6 +921,11 @@ pub struct ProxyEncodeOutcome {
     pub already_cached: bool,
     pub eviction: Option<ProxyEvictionReceipt>,
     pub encode_seconds: u64,
+    /// Original-source declarations retained in the completion receipt even
+    /// though the bounded FFV1 artifact intentionally strips arbitrary
+    /// container metadata.
+    pub source_color: SourceColorDescriptor,
+    pub source_display: SourceDisplayDescriptor,
 }
 
 struct StagingGuard {
@@ -944,7 +968,8 @@ pub fn run_proxy_encode_job(
         });
     }
 
-    let (probe, best_video_stream_index) = probe_proxy_source(&job.source_path)?;
+    let (probe, best_video_stream_index, source_color, source_display) =
+        probe_proxy_source_with_descriptors(&job.source_path)?;
     let plan = plan_proxy_input(probe, settings)?;
 
     // Source admission is MediaSafetyPolicy's, held for the encode lifetime.
@@ -985,6 +1010,8 @@ pub fn run_proxy_encode_job(
                         already_cached: true,
                         eviction: None,
                         encode_seconds: 0,
+                        source_color,
+                        source_display,
                     });
                 }
                 Err(_) => lock_store(store).discard_invalid(key),
@@ -1048,6 +1075,8 @@ pub fn run_proxy_encode_job(
         already_cached: false,
         eviction: Some(receipt),
         encode_seconds,
+        source_color,
+        source_display,
     })
 }
 
@@ -1433,7 +1462,8 @@ pub enum ProxyAdoptionEvent {
         candidate: ProxyAdoptionCandidate,
         artifact_path: PathBuf,
         decoder: Box<ThreadedDecoder>,
-        first_rgba: Vec<u8>,
+        first_rgba: DecodedImagePayload,
+        first_source_generation: u64,
         width: u32,
         height: u32,
         source_fps: f32,
@@ -1547,6 +1577,7 @@ fn prepare_adoption_job(
             height: decoder.height,
             source_fps: decoder.fps,
             first_rgba: seed.rgba,
+            first_source_generation: seed.source_generation,
             decoder: Box::new(decoder),
             preload_bytes,
         });
@@ -2794,6 +2825,7 @@ mod tests {
             artifact_path,
             decoder,
             first_rgba,
+            first_source_generation,
             width,
             height,
             source_fps,
@@ -2804,6 +2836,7 @@ mod tests {
             panic!("expected a prepared adoption");
         };
 
+        let first_payload_id = first_rgba.identity();
         let activation = LayerSourceActivation::stage(
             &device,
             &queue,
@@ -2816,8 +2849,17 @@ mod tests {
             source_fps,
             preload_bytes,
             &first_rgba,
+            candidate.layer_id.get(),
+            first_source_generation,
+            1,
         )
         .unwrap();
+        let attribution = activation
+            .pending_upload_attribution()
+            .expect("proxy seed upload validation attribution");
+        assert_eq!(attribution.payload_id, first_payload_id);
+        assert_eq!(attribution.layer_id, candidate.layer_id.get());
+        assert_eq!(attribution.source_generation, first_source_generation);
         let displaced = layer.commit_adopted_proxy(activation, key.to_hex());
         drop(displaced);
 
@@ -2852,6 +2894,11 @@ mod tests {
         .unwrap();
         let (fresh_width, fresh_height, fresh_fps) =
             (fresh_decoder.width, fresh_decoder.height, fresh_decoder.fps);
+        let fresh_rgba = DecodedImagePayload::from_owned_rgba(vec![
+            0_u8;
+            (fresh_width * fresh_height * 4)
+                as usize
+        ]);
         let fresh = LayerSourceActivation::stage(
             &device,
             &queue,
@@ -2863,7 +2910,10 @@ mod tests {
             fresh_height,
             fresh_fps,
             0,
-            &vec![0_u8; (fresh_width * fresh_height * 4) as usize],
+            &fresh_rgba,
+            layer.stable_layer_id().get(),
+            0,
+            1,
         )
         .unwrap();
         let mut slot_b = layer.active_clip_config().clone();

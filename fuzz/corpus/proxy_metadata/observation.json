@@ -1,0 +1,1 @@
+{"sampled_frames":60,"visible_layers":1,"frame_budget_micros":16667,"decode_p95_micros":4000,"upload_p95_micros":2000,"frame_age_p95_micros":8000,"delivery_hold_p95_micros":0,"delivery_hold_peak_micros":0,"dropped_frames":0,"pending_frames_peak":1,"hardware_decode_active":false,"zero_copy_active":false}

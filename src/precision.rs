@@ -14,6 +14,15 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+#[allow(
+    unused_imports,
+    reason = "the private binary module preserves the formerly local public capability reason names for tests and future runtime surfaces"
+)]
+pub use collide_o_scope::capability::{
+    evaluate_scale_capability, CapabilityDecision, CapabilityDeferredReason,
+    CapabilityEvaluationRequirement, CapabilityEvidence, ScaleCapability,
+};
+
 pub const PRECISION_MAX_EDGE: u32 = 16_384;
 pub const PRECISION_MAX_PIXELS: u64 = 8_192 * 4_320;
 pub const PRECISION_MAX_SURFACE_LAYERS: u32 = 256;
@@ -545,50 +554,6 @@ fn signed_difference(left: u64, right: u64) -> Result<i64, PrecisionError> {
     i64::try_from(difference).map_err(|_| PrecisionError::ArithmeticOverflow)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScaleCapability {
-    HardwareDecode,
-    ZeroCopyDecode,
-    SyphonInput,
-    SyphonOutput,
-    NdiInput,
-    NdiOutput,
-    CaptureInput,
-    BoundedMeshWarp,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CapabilityEvidence {
-    pub platform_supported: bool,
-    pub backend_integrated: bool,
-    pub interoperability_proven: bool,
-    pub sdk_license_authorized: bool,
-    pub network_policy_authorized: bool,
-    pub venue_requirement_proven: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CapabilityDeferredReason {
-    PlatformUnsupported,
-    BackendNotIntegrated,
-    SdkOrLicenseRequired,
-    NetworkPolicyRequired,
-    VenueRequirementNotEstablished,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CapabilityEvaluationRequirement {
-    InteroperabilityProof,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CapabilityDecision {
-    Available,
-    EvaluationRequired(CapabilityEvaluationRequirement),
-    Deferred(CapabilityDeferredReason),
-}
-
 /// The one production source of capability evidence. Until this landed, the
 /// only constructors of [`CapabilityEvidence`] were test fixtures typing
 /// literals; every production question about a scale capability must now be
@@ -618,12 +583,12 @@ pub enum CapabilityDecision {
 /// - `interoperability_proven` is `false`: the tracked hardware-decode
 ///   interop receipt is committed *evidence for the operator's decision*,
 ///   not a runtime fact about this host, and no runtime proof store exists.
-///   Consuming proof at runtime — and everything `Available` would unlock —
+///   Consuming proof at runtime — and everything `Implemented` would unlock —
 ///   is a later, operator-decided tranche.
 /// - `venue_requirement_proven` is `false`: a demonstrated venue requirement
 ///   is an operator fact nobody has recorded.
 ///
-/// This function still moves nothing to `Available`: hardware decode on
+/// This function still moves nothing to `Implemented`: hardware decode on
 /// Windows now stops at `EvaluationRequired(InteroperabilityProof)` — the
 /// exact progression the capability law demands — and everything else stays
 /// `Deferred`. The test suite pins each capability's decision per platform
@@ -662,40 +627,6 @@ pub fn scale_capability_decision(capability: ScaleCapability) -> CapabilityDecis
     evaluate_scale_capability(capability, probe_capability_evidence(capability))
 }
 
-pub fn evaluate_scale_capability(
-    capability: ScaleCapability,
-    evidence: CapabilityEvidence,
-) -> CapabilityDecision {
-    if matches!(
-        capability,
-        ScaleCapability::NdiInput | ScaleCapability::NdiOutput
-    ) {
-        if !evidence.sdk_license_authorized {
-            return CapabilityDecision::Deferred(CapabilityDeferredReason::SdkOrLicenseRequired);
-        }
-        if !evidence.network_policy_authorized {
-            return CapabilityDecision::Deferred(CapabilityDeferredReason::NetworkPolicyRequired);
-        }
-    }
-    if capability == ScaleCapability::BoundedMeshWarp && !evidence.venue_requirement_proven {
-        return CapabilityDecision::Deferred(
-            CapabilityDeferredReason::VenueRequirementNotEstablished,
-        );
-    }
-    if !evidence.platform_supported {
-        return CapabilityDecision::Deferred(CapabilityDeferredReason::PlatformUnsupported);
-    }
-    if !evidence.backend_integrated {
-        return CapabilityDecision::Deferred(CapabilityDeferredReason::BackendNotIntegrated);
-    }
-    if !evidence.interoperability_proven {
-        return CapabilityDecision::EvaluationRequired(
-            CapabilityEvaluationRequirement::InteroperabilityProof,
-        );
-    }
-    CapabilityDecision::Available
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrecisionError {
     InvalidLimits,
@@ -718,28 +649,39 @@ impl fmt::Display for PrecisionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidLimits => formatter.write_str("invalid precision resource limits"),
-            Self::ZeroDimension => formatter.write_str("precision surface dimensions must be non-zero"),
+            Self::ZeroDimension => {
+                formatter.write_str("precision surface dimensions must be non-zero")
+            }
             Self::EdgeLimit { requested, limit } => write!(
                 formatter,
                 "precision surface {}x{} exceeds edge limit {limit}",
                 requested[0], requested[1]
             ),
             Self::PixelLimit { pixels, limit } => {
-                write!(formatter, "precision surface has {pixels} pixels; limit is {limit}")
+                write!(
+                    formatter,
+                    "precision surface has {pixels} pixels; limit is {limit}"
+                )
             }
             Self::SurfaceLayerLimit { layers, limit } => write!(
                 formatter,
                 "precision plan has {layers} surfaces; limit is {limit}"
             ),
             Self::GpuByteLimit { bytes, limit } => {
-                write!(formatter, "precision GPU ledger is {bytes} bytes; limit is {limit}")
+                write!(
+                    formatter,
+                    "precision GPU ledger is {bytes} bytes; limit is {limit}"
+                )
             }
             Self::HostTransferByteLimit { bytes, limit } => write!(
                 formatter,
                 "precision host-transfer ledger is {bytes} bytes; limit is {limit}"
             ),
             Self::TotalByteLimit { bytes, limit } => {
-                write!(formatter, "precision total ledger is {bytes} bytes; limit is {limit}")
+                write!(
+                    formatter,
+                    "precision total ledger is {bytes} bytes; limit is {limit}"
+                )
             }
             Self::CreativeByteMismatch {
                 calculated,
@@ -755,7 +697,10 @@ impl fmt::Display for PrecisionError {
             Self::NonFiniteOrUnboundedSample => formatter.write_str(
                 "precision fixtures require finite samples inside the RGBA16Float numeric envelope",
             ),
-            Self::FixtureLengthMismatch { reference, observed } => write!(
+            Self::FixtureLengthMismatch {
+                reference,
+                observed,
+            } => write!(
                 formatter,
                 "precision fixture lengths differ: reference {reference}, observed {observed}"
             ),
@@ -978,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn external_and_mesh_capabilities_are_deferred_without_real_evidence() {
+    fn external_and_mesh_capabilities_are_not_implemented_without_real_evidence() {
         for capability in [
             ScaleCapability::HardwareDecode,
             ScaleCapability::ZeroCopyDecode,
@@ -991,7 +936,7 @@ mod tests {
         ] {
             assert!(matches!(
                 evaluate_scale_capability(capability, CapabilityEvidence::default()),
-                CapabilityDecision::Deferred(_)
+                CapabilityDecision::Deferred(_) | CapabilityDecision::UnavailableOnPlatform(_)
             ));
         }
         assert_eq!(
@@ -1021,7 +966,7 @@ mod tests {
     }
 
     /// Pins the production probe's decision for every capability on the
-    /// platform running the test. Nothing may be `Available` today, and each
+    /// platform running the test. Nothing may be `Implemented` today, and each
     /// capability's exact answer is the actionable one: NDI names its
     /// purchase before anything else, the mesh warp names its venue fact,
     /// Syphon names the platform where that is the truth, and every
@@ -1030,15 +975,17 @@ mod tests {
     /// capability whose backend has landed (Gate 4's evaluation-only
     /// D3D11VA session, Windows only), so on Windows it stops at exactly
     /// `EvaluationRequired(InteroperabilityProof)` — the demanded
-    /// progression, never straight to `Available` — while zero-copy
+    /// progression, never straight to `Implemented` — while zero-copy
     /// deliberately stays `BackendNotIntegrated`: downloading frames is not
     /// a zero-copy path.
     #[test]
     fn the_production_probe_defers_every_capability_with_its_actionable_reason() {
         let expected_syphon = if cfg!(target_os = "macos") {
-            CapabilityDeferredReason::BackendNotIntegrated
+            CapabilityDecision::Deferred(CapabilityDeferredReason::BackendNotIntegrated)
         } else {
-            CapabilityDeferredReason::PlatformUnsupported
+            CapabilityDecision::UnavailableOnPlatform(
+                collide_o_scope::capability::CapabilityPlatformRequirement::Macos,
+            )
         };
         let expected_hardware_decode = if cfg!(target_os = "windows") {
             CapabilityDecision::EvaluationRequired(
@@ -1053,14 +1000,8 @@ mod tests {
                 ScaleCapability::ZeroCopyDecode,
                 CapabilityDecision::Deferred(CapabilityDeferredReason::BackendNotIntegrated),
             ),
-            (
-                ScaleCapability::SyphonInput,
-                CapabilityDecision::Deferred(expected_syphon),
-            ),
-            (
-                ScaleCapability::SyphonOutput,
-                CapabilityDecision::Deferred(expected_syphon),
-            ),
+            (ScaleCapability::SyphonInput, expected_syphon),
+            (ScaleCapability::SyphonOutput, expected_syphon),
             (
                 ScaleCapability::NdiInput,
                 CapabilityDecision::Deferred(CapabilityDeferredReason::SdkOrLicenseRequired),
@@ -1088,10 +1029,10 @@ mod tests {
             );
         }
         // The claims seam stays a theorem: EvaluationRequired is not
-        // Available, so no decode activity can be claimed anywhere.
+        // Implemented, so no decode activity can be claimed anywhere.
         assert_ne!(
             scale_capability_decision(ScaleCapability::HardwareDecode),
-            CapabilityDecision::Available
+            CapabilityDecision::Implemented
         );
     }
 }

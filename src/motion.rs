@@ -682,6 +682,10 @@ pub struct MotionScopeResourceRequest {
     /// admits the same canonical field even when the layer's own Motion
     /// effects are exact-zero.
     pub required_as_garden_signal: bool,
+    /// A resolved Study ABI 1.1 program consumes this scope's primitive
+    /// motion input. Like donor and Garden routing, this admits the field even
+    /// when ordinary Motion effects are exactly zero.
+    pub required_as_study_input: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -710,8 +714,10 @@ impl MotionResourcePlan {
             let params = request.params.sanitized();
             let transplant_active = params.transplant.amount > 0.0;
             let shutter_active = !params.shutter.is_exact_zero();
-            let field_required =
-                request.required_as_donor || request.required_as_garden_signal || shutter_active;
+            let field_required = request.required_as_donor
+                || request.required_as_garden_signal
+                || request.required_as_study_input
+                || shutter_active;
             if !transplant_active && !field_required {
                 continue;
             }
@@ -3221,6 +3227,7 @@ mod tests {
             codec_vectors_available: false,
             required_as_donor: false,
             required_as_garden_signal: true,
+            required_as_study_input: false,
         };
         let grid = MotionGrid::for_source([1920, 1080], MotionLatticeQuality::Live).unwrap();
         let plan = MotionResourcePlan::preflight(&[request], generous_limits()).unwrap();
@@ -3266,6 +3273,7 @@ mod tests {
             codec_vectors_available: false,
             required_as_donor: false,
             required_as_garden_signal: false,
+            required_as_study_input: false,
         };
         let plan = MotionResourcePlan::preflight(&[request], generous_limits()).unwrap();
         assert_eq!(plan.active_field_slots, 1);
@@ -3335,6 +3343,7 @@ mod tests {
             codec_vectors_available: false,
             required_as_donor: false,
             required_as_garden_signal: false,
+            required_as_study_input: false,
         };
         let donor = MotionScopeResourceRequest {
             source_dimensions: [1280, 720],
@@ -3344,6 +3353,7 @@ mod tests {
             codec_vectors_available: false,
             required_as_donor: true,
             required_as_garden_signal: false,
+            required_as_study_input: false,
         };
         let plan = MotionResourcePlan::preflight(&[recipient, donor], generous_limits()).unwrap();
         assert_eq!(plan.active_transplants, 1);
@@ -3388,6 +3398,7 @@ mod tests {
             codec_vectors_available: false,
             required_as_donor: false,
             required_as_garden_signal: false,
+            required_as_study_input: false,
         };
         let plan = MotionResourcePlan::preflight(&[request], generous_limits()).unwrap();
         let field_bytes = plan.vector_bytes + plan.gate_bytes + plan.luma_bytes;
@@ -4062,6 +4073,7 @@ mod tests {
             codec_vectors_available: false,
             required_as_donor: true,
             required_as_garden_signal: false,
+            required_as_study_input: false,
         };
         let procedural = MotionResourcePlan::preflight(
             &[request(MotionFieldSource::Procedural(

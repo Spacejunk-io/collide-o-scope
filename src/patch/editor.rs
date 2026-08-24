@@ -1,4 +1,5 @@
 use crate::composition::RuntimeComposition;
+use crate::durable_file::{self, PublishMode};
 use crate::effects::EffectUniforms;
 use crate::layers::Layer;
 use crate::motion::MotionParams;
@@ -8,6 +9,11 @@ use crate::visual_rack::RuntimeVisualRack;
 use super::{param_meta, EffectsConfig, LayerConfig, PatchMasterVisual, PatchState};
 
 const MAX_EDITOR_HISTORY_BOUNDARIES: usize = 32;
+
+/// Patches may embed bounded gesture/take/Study documents, but never raw
+/// media. This cap is inspected from metadata before allocation and enforced
+/// again while reading to close a grow-after-metadata race.
+pub const MAX_PATCH_FILE_BYTES: usize = super::yaml_boundary::MAX_PATCH_FILE_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorHistoryBoundary {
@@ -430,6 +436,82 @@ pub fn build_yaml_editor_content(
     ui.weak("click value to edit · ↑↓ step · enter to confirm");
 }
 
+pub(crate) fn parse_patch_bytes(bytes: &[u8]) -> Result<PatchState, String> {
+    let value = super::yaml_boundary::parse_patch_yaml_value(bytes)?;
+    serde_yaml::from_value::<PatchState>(value)
+        .map_err(|error| format!("parse PatchState: {error}"))
+}
+
+fn read_bounded_patch(path: &std::path::Path, max_bytes: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect patch {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!("patch {} is not a regular file", path.display()));
+    }
+    if metadata.len() > max_bytes as u64 {
+        return Err(format!(
+            "patch {} is {} bytes; limit is {max_bytes}",
+            path.display(),
+            metadata.len()
+        ));
+    }
+
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("open patch {}: {error}", path.display()))?;
+    let opened_len = file
+        .metadata()
+        .map_err(|error| format!("inspect open patch {}: {error}", path.display()))?
+        .len();
+    if opened_len > max_bytes as u64 {
+        return Err(format!(
+            "patch {} grew to {opened_len} bytes; limit is {max_bytes}",
+            path.display()
+        ));
+    }
+    let capacity = usize::try_from(opened_len)
+        .unwrap_or(max_bytes)
+        .min(max_bytes);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read patch {}: {error}", path.display()))?;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "patch {} exceeded the {max_bytes}-byte limit while reading",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+fn serialize_patch_preflight(patch: &PatchState) -> Result<Vec<u8>, String> {
+    let yaml = serde_yaml::to_string(patch)
+        .map_err(|error| format!("serialize patch: {error}"))?
+        .into_bytes();
+    if yaml.len() > MAX_PATCH_FILE_BYTES {
+        return Err(format!(
+            "serialized patch is {} bytes; limit is {MAX_PATCH_FILE_BYTES}",
+            yaml.len()
+        ));
+    }
+    // The exact bytes that will be published must survive the hostile-input
+    // boundary and PatchState's semantic validator before any old file moves.
+    let _round_trip = parse_patch_bytes(&yaml)
+        .map_err(|error| format!("serialized patch failed round-trip preflight: {error}"))?;
+    Ok(yaml)
+}
+
+pub(crate) fn publish_patch_state(
+    path: &std::path::Path,
+    patch: &PatchState,
+) -> Result<(), String> {
+    let yaml = serialize_patch_preflight(patch)?;
+    durable_file::publish_bytes(path, &yaml, "patch-publish", PublishMode::Replace)
+        .map_err(|error| format!("publish patch {}: {error}", path.display()))
+}
+
 /// Save full patch state to a YAML file via native dialog.
 // This UI boundary deliberately mirrors the complete PatchState capture
 // inputs so call sites cannot accidentally omit performance state.
@@ -461,15 +543,13 @@ pub fn save_patch(
         morph,
     );
     patch.scenes = scenes.clone();
-    let yaml = serde_yaml::to_string(&patch).unwrap_or_default();
-
     if let Some(path) = rfd::FileDialog::new()
         .set_file_name("patch.yaml")
         .add_filter("YAML", &["yaml", "yml"])
         .save_file()
     {
-        if let Err(e) = std::fs::write(&path, &yaml) {
-            eprintln!("Failed to save patch: {e}");
+        if let Err(error) = publish_patch_state(&path, &patch) {
+            eprintln!("Failed to save patch: {error}");
         }
     }
 }
@@ -543,9 +623,6 @@ pub fn save_patch_with_composition_and_motion(
         morph,
     )?;
     patch.scenes = scenes.clone();
-    let yaml =
-        serde_yaml::to_string(&patch).map_err(|error| format!("serialize patch: {error}"))?;
-
     let Some(path) = rfd::FileDialog::new()
         .set_file_name("patch.yaml")
         .add_filter("YAML", &["yaml", "yml"])
@@ -553,7 +630,7 @@ pub fn save_patch_with_composition_and_motion(
     else {
         return Ok(());
     };
-    std::fs::write(&path, yaml).map_err(|error| format!("write patch {}: {error}", path.display()))
+    publish_patch_state(&path, &patch)
 }
 
 /// Pick and parse a patch via the native dialog. Cancellation is distinct from
@@ -571,10 +648,8 @@ pub fn choose_patch() -> Result<Option<(PatchState, std::path::PathBuf)>, String
 /// Parse a specific patch path through the same bounded semantic entry point
 /// used by the native picker.
 pub fn load_patch_path(path: &std::path::Path) -> Result<PatchState, String> {
-    let yaml = std::fs::read_to_string(path)
-        .map_err(|error| format!("read patch {}: {error}", path.display()))?;
-    serde_yaml::from_str::<PatchState>(&yaml)
-        .map_err(|error| format!("parse patch {}: {error}", path.display()))
+    let bytes = read_bounded_patch(path, MAX_PATCH_FILE_BYTES)?;
+    parse_patch_bytes(&bytes).map_err(|error| format!("parse patch {}: {error}", path.display()))
 }
 
 /// Compatibility wrapper retained for existing native callers.
@@ -592,6 +667,9 @@ pub fn load_patch() -> Option<(PatchState, std::path::PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::patch::yaml_boundary::{
+        validate_yaml_value_boundary, YamlLimits, MAX_PATCH_YAML_DEPTH,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEMP_PATCH: AtomicU64 = AtomicU64::new(0);
@@ -631,6 +709,58 @@ mod tests {
         let current = load_patch_path(&path.0).unwrap();
         assert!(!current.master_paused);
         assert!(current.media_frozen);
+    }
+
+    #[test]
+    fn patch_save_preflight_round_trips_before_atomic_replacement() {
+        let path = TempPatch::new();
+        std::fs::write(&path.0, "master: {}\nlayers: []\nmaster_paused: true\n").unwrap();
+        let patch = load_patch_path(&path.0).unwrap();
+        publish_patch_state(&path.0, &patch).unwrap();
+        let saved = std::fs::read(&path.0).unwrap();
+        assert!(!saved.is_empty());
+        let restored = parse_patch_bytes(&saved).unwrap();
+        assert!(restored.master_paused);
+    }
+
+    #[test]
+    fn metadata_cap_is_checked_before_a_bounded_read() {
+        let path = TempPatch::new();
+        std::fs::write(&path.0, vec![b'x'; 65]).unwrap();
+        let error = read_bounded_patch(&path.0, 64).unwrap_err();
+        assert!(error.contains("65 bytes; limit is 64"), "{error}");
+    }
+
+    #[test]
+    fn hostile_yaml_alias_and_depth_are_rejected_before_patch_deserialization() {
+        let alias = b"master: &master {}\nlayers: []\ncopy: *master\n";
+        let error = parse_patch_bytes(alias).err().expect("anchor must fail");
+        assert!(error.contains("anchors"), "{error}");
+
+        let mut deep = b"master: {}\nlayers: ".to_vec();
+        deep.extend(std::iter::repeat_n(b'[', MAX_PATCH_YAML_DEPTH + 1));
+        deep.extend(std::iter::repeat_n(b']', MAX_PATCH_YAML_DEPTH + 1));
+        let error = parse_patch_bytes(&deep).err().expect("deep flow must fail");
+        assert!(error.contains("flow depth"), "{error}");
+    }
+
+    #[test]
+    fn yaml_collection_and_scalar_boundaries_are_deterministic() {
+        let limits = YamlLimits {
+            max_depth: 8,
+            max_nodes: 16,
+            max_collection_entries: 2,
+            max_scalar_bytes: 4,
+            max_structural_tokens: 32,
+        };
+        let collection = serde_yaml::from_str::<serde_yaml::Value>("[0, 1, 2]").unwrap();
+        assert!(validate_yaml_value_boundary(&collection, limits)
+            .unwrap_err()
+            .contains("collection"));
+        let scalar = serde_yaml::Value::String("12345".to_string());
+        assert!(validate_yaml_value_boundary(&scalar, limits)
+            .unwrap_err()
+            .contains("scalar"));
     }
 
     #[test]

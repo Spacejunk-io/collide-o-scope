@@ -58,6 +58,9 @@ use crate::video::CodecMotionFrame;
 use crate::video::{CodecFrameIdentity, CodecMotionProduct, DecodedStillImage, VideoDecoder};
 use crate::visual_rack::{CreativeResourceLimits, RuntimeVisualRack};
 
+#[path = "motion_sidecar_wire.rs"]
+mod motion_sidecar_wire;
+
 /// App shutdown must not wait forever on a wedged graphics backend. By the
 /// time this expires ExportJob::cancel has already killed/reaped ffmpeg,
 /// removed its partial output, and forbidden any later encoder registration.
@@ -72,7 +75,7 @@ const OUTCOME_FAILED: u8 = 3;
 const OUTCOME_CANCELLED: u8 = 4;
 /// Keep protocol snapshots bounded even when a hand-authored legacy patch
 /// contains an excessive number of unavailable layers.
-const MAX_EXPORT_WARNINGS: usize = 128;
+const MAX_EXPORT_WARNINGS: usize = motion_sidecar_wire::MAX_MOTION_SIDECAR_WARNINGS;
 const MAX_EXPORT_WARNING_CHARS: usize = 1_024;
 /// Bumped from 3 when the sidecar began recording per-slot rack route
 /// identity. Every schema-3 key keeps its name and meaning; schema 4 is purely
@@ -115,19 +118,25 @@ const MAX_EXPORT_WARNING_CHARS: usize = 1_024;
 /// Schema 7 adds the motion-wipe, vector-smear, retained-trail recipe,
 /// accepted-frame min/max recipe observation, and bounded per-layer authored /
 /// observed Mosh Send provenance.
-const EXPORT_MOTION_SIDECAR_SCHEMA_VERSION: u16 = 7;
-const MAX_EXPORT_MOTION_SIDECAR_SOURCES: usize = 256;
-const MAX_EXPORT_MOTION_SIDECAR_SCOPES: usize = 256;
-const MAX_EXPORT_MOTION_DISTINCT_STATES: usize = 512;
+/// Schema 8 adds the path-free, compile-time release BuildIdentity snapshot;
+/// every schema-7 creative, source, and artifact field is unchanged.
+const EXPORT_MOTION_SIDECAR_SCHEMA_VERSION: u16 =
+    motion_sidecar_wire::MOTION_SIDECAR_SCHEMA_VERSION;
+const MAX_EXPORT_MOTION_SIDECAR_SOURCES: usize = motion_sidecar_wire::MAX_MOTION_SIDECAR_SOURCES;
+const MAX_EXPORT_MOTION_SIDECAR_SCOPES: usize = motion_sidecar_wire::MAX_MOTION_SIDECAR_SCOPES;
+const MAX_EXPORT_MOTION_DISTINCT_STATES: usize =
+    motion_sidecar_wire::MAX_MOTION_SIDECAR_DISTINCT_STATES;
 /// Authored Symmetry Field nodes whose route identity is recorded. Racks are
 /// bounded per scope, but the number of scopes is not, so the section carries
 /// its own cap and truncation flag like every other sidecar list.
-const MAX_EXPORT_SYMMETRY_SIDECAR_NODES: usize = 256;
-const MAX_EXPORT_MOTION_SIDECAR_BYTES: usize = 4 * 1024 * 1024;
+const MAX_EXPORT_SYMMETRY_SIDECAR_NODES: usize =
+    motion_sidecar_wire::MAX_MOTION_SIDECAR_SYMMETRY_NODES;
+const MAX_EXPORT_MOTION_SIDECAR_BYTES: usize = motion_sidecar_wire::MAX_MOTION_SIDECAR_BYTES;
 /// One rack holds at most `MAX_NODES_PER_RACK` nodes and a job admits at most
 /// `MAX_EXPORT_MOTION_SIDECAR_SCOPES` scopes, so this cap is generous for any
 /// admissible patch and still bounds a hand-authored one.
-const MAX_EXPORT_RESIDUAL_SIDECAR_NODES: usize = 512;
+const MAX_EXPORT_RESIDUAL_SIDECAR_NODES: usize =
+    motion_sidecar_wire::MAX_MOTION_SIDECAR_RESIDUAL_NODES;
 
 const fn transparent_accumulation_clear() -> wgpu::Color {
     wgpu::Color {
@@ -368,6 +377,9 @@ struct MotionSidecarSource {
     persisted_reference: String,
     fingerprint_sha256: Option<String>,
     fingerprint_bytes: Option<u64>,
+    source_color: crate::video::SourceColorDescriptor,
+    source_display: crate::video::SourceDisplayDescriptor,
+    conversion_policy: crate::video::SourceConversionPolicy,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -579,6 +591,7 @@ struct SymmetrySidecarNode {
 #[derive(Debug, serde::Serialize)]
 struct ExportMotionSidecar {
     schema_version: u16,
+    build_identity: crate::build_identity::BuildIdentitySnapshot,
     artifact: MotionSidecarArtifact,
     algorithm_version: u16,
     cross_gpu_pixel_identity_guaranteed: bool,
@@ -1446,6 +1459,8 @@ fn write_motion_sidecar_atomic(
             MAX_EXPORT_MOTION_SIDECAR_BYTES
         ));
     }
+    motion_sidecar_wire::parse_motion_sidecar(&bytes, EXPORT_MOTION_SIDECAR_SCHEMA_VERSION)
+        .map_err(|error| format!("validate export motion sidecar round trip: {error}"))?;
     let sidecar_path = motion_sidecar_path(output_path);
     let temp_path = sidecar_temp_path(&sidecar_path);
     let write_result = (|| {
@@ -2038,6 +2053,9 @@ struct ExportMotionSourceRecord {
     logical_name: String,
     persisted_reference: String,
     fingerprint: Option<crate::media_source::ContentIdentity>,
+    source_color: crate::video::SourceColorDescriptor,
+    source_display: crate::video::SourceDisplayDescriptor,
+    conversion_policy: crate::video::SourceConversionPolicy,
 }
 
 impl ExportMotionSourceRecord {
@@ -2052,6 +2070,9 @@ impl ExportMotionSourceRecord {
             logical_name: logical_name.to_owned(),
             persisted_reference: persisted_reference.to_owned(),
             fingerprint: None,
+            source_color: Default::default(),
+            source_display: Default::default(),
+            conversion_policy: Default::default(),
         }
     }
 }
@@ -2665,6 +2686,9 @@ impl ExportMotionSidecarAccumulator {
                 ),
                 fingerprint_sha256: fingerprint.map(|identity| identity.sha256.clone()),
                 fingerprint_bytes: fingerprint.map(|identity| identity.byte_len),
+                source_color: layer.motion_source.source_color,
+                source_display: layer.motion_source.source_display,
+                conversion_policy: layer.motion_source.conversion_policy,
             });
         }
 
@@ -2762,6 +2786,7 @@ impl ExportMotionSidecarAccumulator {
     fn finish(self, warnings: Vec<String>) -> ExportMotionSidecar {
         ExportMotionSidecar {
             schema_version: EXPORT_MOTION_SIDECAR_SCHEMA_VERSION,
+            build_identity: crate::build_identity::current().snapshot(),
             artifact: self.artifact,
             algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
             cross_gpu_pixel_identity_guaranteed: false,
@@ -3383,6 +3408,9 @@ fn pattern_export_layer(
                 logical_name: logical_name.to_owned(),
                 persisted_reference: persisted_reference.to_owned(),
                 fingerprint: None,
+                source_color: Default::default(),
+                source_display: Default::default(),
+                conversion_policy: Default::default(),
             }
         },
         decoder: None,
@@ -3467,6 +3495,9 @@ fn text_page_export_layer(
                 logical_name: logical_name.to_owned(),
                 persisted_reference: persisted_reference.to_owned(),
                 fingerprint: None,
+                source_color: Default::default(),
+                source_display: Default::default(),
+                conversion_policy: Default::default(),
             }
         },
         decoder: None,
@@ -3538,6 +3569,9 @@ fn still_export_layer(
                 logical_name: logical_name.to_owned(),
                 persisted_reference: persisted_reference.to_owned(),
                 fingerprint,
+                source_color: decoded.source_color_descriptor,
+                source_display: decoded.source_display_descriptor,
+                conversion_policy: decoded.conversion_policy,
             }
         },
         decoder: None,
@@ -3760,7 +3794,10 @@ struct ExportCreativeGraph {
     master_rack: RuntimeVisualRack,
     layer_racks: Vec<(StableLayerId, RuntimeVisualRack)>,
     composition: RuntimeComposition,
-    address_book: crate::modulation::StableModAddressBook,
+    /// Shared immutable admission book. Per-frame creative-world clones share
+    /// this map, while the job-local topology cache below owns the retained
+    /// offset array and replaces its book only on an exact signature change.
+    address_book: Arc<crate::modulation::StableModAddressBook>,
     /// The job's Study library, built once from the patch's own `studies`
     /// section so live and export resolve every digest identically. A
     /// document that fails validation aborts the job before the first frame.
@@ -3831,12 +3868,14 @@ fn resolve_export_creative_graph(patch: &PatchState) -> Result<ExportCreativeGra
             ))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let address_book = crate::modulation::StableModAddressBook::from_composition(
-        &master_rack,
-        &layer_racks,
-        &composition,
-    )
-    .map_err(|error| format!("resolve export stable modulation: {error}"))?;
+    let address_book = Arc::new(
+        crate::modulation::StableModAddressBook::from_composition(
+            &master_rack,
+            &layer_racks,
+            &composition,
+        )
+        .map_err(|error| format!("resolve export stable modulation: {error}"))?,
+    );
     let mut studies = crate::study_eval::StudyProgramLibrary::default();
     for document in &patch.studies {
         studies
@@ -5327,6 +5366,14 @@ fn export_selective_topology_signature(plan: &SelectiveNtscPlan) -> u64 {
     hash
 }
 
+/// D5's frozen offline export seam. Slot 0 is straight `RGBA8_UNORM_SRGB`
+/// after the creative/Temporal/display stack and before the black opaque pass.
+/// The helper makes that identity reviewable without changing the texture or
+/// bind-group used by ordinary MP4 export.
+fn pre_opaque_straight_alpha_v1_view(views: &[wgpu::TextureView; 3]) -> &wgpu::TextureView {
+    &views[0]
+}
+
 fn run_export(
     patch: &PatchState,
     config: &ExportConfig,
@@ -5681,7 +5728,7 @@ fn run_export(
     let opaque_output_bind_group = crate::renderer::state::build_opaque_output_bind_group(
         &device,
         &opaque_output_bind_group_layout,
-        &composite_views[0],
+        pre_opaque_straight_alpha_v1_view(&composite_views),
         &sampler,
     );
     // The B4 display stage rides the same slot-0 seam offline. Pipelines are
@@ -6014,6 +6061,9 @@ fn run_export(
                 logical_name: clip_filename.to_owned(),
                 persisted_reference: clip_source_path.to_owned(),
                 fingerprint: source_fingerprint,
+                source_color: decoder.source_color_descriptor(),
+                source_display: decoder.source_display_descriptor(),
+                conversion_policy: decoder.conversion_policy(),
             },
             // Offline loop authority is the pure timeline's boundary count;
             // absolute seeks deliberately do not consult decoder EOF state.
@@ -6058,6 +6108,13 @@ fn run_export(
     // export IDs. Missing media still owns its black placeholder ID, so a
     // failed decoder can never retarget a selected-layer image route.
     let mut base_creative_graph = resolve_export_creative_graph(patch)?;
+    let mut stable_mod_topology_cache =
+        crate::modulation::StableModTopologyCache::from_precompiled_composition(
+            Arc::clone(&base_creative_graph.address_book),
+            &base_creative_graph.master_rack,
+            &base_creative_graph.layer_racks,
+            &base_creative_graph.composition,
+        );
 
     // --- Master effects ---
     let mut master_effects = EffectUniforms {
@@ -6513,10 +6570,23 @@ fn run_export(
             }
         }
 
-        let stable_modulation_frame = mod_matrix.stable_frame(&base_creative_graph.address_book);
+        let stable_modulation = match stable_mod_topology_cache.evaluate(
+            &mod_matrix,
+            &base_creative_graph.master_rack,
+            &base_creative_graph.layer_racks,
+            &base_creative_graph.composition,
+        ) {
+            Ok(stable_modulation) => stable_modulation,
+            Err(error) => {
+                write_error = Some(format!(
+                    "export stable modulation topology rejected: {error}"
+                ));
+                break;
+            }
+        };
         crate::modulation::apply_stable_modulation(
-            &base_creative_graph.address_book,
-            &stable_modulation_frame,
+            stable_modulation.address_book(),
+            stable_modulation.frame(),
             &mut frame_morph_world.creative_graph.master_rack,
             &mut frame_morph_world.creative_graph.layer_racks,
             &mut frame_morph_world.creative_graph.composition,
@@ -8212,6 +8282,36 @@ fn readback_pixels(
     staging.unmap();
 
     Ok(pixels)
+}
+
+/// Proof-safe D5 acquisition primitive. A future opt-in job format can reuse
+/// the established bounded staging buffer and cancellation law; ordinary MP4
+/// never calls it and therefore gains no readback or synchronization point.
+#[allow(
+    dead_code,
+    clippy::too_many_arguments,
+    reason = "retained acquisition seam awaits the opt-in export action/config integration"
+)]
+fn readback_pre_opaque_straight_alpha_v1(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    composite_textures: &[wgpu::Texture; 3],
+    staging: &wgpu::Buffer,
+    width: u32,
+    height: u32,
+    bytes_per_row: u32,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    readback_pixels(
+        device,
+        queue,
+        &composite_textures[0],
+        staging,
+        width,
+        height,
+        bytes_per_row,
+        cancel,
+    )
 }
 
 fn upload_engine_composite_export(
@@ -11205,7 +11305,7 @@ layers:
             master_rack,
             layer_racks,
             composition,
-            address_book,
+            address_book: Arc::new(address_book),
         };
         let mut a = crate::morph::MorphSlot {
             layer_racks: Some(a_racks),
@@ -11769,7 +11869,7 @@ layers:
         )
         .finish(Vec::new());
 
-        assert_eq!(sidecar.schema_version, 7);
+        assert_eq!(sidecar.schema_version, EXPORT_MOTION_SIDECAR_SCHEMA_VERSION);
         assert!(sidecar.field_collider.is_none());
         assert!(sidecar.codec_mosh.is_none());
         assert!(!sidecar.authored_residual_nodes_truncated);
@@ -13325,6 +13425,9 @@ layers:
                 persisted_reference: "sha256:fixture".to_owned(),
                 fingerprint_sha256: Some("a".repeat(64)),
                 fingerprint_bytes: Some(1234),
+                source_color: Default::default(),
+                source_display: Default::default(),
+                conversion_policy: Default::default(),
             }],
             sources_truncated: false,
             authored_scopes: vec![sidecar_authored_scope(
@@ -13437,10 +13540,11 @@ layers:
         // Schema 4 appended the per-slot Symmetry Field route section and the
         // Residual Counterpoint section; schema 5 appended the Field Collider
         // section; schema 6 appended Codec Mosh and schema 7 appended its
-        // motion shaping plus frame-evaluated recipe bounds. Every earlier
-        // key below is re-asserted unchanged, and a job that never ran the
-        // collider or the mosh omits both sections entirely.
-        assert_eq!(json["schema_version"], 7);
+        // motion shaping plus frame-evaluated recipe bounds; schema 8 appends
+        // path-free BuildIdentity. Every earlier key below is re-asserted
+        // unchanged, and a job that never ran the collider or the mosh omits
+        // both sections entirely.
+        assert_eq!(json["schema_version"], EXPORT_MOTION_SIDECAR_SCHEMA_VERSION);
         assert!(json.get("field_collider").is_none());
         assert!(json.get("codec_mosh").is_none());
         assert!(json["symmetry_fields"].as_array().unwrap().is_empty());
@@ -15435,6 +15539,9 @@ layers:
                     logical_name: format!("fixture-{source_index}"),
                     persisted_reference: String::new(),
                     fingerprint: None,
+                    source_color: Default::default(),
+                    source_display: Default::default(),
+                    conversion_policy: Default::default(),
                 },
                 decoder: None,
                 codec_motion: None,
@@ -21004,7 +21111,10 @@ mod effects_audit {
             &std::fs::read("renders/audit_codec_mosh.mp4.motion.json").unwrap(),
         )
         .unwrap();
-        assert_eq!(sidecar["schema_version"], 7);
+        assert_eq!(
+            sidecar["schema_version"],
+            EXPORT_MOTION_SIDECAR_SCHEMA_VERSION
+        );
         let mosh = &sidecar["codec_mosh"];
         assert!(
             mosh["encoder"]

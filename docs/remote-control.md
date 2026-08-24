@@ -1,7 +1,10 @@
 # Connecting to the control panel
 
-Collide-o-scope serves plain HTTP for the computer running the engine and HTTPS
-for phones. iOS exposes motion sensors only to a secure page.
+Collide-o-scope serves plain HTTP only on the engine computer's two loopback
+sockets (`127.0.0.1` and `::1`) and serves LAN clients only through HTTPS.
+iOS exposes motion sensors only to a secure page. There is no LAN-plaintext
+fallback: if TLS identity, permissions, configuration, or port 3031 fails, the
+panel reports **LAN unavailable** and publishes no QR code.
 
 This guide covers the live browser surface. For exact persistence, history,
 recording, controller, health, and venue-failure contracts, see
@@ -27,16 +30,20 @@ the key from the visible address bar. WebSocket upgrades, uploads, deletes,
 and other mutating requests must also originate from the exact page origin;
 scripts hosted by another site receive 403 even if they target localhost.
 
-Only one running instance can own ports 3030 and 3031. If a newly built app
-appears to have an old panel, stop the earlier instance and hard-refresh the
-tab; the HTML, CSS, and JavaScript are embedded in the executable.
+Only one running instance can own ports 3030 and 3031. **Restart Panel** in the
+native **RECOVERY** strip retires and joins the old server generation before a
+bounded rebind, rotates its token, and invalidates the old generation's two
+distinct cookies. If a newly built app appears to have an old panel, use that
+operation and hard-refresh the tab; the HTML, CSS, and JavaScript are embedded
+in the executable.
 
 The native preview remains a recovery surface when the browser is closed or the
-listener fails. Its panel status truthfully distinguishes **not started**,
-**starting**, **ready**, and **unavailable** from the separate browser count;
-zero connected browsers is not a server failure. Freeze Program, Blackout, and
-**Revert Visuals** dispatch directly through the engine and do not depend on a
-browser queue. A second status row surfaces recoverable output and media-source
+listener fails. Its panel status reports IPv4 loopback, IPv6 loopback, and LAN
+TLS independently as **starting**, **listening**, **unavailable**, or **stopped**;
+success on one socket never masks failure on another, and zero connected
+browsers is not a server failure. Freeze Program, Blackout, and **Revert
+Visuals** dispatch directly through the engine and do not depend on a browser
+queue. A second status row surfaces recoverable output and media-source
 messages. This is an operator-preview surface only: the strip is hidden while
 single-monitor Output owns the main surface, so audience pixels remain clean;
 leaving that output mode restores it, and a dedicated audience window never
@@ -44,8 +51,9 @@ contains the strip.
 
 ## Phone
 
-On first launch, Windows can show firewall prompts for HTTP 3030 and HTTPS
-3031. Allow both on **private networks** if phones must connect.
+On first launch, Windows can show a firewall prompt for HTTPS 3031. Allow only
+3031 on **private networks** if phones must connect. Port 3030 is loopback-only
+and must not receive a LAN firewall rule.
 
 For each app session:
 
@@ -58,9 +66,13 @@ For each app session:
 5. The responsive, touch-sized panel loads. Under 900 px it uses one column.
 
 The certificate persists across restarts and is regenerated when the LAN
-identity changes. Authentication is session-specific: the strict cookie keeps
-the phone connected during the current run, but the token rotates at the next
-launch, so old bookmarks answer 403.
+identity changes. Certificate, key, SAN manifest, version, and digest are one
+atomically published identity; Unix stores it owner-only and Windows protects
+it to the current OS user. A malformed, permission-unsafe, mismatched, or
+partially published identity closes LAN control rather than relaxing security.
+Authentication is session-specific: LAN uses a `Secure`, HttpOnly,
+`SameSite=Strict` cookie distinct from the loopback cookie. The token rotates at
+launch or **Restart Panel**, so old bookmarks and cookies answer 403.
 
 ## Library and layers
 
@@ -1061,7 +1073,7 @@ proof of any deferred backend.
 | Symptom | Cause and response |
 |---|---|
 | **403 Access denied** | The token belongs to an earlier app session, the request came from another web origin, or a bare untokenized URL was opened. Use the desktop URL opened by the current app or scan its current QR. |
-| **Phone cannot reach the panel** | Confirm one network, private-network firewall permission for both ports, and no guest-Wi-Fi client isolation. A PC hotspot is often the clean venue fallback. |
+| **Phone cannot reach the panel** | Confirm one network, private-network firewall permission for HTTPS 3031, and no guest-Wi-Fi client isolation. Do not expose loopback-only HTTP 3030. A PC hotspot is often the clean venue fallback. |
 | **Certificate warning returned** | The LAN identity changed and the certificate regenerated. Accept it again. |
 | **GYRO says HTTPS is required** | Open the QR's `https://…:3031` URL, not HTTP. |
 | **GYRO reports no sensor data** | Enable it on the physical phone, check browser permission, and confirm the device has orientation sensors. |
@@ -1074,13 +1086,13 @@ proof of any deferred backend.
 | **Spout layer stays black** | Confirm Windows, exact sender name, sender activity, matching GPU/Spout environment, and the layer's status text. |
 | **Spout output is not visible** | Enable it, keep the app rendering, and verify with a real receiver or `cargo run --bin spout_probe`. |
 | **Output window will not open** | Read the error shown under OUTPUT; confirm a usable monitor/GPU surface and try again. The switch reflects the actual closed state. |
-| **Panel server is unavailable** | Read the native RECOVERY status and concrete bind error. Stop any earlier process holding ports 3030/3031, then restart. Browser count alone is not listener health. |
+| **One panel listener is unavailable** | Read the three independent native RECOVERY statuses. Port 3030 occupation can affect either loopback family without hiding LAN TLS; port 3031/TLS failure removes the QR without creating an HTTP fallback. Stop the conflicting process or choose **Restart Panel**. Browser count alone is not listener health. |
 | **Library is empty or points at the wrong folder** | Check the active path in RECOVERY, choose the intended folder, and use Rescan. Choosing or rescanning does not add a layer automatically. |
 | **A large source is rejected in Safe or Expert mode** | Safe intentionally stops above UHD area. Expert still enforces DCI-8K area, absolute/device edge, per-buffer, and aggregate host-planning limits; it is not a guarantee of available VRAM. Reduce the source or close other above-Safe sources. |
 | **VHS reports unavailable or skipped work** | Unavailable means the bounded worker/readback path failed; skipped means healthy latest-only backpressure while a prior frame is processing. Lower the output resolution or other load if skips are frequent, and inspect the reported worker error for unavailable work. |
 | **Bypass Temporal FX is rejected** | Put every dry layer in one contiguous prefix beginning at Layer 1/top and use a flat LegacyExact Program stack. Remove groups, A/B or non-Program bus routing, mattes, advanced racks or advanced Motion, authored Master/layer Motion modulation routes (including zero-depth routes), and routed Refresh Garden; disable VHS. The rejected transaction leaves the previous switch state and audience frame intact. |
 | **Audio meters remain zero** | Select/enable a real input, grant OS access, and inspect the panel error. Software-only tests do not prove venue hardware. |
-| **QR contains 127.0.0.1** | No LAN address was found at launch. Connect networking and restart. |
+| **QR is absent / LAN unavailable** | No routable LAN address was found, TLS identity/configuration failed closed, or port 3031 is occupied. Read the LAN TLS reason, restore networking or permissions, then choose **Restart Panel**. The app never substitutes a `127.0.0.1` or plaintext LAN QR. |
 
 ## Hardware validation boundary
 

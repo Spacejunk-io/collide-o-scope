@@ -1,4 +1,5 @@
 pub mod editor;
+pub(crate) mod yaml_boundary;
 
 use serde::de;
 use serde::{Deserialize, Serialize};
@@ -10464,8 +10465,7 @@ lfos:
         // An authored Residual node whose params section is entirely absent
         // deserializes through the patch's own YAML reader to the exact-bypass
         // default, so it claims no edge and renders the pre-Residual path.
-        let rack_yaml =
-            "nodes:\n- stable_id: 3\n  kind:\n    kind: residual\n    params: {}\nnext_node_id: 4\n";
+        let rack_yaml = "nodes:\n- stable_id: 3\n  kind:\n    kind: residual\n    params: {}\nnext_node_id: 4\n";
         let rack: VisualRack = serde_yaml::from_str(rack_yaml).unwrap();
         let VisualNodeKind::Residual(params) = rack.iter().next().unwrap().kind else {
             panic!("residual node")

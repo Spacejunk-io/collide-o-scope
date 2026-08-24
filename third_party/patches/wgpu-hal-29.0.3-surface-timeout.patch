@@ -1,0 +1,36 @@
+--- a/src/vulkan/swapchain/native.rs
++++ b/src/vulkan/swapchain/native.rs
+@@ -468,7 +468,31 @@ impl Swapchain for NativeSwapchain {
+         // acquire.
+         unsafe {
+             // The `wait_all` argument must be `true` to avoid crash on some Android devices. See https://github.com/gfx-rs/wgpu/pull/8769
+-            self.device
++            //
++            // LOCAL PATCH (collide-o-scope) for gfx-rs/wgpu#9029.
++            //
++            // `map_host_device_oom_and_lost_err` has no `VK_TIMEOUT` arm, so a
++            // presentation engine that has not signalled within `timeout_ns`
++            // (wgpu-core's `FRAME_TIMEOUT_MS`, one second) fell through to
++            // `DeviceError::Unexpected` -- which `Device::handle_hal_error`
++            // matches alongside `Lost` and escalates into a permanent,
++            // unrecoverable device loss. On Windows hosts whose Vulkan driver
++            // presents through DXGI -- every AMD Windows host -- a
++            // borderless-fullscreen transition can stall DWM past a second and
++            // kill the device outright.
++            //
++            // This is reported as `Lost` rather than `Timeout` on purpose.
++            // `vkAcquireNextImageKHR` has already succeeded here, so an image
++            // is acquired; returning `Timeout` would abandon it unpresented and
++            // exhaust the swapchain after a few occurrences. `Lost` makes the
++            // caller recreate the surface, which retires the swapchain and the
++            // image with it, and is a path wgpu users already handle.
++            match self
++                .device
+                 .raw
+                 .wait_for_fences(&[self.fence], true, timeout_ns)
+-                .map_err(map_host_device_oom_and_lost_err)?;
++            {
++                Ok(()) => {}
++                Err(vk::Result::TIMEOUT) => return Err(crate::SurfaceError::Lost),
++                Err(other) => return Err(map_host_device_oom_and_lost_err(other).into()),
++            }

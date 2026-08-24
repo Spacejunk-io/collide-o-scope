@@ -1779,6 +1779,7 @@
               <div class="param-row select-row">
                 <label for="output-display">Display</label>
                 <select id="output-display"><option value="">Automatic</option></select>
+                <button type="button" id="output-display-rescan" title="Refresh the Output and StageMap monitor inventory">Rescan</button>
               </div>
               <div class="param-row toggle-row">
                 <label>Spout</label>
@@ -1855,8 +1856,13 @@
                 <label class="toggle"><input type="checkbox" id="stage-output-identification"><span class="toggle-slider"></span></label>
               </div>
               <div class="stage-health-summary" id="stage-health-summary" role="status" aria-live="polite">Waiting for stage telemetry…</div>
+              <div class="stage-health-timing" id="stage-health-timing"></div>
               <div class="stage-health-budgets" id="stage-health-budgets"></div>
               <div class="stage-health-layers" id="stage-health-layers"></div>
+              <details class="capture-tool">
+                <summary>ABOUT THIS BUILD</summary>
+                <pre class="build-identity" id="build-identity">Waiting for build identity…</pre>
+              </details>
               <div class="audio-status">HUD appears only in the editor preview. Calibration affects only the selected physical endpoint—not Composite, Spout, recording, export, or another output.</div>
             </div>
           </div>

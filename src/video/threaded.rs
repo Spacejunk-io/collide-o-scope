@@ -21,12 +21,17 @@ use crate::media_safety::{
 use super::decoder::validate_media_dimensions;
 use super::decoder::validate_media_dimensions_with_policy as plan_media_dimensions;
 use super::decoder::{KeyframeIndexBuildRequest, SeekWorkload};
+use super::frame_selection::accepted_frame_remains_selected;
 use super::indexed::{KeyframeIndex, MAX_INDEX_BUILD_TIME};
+use super::retirement::{admit_decoder_worker, DecoderSourceFingerprint, DecoderWorkerToken};
+use super::source_descriptor::{
+    SourceColorDescriptor, SourceConversionPolicy, SourceDisplayDescriptor,
+};
 #[cfg(test)]
 use super::CodecMotionFrame;
 use super::{
-    CodecFrameIdentity, CodecMotionProduct, DecodeWorkError, DecodedVideoFrame, FrameMetadata,
-    VideoDecoder,
+    CodecFrameIdentity, CodecMotionProduct, DecodeWorkError, DecodedImagePayload,
+    DecodedVideoFrame, FrameMetadata, VideoDecoder,
 };
 
 const DECODER_OPEN_TIMEOUT: Duration = Duration::from_secs(7);
@@ -363,7 +368,7 @@ where
 
 #[derive(Debug)]
 pub struct DecodedFrame {
-    pub rgba: Vec<u8>,
+    pub rgba: DecodedImagePayload,
     pub codec_motion: Option<CodecMotionProduct>,
     /// Loop progress 0.0..1.0 at the time this frame was decoded.
     pub progress: f32,
@@ -423,7 +428,7 @@ impl DecodedFrame {
     #[cfg(test)]
     fn synthetic(value: u8, source_generation: u64, loop_generation: u64) -> Self {
         Self {
-            rgba: vec![value],
+            rgba: DecodedImagePayload::from_owned_rgba(vec![value]),
             codec_motion: None,
             progress: f32::from(value) / 255.0,
             loop_generation,
@@ -444,7 +449,7 @@ impl DecodedFrame {
 /// Newest completed media frame plus source-time and loop metadata.
 #[derive(Debug, PartialEq)]
 pub struct ReadyFrame {
-    pub rgba: Vec<u8>,
+    pub rgba: DecodedImagePayload,
     pub codec_motion: Option<CodecMotionProduct>,
     pub loops_advanced: u64,
     pub source_generation: u64,
@@ -458,7 +463,7 @@ impl ReadyFrame {
     pub fn still(rgba: Vec<u8>) -> Self {
         let metadata = FrameMetadata::still();
         Self {
-            rgba,
+            rgba: DecodedImagePayload::from_owned_rgba(rgba),
             codec_motion: None,
             loops_advanced: 0,
             source_generation: metadata.source_generation,
@@ -499,6 +504,11 @@ pub enum DecoderHealth {
 /// validated queue upload/poll seam; it is not claimed to be a GPU timestamp.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DecoderTelemetry {
+    /// Immutable source declarations and the actual conversion path frozen
+    /// before the seed picture entered the RGBA mailbox.
+    pub source_color: SourceColorDescriptor,
+    pub source_display: SourceDisplayDescriptor,
+    pub conversion_policy: SourceConversionPolicy,
     pub last_publish_age: Option<Duration>,
     pub last_consume_age: Option<Duration>,
     /// Time since the latest decoded source image was successfully accepted by
@@ -717,7 +727,7 @@ struct CommandMailboxState {
 }
 
 #[derive(Debug)]
-struct DecodeCommandMailbox {
+pub(super) struct DecodeCommandMailbox {
     state: Mutex<CommandMailboxState>,
     wake: Condvar,
     current_epoch: AtomicU64,
@@ -732,7 +742,7 @@ struct DecodeCommandMailbox {
 }
 
 impl DecodeCommandMailbox {
-    fn new() -> Arc<Self> {
+    pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(CommandMailboxState {
                 pending: None,
@@ -838,7 +848,7 @@ impl DecodeCommandMailbox {
         Ok(true)
     }
 
-    fn stop(&self) {
+    pub(super) fn stop(&self) {
         let mut state = lock_recover(&self.state);
         if state.stopped {
             return;
@@ -887,7 +897,7 @@ impl DecodeCommandMailbox {
             && self.current_generation.load(Ordering::Acquire) == generation
     }
 
-    fn generation(&self) -> u64 {
+    pub(super) fn generation(&self) -> u64 {
         self.current_generation.load(Ordering::Acquire)
     }
 
@@ -903,10 +913,16 @@ impl DecodeCommandMailbox {
 pub struct ThreadedDecoder {
     mailbox: Arc<DecodeCommandMailbox>,
     cancel: Arc<AtomicBool>,
+    /// The retirement supervisor owns the `JoinHandle`; this token converts
+    /// that exact worker to a canceling retiree when the decoder is displaced.
+    worker: Option<DecoderWorkerToken>,
     shared: Arc<Mutex<SharedState>>,
     pub width: u32,
     pub height: u32,
     pub fps: f32,
+    source_color_descriptor: SourceColorDescriptor,
+    source_display_descriptor: SourceDisplayDescriptor,
+    conversion_policy: SourceConversionPolicy,
     #[allow(dead_code)]
     pub duration_seconds: f64,
     media_plan: MediaAllocationPlan,
@@ -955,13 +971,31 @@ impl ThreadedDecoder {
     ) -> Result<Self, String> {
         let mailbox = DecodeCommandMailbox::new();
         let worker_mailbox = mailbox.clone();
-        let (meta_tx, meta_rx) =
-            std::sync::mpsc::channel::<Result<(u32, u32, f32, f64, MediaAllocationPlan), String>>();
+        let (meta_tx, meta_rx) = std::sync::mpsc::channel::<
+            Result<
+                (
+                    u32,
+                    u32,
+                    f32,
+                    f64,
+                    MediaAllocationPlan,
+                    SourceColorDescriptor,
+                    SourceDisplayDescriptor,
+                    SourceConversionPolicy,
+                ),
+                String,
+            >,
+        >();
 
         let thread_name = format!("decode-{}", short_name(path));
         let path_owned = path.to_string();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
+        let worker = admit_decoder_worker(
+            DecoderSourceFingerprint::from_source(path),
+            cancel.clone(),
+            mailbox.clone(),
+        )?;
         let shared = Arc::new(Mutex::new(SharedState {
             latest: None,
             last_published_at: None,
@@ -987,7 +1021,7 @@ impl ThreadedDecoder {
             health_revision: 1,
         }));
         let worker_shared = shared.clone();
-        std::thread::Builder::new()
+        let worker_handle = match std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
                 let panic_shared = worker_shared.clone();
@@ -1027,6 +1061,9 @@ impl ThreadedDecoder {
                         decoder.fps,
                         decoder.duration_seconds(),
                         decoder.media_allocation_plan().clone(),
+                        decoder.source_color_descriptor(),
+                        decoder.source_display_descriptor(),
+                        decoder.conversion_policy(),
                     );
                     let mut seeded = SharedState::healthy_with_seed(seed);
                     seeded.record_seed_decode(seed_decode_duration);
@@ -1101,32 +1138,50 @@ impl ThreadedDecoder {
                     lock_state(&panic_shared)
                         .set_failed("Decode worker panicked unexpectedly".to_string());
                 }
-            })
-            .map_err(|error| format!("Failed to spawn decode thread: {error}"))?;
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                worker.abandon();
+                return Err(format!("Failed to spawn decode thread: {error}"));
+            }
+        };
+        worker.attach(worker_handle);
 
-        let (width, height, fps, duration_seconds, media_plan) =
-            match meta_rx.recv_timeout(DECODER_OPEN_TIMEOUT) {
-                Ok(result) => result?,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    cancel.store(true, Ordering::Release);
-                    mailbox.stop();
-                    return Err(format!(
-                        "video decoder open timed out after {} seconds for {path}",
-                        DECODER_OPEN_TIMEOUT.as_secs()
-                    ));
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(format!("decode thread died while opening {path}"));
-                }
-            };
+        let (
+            width,
+            height,
+            fps,
+            duration_seconds,
+            media_plan,
+            source_color_descriptor,
+            source_display_descriptor,
+            conversion_policy,
+        ) = match meta_rx.recv_timeout(DECODER_OPEN_TIMEOUT) {
+            Ok(result) => result?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                cancel.store(true, Ordering::Release);
+                mailbox.stop();
+                return Err(format!(
+                    "video decoder open timed out after {} seconds for {path}",
+                    DECODER_OPEN_TIMEOUT.as_secs()
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(format!("decode thread died while opening {path}"));
+            }
+        };
 
         Ok(Self {
             mailbox,
             cancel,
+            worker: Some(worker),
             shared,
             width,
             height,
             fps,
+            source_color_descriptor,
+            source_display_descriptor,
+            conversion_policy,
             duration_seconds,
             media_plan,
             progress: 0.0,
@@ -1334,7 +1389,7 @@ impl ThreadedDecoder {
     #[allow(dead_code)]
     pub fn try_next_frame_result(&mut self) -> Result<Option<Vec<u8>>, String> {
         self.try_next_ready_frame_result()
-            .map(|ready| ready.map(|frame| frame.rgba))
+            .map(|ready| ready.map(|frame| frame.rgba.into_vec()))
     }
 
     pub fn progress(&self) -> f32 {
@@ -1343,6 +1398,18 @@ impl ThreadedDecoder {
 
     pub fn media_allocation_plan(&self) -> &MediaAllocationPlan {
         &self.media_plan
+    }
+
+    pub const fn source_color_descriptor(&self) -> SourceColorDescriptor {
+        self.source_color_descriptor
+    }
+
+    pub const fn source_display_descriptor(&self) -> SourceDisplayDescriptor {
+        self.source_display_descriptor
+    }
+
+    pub const fn conversion_policy(&self) -> SourceConversionPolicy {
+        self.conversion_policy
     }
 
     pub fn health(&self) -> DecoderHealth {
@@ -1368,6 +1435,9 @@ impl ThreadedDecoder {
             .load(Ordering::Relaxed);
         let state = lock_state(&self.shared);
         DecoderTelemetry {
+            source_color: self.source_color_descriptor,
+            source_display: self.source_display_descriptor,
+            conversion_policy: self.conversion_policy,
             last_publish_age: state
                 .last_published_at
                 .map(|published_at| duration_since_or_zero(sampled_at, published_at)),
@@ -1478,32 +1548,13 @@ impl ThreadedDecoder {
     }
 }
 
-fn accepted_frame_remains_selected(
-    requested_generation: u64,
-    target_seconds: f64,
-    accepted_generation: Option<u64>,
-    accepted_source_seconds: Option<f64>,
-    source_fps: f32,
-) -> bool {
-    let Some(accepted_source_seconds) = accepted_source_seconds else {
-        return false;
-    };
-    if accepted_generation != Some(requested_generation)
-        || !target_seconds.is_finite()
-        || !accepted_source_seconds.is_finite()
-        || !source_fps.is_finite()
-        || source_fps <= 0.0
-        || target_seconds + 0.5 / f64::from(source_fps) < accepted_source_seconds
-    {
-        return false;
-    }
-    target_seconds <= accepted_source_seconds + 0.5 / f64::from(source_fps)
-}
-
 impl Drop for ThreadedDecoder {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Release);
         self.mailbox.stop();
+        if let Some(worker) = self.worker.take() {
+            worker.retire(self.mailbox.generation());
+        }
     }
 }
 
@@ -1679,6 +1730,7 @@ mod tests {
         ThreadedDecoder {
             mailbox,
             cancel: Arc::new(AtomicBool::new(false)),
+            worker: None,
             shared: Arc::new(Mutex::new(SharedState::healthy_with_seed_at(
                 seed,
                 published_at,
@@ -1686,6 +1738,9 @@ mod tests {
             width: 1,
             height: 1,
             fps: 30.0,
+            source_color_descriptor: SourceColorDescriptor::default(),
+            source_display_descriptor: SourceDisplayDescriptor::default(),
+            conversion_policy: SourceConversionPolicy::legacy_video(),
             duration_seconds: 10.0,
             media_plan: crate::media_safety::validate_safe_dimensions(
                 MediaSourceKind::Video,
@@ -2614,7 +2669,7 @@ mod tests {
                 .as_ref()
                 .filter(|frame| frame.source_generation == 11)
             {
-                assert_eq!(frame.rgba, [20]);
+                assert_eq!(frame.rgba.as_slice(), [20]);
                 assert_eq!(frame.codec_motion.as_ref().unwrap().source_generation, 11);
                 break;
             }
@@ -2632,7 +2687,7 @@ mod tests {
     #[test]
     fn decoded_frame_drops_a_codec_product_from_another_generation() {
         let decoded = DecodedVideoFrame {
-            rgba: vec![7],
+            rgba: DecodedImagePayload::from_owned_rgba(vec![7]),
             metadata: FrameMetadata::sanitized(42, Some(7), 0.25, 1.0),
             codec_motion: Some(synthetic_codec_motion(41, 7).into()),
         };
@@ -2642,10 +2697,30 @@ mod tests {
     }
 
     #[test]
+    fn forward_mailbox_delivery_preserves_immutable_payload_identity() {
+        let payload = DecodedImagePayload::from_owned_rgba(vec![3, 4, 5, 6]);
+        let payload_id = payload.identity();
+        let decoded = DecodedVideoFrame {
+            rgba: payload,
+            metadata: FrameMetadata::sanitized(12, Some(90), 3.0, 10.0),
+            codec_motion: None,
+        };
+        let frame = DecodedFrame::from_video(decoded, 0.3, 2, 1);
+        assert_eq!(frame.rgba.identity(), payload_id);
+        let mut decoder = synthetic_decoder(frame);
+        decoder.request_source_time(12, 3.0).unwrap();
+        let ready = decoder.try_next_ready_frame_result().unwrap().unwrap();
+        assert_eq!(ready.rgba.identity(), payload_id);
+        assert_eq!(ready.rgba.as_slice(), &[3, 4, 5, 6]);
+        assert_eq!(ready.source_generation, 12);
+        assert_eq!(ready.pts, Some(90));
+    }
+
+    #[test]
     fn initial_frame_is_seeded_with_source_metadata() {
         let mut decoder = synthetic_decoder(DecodedFrame::synthetic(4, 0, 0));
         let ready = decoder.try_next_ready_frame_result().unwrap().unwrap();
-        assert_eq!(ready.rgba, vec![4]);
+        assert_eq!(ready.rgba.as_slice(), [4]);
         assert_eq!(ready.source_generation, 0);
         assert!(ready.codec_motion.is_none());
         assert_eq!(ready.pts, Some(4));
@@ -2847,14 +2922,28 @@ mod tests {
                 stale_commands,
                 cancelled,
                 failed,
-                telemetry.decode_attempt_p95_duration.map_or(0, |value| value.as_micros()),
-                telemetry.decode_p95_duration.map_or(0, |value| value.as_micros()),
-                telemetry.accepted_upload_interval_p95_duration.map_or(0, |value| value.as_millis()),
-                telemetry.accepted_upload_interval_p99_duration.map_or(0, |value| value.as_millis()),
+                telemetry
+                    .decode_attempt_p95_duration
+                    .map_or(0, |value| value.as_micros()),
+                telemetry
+                    .decode_p95_duration
+                    .map_or(0, |value| value.as_micros()),
+                telemetry
+                    .accepted_upload_interval_p95_duration
+                    .map_or(0, |value| value.as_millis()),
+                telemetry
+                    .accepted_upload_interval_p99_duration
+                    .map_or(0, |value| value.as_millis()),
                 peak_holds[index].as_millis(),
-                telemetry.decoder_delivery_hold_p95_duration.map_or(0, |value| value.as_millis()),
-                telemetry.peak_decoder_delivery_hold_duration.map_or(0, |value| value.as_millis()),
-                Instant::now().saturating_duration_since(last_accepted_at[index]).as_millis(),
+                telemetry
+                    .decoder_delivery_hold_p95_duration
+                    .map_or(0, |value| value.as_millis()),
+                telemetry
+                    .peak_decoder_delivery_hold_duration
+                    .map_or(0, |value| value.as_millis()),
+                Instant::now()
+                    .saturating_duration_since(last_accepted_at[index])
+                    .as_millis(),
             );
             if stale_commands != 0 || cancelled != 0 || failed != 0 {
                 failures.push(format!(

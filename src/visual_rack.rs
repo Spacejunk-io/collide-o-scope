@@ -2161,7 +2161,8 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 17] = [
         budget: NodeResourceBudget {
             full_frame_passes: 1,
             // The declared admission budget, not the ABI worst case: one
-            // carrier load plus up to seven history loads, each a single
+            // carrier load plus the ABI-1.1 motion input (when used) and the
+            // remaining admitted history loads, each a single
             // textureLoad with no bilinear expansion. LoadCurrentColor reads
             // the already-loaded carrier register and costs nothing. A valid
             // document whose history loads exceed this budget stays valid
@@ -2169,12 +2170,13 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 17] = [
             // Residual-grid law, never a silent clamp.
             logical_texture_lookups_per_pixel: 8,
             texture_samples_per_pixel: 8,
-            // Carrier plus the committed clean-history D2 array; two
-            // simultaneous bindings in one dedicated pass, no sampler.
-            sampled_textures_in_pass: 2,
-            // A Study reads only its carrier and the master ring: no image
-            // taps, no donors, no routes — the whole tombstone/route surface
-            // is structurally absent in ABI 1.0.
+            // Carrier, committed clean-history D2 array, and the admitted
+            // scope's primitive motion field; three simultaneous bindings in
+            // one dedicated pass, no sampler. ABI 1.0 never observes the new
+            // lane and retains its exact pixels.
+            sampled_textures_in_pass: 3,
+            // A Study reads only its carrier, the master ring, and its own
+            // scope motion: no image taps, donors, or routes.
             cross_input_taps: 0,
             reduced_resolution_passes: 0,
             reduced_resolution_surfaces: 0,
@@ -5093,15 +5095,41 @@ pub enum ResourcePreflightError {
 impl fmt::Display for ResourcePreflightError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ZeroDimension => formatter.write_str("creative output dimensions must be non-zero"),
-            Self::DimensionLimit { requested, limit } => write!(formatter, "creative output {}x{} exceeds adapter dimension limit {limit}", requested[0], requested[1]),
-            Self::Rack { index, error } => write!(formatter, "rack {index} failed resource validation: {error}"),
-            Self::FrameLogicalLookupBudget { lookups, limit } => write!(formatter, "frame requests {lookups} logical texture lookups per pixel; limit is {limit}"),
-            Self::FrameSampleBudget { samples, limit } => write!(formatter, "frame requests {samples} texture samples per pixel; limit is {limit}"),
-            Self::SampledTextureLimit { requested, limit } => write!(formatter, "pass requests {requested} sampled textures; adapter limit is {limit}"),
-            Self::TextureArrayLayerLimit { requested, limit } => write!(formatter, "creative plan requests {requested} retained texture layers; adapter limit is {limit}"),
-            Self::ArithmeticOverflow => formatter.write_str("creative GPU resource arithmetic overflowed"),
-            Self::CreativeMemoryBudget { bytes, limit } => write!(formatter, "creative plan requests {bytes} bytes; limit is {limit}"),
+            Self::ZeroDimension => {
+                formatter.write_str("creative output dimensions must be non-zero")
+            }
+            Self::DimensionLimit { requested, limit } => write!(
+                formatter,
+                "creative output {}x{} exceeds adapter dimension limit {limit}",
+                requested[0], requested[1]
+            ),
+            Self::Rack { index, error } => write!(
+                formatter,
+                "rack {index} failed resource validation: {error}"
+            ),
+            Self::FrameLogicalLookupBudget { lookups, limit } => write!(
+                formatter,
+                "frame requests {lookups} logical texture lookups per pixel; limit is {limit}"
+            ),
+            Self::FrameSampleBudget { samples, limit } => write!(
+                formatter,
+                "frame requests {samples} texture samples per pixel; limit is {limit}"
+            ),
+            Self::SampledTextureLimit { requested, limit } => write!(
+                formatter,
+                "pass requests {requested} sampled textures; adapter limit is {limit}"
+            ),
+            Self::TextureArrayLayerLimit { requested, limit } => write!(
+                formatter,
+                "creative plan requests {requested} retained texture layers; adapter limit is {limit}"
+            ),
+            Self::ArithmeticOverflow => {
+                formatter.write_str("creative GPU resource arithmetic overflowed")
+            }
+            Self::CreativeMemoryBudget { bytes, limit } => write!(
+                formatter,
+                "creative plan requests {bytes} bytes; limit is {limit}"
+            ),
         }
     }
 }

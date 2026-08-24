@@ -159,13 +159,15 @@ pub(crate) struct CompositionGpuOutput<'a> {
     pub format: wgpu::TextureFormat,
 }
 
-/// One executor-retained post-local dry layer. The view is RGBA16Float and
-/// remains valid until the next topology prepare; callers composite these in
-/// the returned order after the shared Temporal family. No legacy source
-/// rerender may substitute for this image because it already contains the
-/// advanced rack and layer-Motion result.
+/// One executor-retained post-local dry layer. The texture handle gives the
+/// late compositor proof-safe backing identity; its RGBA16Float view remains
+/// valid until the next topology prepare. Callers composite these in returned
+/// order after the shared Temporal family. No legacy source rerender may
+/// substitute for this image because it already contains the advanced rack
+/// and layer-Motion result.
 pub(crate) struct CompositionTemporalBypassOverlay<'a> {
     pub stable_id: StableLayerId,
+    pub texture: &'a wgpu::Texture,
     pub view: &'a wgpu::TextureView,
 }
 
@@ -243,7 +245,11 @@ impl fmt::Display for CompositionGpuError {
             } => write!(
                 formatter,
                 "advanced composition source {} is {}x{}, planned {}x{}",
-                layer_id.get(), supplied[0], supplied[1], planned[0], planned[1]
+                layer_id.get(),
+                supplied[0],
+                supplied[1],
+                planned[0],
+                planned[1]
             ),
             Self::TopologyNotPrepared {
                 prepared,
@@ -256,7 +262,10 @@ impl fmt::Display for CompositionGpuError {
                 "exact legacy composition must be delegated to the frozen renderer path",
             ),
             Self::ResourceCreation(message) => {
-                write!(formatter, "advanced composition GPU resource creation failed: {message}")
+                write!(
+                    formatter,
+                    "advanced composition GPU resource creation failed: {message}"
+                )
             }
             Self::Host(message) => write!(formatter, "advanced composition host failed: {message}"),
             Self::Rack(message) => write!(formatter, "advanced Collision Rack failed: {message}"),
@@ -265,7 +274,10 @@ impl fmt::Display for CompositionGpuError {
                 write!(formatter, "advanced scope readback failed: {message}")
             }
             Self::InvalidSchedule(message) => {
-                write!(formatter, "advanced composition schedule is invalid: {message}")
+                write!(
+                    formatter,
+                    "advanced composition schedule is invalid: {message}"
+                )
             }
             Self::PresentFormatUnsupported(format) => write!(
                 formatter,
@@ -435,14 +447,15 @@ struct PreparedRackSegment {
 /// segment's, because slot index is route identity here: `tap_indices` records
 /// which image slot each admitted route occupies, and a readiness flip on one
 /// slot can never move the other slot's donor.
-/// One prepared dedicated Study pass: the arena slot its program occupies
-/// and its bind group over (Ping carrier, committed history array). No taps,
-/// no motion, no donors — the whole binding set is topology-fixed.
+/// One prepared dedicated Study pass: the arena slot its program occupies,
+/// its admitted scope-motion slot, and both committed motion parities. No
+/// frame creates a bind group; absent/unmaterialized motion is defined zero.
 struct PreparedStudyField {
     scope: VisualScopeId,
     node_id: NodeId,
     uniform_slot: u32,
-    bind_group: wgpu::BindGroup,
+    motion_field_slot: Option<u8>,
+    bind_groups: [wgpu::BindGroup; 2],
 }
 
 /// One prepared dedicated Scan Processor pass: the arena slot its uniforms
@@ -1415,6 +1428,7 @@ impl CompositionGpuExecutor {
                     })?;
                 Ok(CompositionTemporalBypassOverlay {
                     stable_id: *stable_id,
+                    texture: &surface.texture,
                     view: &surface.view,
                 })
             })
@@ -1813,7 +1827,8 @@ impl PreparedAdvanced {
                     executor,
                     ping.view,
                     host.temporal_history_view(),
-                ),
+                    motion.as_ref(),
+                )?,
                 None => Vec::new(),
             };
             let scan_slot_count = scan_processor_field_step_count(plan);
@@ -2972,6 +2987,11 @@ impl PreparedAdvanced {
         // validity from the committed cursor the temporal pass consumes.
         let (history_write, history_valid) = self.host.temporal_history_read_cursor();
         let context = plan.base().context();
+        let motion_read = prepared
+            .motion_field_slot
+            .and_then(|slot| self.motion.as_ref()?.field_read_parity(slot));
+        let motion_parity = motion_read.map_or(0, |read| read.index);
+        let motion_valid = motion_read.is_some_and(|read| read.valid);
         let frame = StudyGpuFrameUniforms::from_parts(
             &crate::study_eval::StudyFrameContext {
                 audio_bands: context.study_audio_bands,
@@ -2983,11 +3003,12 @@ impl PreparedAdvanced {
             crate::temporal::TEMPORAL_HISTORY_LEN,
             field.wet,
             field.blend,
-        );
+        )
+        .with_motion_valid(motion_valid);
         executor.write_frame(queue, prepared.uniform_slot, &frame);
         executor.encode_at(
             encoder,
-            &prepared.bind_group,
+            &prepared.bind_groups[motion_parity],
             self.host.surface(HostSurface::Pong).view,
             prepared.uniform_slot,
         );
@@ -4192,9 +4213,12 @@ fn prepare_study_fields(
     executor: &StudyGpuExecutor,
     carrier: &wgpu::TextureView,
     history: &wgpu::TextureView,
-) -> Vec<PreparedStudyField> {
+    motion: Option<&MotionGpuResources>,
+) -> Result<Vec<PreparedStudyField>, CompositionGpuError> {
     let mut prepared = Vec::new();
-    let mut visit = |scope: VisualScopeId, execution: &EvaluatedScopeExecution| {
+    let mut visit = |scope: VisualScopeId,
+                     execution: &EvaluatedScopeExecution|
+     -> Result<(), CompositionGpuError> {
         for step in execution.steps() {
             let EvaluatedScopeStep::StudyField { plan: field } = step else {
                 continue;
@@ -4203,22 +4227,49 @@ fn prepare_study_fields(
             if let Some(program) = &field.program {
                 executor.write_program(queue, uniform_slot, program);
             }
+            let motion_field_slot = plan
+                .motion()
+                .advanced()
+                .and_then(|motion| motion.scope(scope))
+                .copied()
+                .and_then(|scope| scope.admitted_field_slot());
+            let motion_views = match motion_field_slot {
+                Some(slot) => motion
+                    .and_then(|resources| resources.field_primitive_views(slot))
+                    .map(|views| views.vectors)
+                    .ok_or_else(|| {
+                        CompositionGpuError::InvalidSchedule(format!(
+                            "Study node {} in {scope:?} resolved absent motion slot {slot}",
+                            field.node_id.get()
+                        ))
+                    })?,
+                None => [carrier, carrier],
+            };
             prepared.push(PreparedStudyField {
                 scope,
                 node_id: field.node_id,
                 uniform_slot,
-                bind_group: executor.create_bind_group(device, carrier, history),
+                motion_field_slot,
+                bind_groups: std::array::from_fn(|parity| {
+                    executor.create_bind_group_with_motion(
+                        device,
+                        carrier,
+                        history,
+                        motion_views[parity],
+                    )
+                }),
             });
         }
+        Ok(())
     };
     for layer in plan.layers() {
-        visit(VisualScopeId::Layer(layer.stable_id), &layer.execution);
+        visit(VisualScopeId::Layer(layer.stable_id), &layer.execution)?;
     }
     for group in plan.groups() {
-        visit(VisualScopeId::Group(group.id), &group.execution);
+        visit(VisualScopeId::Group(group.id), &group.execution)?;
     }
-    visit(VisualScopeId::Master, &plan.master().execution);
-    prepared
+    visit(VisualScopeId::Master, &plan.master().execution)?;
+    Ok(prepared)
 }
 
 fn scan_processor_field_step_count(plan: &AdvancedCompositionPlan) -> usize {
@@ -7451,6 +7502,169 @@ mod tests {
             "an unresolved digest is inert — never a fallback onto another document"
         );
         assert!(active.iter().flatten().all(|value| value.is_finite()));
+    }
+
+    /// A resolved ABI 1.1 Study is the only consumer of this layer's motion
+    /// field. Ordinary Motion stays exactly zero, so the primitive slot cannot
+    /// exist accidentally through shutter, transplant, Garden, or donor use.
+    fn study_motion_layer_fixture(dimensions: [u32; 2]) -> EvaluatedCompositionPlan {
+        use crate::study_eval::tests::abi_1_1_motion_document;
+
+        let mut library = crate::study_eval::StudyProgramLibrary::default();
+        let digest = library.insert(abi_1_1_motion_document()).unwrap();
+        let base = evaluated_base(&[1], dimensions);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![RuntimeRootItem::Layer {
+                layer_id: stable_layer(1),
+                bus: BusAssignment::A,
+            }],
+            None,
+            0.0,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut layer_rack = RuntimeVisualRack::empty();
+        layer_rack
+            .push(RuntimeVisualNodeKind::Study(
+                crate::visual_rack::StudyRackParams {
+                    document_digest: Some(digest),
+                },
+            ))
+            .unwrap();
+        let racks = vec![(stable_layer(1), layer_rack)];
+        let motion = [LayerMotionPlanInput {
+            stable_id: stable_layer(1),
+            params: MotionParams {
+                field_source: MotionFieldSource::CodecVectors,
+                ..MotionParams::default()
+            },
+            codec: MotionCodecFrameFacts {
+                available: true,
+                source_generation: 7,
+                frame_ordinal: 9,
+            },
+        }];
+        let mut input = crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+            &composition,
+            &master,
+            &racks,
+        )
+        .with_studies(&library)
+        .with_motion(
+            MotionParams::default(),
+            &motion,
+            MotionDeviceLimits::new(8_192, u64::MAX),
+        );
+        input.resource_limits.max_sampled_textures_per_shader_stage = 16;
+        let plan = EvaluatedCompositionPlan::evaluate(&base, input).unwrap();
+        let EvaluatedCompositionPlan::Advanced(advanced) = &plan else {
+            panic!("a Study node forces an Advanced plan");
+        };
+        let motion = advanced
+            .motion()
+            .advanced()
+            .expect("ABI 1.1 Study motion plan");
+        let scope = motion
+            .scope(VisualScopeId::Layer(stable_layer(1)))
+            .expect("Study layer motion scope");
+        assert!(scope.params.is_exact_zero());
+        assert!(scope.required_as_study_input);
+        assert_eq!(scope.admitted_field_slot(), Some(0));
+        plan
+    }
+
+    /// The complete D1 hand-off on a real adapter: the composition planner
+    /// admits a field solely for Study, the production motion encoder commits
+    /// the matching codec attachment, the dedicated Study pass selects that
+    /// parity, and the fixed interpreter turns direction into audience color.
+    /// Stationary and absent fields are neutral and a warm frame allocates
+    /// nothing.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn production_study_abi_1_1_motion_field_reaches_the_pixels() {
+        let gpu = GpuHarness::new();
+        let dimensions = [16, 16];
+        let grid = MotionGrid::for_source(dimensions, Default::default()).unwrap();
+        let moving = uniform_motion_field(dimensions, grid, [3.0, 4.0]);
+        let stationary = uniform_motion_field(dimensions, grid, [0.0, 0.0]);
+        let plan = study_motion_layer_fixture(dimensions);
+        let source = gpu.source(dimensions, [20, 40, 80, 255], "Study motion carrier");
+        let sources = [CompositionSourceDescriptor::new(
+            stable_layer(1),
+            &source.view,
+            dimensions,
+        )];
+        let scope = VisualScopeId::Layer(stable_layer(1));
+
+        let mut executor =
+            CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        executor
+            .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+            .unwrap();
+        let warmed = executor.allocation_snapshot();
+        let moving_attachment = payoff_attachment(scope, dimensions, grid, &moving);
+        let moved = gpu.render_with_motion(
+            &mut executor,
+            &plan,
+            1.0 / 30.0,
+            false,
+            CompositionMotionFrameInput {
+                attachments: &[moving_attachment],
+                held_scopes: &[],
+            },
+        );
+        assert_eq!(executor.allocation_snapshot(), warmed);
+        let repeated = gpu.render_with_motion(
+            &mut executor,
+            &plan,
+            1.0 / 30.0,
+            false,
+            CompositionMotionFrameInput {
+                attachments: &[moving_attachment],
+                held_scopes: &[],
+            },
+        );
+        assert_eq!(
+            moved, repeated,
+            "the authored motion result is deterministic"
+        );
+        assert_eq!(executor.allocation_snapshot(), warmed);
+
+        let render_once = |field: Option<&MotionField>| {
+            let mut executor =
+                CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+            executor
+                .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+                .unwrap();
+            match field {
+                Some(field) => {
+                    let attachment = payoff_attachment(scope, dimensions, grid, field);
+                    gpu.render_with_motion(
+                        &mut executor,
+                        &plan,
+                        1.0 / 30.0,
+                        false,
+                        CompositionMotionFrameInput {
+                            attachments: &[attachment],
+                            held_scopes: &[],
+                        },
+                    )
+                }
+                None => gpu.render(&mut executor, &plan, 1.0 / 30.0, false),
+            }
+        };
+        let still = render_once(Some(&stationary));
+        let absent = render_once(None);
+        assert_ne!(
+            moved, still,
+            "an ABI 1.1 Study declaring motion must observably influence output"
+        );
+        assert_eq!(
+            still, absent,
+            "zero and absent motion are the same defined neutral input"
+        );
+        assert!(moved.iter().flatten().all(|value| value.is_finite()));
     }
 
     #[derive(Clone, Copy, PartialEq)]

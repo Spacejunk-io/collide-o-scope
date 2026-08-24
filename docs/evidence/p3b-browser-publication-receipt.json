@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "wire_version": 2,
+  "authored_base_required": true,
+  "state_backlog_generations": 1,
+  "action_ack_capacity": 64,
+  "live_cadence_hz": 12,
+  "declared_live_interval_ms": 84,
+  "monitor_fallback_seconds": 10,
+  "zero_receiver_serialization_calls": 0,
+  "physical_hotplug_fixture_executed": false,
+  "physical_hotplug_claimed": false,
+  "status": "automated_contract_green_manual_physical_matrix_pending"
+}

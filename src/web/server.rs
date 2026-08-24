@@ -1,42 +1,56 @@
 //! Axum HTTP + WebSocket server for the control panel.
 //!
-//! Two listeners share one router: plain HTTP on the base port (desktop
-//! convenience) and HTTPS with a self-signed certificate on base+1 — the
-//! QR code points at the HTTPS URL because iOS only exposes motion sensors
-//! to secure contexts. The certificate (SANs: localhost + the LAN IP) is
-//! persisted under %LOCALAPPDATA%, so a phone that accepted it once stays
-//! trusted across restarts; it regenerates only when the LAN IP changes.
+//! Plain HTTP is confined to separately owned IPv4 and IPv6 loopback sockets.
+//! LAN control exists only through HTTPS on base+1; TLS failure publishes an
+//! honest unavailable state and never creates a plaintext fallback. The
+//! certificate/key/SAN identity is one permission-safe atomic generation.
 //!
 //! Access control: every client must present the per-session token — normally
 //! through the app-opened URL or QR code — after which a strict cookie keeps
 //! it authenticated. WebSockets and mutation POSTs also require an exact
 //! same-origin Origin header. Unknown and cross-origin clients get 403.
 
-use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State, WebSocketUpgrade};
-use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::extract::{
+    ConnectInfo, DefaultBodyLimit, FromRef, Path, Query, Request, State, WebSocketUpgrade,
+};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
+use sha2::Digest as _;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::broadcast::error::RecvError;
+
+use crate::durable_file::{self, AdmissionError, AdmissionLimits, PublishMode, StagedPublication};
 
 use super::state::{
-    CaptureTargetSnapshot, CompositionRootSnapshot, CreativeImageSourceSnapshot,
-    CreativeImageTapSnapshot, CreativeScopeSnapshot, EnqueueOutcome, ImageInputSnapshot,
-    MotionScopeSnapshot, PresetTargetSnapshot, RerollScope, SymmetryRouteSnapshot, WebAction,
-    WebState, MAX_SCENE_NAME_BYTES,
+    ActionIngressAck, ActionIngressTerminalGuard, CaptureTargetSnapshot, CompositionRootSnapshot,
+    ControlAccessUrl, ControlListenerSlot, ControlListenerStatus, ControlServerInfo,
+    CreativeImageSourceSnapshot, CreativeImageTapSnapshot, CreativeScopeSnapshot, EnqueueOutcome,
+    ImageInputSnapshot, MotionScopeSnapshot, PresetTargetSnapshot, RerollScope,
+    SymmetryRouteSnapshot, WebAction, WebState, MAX_SCENE_NAME_BYTES,
 };
 use super::static_files;
+use super::tls_identity::{self, IdentityFaults};
 
-const AUTH_COOKIE: &str = "cos_key";
-const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024;
+const LOOPBACK_AUTH_COOKIE: &str = "cos_loopback";
+const LAN_AUTH_COOKIE: &str = "cos_lan";
+const MAX_LISTENER_REASON_CHARS: usize = 256;
+const RETIRE_TIMEOUT: Duration = Duration::from_secs(3);
+const RESTART_BACKOFF: [Duration; 3] = [
+    Duration::ZERO,
+    Duration::from_millis(75),
+    Duration::from_millis(250),
+];
+const MAX_WS_MESSAGE_BYTES: usize = super::action_wire::MAX_WEB_ACTION_BYTES;
 const MAX_LOGGED_MESSAGE_CHARS: usize = 256;
 const MAX_ACTION_VALUE_DEPTH: usize = 8;
 const MAX_ACTION_VALUE_NODES: usize = 512;
@@ -46,110 +60,726 @@ const MAX_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 /// upload itself as well so a malformed or accidental multi-gigabyte file
 /// cannot consume library storage before FFmpeg gets a chance to reject it.
 const MAX_AUDIO_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_VISUAL_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_UPLOAD_AGGREGATE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MIN_UPLOAD_DISK_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_CONCURRENT_UPLOADS: usize = 2;
+const UPLOAD_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+const UPLOAD_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAX_UPLOAD_DESTINATION_ATTEMPTS: u32 = 4_096;
+const MAX_UPLOAD_ORPHAN_SCAN_ENTRIES: usize = 8_192;
 // Leave room for the atomic reservation prefix and the largest numbered
 // collision suffix while staying below Windows' 255 UTF-16-code-unit
 // component limit.
 const MAX_LIBRARY_FILENAME_UTF16: usize = 220;
+const MAX_CONCURRENT_LIBRARY_PAGE_SEARCHES: usize = 4;
 
-fn exceeds_upload_limit(extension: &str, bytes: u64) -> bool {
-    crate::audio::is_supported_audio_extension(extension) && bytes > MAX_AUDIO_UPLOAD_BYTES
+fn library_page_gate() -> Arc<tokio::sync::Semaphore> {
+    static GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    GATE.get_or_init(|| {
+        Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_LIBRARY_PAGE_SEARCHES,
+        ))
+    })
+    .clone()
 }
 
-/// Start the web server on a background thread. Returns the local URL.
-pub fn spawn(state: Arc<WebState>, port: u16) -> String {
-    let local_url = format!("http://127.0.0.1:{port}/?key={}", state.access_token);
-    state.mark_control_server_starting(local_url.clone());
-    let https_port = port + 1;
-    let lan_ip = detect_lan_ip();
+fn exceeds_upload_limit(extension: &str, bytes: u64) -> bool {
+    bytes > upload_limit_for_extension(extension)
+}
 
-    // Self-signed TLS: load or mint a certificate covering the LAN IP.
-    let tls = load_or_create_tls(lan_ip);
-    if let Err(ref e) = tls {
-        log::warn!("TLS unavailable, phone sensors will need HTTP: {e}");
+fn upload_limit_for_extension(extension: &str) -> u64 {
+    if crate::audio::is_supported_audio_extension(extension) {
+        MAX_AUDIO_UPLOAD_BYTES
+    } else {
+        MAX_VISUAL_UPLOAD_BYTES
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListenerRole {
+    LoopbackIpv4,
+    LoopbackIpv6,
+    LanTls,
+}
+
+impl ListenerRole {
+    const fn slot(self) -> ControlListenerSlot {
+        match self {
+            Self::LoopbackIpv4 => ControlListenerSlot::LoopbackIpv4,
+            Self::LoopbackIpv6 => ControlListenerSlot::LoopbackIpv6,
+            Self::LanTls => ControlListenerSlot::LanTls,
+        }
     }
 
-    // The QR points at HTTPS (secure context → iOS sensors work).
-    let lan_url = match (lan_ip, tls.is_ok()) {
-        (Some(ip), true) => format!("https://{ip}:{https_port}/?key={}", state.access_token),
-        (Some(ip), false) => format!("http://{ip}:{port}/?key={}", state.access_token),
-        _ => local_url.clone(),
+    const fn is_loopback(self) -> bool {
+        matches!(self, Self::LoopbackIpv4 | Self::LoopbackIpv6)
+    }
+
+    const fn cookie_name(self) -> &'static str {
+        if self.is_loopback() {
+            LOOPBACK_AUTH_COOKIE
+        } else {
+            LAN_AUTH_COOKIE
+        }
+    }
+
+    const fn cookie_is_secure(self) -> bool {
+        matches!(self, Self::LanTls)
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::LoopbackIpv4 => "loopback IPv4 HTTP",
+            Self::LoopbackIpv6 => "loopback IPv6 HTTP",
+            Self::LanTls => "LAN HTTPS",
+        }
+    }
+}
+
+struct SessionSecret(String);
+
+impl std::fmt::Debug for SessionSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionSecret(<redacted>)")
+    }
+}
+
+#[derive(Debug)]
+struct ControlSession {
+    token: SessionSecret,
+    fingerprint: String,
+}
+
+impl ControlSession {
+    fn random() -> Result<Arc<Self>, String> {
+        let mut token = [0_u8; 16];
+        getrandom::fill(&mut token)
+            .map_err(|error| format!("OS entropy unavailable for control session: {error}"))?;
+        Self::from_seed(hex_lower(&token))
+    }
+
+    fn from_seed(token: String) -> Result<Arc<Self>, String> {
+        if token.len() != 32 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(
+                "control session token must be exactly 128 bits of hexadecimal".to_string(),
+            );
+        }
+        let token = token.to_ascii_lowercase();
+        let fingerprint = hex_lower(&sha2::Sha256::digest(token.as_bytes()))[..12].to_string();
+        Ok(Arc::new(Self {
+            token: SessionSecret(token),
+            fingerprint,
+        }))
+    }
+
+    fn access_url(&self, scheme: &str, address: SocketAddr) -> ControlAccessUrl {
+        ControlAccessUrl::new(format!("{scheme}://{address}/?key={}", self.token.0))
+    }
+}
+
+#[derive(Clone)]
+struct ControlRouterState {
+    web: Arc<WebState>,
+    session: Arc<ControlSession>,
+    role: ListenerRole,
+}
+
+impl FromRef<ControlRouterState> for Arc<WebState> {
+    fn from_ref(state: &ControlRouterState) -> Self {
+        state.web.clone()
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct StartFaults {
+    identity: IdentityFaults,
+    tls_config: bool,
+    crash_role: Option<ListenerRole>,
+}
+
+struct StartConfig {
+    base_port: u16,
+    lan_ip: Option<IpAddr>,
+    identity_dir: PathBuf,
+    token_seed: Option<String>,
+    faults: StartFaults,
+}
+
+impl StartConfig {
+    fn production(base_port: u16) -> Self {
+        Self {
+            base_port,
+            lan_ip: detect_lan_ip(),
+            identity_dir: tls_identity::default_identity_dir(),
+            token_seed: None,
+            faults: StartFaults::default(),
+        }
+    }
+}
+
+enum PreparedListener {
+    Plain {
+        role: ListenerRole,
+        listener: TcpListener,
+        router: Router,
+        handle: axum_server::Handle,
+    },
+    Tls {
+        listener: TcpListener,
+        router: Router,
+        handle: axum_server::Handle,
+        config: axum_server::tls_rustls::RustlsConfig,
+    },
+}
+
+/// Owns the runtime thread, all listener shutdown handles, the generation's
+/// secret session, and the final join/retirement witness.
+pub struct ControlServerHandle {
+    generation: u64,
+    base_port: u16,
+    state: Arc<WebState>,
+    session: Arc<ControlSession>,
+    local_url: Option<ControlAccessUrl>,
+    listeners: Vec<axum_server::Handle>,
+    stopping: Arc<AtomicBool>,
+    finished: mpsc::Receiver<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    loopback_bound: bool,
+}
+
+impl std::fmt::Debug for ControlServerHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlServerHandle")
+            .field("generation", &self.generation)
+            .field("base_port", &self.base_port)
+            .field("session_fingerprint", &self.session.fingerprint)
+            .field("local_url", &self.local_url)
+            .field("listener_count", &self.listeners.len())
+            .field("loopback_bound", &self.loopback_bound)
+            .finish()
+    }
+}
+
+impl ControlServerHandle {
+    pub fn local_url(&self) -> Option<&str> {
+        self.local_url
+            .as_ref()
+            .map(ControlAccessUrl::expose_to_local_ui)
+    }
+
+    pub fn session_fingerprint(&self) -> &str {
+        &self.session.fingerprint
+    }
+
+    pub fn has_loopback_listener(&self) -> bool {
+        self.loopback_bound
+    }
+
+    pub fn retire(&mut self) -> Result<(), String> {
+        let Some(_) = self.thread.as_ref() else {
+            self.state.mark_control_server_stopped(self.generation);
+            return Ok(());
+        };
+        self.state.mark_control_server_stopping(self.generation);
+        self.stopping.store(true, Ordering::Release);
+        for listener in &self.listeners {
+            listener.shutdown();
+        }
+        match self.finished.recv_timeout(RETIRE_TIMEOUT) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(format!(
+                    "control server generation {} did not retire within {} ms",
+                    self.generation,
+                    RETIRE_TIMEOUT.as_millis()
+                ));
+            }
+        }
+        if let Some(thread) = self.thread.take() {
+            thread.join().map_err(|_| {
+                "control server runtime thread panicked during retirement".to_string()
+            })?;
+        }
+        self.state.mark_control_server_stopped(self.generation);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn token_for_test(&self) -> &str {
+        &self.session.token.0
+    }
+}
+
+impl Drop for ControlServerHandle {
+    fn drop(&mut self) {
+        if let Err(error) = self.retire() {
+            log::error!("{error}; waiting for owned control runtime to finish");
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+/// Start one server generation. Partial listener success is returned as a
+/// handle and represented in [`ControlServerInfo`]; only entropy/runtime setup
+/// failures prevent creation of the owned handle itself.
+pub fn spawn(state: Arc<WebState>, port: u16) -> Result<ControlServerHandle, String> {
+    start(state, StartConfig::production(port))
+}
+
+/// Retire/rebind with a finite three-attempt backoff. A failed old retirement
+/// returns before any new bind, so two generations never race for the ports.
+pub fn restart_with_backoff(
+    state: Arc<WebState>,
+    port: u16,
+) -> Result<ControlServerHandle, String> {
+    let mut last: Option<ControlServerHandle> = None;
+    for delay in RESTART_BACKOFF {
+        if let Some(mut prior) = last.take() {
+            prior.retire()?;
+        }
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        let handle = spawn(state.clone(), port)?;
+        if handle.has_loopback_listener() {
+            return Ok(handle);
+        }
+        last = Some(handle);
+    }
+    Ok(last.expect("the bounded restart table has at least one attempt"))
+}
+
+/// Hidden packet-test fixture: the caller supplies an isolated identity root
+/// and a deterministic non-production token, but receives no token in output.
+pub(crate) fn spawn_fixture(
+    state: Arc<WebState>,
+    port: u16,
+    identity_dir: &FsPath,
+    token_seed: String,
+) -> Result<ControlServerHandle, String> {
+    start(
+        state,
+        StartConfig {
+            base_port: port,
+            lan_ip: detect_lan_ip(),
+            identity_dir: identity_dir.to_path_buf(),
+            token_seed: Some(token_seed),
+            faults: StartFaults::default(),
+        },
+    )
+}
+
+fn start(state: Arc<WebState>, config: StartConfig) -> Result<ControlServerHandle, String> {
+    let https_port = config
+        .base_port
+        .checked_add(1)
+        .ok_or_else(|| "control server base port cannot be 65535".to_string())?;
+    let session = match config.token_seed {
+        Some(token) => ControlSession::from_seed(token)?,
+        None => ControlSession::random()?,
     };
-    log::info!("Remote control URL: {lan_url}");
-    if let Ok(mut slot) = state.lan_url.write() {
-        *slot = lan_url;
-    }
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
-        .expect("Failed to create tokio runtime");
-
-    std::thread::spawn(move || {
-        rt.block_on(async move {
-            let app = control_router(state.clone());
-
-            // HTTPS listener (phones — secure context for sensors).
-            if let Ok((cert_chain, key_der)) = tls {
-                let https_app = app.clone();
-                tokio::spawn(async move {
-                    match axum_server::tls_rustls::RustlsConfig::from_der(cert_chain, key_der).await
-                    {
-                        Ok(config) => {
-                            let addr = SocketAddr::from(([0, 0, 0, 0], https_port));
-                            log::info!("HTTPS control panel listening on {addr}");
-                            if let Err(e) = axum_server::bind_rustls(addr, config)
-                                .serve(
-                                    https_app.into_make_service_with_connect_info::<SocketAddr>(),
-                                )
-                                .await
-                            {
-                                log::warn!("HTTPS server error: {e}");
-                            }
-                        }
-                        Err(e) => log::warn!("TLS config rejected: {e}"),
-                    }
-                });
-            }
-
-            // HTTP listener (desktop convenience, unchanged behavior).
-            let addr = format!("0.0.0.0:{port}");
-            let listener = match tokio::net::TcpListener::bind(&addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    state.mark_control_server_unavailable(format!("cannot bind port {port}: {e}"));
-                    log::error!(
-                        "Cannot bind port {port} ({e}) — is another collide-o-scope \
-                         already running? This instance continues without a control panel."
-                    );
-                    return;
-                }
-            };
-            state.mark_control_server_listening();
-            log::info!("Web control panel listening on {addr}");
-            if let Err(error) = axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            {
-                state.mark_control_server_unavailable(format!("control server stopped: {error}"));
-                log::error!("Web control panel stopped: {error}");
-            }
-        });
+        .map_err(|error| format!("control server runtime creation failed: {error}"))?;
+    let generation = state.begin_control_server_generation();
+    state.publish_control_server_info(ControlServerInfo {
+        generation,
+        loopback_ipv4: ControlListenerStatus::Starting,
+        loopback_ipv6: ControlListenerStatus::Starting,
+        lan_tls: ControlListenerStatus::Starting,
+        loopback_ipv4_url: None,
+        loopback_ipv6_url: None,
+        lan_url: None,
+        session_fingerprint: session.fingerprint.clone(),
     });
 
-    local_url
+    let mut info = ControlServerInfo {
+        generation,
+        session_fingerprint: session.fingerprint.clone(),
+        ..ControlServerInfo::default()
+    };
+    let mut prepared = Vec::new();
+    let mut shutdown_handles = Vec::new();
+
+    let ipv4_address = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), config.base_port);
+    match bind(ipv4_address) {
+        Ok((listener, address)) => {
+            info.loopback_ipv4 = ControlListenerStatus::Listening { address };
+            info.loopback_ipv4_url = Some(session.access_url("http", address));
+            let handle = axum_server::Handle::new();
+            shutdown_handles.push(handle.clone());
+            prepared.push(PreparedListener::Plain {
+                role: ListenerRole::LoopbackIpv4,
+                listener,
+                router: control_router(state.clone(), session.clone(), ListenerRole::LoopbackIpv4),
+                handle,
+            });
+        }
+        Err(error) => {
+            info.loopback_ipv4 = unavailable(format!("cannot bind loopback IPv4: {error}"));
+        }
+    }
+
+    let ipv6_address = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), config.base_port);
+    match bind(ipv6_address) {
+        Ok((listener, address)) => {
+            info.loopback_ipv6 = ControlListenerStatus::Listening { address };
+            info.loopback_ipv6_url = Some(session.access_url("http", address));
+            let handle = axum_server::Handle::new();
+            shutdown_handles.push(handle.clone());
+            prepared.push(PreparedListener::Plain {
+                role: ListenerRole::LoopbackIpv6,
+                listener,
+                router: control_router(state.clone(), session.clone(), ListenerRole::LoopbackIpv6),
+                handle,
+            });
+        }
+        Err(error) => {
+            info.loopback_ipv6 = unavailable(format!("cannot bind loopback IPv6: {error}"));
+        }
+    }
+
+    match prepare_tls(config.lan_ip, &config.identity_dir, config.faults, &runtime) {
+        Ok((lan_ip, tls_config)) => {
+            let requested = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), https_port);
+            match bind(requested) {
+                Ok((listener, bound_address)) => {
+                    info.lan_tls = ControlListenerStatus::Listening {
+                        address: bound_address,
+                    };
+                    let advertised = SocketAddr::new(lan_ip, bound_address.port());
+                    info.lan_url = Some(session.access_url("https", advertised));
+                    let handle = axum_server::Handle::new();
+                    shutdown_handles.push(handle.clone());
+                    prepared.push(PreparedListener::Tls {
+                        listener,
+                        router: control_router(
+                            state.clone(),
+                            session.clone(),
+                            ListenerRole::LanTls,
+                        ),
+                        handle,
+                        config: tls_config,
+                    });
+                }
+                Err(error) => {
+                    info.lan_tls = unavailable(format!("cannot bind LAN HTTPS: {error}"));
+                }
+            }
+        }
+        Err(error) => info.lan_tls = unavailable(error),
+    }
+
+    let loopback_bound = matches!(info.loopback_ipv4, ControlListenerStatus::Listening { .. })
+        || matches!(info.loopback_ipv6, ControlListenerStatus::Listening { .. });
+    let local_url = info.local_url().cloned();
+    state.publish_control_server_info(info.clone());
+
+    for (role, status) in [
+        (ListenerRole::LoopbackIpv4, &info.loopback_ipv4),
+        (ListenerRole::LoopbackIpv6, &info.loopback_ipv6),
+        (ListenerRole::LanTls, &info.lan_tls),
+    ] {
+        match status {
+            ControlListenerStatus::Listening { address } => log::info!(
+                "{} listening on {address} (session {})",
+                role.label(),
+                session.fingerprint
+            ),
+            ControlListenerStatus::Unavailable { reason } => {
+                log::warn!("{} unavailable: {reason}", role.label())
+            }
+            ControlListenerStatus::Starting | ControlListenerStatus::Stopped => {}
+        }
+    }
+
+    let stopping = Arc::new(AtomicBool::new(false));
+    let thread_stopping = stopping.clone();
+    let thread_state = state.clone();
+    let crash_role = config.faults.crash_role;
+    let active_slots = prepared
+        .iter()
+        .map(|listener| match listener {
+            PreparedListener::Plain { role, .. } => role.slot(),
+            PreparedListener::Tls { .. } => ControlListenerSlot::LanTls,
+        })
+        .collect::<Vec<_>>();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let thread = match std::thread::Builder::new()
+        .name(format!("cos-control-{generation}"))
+        .spawn(move || {
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(run_listeners(
+                    prepared,
+                    thread_state.clone(),
+                    generation,
+                    thread_stopping.clone(),
+                    crash_role,
+                ));
+            }));
+            if run.is_err() && !thread_stopping.load(Ordering::Acquire) {
+                for slot in active_slots {
+                    thread_state.update_control_listener(
+                        generation,
+                        slot,
+                        unavailable("control listener runtime crashed"),
+                    );
+                }
+            }
+            let _ = finished_tx.send(());
+        }) {
+        Ok(thread) => thread,
+        Err(error) => {
+            for slot in [
+                ControlListenerSlot::LoopbackIpv4,
+                ControlListenerSlot::LoopbackIpv6,
+                ControlListenerSlot::LanTls,
+            ] {
+                state.update_control_listener(
+                    generation,
+                    slot,
+                    unavailable("control server thread creation failed"),
+                );
+            }
+            return Err(format!("control server thread creation failed: {error}"));
+        }
+    };
+
+    Ok(ControlServerHandle {
+        generation,
+        base_port: config.base_port,
+        state,
+        session,
+        local_url,
+        listeners: shutdown_handles,
+        stopping,
+        finished: finished_rx,
+        thread: Some(thread),
+        loopback_bound,
+    })
+}
+
+async fn run_listeners(
+    listeners: Vec<PreparedListener>,
+    state: Arc<WebState>,
+    generation: u64,
+    stopping: Arc<AtomicBool>,
+    crash_role: Option<ListenerRole>,
+) {
+    // No listener accepts a body until one bounded startup pass has removed
+    // staging/reservation artifacts left by a prior crashed process.
+    if let Some(folder) = state
+        .library_folder
+        .read()
+        .ok()
+        .and_then(|folder| folder.clone())
+    {
+        let cleanup_generation = state.library_generation();
+        match tokio::task::spawn_blocking(move || {
+            durable_file::cleanup_orphans(
+                &folder,
+                &[".upload-stage-", ".upload-reserve-"],
+                MAX_UPLOAD_ORPHAN_SCAN_ENTRIES,
+            )
+        })
+        .await
+        {
+            Ok(Ok(removed)) => {
+                state
+                    .upload_admission()
+                    .mark_cleanup_complete(cleanup_generation);
+                if removed > 0 {
+                    log::info!("Removed {removed} orphaned browser-upload staging files");
+                }
+            }
+            Ok(Err(error)) => log::warn!("Browser-upload orphan cleanup failed: {error}"),
+            Err(error) => log::warn!("Browser-upload orphan cleanup worker failed: {error}"),
+        }
+    }
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for listener in listeners {
+        match listener {
+            PreparedListener::Plain {
+                role,
+                listener,
+                router,
+                handle,
+            } => {
+                tasks.spawn(async move {
+                    let future = async move {
+                        if crash_role == Some(role) {
+                            panic!("injected listener task crash");
+                        }
+                        axum_server::from_tcp(listener)
+                            .handle(handle)
+                            .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                            .await
+                    };
+                    (
+                        role,
+                        std::panic::AssertUnwindSafe(future).catch_unwind().await,
+                    )
+                });
+            }
+            PreparedListener::Tls {
+                listener,
+                router,
+                handle,
+                config,
+            } => {
+                tasks.spawn(async move {
+                    let future = async move {
+                        if crash_role == Some(ListenerRole::LanTls) {
+                            panic!("injected listener task crash");
+                        }
+                        axum_server::from_tcp_rustls(listener, config)
+                            .handle(handle)
+                            .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                            .await
+                    };
+                    (
+                        ListenerRole::LanTls,
+                        std::panic::AssertUnwindSafe(future).catch_unwind().await,
+                    )
+                });
+            }
+        }
+    }
+
+    while let Some(joined) = tasks.join_next().await {
+        if stopping.load(Ordering::Acquire) {
+            continue;
+        }
+        let (role, outcome) = match joined {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                log::error!("Control listener join failed: {error}");
+                continue;
+            }
+        };
+        let reason = match outcome {
+            Ok(Ok(())) => "listener task stopped unexpectedly".to_string(),
+            Ok(Err(error)) => format!("listener task failed: {error}"),
+            Err(_) => "listener task crashed".to_string(),
+        };
+        state.update_control_listener(generation, role.slot(), unavailable(reason));
+    }
+}
+
+fn bind(address: SocketAddr) -> Result<(TcpListener, SocketAddr), String> {
+    let listener = TcpListener::bind(address).map_err(|error| error.to_string())?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("set nonblocking: {error}"))?;
+    let bound = listener
+        .local_addr()
+        .map_err(|error| format!("inspect bound address: {error}"))?;
+    Ok((listener, bound))
+}
+
+fn prepare_tls(
+    lan_ip: Option<IpAddr>,
+    identity_dir: &FsPath,
+    faults: StartFaults,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<(IpAddr, axum_server::tls_rustls::RustlsConfig), String> {
+    let lan_ip = lan_ip.ok_or_else(|| "no routable LAN address was detected".to_string())?;
+    let required_sans = vec![
+        "localhost".to_string(),
+        Ipv4Addr::LOCALHOST.to_string(),
+        Ipv6Addr::LOCALHOST.to_string(),
+        lan_ip.to_string(),
+    ];
+    let identity = tls_identity::load_or_create(identity_dir, &required_sans, faults.identity)?;
+    if faults.tls_config {
+        return Err("injected TLS configuration fault".to_string());
+    }
+    let config = rustls_config_from_der(runtime, identity.cert_chain, identity.key_der)?;
+    Ok((lan_ip, config))
+}
+
+/// `RustlsConfig::from_der` uses `tokio::spawn_blocking`, so polling it without
+/// an entered Tokio runtime panics. Run the validation on one short, joined
+/// scope thread entered into the runtime that the owned server will later use.
+/// The extra thread also makes this synchronous API safe when a caller already
+/// happens to be inside a different Tokio runtime.
+fn rustls_config_from_der(
+    runtime: &tokio::runtime::Runtime,
+    cert_chain: Vec<Vec<u8>>,
+    key_der: Vec<u8>,
+) -> Result<axum_server::tls_rustls::RustlsConfig, String> {
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("cos-tls-config".to_string())
+            .spawn_scoped(scope, move || {
+                runtime.block_on(axum_server::tls_rustls::RustlsConfig::from_der(
+                    cert_chain, key_der,
+                ))
+            })
+            .map_err(|error| format!("TLS validation worker creation failed: {error}"))?;
+        worker
+            .join()
+            .map_err(|_| "TLS validation worker panicked".to_string())?
+            .map_err(|error| format!("TLS certificate/private-key validation failed: {error}"))
+    })
+}
+
+fn unavailable(reason: impl AsRef<str>) -> ControlListenerStatus {
+    ControlListenerStatus::Unavailable {
+        reason: bounded_reason(reason.as_ref()),
+    }
+}
+
+fn bounded_reason(reason: &str) -> String {
+    let mut bounded = String::with_capacity(reason.len().min(MAX_LISTENER_REASON_CHARS));
+    for (index, character) in reason.chars().enumerate() {
+        if index >= MAX_LISTENER_REASON_CHARS {
+            bounded.push('\u{2026}');
+            break;
+        }
+        bounded.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
+    }
+    bounded
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
 }
 
 /// Build the exact production router independently of listener ownership.
 /// Keeping this seam small lets the transport test bind an ephemeral port and
 /// exercise the real authentication, WebSocket upgrade, and action ingress.
-fn control_router(state: Arc<WebState>) -> Router {
+fn control_router(
+    state: Arc<WebState>,
+    session: Arc<ControlSession>,
+    role: ListenerRole,
+) -> Router {
+    let router_state = ControlRouterState {
+        web: state,
+        session,
+        role,
+    };
     Router::new()
         .route("/ws", get(ws_handler))
         .route("/thumb/:filename", get(thumb_handler))
         .route("/preview/:filename/:index", get(preview_handler))
+        .route("/library-index", get(library_index_handler))
         .route("/qr.svg", get(qr_handler))
         .route(
             "/controller-profile",
@@ -159,67 +789,15 @@ fn control_router(state: Arc<WebState>) -> Router {
         )
         .route(
             "/upload",
-            post(upload_handler).layer(DefaultBodyLimit::max(8 * 1024 * 1024 * 1024)),
+            post(upload_handler).layer(DefaultBodyLimit::max(MAX_VISUAL_UPLOAD_BYTES as usize)),
         )
         .route("/delete", post(delete_handler))
         .fallback(get(static_files::serve))
-        .layer(middleware::from_fn_with_state(state.clone(), auth))
-        .with_state(state)
-}
-
-/// Load the persisted self-signed certificate, or mint a fresh one when
-/// absent or when the LAN IP is no longer among its subject names.
-/// Returns (DER cert chain, DER private key).
-fn load_or_create_tls(lan_ip: Option<IpAddr>) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
-    let dir = tls_dir()?;
-    let cert_path = dir.join("cert.der");
-    let key_path = dir.join("key.der");
-    let sans_path = dir.join("sans.txt");
-
-    let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-    if let Some(ip) = lan_ip {
-        sans.push(ip.to_string());
-    }
-
-    // Reuse the stored cert if it already covers every name we need —
-    // regenerating would invalidate the trust a phone already granted.
-    if cert_path.exists() && key_path.exists() {
-        if let Ok(stored) = std::fs::read_to_string(&sans_path) {
-            let stored: Vec<&str> = stored.lines().collect();
-            if sans.iter().all(|s| stored.contains(&s.as_str())) {
-                let cert = std::fs::read(&cert_path).map_err(|e| e.to_string())?;
-                let key = std::fs::read(&key_path).map_err(|e| e.to_string())?;
-                log::info!("TLS: using persisted certificate ({})", dir.display());
-                return Ok((vec![cert], key));
-            }
-        }
-        log::info!("TLS: LAN address changed; regenerating certificate");
-    }
-
-    let certified = rcgen::generate_simple_self_signed(sans.clone())
-        .map_err(|e| format!("certificate generation: {e}"))?;
-    let cert_der = certified.cert.der().to_vec();
-    let key_der = certified.key_pair.serialize_der();
-
-    std::fs::write(&cert_path, &cert_der).map_err(|e| format!("write cert: {e}"))?;
-    std::fs::write(&key_path, &key_der).map_err(|e| format!("write key: {e}"))?;
-    std::fs::write(&sans_path, sans.join("\n")).map_err(|e| format!("write sans: {e}"))?;
-    log::info!("TLS: generated self-signed certificate ({})", dir.display());
-
-    Ok((vec![cert_der], key_der))
-}
-
-/// Certificate storage, under the shared per-user state root: `tls`.
-///
-/// This used to fall back to a relative `./.tls` whenever `%LOCALAPPDATA%` was
-/// absent, which is every non-Windows host. The certificate then followed the
-/// working directory, so a phone that had accepted it once stopped trusting the
-/// panel as soon as the program was launched from somewhere else — the exact
-/// opposite of the documented "accept once" behaviour.
-fn tls_dir() -> Result<PathBuf, String> {
-    let base = crate::host_paths::state_root().join("tls");
-    std::fs::create_dir_all(&base).map_err(|e| format!("tls dir: {e}"))?;
-    Ok(base)
+        .layer(middleware::from_fn_with_state(router_state.clone(), auth))
+        // Added last so even authentication refusals receive the no-store and
+        // browser-hardening headers.
+        .layer(middleware::from_fn(security_headers))
+        .with_state(router_state)
 }
 
 /// The machine's outbound-facing LAN address. The UDP "connect" sends no
@@ -238,7 +816,7 @@ fn detect_lan_ip() -> Option<IpAddr> {
 /// Browser mutation routes must come from the exact host serving the panel.
 /// `Origin` is intentionally required for WebSockets and POSTs: ordinary page
 /// navigation has no Origin header, while browser script mutations always do.
-fn same_origin(headers: &HeaderMap) -> bool {
+fn same_origin(headers: &HeaderMap, role: ListenerRole) -> bool {
     let Some(host) = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
@@ -253,7 +831,12 @@ fn same_origin(headers: &HeaderMap) -> bool {
     };
     let origin = origin.to_ascii_lowercase();
     let host = host.to_ascii_lowercase();
-    origin == format!("http://{host}") || origin == format!("https://{host}")
+    let scheme = if role.cookie_is_secure() {
+        "https"
+    } else {
+        "http"
+    };
+    origin == format!("{scheme}://{host}")
 }
 
 fn requires_same_origin(method: &Method, path: &str) -> bool {
@@ -274,11 +857,22 @@ fn forbidden(message: &'static str) -> Response {
 /// browser mutations additionally require an exact same-origin Origin header.
 async fn auth(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<Arc<WebState>>,
+    State(state): State<ControlRouterState>,
     req: Request,
     next: Next,
 ) -> Response {
-    let token = &state.access_token;
+    if state.role.is_loopback() && !addr.ip().is_loopback() {
+        log::warn!(
+            "Rejected non-loopback client on {} listener: {}",
+            state.role.label(),
+            addr.ip()
+        );
+        return forbidden(
+            "<h3>collide-o-scope</h3><p>This plaintext listener accepts loopback clients only.</p>",
+        );
+    }
+    let token = &state.session.token.0;
+    let cookie_name = state.role.cookie_name();
 
     let cookie_ok = req
         .headers()
@@ -287,7 +881,7 @@ async fn auth(
         .map(|cookies| {
             cookies.split(';').any(|c| {
                 c.trim()
-                    .strip_prefix(AUTH_COOKIE)
+                    .strip_prefix(cookie_name)
                     .and_then(|rest| rest.strip_prefix('='))
                     .is_some_and(|v| v == token)
             })
@@ -310,15 +904,22 @@ async fn auth(
         );
     }
 
-    if requires_same_origin(req.method(), req.uri().path()) && !same_origin(req.headers()) {
+    if requires_same_origin(req.method(), req.uri().path())
+        && !same_origin(req.headers(), state.role)
+    {
         log::warn!("Rejected cross-origin control mutation from {}", addr.ip());
         return forbidden("<h3>collide-o-scope</h3><p>Cross-origin control request denied.</p>");
     }
 
     let mut response = next.run(req).await;
     if query_ok && !cookie_ok {
-        if let Ok(cookie) = header::HeaderValue::from_str(&format!(
-            "{AUTH_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict"
+        let secure = if state.role.cookie_is_secure() {
+            "; Secure"
+        } else {
+            ""
+        };
+        if let Ok(cookie) = HeaderValue::from_str(&format!(
+            "{cookie_name}={token}; Path=/; HttpOnly; SameSite=Strict{secure}"
         )) {
             response.headers_mut().append(header::SET_COOKIE, cookie);
         }
@@ -326,9 +927,46 @@ async fn auth(
     response
 }
 
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(
+            "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; media-src 'none'; worker-src 'none'",
+        ),
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+}
+
 /// QR code (SVG) of the remote URL, rendered on demand.
-async fn qr_handler(State(state): State<Arc<WebState>>) -> impl IntoResponse {
-    let url = state.lan_url.read().map(|s| s.clone()).unwrap_or_default();
+async fn qr_handler(State(state): State<Arc<WebState>>) -> Response {
+    let info = state.control_server_info();
+    let Some(url) = info.lan_url.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "LAN HTTPS control is unavailable; no QR code was published.",
+        )
+            .into_response();
+    };
+    let url = url.expose_to_local_ui();
 
     match qrcode::QrCode::new(url.as_bytes()) {
         Ok(code) => {
@@ -356,7 +994,8 @@ async fn controller_profile_handler(
     State(state): State<Arc<WebState>>,
     body: axum::body::Bytes,
 ) -> Response {
-    let request = match crate::controller_profile::ControllerProfileAction::from_json_bytes(&body) {
+    let request = match crate::controller_profile::ControllerProfileAction::decode_json_bytes(&body)
+    {
         Ok(request) => request,
         Err(error) => {
             return (
@@ -381,23 +1020,21 @@ async fn controller_profile_handler(
             .into_response(),
         request @ crate::controller_profile::ControllerProfileAction::Import { .. } => {
             let action = WebAction::ControllerProfile { request };
-            if !valid_action(&action, 0) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    "invalid controller profile document",
-                )
-                    .into_response();
+            let envelope = state.envelope_web_action(action);
+            if !valid_action(envelope.payload(), 0) {
+                let acknowledgement = state.terminal_action_identity_with_ack(
+                    envelope.identity(),
+                    crate::action_correlation::ActionDisposition::Refused,
+                );
+                return (StatusCode::BAD_REQUEST, axum::Json(acknowledgement)).into_response();
             }
-            match state.enqueue_action(action).await {
-                EnqueueOutcome::Added | EnqueueOutcome::Coalesced => {
-                    (StatusCode::ACCEPTED, "controller profile import queued").into_response()
-                }
-                EnqueueOutcome::Dropped => (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "controller action queue is full",
-                )
-                    .into_response(),
-            }
+            let (outcome, acknowledgement) =
+                state.enqueue_enveloped_action_with_ack(envelope).await;
+            let status = match outcome {
+                EnqueueOutcome::Added | EnqueueOutcome::Coalesced => StatusCode::ACCEPTED,
+                EnqueueOutcome::Dropped => StatusCode::TOO_MANY_REQUESTS,
+            };
+            (status, axum::Json(acknowledgement)).into_response()
         }
     }
 }
@@ -405,6 +1042,91 @@ async fn controller_profile_handler(
 #[derive(serde::Deserialize)]
 struct UploadQuery {
     name: String,
+}
+
+#[derive(serde::Serialize)]
+struct LibraryMutationAck {
+    #[serde(flatten)]
+    action: ActionIngressAck,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn library_mutation_response(
+    status: StatusCode,
+    action: ActionIngressAck,
+    name: Option<String>,
+    error: Option<String>,
+) -> Response {
+    (
+        status,
+        axum::Json(LibraryMutationAck {
+            action,
+            name,
+            error,
+        }),
+    )
+        .into_response()
+}
+
+/// Exact-once terminal guard for authenticated durable library mutations. A
+/// handler cancellation or future early-return after identity minting is an
+/// explicit Refused action rather than an orphaned engine sequence.
+struct LibraryMutationTerminalGuard {
+    state: Arc<WebState>,
+    identity: Option<crate::action_correlation::ActionIdentity>,
+}
+
+impl LibraryMutationTerminalGuard {
+    fn browser(state: Arc<WebState>) -> Self {
+        let identity = state
+            .action_sequencer()
+            .envelope(crate::action_correlation::ActionSourceClass::Browser, ())
+            .identity();
+        Self {
+            state,
+            identity: Some(identity),
+        }
+    }
+
+    fn finish(
+        mut self,
+        disposition: crate::action_correlation::ActionDisposition,
+    ) -> ActionIngressAck {
+        let identity = self
+            .identity
+            .take()
+            .expect("library mutation finishes once");
+        self.state
+            .terminal_action_identity_with_ack(identity, disposition)
+    }
+}
+
+impl Drop for LibraryMutationTerminalGuard {
+    fn drop(&mut self) {
+        if let Some(identity) = self.identity.take() {
+            self.state.record_terminal_action_identity(
+                identity,
+                crate::action_correlation::ActionDisposition::Refused,
+            );
+        }
+    }
+}
+
+fn finish_blocking_library_mutation<T, E>(
+    mutation: LibraryMutationTerminalGuard,
+    operation: impl FnOnce() -> Result<T, E>,
+) -> (Result<T, E>, ActionIngressAck) {
+    let result = operation();
+    let disposition = if result.is_ok() {
+        crate::action_correlation::ActionDisposition::Coalesced
+    } else {
+        crate::action_correlation::ActionDisposition::Refused
+    };
+    let acknowledgement = mutation.finish(disposition);
+    (result, acknowledgement)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -483,13 +1205,13 @@ fn validate_library_filename(input: &str) -> Option<ValidatedLibraryFilename> {
     })
 }
 
-async fn reserve_upload_destination(
+fn reserve_upload_destination(
     folder: &std::path::Path,
     original_name: &str,
     stem: &str,
     ext: &str,
-) -> Result<(String, PathBuf, PathBuf), String> {
-    for counter in 0_u32.. {
+) -> Result<(String, PathBuf, RemovePathOnDrop), String> {
+    for counter in 0..MAX_UPLOAD_DESTINATION_ATTEMPTS {
         let candidate = if counter == 0 {
             original_name.to_string()
         } else {
@@ -500,49 +1222,67 @@ async fn reserve_upload_destination(
             continue;
         }
         let reservation_path = folder.join(format!(".upload-reserve-{candidate}"));
-        match tokio::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&reservation_path)
-            .await
         {
             Ok(file) => {
                 drop(file);
+                let reservation = RemovePathOnDrop::new(reservation_path);
                 // Cover files created by another process between our first
                 // existence check and reservation.
                 if final_path.exists() {
-                    let _ = tokio::fs::remove_file(&reservation_path).await;
+                    drop(reservation);
                     continue;
                 }
-                return Ok((candidate, final_path, reservation_path));
+                return Ok((candidate, final_path, reservation));
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(format!("reserve destination: {error}")),
         }
     }
-    unreachable!("u32 upload suffix space exhausted")
+    Err(format!(
+        "could not reserve a destination after {MAX_UPLOAD_DESTINATION_ATTEMPTS} names"
+    ))
 }
 
-async fn create_unique_upload_temp(
-    folder: &std::path::Path,
-) -> Result<(PathBuf, tokio::fs::File), String> {
-    for _ in 0..8 {
-        let mut random = [0_u8; 16];
-        getrandom::fill(&mut random).map_err(|error| format!("upload entropy: {error}"))?;
-        let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-        let path = folder.join(format!(".upload-{suffix}.part"));
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await
-        {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("create upload temp: {error}")),
+#[derive(Debug)]
+struct RemovePathOnDrop {
+    path: Option<PathBuf>,
+}
+
+impl RemovePathOnDrop {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn remove(mut self) -> std::io::Result<()> {
+        let Some(path) = self.path.take() else {
+            return Ok(());
+        };
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
         }
     }
-    Err("could not allocate a unique upload temp file".to_string())
+}
+
+impl Drop for RemovePathOnDrop {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Field order is deliberate: if a detached blocking probe finishes after
+/// its HTTP future was cancelled, the open file closes before the publication
+/// guard retries staging cleanup.
+struct SyncedUploadStaging {
+    file: std::fs::File,
+    publication: StagedPublication,
 }
 
 /// Whether a completed upload body is short of what the client declared.
@@ -560,6 +1300,89 @@ fn upload_is_truncated(declared_length: Option<u64>, written: u64) -> bool {
     declared_length.is_some_and(|declared| written < declared)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct UploadDeadline {
+    started: Instant,
+    absolute: Duration,
+    idle: Duration,
+}
+
+impl UploadDeadline {
+    fn production() -> Self {
+        Self {
+            started: Instant::now(),
+            absolute: UPLOAD_ABSOLUTE_TIMEOUT,
+            idle: UPLOAD_CHUNK_IDLE_TIMEOUT,
+        }
+    }
+
+    fn remaining_at(self, now: Instant) -> Option<Duration> {
+        self.absolute
+            .checked_sub(now.checked_duration_since(self.started)?)
+    }
+
+    fn remaining(self) -> Option<Duration> {
+        self.remaining_at(Instant::now())
+    }
+
+    fn next_chunk_wait(self) -> Option<Duration> {
+        self.next_chunk_wait_at(Instant::now())
+    }
+
+    fn next_chunk_wait_at(self, now: Instant) -> Option<Duration> {
+        self.remaining_at(now)
+            .map(|remaining| remaining.min(self.idle))
+    }
+}
+
+fn upload_is_current(state: &WebState, server_generation: u64, library_generation: u64) -> bool {
+    state.control_server_generation_accepts_upload(server_generation)
+        && state.library_generation_is_current(library_generation)
+}
+
+fn cancelled_upload_response() -> Response {
+    (
+        StatusCode::CONFLICT,
+        "upload cancelled because the server or library changed",
+    )
+        .into_response()
+}
+
+fn upload_timeout_response(kind: &str) -> Response {
+    (
+        StatusCode::REQUEST_TIMEOUT,
+        format!("upload {kind} deadline expired"),
+    )
+        .into_response()
+}
+
+fn probe_uploaded_media(
+    staging: &FsPath,
+    extension: &str,
+    media_policy: &crate::media_safety::MediaSafetyPolicy,
+) -> Result<(), String> {
+    if crate::audio::is_supported_audio_extension(extension) {
+        crate::audio::clip::AudioClip::open(staging).map(|_| ())
+    } else if crate::layers::STILL_IMAGE_EXTENSIONS
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    {
+        crate::video::probe_still_image_dimensions_with_media_policy(
+            staging,
+            media_policy,
+            crate::media_safety::MediaDeviceLimits::none(),
+        )
+        .map(|_| ())
+    } else {
+        crate::video::VideoDecoder::probe_dimensions_with_media_policy(
+            &staging.to_string_lossy(),
+            media_policy,
+            crate::media_safety::MediaDeviceLimits::none(),
+        )
+        .map(|_| ())
+    }
+}
+
 /// Streamed clip upload into the library folder. The body is written in
 /// chunks to a temp file (never buffered whole in memory), renamed into
 /// place on success, and the render thread is asked to rescan. Names are
@@ -572,6 +1395,7 @@ async fn upload_handler(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Response {
+    let deadline = UploadDeadline::production();
     let Some(validated) = validate_library_filename(&query.name) else {
         return (StatusCode::BAD_REQUEST, "unsupported or unsafe filename").into_response();
     };
@@ -581,14 +1405,24 @@ async fn upload_handler(
         extension: ext,
     } = validated;
 
-    let declared_length = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
+    let declared_length = match headers.get(header::CONTENT_LENGTH) {
+        Some(value) => match value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            Some(length) => Some(length),
+            None => return (StatusCode::BAD_REQUEST, "invalid Content-Length").into_response(),
+        },
+        None => None,
+    };
     if declared_length.is_some_and(|length| exceeds_upload_limit(&ext, length)) {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
-            "audio upload exceeds the 512 MiB limit",
+            format!(
+                "upload exceeds the {}-byte limit for .{ext}",
+                upload_limit_for_extension(&ext)
+            ),
         )
             .into_response();
     }
@@ -600,67 +1434,263 @@ async fn upload_handler(
         )
             .into_response();
     };
+    let server_generation = state.control_server_generation();
+    let library_generation = state.library_generation();
+    if !upload_is_current(&state, server_generation, library_generation) {
+        return cancelled_upload_response();
+    }
 
-    // Atomically reserve a collision-free destination. This prevents two
-    // simultaneous same-name uploads from sharing either output or temp data.
-    let (final_name, final_path, reservation_path) =
-        match reserve_upload_destination(&folder, &name, &stem, &ext).await {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
-            }
-        };
-    let (temp_path, mut file) = match create_unique_upload_temp(&folder).await {
-        Ok(temp) => temp,
-        Err(error) => {
-            let _ = tokio::fs::remove_file(&reservation_path).await;
-            return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
-        }
-    };
-
-    let mut stream = body.into_data_stream();
-    let mut written: u64 = 0;
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(bytes) => {
-                if exceeds_upload_limit(&ext, written.saturating_add(bytes.len() as u64)) {
-                    drop(file);
-                    let _ = tokio::fs::remove_file(&temp_path).await;
-                    let _ = tokio::fs::remove_file(&reservation_path).await;
+    let admission = state.upload_admission();
+    match admission.begin_cleanup(library_generation) {
+        Ok(None) => {}
+        Ok(Some(cleanup_lease)) => {
+            let cleanup_folder = folder.clone();
+            let cleanup_job = tokio::task::spawn_blocking(move || {
+                let result = durable_file::cleanup_orphans(
+                    &cleanup_folder,
+                    &[".upload-stage-", ".upload-reserve-"],
+                    MAX_UPLOAD_ORPHAN_SCAN_ENTRIES,
+                );
+                if result.is_ok() {
+                    cleanup_lease.complete();
+                }
+                result
+            });
+            let Some(remaining) = deadline.remaining() else {
+                return upload_timeout_response("absolute");
+            };
+            match tokio::time::timeout(remaining, cleanup_job).await {
+                Ok(Ok(Ok(_))) => {}
+                Ok(Ok(Err(error))) => {
                     return (
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        "audio upload exceeds the 512 MiB limit",
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("upload orphan cleanup failed: {error}"),
                     )
                         .into_response();
                 }
-                if let Err(e) = file.write_all(&bytes).await {
-                    drop(file);
-                    let _ = tokio::fs::remove_file(&temp_path).await;
-                    let _ = tokio::fs::remove_file(&reservation_path).await;
-                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}"))
+                Ok(Err(error)) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("upload orphan cleanup worker failed: {error}"),
+                    )
                         .into_response();
                 }
-                written += bytes.len() as u64;
+                Err(_) => return upload_timeout_response("absolute"),
             }
-            Err(e) => {
-                drop(file);
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                let _ = tokio::fs::remove_file(&reservation_path).await;
-                return (StatusCode::BAD_REQUEST, format!("stream: {e}")).into_response();
+        }
+        Err(AdmissionError::CleanupBusy) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "library upload cleanup or prior-generation cancellation is still in progress",
+            )
+                .into_response();
+        }
+        Err(_) => unreachable!("begin_cleanup only returns CleanupBusy"),
+    }
+
+    // A chunked request reserves its complete per-file ceiling up front. That
+    // makes aggregate and disk admission truthful even before the first byte
+    // arrives; the lease releases automatically on every disconnect/error.
+    let reserved_bytes = declared_length
+        .unwrap_or_else(|| upload_limit_for_extension(&ext))
+        .max(1);
+    let disk_folder = folder.clone();
+    let disk_job = tokio::task::spawn_blocking(move || durable_file::available_space(&disk_folder));
+    let Some(remaining) = deadline.remaining() else {
+        return upload_timeout_response("absolute");
+    };
+    let available_bytes = match tokio::time::timeout(remaining, disk_job).await {
+        Ok(Ok(Ok(bytes))) => bytes,
+        Ok(Ok(Err(error))) => {
+            return (
+                StatusCode::INSUFFICIENT_STORAGE,
+                format!("cannot inspect library disk headroom: {error}"),
+            )
+                .into_response();
+        }
+        Ok(Err(error)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("disk-headroom worker failed: {error}"),
+            )
+                .into_response();
+        }
+        Err(_) => return upload_timeout_response("absolute"),
+    };
+    let _lease = match admission.try_reserve(
+        reserved_bytes,
+        available_bytes,
+        AdmissionLimits {
+            max_concurrent: MAX_CONCURRENT_UPLOADS,
+            max_reserved_bytes: MAX_UPLOAD_AGGREGATE_BYTES,
+            min_free_after_reservations: MIN_UPLOAD_DISK_HEADROOM_BYTES,
+        },
+    ) {
+        Ok(lease) => lease,
+        Err(AdmissionError::Concurrency) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "at most two browser uploads may run concurrently",
+            )
+                .into_response();
+        }
+        Err(AdmissionError::AggregateBytes) => {
+            return (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "aggregate upload-byte reservations are full",
+            )
+                .into_response();
+        }
+        Err(AdmissionError::DiskHeadroom) => {
+            return (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "upload would consume the required library disk headroom",
+            )
+                .into_response();
+        }
+        Err(AdmissionError::CleanupBusy) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "library upload cleanup is still in progress",
+            )
+                .into_response();
+        }
+    };
+
+    // Atomically reserve a collision-free destination. This prevents two
+    // simultaneous same-name uploads from sharing either output or temp data.
+    let Some(wait) = deadline.next_chunk_wait() else {
+        return upload_timeout_response("absolute");
+    };
+    let reservation_folder = folder.clone();
+    let reservation_name = name.clone();
+    let reservation_stem = stem.clone();
+    let reservation_extension = ext.clone();
+    let reservation_job = tokio::task::spawn_blocking(move || {
+        reserve_upload_destination(
+            &reservation_folder,
+            &reservation_name,
+            &reservation_stem,
+            &reservation_extension,
+        )
+    });
+    let (final_name, final_path, reservation) =
+        match tokio::time::timeout(wait, reservation_job).await {
+            Ok(Ok(Ok(reservation))) => reservation,
+            Ok(Ok(Err(error))) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+            }
+            Ok(Err(error)) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("upload destination worker failed: {error}"),
+                )
+                    .into_response();
+            }
+            Err(_) => return upload_timeout_response("idle"),
+        };
+    let staging_destination = final_path.clone();
+    let staging_job = tokio::task::spawn_blocking(move || {
+        StagedPublication::create(&staging_destination, "upload-stage")
+            .map(|(publication, file)| SyncedUploadStaging { file, publication })
+    });
+    let Some(remaining) = deadline.remaining() else {
+        return upload_timeout_response("absolute");
+    };
+    let staging = match tokio::time::timeout(remaining, staging_job).await {
+        Ok(Ok(Ok(staging))) => staging,
+        Ok(Ok(Err(error))) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("create upload staging file: {error}"),
+            )
+                .into_response();
+        }
+        Ok(Err(error)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("upload staging worker failed: {error}"),
+            )
+                .into_response();
+        }
+        Err(_) => return upload_timeout_response("absolute"),
+    };
+    let SyncedUploadStaging {
+        file: std_file,
+        publication,
+    } = staging;
+    let mut file = tokio::fs::File::from_std(std_file);
+
+    let mut stream = body.into_data_stream();
+    let mut written: u64 = 0;
+    loop {
+        if !upload_is_current(&state, server_generation, library_generation) {
+            return cancelled_upload_response();
+        }
+        let Some(absolute_remaining) = deadline.remaining() else {
+            return upload_timeout_response("absolute");
+        };
+        let wait = absolute_remaining.min(deadline.idle);
+        let chunk = match tokio::time::timeout(wait, stream.next()).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) if absolute_remaining <= deadline.idle => {
+                return upload_timeout_response("absolute");
+            }
+            Err(_) => return upload_timeout_response("idle"),
+        };
+        match chunk {
+            Ok(bytes) => {
+                let Some(next_written) = written.checked_add(bytes.len() as u64) else {
+                    return (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "upload byte count overflowed",
+                    )
+                        .into_response();
+                };
+                if exceeds_upload_limit(&ext, next_written)
+                    || declared_length.is_some_and(|declared| next_written > declared)
+                {
+                    return (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        format!(
+                            "upload exceeds its declared or {}-byte format limit",
+                            upload_limit_for_extension(&ext)
+                        ),
+                    )
+                        .into_response();
+                }
+                let Some(absolute_remaining) = deadline.remaining() else {
+                    return upload_timeout_response("absolute");
+                };
+                let wait = absolute_remaining.min(deadline.idle);
+                match tokio::time::timeout(wait, file.write_all(&bytes)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("write upload staging file: {error}"),
+                        )
+                            .into_response();
+                    }
+                    Err(_) if absolute_remaining <= deadline.idle => {
+                        return upload_timeout_response("absolute");
+                    }
+                    Err(_) => return upload_timeout_response("idle"),
+                }
+                written = next_written;
+            }
+            Err(error) => {
+                return (StatusCode::BAD_REQUEST, format!("upload stream: {error}"))
+                    .into_response();
             }
         }
     }
-    if file.flush().await.is_err() || written == 0 {
-        drop(file);
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        let _ = tokio::fs::remove_file(&reservation_path).await;
+    if written == 0 {
         return (StatusCode::BAD_REQUEST, "empty upload").into_response();
     }
     if upload_is_truncated(declared_length, written) {
         let declared = declared_length.unwrap_or_default();
-        drop(file);
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        let _ = tokio::fs::remove_file(&reservation_path).await;
         log::warn!(
             "Rejected truncated upload {name}: {written} of {declared} declared bytes arrived"
         );
@@ -670,19 +1700,144 @@ async fn upload_handler(
         )
             .into_response();
     }
-    drop(file);
-
-    if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        let _ = tokio::fs::remove_file(&reservation_path).await;
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("rename: {e}")).into_response();
+    if !upload_is_current(&state, server_generation, library_generation) {
+        return cancelled_upload_response();
     }
-    let _ = tokio::fs::remove_file(&reservation_path).await;
+    let Some(absolute_remaining) = deadline.remaining() else {
+        return upload_timeout_response("absolute");
+    };
+    let wait = absolute_remaining.min(deadline.idle);
+    match tokio::time::timeout(wait, file.flush()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("flush upload staging file: {error}"),
+            )
+                .into_response();
+        }
+        Err(_) if absolute_remaining <= deadline.idle => {
+            return upload_timeout_response("absolute");
+        }
+        Err(_) => return upload_timeout_response("idle"),
+    }
+
+    let Some(remaining) = deadline.remaining() else {
+        return upload_timeout_response("absolute");
+    };
+    let std_file = match tokio::time::timeout(remaining, file.into_std()).await {
+        Ok(file) => file,
+        Err(_) => return upload_timeout_response("absolute"),
+    };
+    let probe_extension = ext.clone();
+    let media_policy = state.upload_media_safety_policy();
+    let probe_job = tokio::task::spawn_blocking(move || -> Result<SyncedUploadStaging, String> {
+        let staging = SyncedUploadStaging {
+            file: std_file,
+            publication,
+        };
+        staging
+            .file
+            .sync_all()
+            .map_err(|error| format!("sync upload staging file: {error}"))?;
+        probe_uploaded_media(
+            staging.publication.staging_path(),
+            &probe_extension,
+            &media_policy,
+        )?;
+        Ok(staging)
+    });
+    let Some(remaining) = deadline.remaining() else {
+        return upload_timeout_response("absolute");
+    };
+    let staging = match tokio::time::timeout(remaining, probe_job).await {
+        Ok(Ok(Ok(staging))) => staging,
+        Ok(Ok(Err(error))) => return (StatusCode::UNSUPPORTED_MEDIA_TYPE, error).into_response(),
+        Ok(Err(error)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("media-safety probe worker failed: {error}"),
+            )
+                .into_response();
+        }
+        Err(_) => return upload_timeout_response("absolute"),
+    };
+    let SyncedUploadStaging {
+        file: std_file,
+        publication,
+    } = staging;
+
+    // The bounded body and media probe have now admitted one typed durable
+    // library mutation. Mint before the first final-path publication; staging
+    // transport failures above this point have no application action identity.
+    let mutation = LibraryMutationTerminalGuard::browser(state.clone());
+    let commit_state = state.clone();
+    let commit_job = tokio::task::spawn_blocking(move || {
+        finish_blocking_library_mutation(mutation, || {
+            commit_state.with_upload_publication_gate(|| {
+                if deadline.remaining().is_none() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "upload absolute deadline expired before publication",
+                    ));
+                }
+                if !upload_is_current(&commit_state, server_generation, library_generation) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "server or library generation changed before publication",
+                    ));
+                }
+                publication.commit_presynced(std_file, PublishMode::NoReplace)
+            })
+        })
+    });
+    let (commit, acknowledgement) = match commit_job.await {
+        Ok(result) => result,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "upload publication worker failed after its identity was terminalized: {error}"
+                ),
+            )
+                .into_response();
+        }
+    };
+    if let Err(error) = commit {
+        let (status, message) = match error.kind() {
+            std::io::ErrorKind::AlreadyExists => (
+                StatusCode::CONFLICT,
+                "the final upload name was claimed before publication".to_string(),
+            ),
+            std::io::ErrorKind::Interrupted => (
+                StatusCode::CONFLICT,
+                "upload cancelled because the server or library changed".to_string(),
+            ),
+            std::io::ErrorKind::TimedOut => (
+                StatusCode::REQUEST_TIMEOUT,
+                "upload absolute deadline expired".to_string(),
+            ),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("publish upload: {error}"),
+            ),
+        };
+        return library_mutation_response(status, acknowledgement, None, Some(message));
+    }
+    // The blocking owner terminalized the exact durable result before cleanup
+    // or the independent rescan enqueue, neither of which may relabel it.
+    match tokio::task::spawn_blocking(move || reservation.remove()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log::warn!("Upload reservation cleanup failed: {error}"),
+        Err(error) => log::warn!("Upload reservation cleanup worker failed: {error}"),
+    }
 
     log::info!("Uploaded clip: {final_name} ({written} bytes)");
-    let _ = state.enqueue_action(WebAction::RescanLibrary).await;
+    if state.library_generation_is_current(library_generation) {
+        let _ = state.enqueue_action(WebAction::RescanLibrary).await;
+    }
 
-    (StatusCode::OK, final_name).into_response()
+    library_mutation_response(StatusCode::OK, acknowledgement, Some(final_name), None)
 }
 
 #[derive(serde::Deserialize)]
@@ -711,19 +1866,29 @@ async fn delete_handler(
         return (StatusCode::NOT_FOUND, "clip not found").into_response();
     }
 
-    match tokio::task::spawn_blocking(move || trash::delete(&path)).await {
-        Ok(Ok(())) => {
+    let mutation = LibraryMutationTerminalGuard::browser(state.clone());
+    match tokio::task::spawn_blocking(move || {
+        finish_blocking_library_mutation(mutation, || trash::delete(&path))
+    })
+    .await
+    {
+        Ok((Ok(()), acknowledgement)) => {
             state.remove_library_media_cache_entry(&name);
             log::info!("Clip moved to Recycle Bin: {name}");
             let _ = state.enqueue_action(WebAction::RescanLibrary).await;
-            (StatusCode::OK, name).into_response()
+            library_mutation_response(StatusCode::OK, acknowledgement, Some(name), None)
         }
-        Ok(Err(e)) => (
+        Ok((Err(error), acknowledgement)) => library_mutation_response(
             StatusCode::CONFLICT,
-            format!("cannot remove (in use by a layer?): {e}"),
+            acknowledgement,
+            None,
+            Some(format!("cannot remove (in use by a layer?): {error}")),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("delete worker failed after its identity was terminalized: {error}"),
         )
             .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }
 
@@ -761,6 +1926,85 @@ async fn preview_handler(
         }
     }
     StatusCode::NOT_FOUND.into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct LibraryIndexQuery {
+    revision: Option<u64>,
+    offset: Option<u32>,
+    limit: Option<usize>,
+    query: Option<String>,
+    kind: Option<String>,
+}
+
+/// Authenticated, revision-checked and explicitly bounded library paging.
+/// Searching a large (but capped) immutable index is kept off the async server
+/// executor so neither Main nor unrelated control requests inherit the scan.
+async fn library_index_handler(
+    Query(query): Query<LibraryIndexQuery>,
+    State(state): State<Arc<WebState>>,
+) -> Response {
+    let kind = match query.kind.as_deref().unwrap_or("visual") {
+        "all" => None,
+        value => match crate::library_index::LibraryEntryKind::parse(value) {
+            Some(kind) => Some(kind),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "library kind must be visual, audio, or all",
+                )
+                    .into_response();
+            }
+        },
+    };
+    let request = match crate::library_index::LibraryPageRequest::new(
+        query.revision,
+        query.offset.unwrap_or(0),
+        query
+            .limit
+            .unwrap_or(crate::library_index::LIBRARY_INDEX_DEFAULT_PAGE_SIZE),
+        query.query.as_deref(),
+        kind,
+    ) {
+        Ok(request) => request,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let permit = match library_page_gate().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "library page/search capacity is busy",
+            )
+                .into_response();
+        }
+    };
+    let index = state.library_index();
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        index.page(request)
+    })
+    .await
+    {
+        Ok(Ok(page)) => match serde_json::to_vec(&page) {
+            Ok(body) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                body,
+            )
+                .into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        Ok(Err(error @ crate::library_index::LibraryPageError::RevisionMismatch { .. })) => {
+            (StatusCode::CONFLICT, error.to_string()).into_response()
+        }
+        Ok(Err(error)) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "library page worker unavailable",
+        )
+            .into_response(),
+    }
 }
 
 fn safe_log_excerpt(text: &str) -> String {
@@ -1851,7 +3095,7 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
         | WebAction::RemoveScene { .. }
         | WebAction::TriggerScene { .. } => true,
         WebAction::AddSpoutLayer { sender } => valid_identifier(sender, 255),
-        WebAction::SetOutputDisplay { display_id } => {
+        WebAction::SetOutputDisplay { display_id, .. } => {
             display_id.is_empty()
                 || (display_id.len() <= 64
                     && display_id
@@ -2337,41 +3581,72 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<WebState>>) ->
 async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
     let client_id = state.allocate_client_id();
     let (mut sender, mut receiver) = socket.split();
-
-    // Send current state on connect
-    let current = state.app.read().await;
-    let init_msg = serde_json::to_string(&*current).unwrap();
-    drop(current);
-    let _ = sender.send(Message::Text(init_msg)).await;
-
-    // Subscribe to broadcast updates (state JSON)
+    // Subscribe first so Main can observe a real receiver, then request one
+    // fresh complete generation. This avoids maintaining or serializing a
+    // 30 Hz snapshot while no browser exists.
     let mut rx = state.tx.subscribe();
-    let send_state = state.clone();
+    let observed_generation = state.request_snapshot();
+    let fresh = tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            if state.full_snapshot_generation() > observed_generation {
+                let full = state.last_full_snapshot();
+                if !full.is_empty() {
+                    // Consume whatever newest-only value accompanied the full
+                    // publication. It may already be a later live-domain
+                    // sample; skipping that one is safer than applying any
+                    // delta before this socket has received its full base.
+                    let _ = rx.borrow_and_update();
+                    return Some(full);
+                }
+            }
+            if rx.changed().await.is_err() {
+                return None;
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    let init_msg = if let Some(message) = fresh {
+        message
+    } else {
+        // A stopped/blocked renderer still gets one bounded startup snapshot;
+        // ordinary production connects are fulfilled by Main on its next
+        // accepted frame and never take this fallback.
+        let current = state.app.read().await;
+        Arc::new(serde_json::to_string(&*current).unwrap_or_else(|_| "{}".to_string()))
+    };
+    if sender
+        .send(Message::Text(init_msg.as_ref().clone()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    // Action dispositions are a separate bounded reliable stream. They are
+    // never coalesced with newest-only state and therefore cannot disappear
+    // merely because telemetry publishes again.
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel::<String>(64);
 
-    // Forward broadcasts to this client
+    // Forward newest-only state generations to this client. `watch` retains
+    // exactly one payload; a slow socket skips obsolete intermediates.
     let mut send_task = tokio::spawn(async move {
         loop {
-            let msg = match rx.recv().await {
-                Ok(msg) => msg,
-                Err(RecvError::Lagged(_)) => {
-                    // A temporarily slow socket does not need every stale
-                    // 30 Hz snapshot. Jump to the live edge and send one
-                    // fresh state instead of disconnecting/reconnecting.
-                    let current = send_state.app.read().await;
-                    let fresh = match serde_json::to_string(&*current) {
-                        Ok(fresh) => fresh,
-                        Err(error) => {
-                            log::warn!("Failed to serialize lag recovery state: {error}");
-                            continue;
-                        }
-                    };
-                    drop(current);
-                    rx = rx.resubscribe();
-                    fresh
+            let message = tokio::select! {
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    rx.borrow_and_update().as_ref().clone()
                 }
-                Err(RecvError::Closed) => break,
+                ack = ack_rx.recv() => {
+                    let Some(ack) = ack else {
+                        break;
+                    };
+                    ack
+                }
             };
-            if sender.send(Message::Text(msg)).await.is_err() {
+            if sender.send(Message::Text(message)).await.is_err() {
                 break;
             }
         }
@@ -2382,74 +3657,148 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
     // If a tab disappears mid-drag, publish an ordered End on disconnect so
     // Main records the final authored value (or an exact no-op) instead of
     // remaining permanently blocked by an orphaned gesture.
+    let socket_ack_tx = ack_tx.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             if let Message::Text(text) = msg {
                 // Try to parse as a WebAction
-                match serde_json::from_str::<WebAction>(&text) {
-                    Ok(action) if valid_action(&action, 0) => match action {
-                        WebAction::GyroStream { enabled } => {
-                            state_clone.set_gyro_stream(client_id, enabled);
+                match super::action_wire::parse_web_action::<WebAction>(text.as_bytes()) {
+                    Ok(action) => {
+                        // Mint at the typed parse edge, before semantic/gesture
+                        // validation or any socket-local mutation. Every valid
+                        // WebAction therefore gets one engine sequence even
+                        // when it never enters Main's bounded queue.
+                        let envelope = state_clone.envelope_web_action(action);
+                        let terminal =
+                            state_clone.action_ingress_terminal_guard(envelope.identity());
+                        if !valid_action(envelope.payload(), 0) {
+                            send_guarded_socket_refusal(
+                                &socket_ack_tx,
+                                terminal,
+                                "invalid_payload",
+                            )
+                            .await;
+                            log::warn!("Rejected invalid WebAction payload");
+                            continue;
                         }
-                        WebAction::MonitorWatch { enabled } => {
-                            state_clone.set_monitor_watch(client_id, enabled);
-                        }
-                        action @ WebAction::Gyro { .. } => {
-                            let outcome = state_clone.enqueue_action(action).await;
-                            if outcome != EnqueueOutcome::Dropped {
-                                state_clone.note_gyro_sample(client_id);
+                        match envelope.payload() {
+                            WebAction::GyroStream { enabled } => {
+                                let identity = envelope.identity();
+                                let changed = state_clone.set_gyro_stream(client_id, *enabled);
+                                debug_assert_eq!(terminal.identity(), identity);
+                                let acknowledgement = terminal.terminalize(if changed {
+                                    crate::action_correlation::ActionDisposition::Coalesced
+                                } else {
+                                    crate::action_correlation::ActionDisposition::Refused
+                                });
+                                send_socket_ack(&socket_ack_tx, acknowledgement).await;
                             }
-                        }
-                        action @ WebAction::BeginHistoryGesture { gesture_id } => {
-                            if !state_clone
-                                .begin_browser_history_gesture(client_id, gesture_id)
-                                .await
-                            {
-                                log::warn!("Rejected nested browser history gesture");
-                                continue;
+                            WebAction::MonitorWatch { enabled } => {
+                                let identity = envelope.identity();
+                                let changed = state_clone.set_monitor_watch(client_id, *enabled);
+                                debug_assert_eq!(terminal.identity(), identity);
+                                let acknowledgement = terminal.terminalize(if changed {
+                                    crate::action_correlation::ActionDisposition::Coalesced
+                                } else {
+                                    crate::action_correlation::ActionDisposition::Refused
+                                });
+                                send_socket_ack(&socket_ack_tx, acknowledgement).await;
                             }
-                            if state_clone.enqueue_action(action).await == EnqueueOutcome::Dropped {
-                                state_clone
-                                    .finish_browser_history_gesture(client_id, gesture_id)
-                                    .await;
+                            WebAction::Gyro { .. } => {
+                                let outcome = enqueue_socket_action(
+                                    &state_clone,
+                                    &socket_ack_tx,
+                                    envelope,
+                                    terminal,
+                                )
+                                .await;
+                                if outcome != EnqueueOutcome::Dropped {
+                                    state_clone.note_gyro_sample(client_id);
+                                }
                             }
-                        }
-                        action @ (WebAction::EndHistoryGesture { gesture_id }
-                        | WebAction::CancelHistoryGesture { gesture_id }) => {
-                            let cancel = matches!(&action, WebAction::CancelHistoryGesture { .. });
-                            if !state_clone
-                                .may_finish_browser_history_gesture(client_id, gesture_id, cancel)
-                                .await
-                            {
-                                log::warn!(
-                                    "Rejected mismatched or dirty-cancel browser history boundary"
+                            WebAction::BeginHistoryGesture { gesture_id } => {
+                                let gesture_id = *gesture_id;
+                                match state_clone
+                                    .enqueue_browser_history_begin_with_ack(
+                                        client_id, gesture_id, envelope, terminal,
+                                    )
+                                    .await
+                                {
+                                    Ok((_, acknowledgement)) => {
+                                        send_socket_ack(&socket_ack_tx, acknowledgement).await;
+                                    }
+                                    Err(acknowledgement) => {
+                                        send_socket_ack_with_reason(
+                                            &socket_ack_tx,
+                                            acknowledgement,
+                                            "gesture_boundary",
+                                        )
+                                        .await;
+                                        log::warn!("Rejected nested browser history gesture");
+                                    }
+                                }
+                            }
+                            WebAction::EndHistoryGesture { gesture_id }
+                            | WebAction::CancelHistoryGesture { gesture_id } => {
+                                let gesture_id = *gesture_id;
+                                let cancel = matches!(
+                                    envelope.payload(),
+                                    WebAction::CancelHistoryGesture { .. }
                                 );
-                                continue;
+                                match state_clone
+                                    .enqueue_browser_history_finish_with_ack(
+                                        client_id, gesture_id, cancel, envelope, terminal,
+                                    )
+                                    .await
+                                {
+                                    Ok((_, acknowledgement)) => {
+                                        send_socket_ack(&socket_ack_tx, acknowledgement).await;
+                                    }
+                                    Err(acknowledgement) => {
+                                        send_socket_ack_with_reason(
+                                            &socket_ack_tx,
+                                            acknowledgement,
+                                            "gesture_boundary",
+                                        )
+                                        .await;
+                                        log::warn!(
+                                            "Rejected mismatched or dirty-cancel browser history boundary"
+                                        );
+                                    }
+                                }
                             }
-                            if state_clone.enqueue_action(action).await != EnqueueOutcome::Dropped {
-                                state_clone
-                                    .finish_browser_history_gesture(client_id, gesture_id)
-                                    .await;
+                            _ => {
+                                match state_clone
+                                    .enqueue_browser_action_during_gesture_with_ack(
+                                        client_id, envelope, terminal,
+                                    )
+                                    .await
+                                {
+                                    Ok((_, acknowledgement)) => {
+                                        send_socket_ack(&socket_ack_tx, acknowledgement).await;
+                                    }
+                                    Err(acknowledgement) => {
+                                        send_socket_ack_with_reason(
+                                            &socket_ack_tx,
+                                            acknowledgement,
+                                            "gesture_ownership",
+                                        )
+                                        .await;
+                                        log::warn!(
+                                            "Rejected cross-controller or cross-destination history action"
+                                        );
+                                    }
+                                }
                             }
                         }
-                        action => {
-                            if !state_clone
-                                .admit_browser_action_during_gesture(client_id, &action)
-                                .await
-                            {
-                                log::warn!(
-                                    "Rejected cross-controller or cross-destination history action"
-                                );
-                                continue;
-                            }
-                            let _ = state_clone.enqueue_action(action).await;
-                        }
-                    },
-                    Ok(_) => log::warn!("Rejected invalid WebAction payload"),
-                    Err(error) => log::warn!(
-                        "Failed to parse WebAction: {error} - excerpt: {}",
-                        safe_log_excerpt(&text)
-                    ),
+                    }
+                    Err(error) => {
+                        send_uncorrelated_socket_refusal(&socket_ack_tx, "invalid_json").await;
+                        log::warn!(
+                            "Failed to parse WebAction: {error} - excerpt: {}",
+                            safe_log_excerpt(&text)
+                        );
+                    }
                 }
             }
         }
@@ -2473,12 +3822,183 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
     state.disconnect_monitor_client(client_id);
 }
 
+async fn enqueue_socket_action(
+    state: &Arc<WebState>,
+    acknowledgements: &tokio::sync::mpsc::Sender<String>,
+    action: crate::action_correlation::ActionEnvelope<WebAction>,
+    terminal: ActionIngressTerminalGuard,
+) -> EnqueueOutcome {
+    let (outcome, acknowledgement) = state
+        .enqueue_guarded_action_with_ack(action, terminal)
+        .await;
+    send_socket_ack(acknowledgements, acknowledgement).await;
+    outcome
+}
+
+async fn send_socket_ack(
+    acknowledgements: &tokio::sync::mpsc::Sender<String>,
+    acknowledgement: super::state::ActionIngressAck,
+) {
+    if let Ok(message) = serde_json::to_string(&acknowledgement) {
+        let _ = acknowledgements.send(message).await;
+    }
+}
+
+#[cfg(test)]
+async fn send_correlated_socket_refusal(
+    state: &Arc<WebState>,
+    acknowledgements: &tokio::sync::mpsc::Sender<String>,
+    identity: crate::action_correlation::ActionIdentity,
+    reason_code: &'static str,
+) {
+    let guard = state.action_ingress_terminal_guard(identity);
+    send_guarded_socket_refusal(acknowledgements, guard, reason_code).await;
+}
+
+async fn send_guarded_socket_refusal(
+    acknowledgements: &tokio::sync::mpsc::Sender<String>,
+    terminal: ActionIngressTerminalGuard,
+    reason_code: &'static str,
+) {
+    let acknowledgement =
+        terminal.terminalize(crate::action_correlation::ActionDisposition::Refused);
+    send_socket_ack_with_reason(acknowledgements, acknowledgement, reason_code).await;
+}
+
+async fn send_socket_ack_with_reason(
+    acknowledgements: &tokio::sync::mpsc::Sender<String>,
+    acknowledgement: ActionIngressAck,
+    reason_code: &'static str,
+) {
+    let message = serde_json::json!({
+        "type": acknowledgement.kind,
+        "sequence": acknowledgement.sequence,
+        "disposition": acknowledgement.disposition,
+        "reason_code": reason_code,
+    })
+    .to_string();
+    let _ = acknowledgements.send(message).await;
+}
+
+async fn send_uncorrelated_socket_refusal(
+    acknowledgements: &tokio::sync::mpsc::Sender<String>,
+    reason_code: &'static str,
+) {
+    let message = serde_json::json!({
+        // Malformed JSON has no typed ActionEnvelope and therefore cannot
+        // truthfully carry the non-zero engine ActionSequence vocabulary.
+        "type": "transport_refusal",
+        "reason_code": reason_code,
+    })
+    .to_string();
+    let _ = acknowledgements.send(message).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
     use axum::http::HeaderValue;
+    use tokio::io::AsyncReadExt as _;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+    const FIRST_TEST_TOKEN: &str = "11111111111111111111111111111111";
+    const SECOND_TEST_TOKEN: &str = "22222222222222222222222222222222";
+
+    fn control_test_dir(label: &str) -> PathBuf {
+        let mut random = [0_u8; 8];
+        getrandom::fill(&mut random).unwrap();
+        std::env::temp_dir().join(format!(
+            "collide-o-scope-control-{label}-{}-{}",
+            std::process::id(),
+            hex_lower(&random)
+        ))
+    }
+
+    fn available_port_pair() -> u16 {
+        for _ in 0..128 {
+            let base = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = base.local_addr().unwrap().port();
+            if port == u16::MAX {
+                continue;
+            }
+            let lan = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port + 1));
+            if let Ok(lan) = lan {
+                drop(lan);
+                drop(base);
+                return port;
+            }
+        }
+        panic!("could not reserve an adjacent control-server port pair");
+    }
+
+    fn test_start_config(
+        base_port: u16,
+        identity_dir: &FsPath,
+        token: &str,
+        faults: StartFaults,
+    ) -> StartConfig {
+        StartConfig {
+            base_port,
+            lan_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
+            identity_dir: identity_dir.to_path_buf(),
+            token_seed: Some(token.to_string()),
+            faults,
+        }
+    }
+
+    async fn start_test_router(
+        state: Arc<WebState>,
+        session: Arc<ControlSession>,
+        role: ListenerRole,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                control_router(state, session, role)
+                    .into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        (address, server)
+    }
+
+    async fn raw_http_get(address: SocketAddr, target: &str, extra_headers: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n{extra_headers}\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("HTTP response timed out")
+            .unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    fn response_headers(response: &str) -> &str {
+        response.split_once("\r\n\r\n").unwrap().0
+    }
+
+    fn response_cookie(response: &str, name: &str) -> String {
+        response_headers(response)
+            .lines()
+            .find_map(|line| {
+                let (header, value) = line.split_once(':')?;
+                (header.eq_ignore_ascii_case("set-cookie")
+                    && value.trim_start().starts_with(&format!("{name}=")))
+                .then(|| value.trim().split(';').next().unwrap().to_string())
+            })
+            .expect("authenticated query did not mint its listener cookie")
+    }
 
     #[test]
     fn a_short_upload_body_is_refused_rather_than_published_as_a_clip() {
@@ -2506,6 +4026,292 @@ mod tests {
         assert!(!upload_is_truncated(None, 170));
     }
 
+    #[test]
+    fn upload_deadline_has_independent_idle_and_absolute_bounds() {
+        let started = Instant::now();
+        let deadline = UploadDeadline {
+            started,
+            absolute: Duration::from_secs(10),
+            idle: Duration::from_secs(3),
+        };
+        assert_eq!(
+            deadline.remaining_at(started + Duration::from_secs(4)),
+            Some(Duration::from_secs(6))
+        );
+        assert_eq!(
+            deadline
+                .next_chunk_wait_at(started + Duration::from_secs(4))
+                .unwrap(),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            deadline.remaining_at(started + Duration::from_secs(10)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            deadline.remaining_at(started + Duration::from_secs(11)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_still_upload_uses_probe_and_durable_no_replace_publication() {
+        use image::ImageEncoder as _;
+
+        let folder = control_test_dir("durable-upload");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join(".upload-stage-crash.part"), b"partial").unwrap();
+        fs::write(folder.join(".upload-reserve-crash.png"), b"").unwrap();
+        let state = WebState::new().unwrap();
+        *state.library_folder.write().unwrap() = Some(folder.clone());
+        let library_generation = state.begin_library_generation();
+        let server_generation = state.begin_control_server_generation();
+        assert!(upload_is_current(
+            &state,
+            server_generation,
+            library_generation
+        ));
+
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[0, 0, 0, 0], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&png.len().to_string()).unwrap(),
+        );
+        let response = upload_handler(
+            State(state.clone()),
+            Query(UploadQuery {
+                name: "atomic.png".to_string(),
+            }),
+            headers,
+            axum::body::Body::from(png.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 2048)
+            .await
+            .unwrap();
+        let acknowledgement: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(acknowledgement["type"], "action_ack");
+        assert_eq!(acknowledgement["sequence"], 1);
+        assert_eq!(acknowledgement["disposition"], "coalesced");
+        assert_eq!(acknowledgement["name"], "atomic.png");
+        assert_eq!(fs::read(folder.join("atomic.png")).unwrap(), png);
+        assert!(fs::read_dir(&folder).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".upload-")
+        }));
+        let mut actions = state.actions.lock().await;
+        assert!(matches!(
+            actions.pop().map(|action| action.into_payload()),
+            Some(WebAction::RescanLibrary)
+        ));
+        drop(actions);
+        let receipts = state.action_receipts_for_test();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].sequence.get(), 1);
+        assert_eq!(
+            receipts[0].disposition,
+            crate::action_correlation::ActionDisposition::Coalesced,
+        );
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_library_mutation_identity_is_exact_on_error_and_full_queue() {
+        use crate::action_correlation::{ActionDisposition, ActionSourceClass};
+
+        let state = WebState::new().unwrap();
+        {
+            let mut actions = state.actions.lock().await;
+            for _ in 0..super::super::state::MAX_PENDING_ACTIONS {
+                actions.push(state.action_sequencer().envelope(
+                    ActionSourceClass::Browser,
+                    WebAction::RestoreRecoveryJournal,
+                ));
+            }
+        }
+
+        let admitted = LibraryMutationTerminalGuard::browser(state.clone());
+        let acknowledgement = admitted.finish(ActionDisposition::Coalesced);
+        assert!(acknowledgement.sequence > super::super::state::MAX_PENDING_ACTIONS as u64);
+        assert_eq!(
+            acknowledgement.disposition,
+            super::super::state::ActionIngressDisposition::Coalesced,
+        );
+
+        let refused_sequence = acknowledgement.sequence + 1;
+        drop(LibraryMutationTerminalGuard::browser(state.clone()));
+        let receipts = state.action_receipts_for_test();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].sequence.get(), acknowledgement.sequence);
+        assert_eq!(receipts[0].disposition, ActionDisposition::Coalesced);
+        assert_eq!(receipts[1].sequence.get(), refused_sequence);
+        assert_eq!(receipts[1].disposition, ActionDisposition::Refused);
+        assert_eq!(
+            state.actions.lock().await.len(),
+            super::super::state::MAX_PENDING_ACTIONS
+        );
+
+        // Once spawn_blocking starts, aborting/dropping the async JoinHandle
+        // does not stop the irreversible worker. The identity therefore lives
+        // with that worker and reflects its durable result, not handler life.
+        let detached_state = WebState::new().unwrap();
+        let mutation = LibraryMutationTerminalGuard::browser(detached_state.clone());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            finish_blocking_library_mutation(mutation, || Ok::<_, ()>(()))
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocking mutation did not start");
+        worker.abort();
+        drop(worker);
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let receipts = detached_state.action_receipts_for_test();
+            if !receipts.is_empty() {
+                assert_eq!(receipts.len(), 1);
+                assert_eq!(receipts[0].sequence.get(), 1);
+                assert_eq!(receipts[0].disposition, ActionDisposition::Coalesced);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "detached mutation lost its identity"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn delete_endpoint_correlates_the_actual_recycle_bin_mutation() {
+        let folder = control_test_dir("correlated-delete");
+        fs::create_dir(&folder).unwrap();
+        let path = folder.join("delete-me.png");
+        fs::write(&path, b"temporary delete fixture").unwrap();
+        let state = WebState::new().unwrap();
+        *state.library_folder.write().unwrap() = Some(folder.clone());
+
+        let response = delete_handler(
+            State(state.clone()),
+            Query(DeleteQuery {
+                name: "delete-me.png".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 2048)
+            .await
+            .unwrap();
+        let acknowledgement: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(acknowledgement["type"], "action_ack");
+        assert_eq!(acknowledgement["sequence"], 1);
+        assert_eq!(acknowledgement["disposition"], "coalesced");
+        assert_eq!(acknowledgement["name"], "delete-me.png");
+        assert!(!path.exists());
+        let receipts = state.action_receipts_for_test();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].disposition,
+            crate::action_correlation::ActionDisposition::Coalesced,
+        );
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_and_failed_media_probe_leave_no_final_or_staging_file() {
+        let folder = control_test_dir("cancelled-upload");
+        fs::create_dir(&folder).unwrap();
+        let state = WebState::new().unwrap();
+        *state.library_folder.write().unwrap() = Some(folder.clone());
+        state.begin_library_generation();
+        state.begin_control_server_generation();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("8"));
+        let disconnected = axum::body::Body::from_stream(futures::stream::iter([
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"part")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "injected disconnect",
+            )),
+        ]));
+        let response = upload_handler(
+            State(state.clone()),
+            Query(UploadQuery {
+                name: "disconnected.png".to_string(),
+            }),
+            headers,
+            disconnected,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!folder.join("disconnected.png").exists());
+
+        let bytes = b"not a real PNG";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&bytes.len().to_string()).unwrap(),
+        );
+        let response = upload_handler(
+            State(state.clone()),
+            Query(UploadQuery {
+                name: "hostile.png".to_string(),
+            }),
+            headers,
+            axum::body::Body::from(axum::body::Bytes::from_static(bytes)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(!folder.join("hostile.png").exists());
+        assert!(state.actions.lock().await.is_empty());
+        assert!(fs::read_dir(&folder).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".upload-")
+        }));
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn server_stop_and_library_generation_are_upload_cancellation_barriers() {
+        let state = WebState::new().unwrap();
+        let library_generation = state.begin_library_generation();
+        let server_generation = state.begin_control_server_generation();
+        assert!(upload_is_current(
+            &state,
+            server_generation,
+            library_generation
+        ));
+        state.mark_control_server_stopping(server_generation);
+        assert!(!upload_is_current(
+            &state,
+            server_generation,
+            library_generation
+        ));
+
+        let next_server = state.begin_control_server_generation();
+        let next_library = state.begin_library_generation();
+        assert!(upload_is_current(&state, next_server, next_library));
+        state.begin_library_generation();
+        assert!(!upload_is_current(&state, next_server, next_library));
+    }
+
     #[tokio::test]
     async fn controller_profile_endpoint_is_bounded_pathless_and_exports_latest_publication() {
         let state = WebState::new().expect("test access token");
@@ -2531,6 +4337,44 @@ mod tests {
             published
         );
 
+        // A malformed transport payload has no typed action and therefore
+        // consumes neither an engine sequence nor a correlation receipt.
+        let malformed =
+            controller_profile_handler(State(state.clone()), axum::body::Bytes::from_static(b"{"))
+                .await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert!(state.action_receipts_for_test().is_empty());
+
+        // Structural decoding succeeds, then semantic validation refuses the
+        // action under the first real engine-owned identity.
+        let semantic_invalid = crate::controller_profile::ControllerProfileAction::Import {
+            document: crate::controller_profile::ControllerProfileDocument {
+                version: 0,
+                ..Default::default()
+            },
+        };
+        let semantic_invalid = serde_json::to_vec(&semantic_invalid).unwrap();
+        let semantic_invalid = controller_profile_handler(
+            State(state.clone()),
+            axum::body::Bytes::from(semantic_invalid),
+        )
+        .await;
+        assert_eq!(semantic_invalid.status(), StatusCode::BAD_REQUEST);
+        let semantic_ack = axum::body::to_bytes(semantic_invalid.into_body(), 1024)
+            .await
+            .unwrap();
+        let semantic_ack: serde_json::Value = serde_json::from_slice(&semantic_ack).unwrap();
+        assert_eq!(semantic_ack["type"], "action_ack");
+        assert_eq!(semantic_ack["sequence"], 1);
+        assert_eq!(semantic_ack["disposition"], "refused");
+        let receipts = state.action_receipts_for_test();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].sequence.get(), 1);
+        assert_eq!(
+            receipts[0].disposition,
+            crate::action_correlation::ActionDisposition::Refused,
+        );
+
         let imported = crate::controller_profile::ControllerProfileDocument {
             name: "Queued browser import".to_string(),
             ..Default::default()
@@ -2542,33 +4386,102 @@ mod tests {
         .unwrap();
         let response = controller_profile_handler(State(state.clone()), request.into()).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let acknowledgement = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let acknowledgement: serde_json::Value = serde_json::from_slice(&acknowledgement).unwrap();
+        assert_eq!(acknowledgement["type"], "action_ack");
+        assert_eq!(acknowledgement["sequence"], 2);
+        assert_eq!(acknowledgement["disposition"], "queued");
         let mut actions = state.actions.lock().await;
+        let action = actions.pop().expect("correlated controller import");
+        assert_eq!(action.sequence().get(), 2);
         assert!(matches!(
-            actions.pop(),
-            Some(WebAction::ControllerProfile {
+            action.into_payload(),
+            WebAction::ControllerProfile {
                 request: crate::controller_profile::ControllerProfileAction::Import { document }
-            }) if document == imported
+            } if document == imported
         ));
+    }
+
+    #[tokio::test]
+    async fn socket_local_meta_and_semantic_refusals_ack_their_real_engine_sequence() {
+        use crate::action_correlation::{ActionDisposition, ActionSourceClass};
+
+        let state = WebState::new().expect("test access token");
+        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel(8);
+
+        let gyro = state.envelope_web_action(WebAction::GyroStream { enabled: true });
+        let gyro_identity = gyro.identity();
+        assert_eq!(gyro_identity.source(), ActionSourceClass::Phone);
+        assert!(state.set_gyro_stream(7, true));
+        let acknowledgement =
+            state.terminal_action_identity_with_ack(gyro_identity, ActionDisposition::Coalesced);
+        send_socket_ack(&ack_tx, acknowledgement).await;
+        let gyro_ack = ack_rx.recv().await.expect("gyro acknowledgement");
+        let gyro_ack: serde_json::Value = serde_json::from_str(&gyro_ack).unwrap();
+        assert_eq!(gyro_ack["sequence"], 1);
+        assert_eq!(gyro_ack["disposition"], "coalesced");
+        assert!(gyro_ack.get("enabled").is_none());
+
+        let watch = state.envelope_web_action(WebAction::MonitorWatch { enabled: true });
+        let watch_identity = watch.identity();
+        assert_eq!(watch_identity.source(), ActionSourceClass::Browser);
+        assert!(state.set_monitor_watch(7, true));
+        let acknowledgement =
+            state.terminal_action_identity_with_ack(watch_identity, ActionDisposition::Coalesced);
+        send_socket_ack(&ack_tx, acknowledgement).await;
+        let watch_ack = ack_rx.recv().await.expect("watch acknowledgement");
+        let watch_ack: serde_json::Value = serde_json::from_str(&watch_ack).unwrap();
+        assert_eq!(watch_ack["sequence"], 2);
+        assert_eq!(watch_ack["disposition"], "coalesced");
+
+        let invalid = state.envelope_web_action(WebAction::SetProxySettings {
+            scale: crate::proxy::ProxyScale::Half,
+            frame_rate: crate::proxy::ProxyFrameRate::Fixed {
+                numerator: 0,
+                denominator: 1,
+            },
+            include_audio: true,
+        });
+        assert!(!valid_action(invalid.payload(), 0));
+        send_correlated_socket_refusal(&state, &ack_tx, invalid.identity(), "invalid_payload")
+            .await;
+        let invalid_ack = ack_rx.recv().await.expect("invalid acknowledgement");
+        let invalid_ack: serde_json::Value = serde_json::from_str(&invalid_ack).unwrap();
+        assert_eq!(invalid_ack["sequence"], 3);
+        assert_eq!(invalid_ack["disposition"], "refused");
+        assert_eq!(invalid_ack["reason_code"], "invalid_payload");
+        assert!(invalid_ack.get("param").is_none());
+
+        let receipts = state.action_receipts_for_test();
+        assert_eq!(receipts.len(), 3);
+        assert_eq!(receipts[0].disposition, ActionDisposition::Coalesced);
+        assert_eq!(receipts[1].disposition, ActionDisposition::Coalesced);
+        assert_eq!(receipts[2].disposition, ActionDisposition::Refused);
     }
 
     #[tokio::test]
     async fn authenticated_websocket_round_trip_dispatches_and_returns_authoritative_state() {
         let state = WebState::new().expect("test access token");
+        let session = ControlSession::random().expect("test access token");
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
         let server_state = state.clone();
+        let server_session = session.clone();
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                control_router(server_state).into_make_service_with_connect_info::<SocketAddr>(),
+                control_router(server_state, server_session, ListenerRole::LoopbackIpv4)
+                    .into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
             .unwrap();
         });
 
-        let mut request = format!("ws://{address}/ws?key={}", state.access_token)
+        let mut request = format!("ws://{address}/ws?key={}", session.token.0)
             .into_client_request()
             .unwrap();
         request.headers_mut().insert(
@@ -2595,6 +4508,54 @@ mod tests {
         let snapshot: crate::web::state::AppSnapshot = serde_json::from_str(&initial).unwrap();
         assert_eq!(snapshot.msg_type, "state");
 
+        socket
+            .send(ClientMessage::Text("{not-json".to_string()))
+            .await
+            .unwrap();
+        let transport_refusal =
+            tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+                .await
+                .expect("malformed transport refusal timed out")
+                .expect("server closed before malformed transport refusal")
+                .expect("malformed transport refusal frame");
+        let ClientMessage::Text(transport_refusal) = transport_refusal else {
+            panic!("expected malformed transport-refusal text");
+        };
+        let transport_refusal: serde_json::Value =
+            serde_json::from_str(&transport_refusal).unwrap();
+        assert_eq!(transport_refusal["type"], "transport_refusal");
+        assert_eq!(transport_refusal["reason_code"], "invalid_json");
+        assert!(transport_refusal.get("sequence").is_none());
+        assert!(state.action_receipts_for_test().is_empty());
+
+        socket
+            .send(ClientMessage::Text(
+                r#"{"action":"set_proxy_settings","scale":"half","frame_rate":{"fixed":{"numerator":0,"denominator":1}},"include_audio":true}"#
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        let semantic_refusal =
+            tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+                .await
+                .expect("semantic action refusal timed out")
+                .expect("server closed before semantic action refusal")
+                .expect("semantic action refusal frame");
+        let ClientMessage::Text(semantic_refusal) = semantic_refusal else {
+            panic!("expected semantic action-refusal text");
+        };
+        let semantic_refusal: serde_json::Value = serde_json::from_str(&semantic_refusal).unwrap();
+        assert_eq!(semantic_refusal["type"], "action_ack");
+        assert_eq!(semantic_refusal["sequence"], 1);
+        assert_eq!(semantic_refusal["disposition"], "refused");
+        assert_eq!(semantic_refusal["reason_code"], "invalid_payload");
+        let receipts = state.action_receipts_for_test();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].disposition,
+            crate::action_correlation::ActionDisposition::Refused,
+        );
+
         for payload in [
             r#"{"action":"reset_fx"}"#,
             r#"{"action":"reset_visual_program"}"#,
@@ -2620,20 +4581,20 @@ mod tests {
         .expect("actions did not cross the real WebSocket ingress");
 
         let mut queued = state.actions.lock().await;
-        assert!(matches!(queued[0], WebAction::ResetFx));
-        assert!(matches!(queued[1], WebAction::ResetVisualProgram));
+        assert!(matches!(queued[0].payload(), WebAction::ResetFx));
+        assert!(matches!(queued[1].payload(), WebAction::ResetVisualProgram));
         assert!(matches!(
-            &queued[2],
+            queued[2].payload(),
             WebAction::SetRouting { value, .. } if value == "layer17_opacity"
         ));
         assert!(matches!(
-            queued[3],
+            queued[3].payload(),
             WebAction::SetMediaSafetyMode {
                 mode: crate::media_safety::MediaSafetyMode::Expert
             }
         ));
         assert!(matches!(
-            &queued[4],
+            queued[4].payload(),
             WebAction::SetParam { param, value }
                 if param == "brightness" && value.as_f64() == Some(0.375)
         ));
@@ -2646,14 +4607,19 @@ mod tests {
         // authenticated WebSocket as authoritative state.
         let mut app = crate::App::new(None, None, state.clone());
         for action in actions {
-            app.handle_web_action(action);
+            app.handle_web_action(action.into_payload());
         }
         app.push_web_state();
 
         let returned = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 match socket.next().await {
-                    Some(Ok(ClientMessage::Text(message))) => break message,
+                    Some(Ok(ClientMessage::Text(message))) => {
+                        let value: serde_json::Value = serde_json::from_str(&message).unwrap();
+                        if value.get("type").and_then(serde_json::Value::as_str) == Some("state") {
+                            break message;
+                        }
+                    }
                     Some(Ok(_)) => continue,
                     Some(Err(error)) => panic!("WebSocket failed before returned state: {error}"),
                     None => panic!("server closed before returned state"),
@@ -2724,13 +4690,19 @@ mod tests {
         .await
         .expect("disconnect did not close the browser history gesture");
         let queued = state.actions.lock().await;
+        assert_eq!(queued.len(), 3);
         assert!(matches!(
-            queued.as_slice(),
-            [
-                WebAction::BeginHistoryGesture { gesture_id: 77 },
-                WebAction::SetParam { param, value },
-                WebAction::EndHistoryGesture { gesture_id: 77 }
-            ] if param == "brightness" && value.as_f64() == Some(0.625)
+            queued[0].payload(),
+            WebAction::BeginHistoryGesture { gesture_id: 77 }
+        ));
+        assert!(matches!(
+            queued[1].payload(),
+            WebAction::SetParam { param, value }
+                if param == "brightness" && value.as_f64() == Some(0.625)
+        ));
+        assert!(matches!(
+            queued[2].payload(),
+            WebAction::EndHistoryGesture { gesture_id: 77 }
         ));
         drop(queued);
         server.abort();
@@ -2869,7 +4841,9 @@ mod tests {
             assert!(!exceeds_upload_limit(extension, MAX_AUDIO_UPLOAD_BYTES));
             assert!(exceeds_upload_limit(extension, MAX_AUDIO_UPLOAD_BYTES + 1));
         }
-        assert!(!exceeds_upload_limit("mp4", u64::MAX));
+        assert_eq!(MAX_VISUAL_UPLOAD_BYTES, 2_147_483_648);
+        assert!(!exceeds_upload_limit("mp4", MAX_VISUAL_UPLOAD_BYTES));
+        assert!(exceeds_upload_limit("mp4", MAX_VISUAL_UPLOAD_BYTES + 1));
     }
 
     #[test]
@@ -2880,14 +4854,314 @@ mod tests {
             header::ORIGIN,
             HeaderValue::from_static("http://127.0.0.1:3030"),
         );
-        assert!(same_origin(&headers));
+        assert!(same_origin(&headers, ListenerRole::LoopbackIpv4));
+        assert!(!same_origin(&headers, ListenerRole::LanTls));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://127.0.0.1:3030"),
+        );
+        assert!(same_origin(&headers, ListenerRole::LanTls));
+        assert!(!same_origin(&headers, ListenerRole::LoopbackIpv4));
         headers.insert(
             header::ORIGIN,
             HeaderValue::from_static("http://evil.example"),
         );
-        assert!(!same_origin(&headers));
+        assert!(!same_origin(&headers, ListenerRole::LoopbackIpv4));
         headers.remove(header::ORIGIN);
-        assert!(!same_origin(&headers));
+        assert!(!same_origin(&headers, ListenerRole::LoopbackIpv4));
+    }
+
+    #[tokio::test]
+    async fn listener_cookie_policies_and_hardening_headers_are_exact() {
+        for (role, cookie_name, secure) in [
+            (ListenerRole::LoopbackIpv4, LOOPBACK_AUTH_COOKIE, false),
+            (ListenerRole::LanTls, LAN_AUTH_COOKIE, true),
+        ] {
+            let state = WebState::new().unwrap();
+            let session = ControlSession::from_seed(FIRST_TEST_TOKEN.to_string()).unwrap();
+            let (address, server) = start_test_router(state, session, role).await;
+            let response =
+                raw_http_get(address, &format!("/missing?key={FIRST_TEST_TOKEN}"), "").await;
+            let headers = response_headers(&response).to_ascii_lowercase();
+            assert!(headers.starts_with("http/1.1 404"));
+            assert!(headers.contains(&format!("set-cookie: {cookie_name}={FIRST_TEST_TOKEN}")));
+            assert!(headers.contains("; httponly; samesite=strict"));
+            assert_eq!(headers.contains("; secure"), secure);
+            assert!(headers.contains("content-security-policy: default-src 'self'"));
+            assert!(headers.contains("connect-src 'self'"));
+            assert!(!headers.contains("connect-src 'self' ws:"));
+            assert!(headers.contains("x-content-type-options: nosniff"));
+            assert!(headers.contains("x-frame-options: deny"));
+            assert!(headers.contains("referrer-policy: no-referrer"));
+            assert!(headers.contains("cache-control: no-store, max-age=0"));
+            assert!(headers.contains("pragma: no-cache"));
+            server.abort();
+            let _ = server.await;
+        }
+
+        // The outer layer applies the same no-store/browser policy to an
+        // authentication refusal, so an intermediary cannot retain either
+        // the denial page or a later token-bearing navigation.
+        let state = WebState::new().unwrap();
+        let session = ControlSession::from_seed(FIRST_TEST_TOKEN.to_string()).unwrap();
+        let (address, server) = start_test_router(state, session, ListenerRole::LoopbackIpv4).await;
+        let denied = raw_http_get(address, "/missing", "").await;
+        let denied_headers = response_headers(&denied).to_ascii_lowercase();
+        assert!(denied_headers.starts_with("http/1.1 403"));
+        assert!(denied_headers.contains("content-security-policy:"));
+        assert!(denied_headers.contains("cache-control: no-store, max-age=0"));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn library_index_pages_require_auth_and_reject_unbounded_or_stale_requests() {
+        let state = WebState::new().unwrap();
+        let session = ControlSession::from_seed(FIRST_TEST_TOKEN.to_string()).unwrap();
+        let (address, server) = start_test_router(state, session, ListenerRole::LoopbackIpv4).await;
+
+        let denied = raw_http_get(address, "/library-index?limit=1", "").await;
+        assert!(response_headers(&denied).starts_with("HTTP/1.1 403"));
+
+        let accepted = raw_http_get(
+            address,
+            &format!("/library-index?key={FIRST_TEST_TOKEN}&kind=all&limit=1"),
+            "",
+        )
+        .await;
+        assert!(response_headers(&accepted).starts_with("HTTP/1.1 200"));
+        let body = accepted.split_once("\r\n\r\n").unwrap().1;
+        let page: crate::library_index::LibraryPageSnapshot =
+            serde_json::from_str(body).expect("bounded library page JSON");
+        assert_eq!(page.limit, 1);
+        assert!(page.entries.is_empty());
+
+        let too_large = raw_http_get(
+            address,
+            &format!(
+                "/library-index?key={FIRST_TEST_TOKEN}&limit={}",
+                crate::library_index::LIBRARY_INDEX_MAX_PAGE_SIZE + 1
+            ),
+            "",
+        )
+        .await;
+        assert!(response_headers(&too_large).starts_with("HTTP/1.1 400"));
+
+        let stale = raw_http_get(
+            address,
+            &format!("/library-index?key={FIRST_TEST_TOKEN}&revision=1&limit=1"),
+            "",
+        )
+        .await;
+        assert!(response_headers(&stale).starts_with("HTTP/1.1 409"));
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn tls_fault_and_independent_port_occupation_publish_exact_listener_truth() {
+        let base_port = available_port_pair();
+        let identity_dir = control_test_dir("tls-fault");
+        let state = WebState::new().unwrap();
+        let mut handle = start(
+            state.clone(),
+            test_start_config(
+                base_port,
+                &identity_dir,
+                FIRST_TEST_TOKEN,
+                StartFaults {
+                    tls_config: true,
+                    ..StartFaults::default()
+                },
+            ),
+        )
+        .unwrap();
+        let info = state.control_server_info();
+        assert!(matches!(
+            info.loopback_ipv4,
+            ControlListenerStatus::Listening { address }
+                if address == SocketAddr::new(Ipv4Addr::LOCALHOST.into(), base_port)
+        ));
+        assert!(matches!(
+            info.lan_tls,
+            ControlListenerStatus::Unavailable { ref reason }
+                if reason.contains("injected TLS configuration fault")
+        ));
+        assert!(info.lan_url.is_none());
+        handle.retire().unwrap();
+        fs::remove_dir_all(&identity_dir).unwrap();
+
+        let base_port = available_port_pair();
+        let identity_dir = control_test_dir("occupied-lan");
+        let occupied_lan = TcpListener::bind((Ipv4Addr::UNSPECIFIED, base_port + 1)).unwrap();
+        let state = WebState::new().unwrap();
+        let mut handle = start(
+            state.clone(),
+            test_start_config(
+                base_port,
+                &identity_dir,
+                FIRST_TEST_TOKEN,
+                StartFaults::default(),
+            ),
+        )
+        .unwrap();
+        let info = state.control_server_info();
+        assert!(matches!(
+            info.loopback_ipv4,
+            ControlListenerStatus::Listening { .. }
+        ));
+        assert!(matches!(
+            info.lan_tls,
+            ControlListenerStatus::Unavailable { ref reason }
+                if reason.contains("cannot bind LAN HTTPS")
+        ));
+        assert!(info.lan_url.is_none());
+        handle.retire().unwrap();
+        drop(occupied_lan);
+        fs::remove_dir_all(&identity_dir).unwrap();
+
+        let base_port = available_port_pair();
+        let identity_dir = control_test_dir("occupied-loopback");
+        let occupied_loopback = TcpListener::bind((Ipv4Addr::LOCALHOST, base_port)).unwrap();
+        let state = WebState::new().unwrap();
+        let mut handle = start(
+            state.clone(),
+            test_start_config(
+                base_port,
+                &identity_dir,
+                FIRST_TEST_TOKEN,
+                StartFaults::default(),
+            ),
+        )
+        .unwrap();
+        let info = state.control_server_info();
+        assert!(matches!(
+            info.loopback_ipv4,
+            ControlListenerStatus::Unavailable { ref reason }
+                if reason.contains("cannot bind loopback IPv4")
+        ));
+        assert!(matches!(
+            info.lan_tls,
+            ControlListenerStatus::Listening { .. }
+        ));
+        assert!(info.lan_url.is_some());
+        handle.retire().unwrap();
+        drop(occupied_loopback);
+        fs::remove_dir_all(&identity_dir).unwrap();
+    }
+
+    #[test]
+    fn one_listener_task_crash_does_not_mask_or_retire_the_other_roles() {
+        let base_port = available_port_pair();
+        let identity_dir = control_test_dir("task-crash");
+        let state = WebState::new().unwrap();
+        let mut handle = start(
+            state.clone(),
+            test_start_config(
+                base_port,
+                &identity_dir,
+                FIRST_TEST_TOKEN,
+                StartFaults {
+                    crash_role: Some(ListenerRole::LoopbackIpv4),
+                    ..StartFaults::default()
+                },
+            ),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let info = loop {
+            let info = state.control_server_info();
+            if matches!(
+                info.loopback_ipv4,
+                ControlListenerStatus::Unavailable { .. }
+            ) {
+                break info;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "injected listener crash did not publish before its deadline"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(matches!(
+            info.loopback_ipv4,
+            ControlListenerStatus::Unavailable { ref reason }
+                if reason == "listener task crashed"
+        ));
+        assert!(matches!(
+            info.lan_tls,
+            ControlListenerStatus::Listening { .. }
+        ));
+        assert!(info.lan_url.is_some());
+        handle.retire().unwrap();
+        fs::remove_dir_all(&identity_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_rebinds_fixed_ports_rotates_secrets_and_rejects_old_cookie() {
+        let base_port = available_port_pair();
+        let identity_dir = control_test_dir("restart");
+        let state = WebState::new().unwrap();
+        let mut first = start(
+            state.clone(),
+            test_start_config(
+                base_port,
+                &identity_dir,
+                FIRST_TEST_TOKEN,
+                StartFaults::default(),
+            ),
+        )
+        .unwrap();
+        let first_response = raw_http_get(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), base_port),
+            &format!("/missing?key={FIRST_TEST_TOKEN}"),
+            "",
+        )
+        .await;
+        assert!(response_headers(&first_response).starts_with("HTTP/1.1 404"));
+        let old_cookie = response_cookie(&first_response, LOOPBACK_AUTH_COOKIE);
+        assert!(!format!("{first:?}").contains(FIRST_TEST_TOKEN));
+        assert!(!format!("{:?}", state.control_server_info()).contains(FIRST_TEST_TOKEN));
+        first.retire().unwrap();
+        assert!(first.thread.is_none());
+
+        let mut second = start(
+            state.clone(),
+            test_start_config(
+                base_port,
+                &identity_dir,
+                SECOND_TEST_TOKEN,
+                StartFaults::default(),
+            ),
+        )
+        .unwrap();
+        assert_ne!(first.token_for_test(), second.token_for_test());
+        let old_cookie_response = raw_http_get(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), base_port),
+            "/missing",
+            &format!("Cookie: {old_cookie}\r\n"),
+        )
+        .await;
+        assert!(response_headers(&old_cookie_response).starts_with("HTTP/1.1 403"));
+        let fresh_response = raw_http_get(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), base_port),
+            &format!("/missing?key={SECOND_TEST_TOKEN}"),
+            "",
+        )
+        .await;
+        assert!(response_headers(&fresh_response).starts_with("HTTP/1.1 404"));
+        assert!(!format!("{second:?}").contains(SECOND_TEST_TOKEN));
+        second.retire().unwrap();
+        assert!(second.thread.is_none());
+
+        // Retirement joined every owned task before returning: both fixed
+        // roles can be rebound immediately, without a sleep or orphan race.
+        let rebound_loopback = TcpListener::bind((Ipv4Addr::LOCALHOST, base_port)).unwrap();
+        let rebound_lan = TcpListener::bind((Ipv4Addr::UNSPECIFIED, base_port + 1)).unwrap();
+        drop(rebound_loopback);
+        drop(rebound_lan);
+        fs::remove_dir_all(&identity_dir).unwrap();
     }
 
     #[test]
@@ -5073,15 +7347,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lagged_broadcast_receiver_can_jump_to_live_edge() {
-        let (tx, mut rx) = tokio::sync::broadcast::channel(2);
-        for value in 0..3 {
-            tx.send(value).unwrap();
+    async fn newest_only_state_receiver_observes_one_latest_generation() {
+        let (tx, mut rx) = tokio::sync::watch::channel(Arc::new(0_u32));
+        for value in 1..=3 {
+            tx.send_replace(Arc::new(value));
         }
-        assert!(matches!(rx.recv().await, Err(RecvError::Lagged(_))));
-        rx = rx.resubscribe();
-        tx.send(3).unwrap();
-        assert_eq!(rx.recv().await.unwrap(), 3);
+        rx.changed().await.unwrap();
+        assert_eq!(**rx.borrow_and_update(), 3);
+        assert!(!rx.has_changed().unwrap());
     }
     #[test]
     fn gesture_ingress_bounds_every_field_and_closes_its_phase_and_mode_vocabularies() {
@@ -5534,6 +7807,7 @@ WORLD"
     fn fullscreen_display_ids_are_bounded_opaque_session_tokens() {
         let parse = |display_id: &str| WebAction::SetOutputDisplay {
             display_id: display_id.to_string(),
+            inventory_generation: None,
         };
         assert!(valid_action(&parse(""), 0), "empty selects Automatic");
         assert!(valid_action(&parse("display-0123456789abcdef-2"), 0));

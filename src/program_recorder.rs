@@ -27,7 +27,7 @@ use crate::visual_rack::GroupId;
 pub const RECORDER_FRAME_POOL_CAPACITY: usize = 4;
 pub const RECORDER_FRAME_QUEUE_CAPACITY: usize = 2;
 pub const RECORDER_MAX_POOL_BYTES: u64 = 128 * 1024 * 1024;
-pub const RECORDER_REPORT_SCHEMA_VERSION: u16 = 1;
+pub const RECORDER_REPORT_SCHEMA_VERSION: u16 = 2;
 pub const RECORDER_MAX_REPORT_BYTES: usize = 64 * 1024;
 
 const RECORDER_EVENT_QUEUE_CAPACITY: usize = 1;
@@ -1238,6 +1238,7 @@ fn metadata_follows(previous: Option<RecorderFrameMetadata>, next: RecorderFrame
 #[derive(Debug, Serialize)]
 struct RecorderReport {
     schema_version: u16,
+    build_identity: crate::build_identity::BuildIdentitySnapshot,
     media_file_name: String,
     width: u32,
     height: u32,
@@ -1358,6 +1359,7 @@ impl RecorderReport {
         };
         Self {
             schema_version: RECORDER_REPORT_SCHEMA_VERSION,
+            build_identity: crate::build_identity::current().snapshot(),
             media_file_name: output_path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())

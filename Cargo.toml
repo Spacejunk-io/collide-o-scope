@@ -1,6 +1,6 @@
 [package]
 name = "collide-o-scope"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 default-run = "collide-o-scope"
 license = "GPL-3.0-or-later"
@@ -31,7 +31,7 @@ tower-http = { version = "0.5", features = ["fs"] }
 futures = "0.3"
 open = "5"
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png", "webp"] }
-ntsc-rs = { git = "https://github.com/ntsc-rs/ntsc-rs", package = "ntsc-rs", features = ["rayon"] }
+ntsc-rs = { version = "=0.1.2", git = "https://github.com/ntsc-rs/ntsc-rs", rev = "4b79500dfac64efcfb393eebc89f5c75565ee5ae", package = "ntsc-rs", features = ["rayon"] }
 cpal = "0.16"
 rustfft = "6"
 midir = "0.10"
@@ -39,11 +39,11 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 getrandom = "0.3"
 trash = "5"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
-rcgen = "0.13"
+rcgen = { version = "0.13", features = ["x509-parser"] }
 
 [target.'cfg(windows)'.dependencies]
 spout2-rs = { version = "0.1", default-features = false, features = ["dx"] }
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_SystemInformation"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -56,7 +56,18 @@ libc = "0.2"
 winresource = "0.1"
 
 [dev-dependencies]
+criterion = "0.7"
+loom = "0.7"
+proptest = "1.7"
 tokio-tungstenite = "0.24"
+
+[build-dependencies]
+sha2 = "0.10"
+
+[[bench]]
+name = "study_parse"
+harness = false
+test = false
 
 # ntsc-rs is CPU-intensive; always optimize it even in debug builds
 [profile.dev.package.ntsc-rs]

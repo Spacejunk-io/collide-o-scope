@@ -1,0 +1,55 @@
+{
+  "schema": "collide-o-scope-audit-campaign-status/1",
+  "campaigns": [
+    {
+      "id": "d1_study_motion_abi_1_1",
+      "status": "implemented",
+      "gate": "complete"
+    },
+    {
+      "id": "d2_photosensitivity_advisor",
+      "status": "evaluation",
+      "gate": "accessibility_legal_and_p1_gpu_timing"
+    },
+    {
+      "id": "d3_portable_show_bundle",
+      "status": "retained",
+      "gate": "machine_a_clean_machine_b_live_export"
+    },
+    {
+      "id": "d4_accepted_creative_mutation",
+      "status": "implemented",
+      "gate": "complete"
+    },
+    {
+      "id": "d5_straight_alpha_key_fill",
+      "status": "retained",
+      "gate": "application_action_live_acquisition_and_p1_readback"
+    },
+    {
+      "id": "exact_pts_vfr_live",
+      "status": "deferred",
+      "gate": "independent_ffmpeg_timeline"
+    },
+    {
+      "id": "live_recorder_audio_mux",
+      "status": "deferred",
+      "gate": "owned_program_pcm"
+    },
+    {
+      "id": "physical_venue_matrix",
+      "status": "evaluation",
+      "gate": "external_hardware_receipts"
+    },
+    {
+      "id": "capture_ndi_syphon_zero_copy_mesh",
+      "status": "deferred",
+      "gate": "platform_license_interoperability"
+    },
+    {
+      "id": "full16_temporal_history",
+      "status": "rejected",
+      "gate": "new_resource_benefit_evidence"
+    }
+  ]
+}

@@ -1,0 +1,166 @@
+name: Adversarial verification
+
+on:
+  push:
+    tags:
+      - "v*"
+    paths:
+      - "fuzz/**"
+      - "src/history.rs"
+      - "src/bounded_json.rs"
+      - "src/controller_profile.rs"
+      - "src/osc.rs"
+      - "src/motion_sidecar_wire.rs"
+      - "src/patch/editor.rs"
+      - "src/patch/yaml_boundary.rs"
+      - "src/publication_gate.rs"
+      - "src/proxy.rs"
+      - "src/recovery_journal.rs"
+      - "src/study.rs"
+      - "src/web/action_wire.rs"
+      - "src/web/server.rs"
+      - "tests/loom_publication_gate.rs"
+      - ".github/workflows/adversarial.yml"
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - "src/history.rs"
+      - "src/bounded_json.rs"
+      - "src/controller_profile.rs"
+      - "src/osc.rs"
+      - "src/motion_sidecar_wire.rs"
+      - "src/patch/editor.rs"
+      - "src/patch/yaml_boundary.rs"
+      - "src/publication_gate.rs"
+      - "src/proxy.rs"
+      - "src/recovery_journal.rs"
+      - "src/study.rs"
+      - "src/web/action_wire.rs"
+      - "src/web/server.rs"
+      - "tests/loom_publication_gate.rs"
+      - ".github/workflows/adversarial.yml"
+  workflow_dispatch:
+  schedule:
+    - cron: "23 4 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adversarial-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  FUZZ_TOOLCHAIN: nightly-2026-08-20
+
+jobs:
+  bounded-fuzz:
+    name: Bounded parser and state-machine fuzz
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 135
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install pinned nightly toolchain
+        run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+
+      - name: Cache Cargo downloads and cargo-fuzz
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+          key: fuzz-${{ runner.os }}-${{ runner.arch }}-nightly-2026-08-20-cargo-fuzz-0.13.2-${{ hashFiles('fuzz/Cargo.lock') }}
+
+      - name: Install pinned cargo-fuzz
+        run: |
+          if [ "$(cargo-fuzz --version 2>/dev/null)" != "cargo-fuzz 0.13.2" ]; then
+            cargo install --locked --force cargo-fuzz --version 0.13.2
+          fi
+          test "$(cargo-fuzz --version)" = "cargo-fuzz 0.13.2"
+
+      - name: Run fixed smoke budgets
+        run: |
+          cargo +"$FUZZ_TOOLCHAIN" fuzz run study_document fuzz/corpus/study_document -- -dict=fuzz/study.dict -max_len=1048576 -rss_limit_mb=2048 -timeout=5 -runs=10000 -print_final_stats=1
+          cargo +"$FUZZ_TOOLCHAIN" fuzz run publication_gate fuzz/corpus/publication_gate -- -max_len=4096 -rss_limit_mb=2048 -timeout=5 -runs=10000 -print_final_stats=1
+          cargo +"$FUZZ_TOOLCHAIN" fuzz run patch_yaml fuzz/corpus/patch_yaml -- -max_len=1048576 -rss_limit_mb=2048 -timeout=5 -runs=10000 -print_final_stats=1
+          cargo +"$FUZZ_TOOLCHAIN" fuzz run controller_profile_midi fuzz/corpus/controller_profile_midi -- -max_len=263168 -rss_limit_mb=2048 -timeout=5 -runs=10000 -print_final_stats=1
+          cargo +"$FUZZ_TOOLCHAIN" fuzz run osc_packet fuzz/corpus/osc_packet -- -max_len=16384 -rss_limit_mb=2048 -timeout=5 -runs=10000 -print_final_stats=1
+          cargo +"$FUZZ_TOOLCHAIN" fuzz run recovery_journal_record fuzz/corpus/recovery_journal_record -- -max_len=1048576 -rss_limit_mb=2048 -timeout=5 -runs=10000 -print_final_stats=1
+          cargo +"$FUZZ_TOOLCHAIN" fuzz run proxy_metadata fuzz/corpus/proxy_metadata -- -max_len=262144 -rss_limit_mb=2048 -timeout=5 -runs=10000 -print_final_stats=1
+          cargo +"$FUZZ_TOOLCHAIN" fuzz run web_action_json fuzz/corpus/web_action_json -- -max_len=16384 -rss_limit_mb=2048 -timeout=5 -runs=10000 -print_final_stats=1
+          cargo +"$FUZZ_TOOLCHAIN" fuzz run motion_sidecar_json fuzz/corpus/motion_sidecar_json -- -max_len=1048576 -rss_limit_mb=2048 -timeout=5 -runs=10000 -print_final_stats=1
+
+  scheduled-fuzz:
+    name: One-hour fuzz (${{ matrix.target }})
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: study_document
+            corpus: fuzz/corpus/study_document
+            max_len: 1048576
+            extra: -dict=fuzz/study.dict
+          - target: publication_gate
+            corpus: fuzz/corpus/publication_gate
+            max_len: 4096
+            extra: ""
+          - target: patch_yaml
+            corpus: fuzz/corpus/patch_yaml
+            max_len: 1048576
+            extra: ""
+          - target: controller_profile_midi
+            corpus: fuzz/corpus/controller_profile_midi
+            max_len: 263168
+            extra: ""
+          - target: osc_packet
+            corpus: fuzz/corpus/osc_packet
+            max_len: 16384
+            extra: ""
+          - target: recovery_journal_record
+            corpus: fuzz/corpus/recovery_journal_record
+            max_len: 1048576
+            extra: ""
+          - target: proxy_metadata
+            corpus: fuzz/corpus/proxy_metadata
+            max_len: 262144
+            extra: ""
+          - target: web_action_json
+            corpus: fuzz/corpus/web_action_json
+            max_len: 16384
+            extra: ""
+          - target: motion_sidecar_json
+            corpus: fuzz/corpus/motion_sidecar_json
+            max_len: 1048576
+            extra: ""
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install pinned nightly toolchain
+        run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+
+      - name: Cache Cargo downloads and cargo-fuzz
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+          key: fuzz-${{ runner.os }}-${{ runner.arch }}-nightly-2026-08-20-cargo-fuzz-0.13.2-${{ hashFiles('fuzz/Cargo.lock') }}
+
+      - name: Install pinned cargo-fuzz
+        run: |
+          if [ "$(cargo-fuzz --version 2>/dev/null)" != "cargo-fuzz 0.13.2" ]; then
+            cargo install --locked --force cargo-fuzz --version 0.13.2
+          fi
+          test "$(cargo-fuzz --version)" = "cargo-fuzz 0.13.2"
+
+      - name: Run one-hour bounded target
+        run: |
+          cargo +"$FUZZ_TOOLCHAIN" fuzz run "${{ matrix.target }}" "${{ matrix.corpus }}" -- ${{ matrix.extra }} -max_len=${{ matrix.max_len }} -rss_limit_mb=2048 -timeout=5 -max_total_time=3600 -print_final_stats=1

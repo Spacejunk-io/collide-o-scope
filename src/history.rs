@@ -928,6 +928,8 @@ impl<T> ManualHistory<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as ProptestConfig, RngSeed};
 
     fn checkpoint(value: u64, label: &str) -> HistoryCheckpoint<u64> {
         HistoryCheckpoint::from_canonical(value, &value.to_le_bytes(), label, "transform").unwrap()
@@ -1531,5 +1533,256 @@ mod tests {
             HistoryCheckpoint::from_canonical((), &huge, "Edit", "rack"),
             Err(HistoryError::CheckpointTooLarge { .. })
         ));
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct ModelLayer {
+        stable_id: u64,
+        group: u8,
+        route: Option<u64>,
+        morph_milli: u16,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct ModelWorld {
+        layers: Vec<ModelLayer>,
+        scene: u8,
+        quantized_epoch: u64,
+    }
+
+    fn model_canonical(world: &ModelWorld) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(16 + world.layers.len() * 24);
+        bytes.push(world.scene);
+        bytes.extend_from_slice(&world.quantized_epoch.to_le_bytes());
+        bytes.extend_from_slice(&(world.layers.len() as u64).to_le_bytes());
+        for layer in &world.layers {
+            bytes.extend_from_slice(&layer.stable_id.to_le_bytes());
+            bytes.push(layer.group);
+            bytes.extend_from_slice(&layer.route.unwrap_or(0).to_le_bytes());
+            bytes.extend_from_slice(&layer.morph_milli.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn model_checkpoint(world: &ModelWorld) -> HistoryCheckpoint<ModelWorld> {
+        HistoryCheckpoint::from_canonical(
+            world.clone(),
+            &model_canonical(world),
+            "State-machine edit",
+            "model",
+        )
+        .unwrap()
+    }
+
+    fn trim_model_stacks(
+        undo: &mut VecDeque<ModelWorld>,
+        redo: &mut VecDeque<ModelWorld>,
+        max_entries: usize,
+    ) {
+        while undo.len() + redo.len() > max_entries {
+            if undo.pop_front().is_none() {
+                redo.pop_front();
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 10_000,
+            failure_persistence: None,
+            rng_seed: RngSeed::Fixed(0xC011_1DE0_5C0F_E001),
+            ..ProptestConfig::default()
+        })]
+
+        /// A fixed-seed 10k-sequence state machine spans add/remove/reorder,
+        /// group/reroute, Morph, scene/quantized changes, automation, and the
+        /// full two-phase undo/redo protocol. Every step compares the bounded
+        /// implementation with a deliberately small reference model.
+        #[test]
+        fn authored_state_machine_preserves_identity_bounds_and_atomic_history(
+            operations in proptest::collection::vec(any::<u8>(), 0..65)
+        ) {
+            const MAX_ENTRIES: usize = 16;
+            let limits = HistoryLimits {
+                max_entries: MAX_ENTRIES,
+                max_bytes: 256 * 1024,
+                max_checkpoint_bytes: 8 * 1024,
+            };
+            let mut history = ManualHistory::with_limits(limits).unwrap();
+            let mut world = ModelWorld {
+                layers: vec![
+                    ModelLayer { stable_id: 1, group: 0, route: None, morph_milli: 0 },
+                    ModelLayer { stable_id: 2, group: 0, route: Some(1), morph_milli: 0 },
+                    ModelLayer { stable_id: 3, group: 1, route: Some(2), morph_milli: 0 },
+                ],
+                scene: 0,
+                quantized_epoch: 0,
+            };
+            let mut next_stable_id = 4_u64;
+            let mut model_undo = VecDeque::<ModelWorld>::new();
+            let mut model_redo = VecDeque::<ModelWorld>::new();
+
+            for (step, operation) in operations.into_iter().enumerate() {
+                let before = world.clone();
+                let manual = match operation % 12 {
+                    0 => {
+                        world.layers.push(ModelLayer {
+                            stable_id: next_stable_id,
+                            group: (operation / 12) % 16,
+                            route: world.layers.first().map(|layer| layer.stable_id),
+                            morph_milli: 0,
+                        });
+                        next_stable_id += 1;
+                        true
+                    }
+                    1 => {
+                        if !world.layers.is_empty() {
+                            let index = (usize::from(operation) + step) % world.layers.len();
+                            let removed = world.layers.remove(index).stable_id;
+                            for layer in &mut world.layers {
+                                if layer.route == Some(removed) {
+                                    layer.route = None;
+                                }
+                            }
+                        }
+                        true
+                    }
+                    2 => {
+                        if world.layers.len() > 1 {
+                            let by = (usize::from(operation) + step) % world.layers.len();
+                            world.layers.rotate_left(by);
+                        }
+                        true
+                    }
+                    3 => {
+                        if !world.layers.is_empty() {
+                            let index = step % world.layers.len();
+                            world.layers[index].group = operation.wrapping_add(step as u8) % 16;
+                        }
+                        true
+                    }
+                    4 => {
+                        if world.layers.len() > 1 {
+                            let index = step % world.layers.len();
+                            let donor = world.layers[(index + 1) % world.layers.len()].stable_id;
+                            world.layers[index].route = Some(donor);
+                        }
+                        true
+                    }
+                    5 => {
+                        if !world.layers.is_empty() {
+                            let index = step % world.layers.len();
+                            world.layers[index].morph_milli =
+                                (u16::from(operation) * 37 + step as u16) % 1_001;
+                        }
+                        true
+                    }
+                    6 => {
+                        world.scene = operation.wrapping_add(step as u8) % 32;
+                        world.quantized_epoch = world.quantized_epoch.saturating_add(1);
+                        true
+                    }
+                    7 => {
+                        let candidate = history.prepare_undo().unwrap();
+                        match (candidate, model_undo.back().cloned()) {
+                            (Some(candidate), Some(expected)) => {
+                                prop_assert_eq!(candidate.target(), &expected);
+                                let current = candidate
+                                    .checkpoint_current(world.clone(), &model_canonical(&world))
+                                    .unwrap();
+                                history.commit_restore(candidate.token(), current).unwrap();
+                                let previous = std::mem::replace(&mut world, expected);
+                                model_undo.pop_back();
+                                model_redo.push_back(previous);
+                            }
+                            (None, None) => {}
+                            _ => prop_assert!(false, "undo availability diverged"),
+                        }
+                        false
+                    }
+                    8 => {
+                        let candidate = history.prepare_redo().unwrap();
+                        match (candidate, model_redo.back().cloned()) {
+                            (Some(candidate), Some(expected)) => {
+                                prop_assert_eq!(candidate.target(), &expected);
+                                let current = candidate
+                                    .checkpoint_current(world.clone(), &model_canonical(&world))
+                                    .unwrap();
+                                history.commit_restore(candidate.token(), current).unwrap();
+                                let previous = std::mem::replace(&mut world, expected);
+                                model_redo.pop_back();
+                                model_undo.push_back(previous);
+                            }
+                            (None, None) => {}
+                            _ => prop_assert!(false, "redo availability diverged"),
+                        }
+                        false
+                    }
+                    9 => {
+                        world.scene = world.scene.wrapping_add(1) % 32;
+                        let outcome = history.record_manual(
+                            MutationOrigin::Osc,
+                            model_checkpoint(&before),
+                            fingerprint_canonical(&model_canonical(&world)),
+                        ).unwrap();
+                        prop_assert_eq!(outcome, HistoryRecordOutcome::IgnoredNonManual);
+                        false
+                    }
+                    10 => true,
+                    _ => {
+                        let undo_before = history.metrics();
+                        if let Some(candidate) = history.prepare_undo().unwrap() {
+                            let token = candidate.token();
+                            history.reject_restore(token).unwrap();
+                            let after = history.metrics();
+                            prop_assert_eq!(after.undo_depth, undo_before.undo_depth);
+                            prop_assert_eq!(after.redo_depth, undo_before.redo_depth);
+                        }
+                        false
+                    }
+                };
+
+                if manual {
+                    let after_fingerprint = fingerprint_canonical(&model_canonical(&world));
+                    let outcome = history
+                        .record_manual(
+                            MutationOrigin::BrowserManual,
+                            model_checkpoint(&before),
+                            after_fingerprint,
+                        )
+                        .unwrap();
+                    if world == before {
+                        prop_assert_eq!(outcome, HistoryRecordOutcome::NoChange);
+                    } else {
+                        prop_assert_eq!(outcome, HistoryRecordOutcome::Recorded);
+                        model_redo.clear();
+                        model_undo.push_back(before);
+                        trim_model_stacks(&mut model_undo, &mut model_redo, MAX_ENTRIES);
+                    }
+                }
+
+                let metrics = history.metrics();
+                prop_assert_eq!(metrics.undo_depth, model_undo.len());
+                prop_assert_eq!(metrics.redo_depth, model_redo.len());
+                prop_assert!(metrics.undo_depth + metrics.redo_depth <= MAX_ENTRIES);
+                prop_assert!(metrics.bytes <= metrics.max_bytes);
+                prop_assert_eq!(metrics.can_undo, !model_undo.is_empty());
+                prop_assert_eq!(metrics.can_redo, !model_redo.is_empty());
+                prop_assert!(!metrics.gesture_open);
+                prop_assert!(!metrics.restore_pending);
+                prop_assert!(world.layers.iter().all(|layer| layer.morph_milli <= 1_000));
+                prop_assert!(world.layers.len() <= 67, "generated world escaped its plan bound");
+                let mut ids = world.layers.iter().map(|layer| layer.stable_id).collect::<Vec<_>>();
+                ids.sort_unstable();
+                ids.dedup();
+                prop_assert_eq!(ids.len(), world.layers.len(), "stable identity was duplicated");
+                prop_assert!(world.layers.iter().all(|layer| {
+                    layer.route.is_none_or(|route| route != layer.stable_id && ids.binary_search(&route).is_ok())
+                }), "stable route rebound by position or points at a removed identity");
+                let serialized = serde_json::to_vec(&world).unwrap();
+                let round_trip: ModelWorld = serde_json::from_slice(&serialized).unwrap();
+                prop_assert_eq!(&round_trip, &world, "state serialization lost authored identity");
+            }
+        }
     }
 }

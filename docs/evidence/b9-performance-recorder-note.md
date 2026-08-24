@@ -54,12 +54,15 @@ topology, and routes are outside the recordable vocabulary entirely, by law.
 
 ## Recording: the drain tap and the acceptance gate
 
-The record tap sits on `handle_web_action_inner_with_feedback`, the one seam
+The record tap sits on
+`handle_web_action_inner_with_feedback_from_origin`, the one source-aware seam
 every final application funnels through — the drained browser batch, the
-downbeat release, native RECOVERY, and the transform gizmo — so a take stores
-what the program actually did: a coalesced-away value never dispatches and so
-never records, and a batch remainder dropped by a snapshot/look barrier
-records nothing. Staged edits commit at the same accepted, program-advancing
+downbeat release, native controls, typed MIDI/OSC/host automation, and the
+transform gizmo. D4 promotes a candidate only after the live applier reports
+success, so refused/stale/safety actions record nothing. Canonical same-frame
+duplicates collapse independent of process-only origin; a coalesced-away value
+never dispatches, and a batch remainder dropped by a snapshot/look barrier
+records nothing. Accepted edits commit at the same accepted, program-advancing
 frame gate the temporal and gesture recorders share (as a free function over
 disjoint fields, because the renderer borrow is live there), so a rejected
 frame or a frozen program neither consumes a tick nor records an edit. Arming
@@ -73,12 +76,13 @@ the hashed flags.
 Playback compiles the take once at arm — each event becomes a real `WebAction`
 with the layer position bound to the live stable ID occupying that position —
 and dispatches due events per frame through
-`handle_web_action_inner_with_feedback`, the transform-gizmo delegation seam,
+`handle_web_action_inner_with_feedback_from_origin`, the transform-gizmo delegation seam,
 so Morph ownership transfer, beat-latch materialization, engine sanitize, and
 every refusal apply exactly as they would to a hand-made edit, while
 `MutationOrigin` law keeps every replayed edit out of manual history (proven:
-`undo_label()` stays `None`). A guard flag keeps the record tap from observing
-the replayer's own dispatches. An address the program cannot resolve at arm
+`undo_label()` stays `None`). A bounded Replay origin is independently excluded
+from candidate construction; the guard flag remains defense in depth. An
+address the program cannot resolve at arm
 degrades to a **named no-op** — `layer_effect:3:pixelate` in the snapshot's
 `degraded` list — and is never retargeted (the stale-ID law). Replay dispatch
 runs after the downbeat release, only while the program advances: a take is an

@@ -99,10 +99,7 @@ impl fmt::Display for GestureCanvasGpuError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Plan(error) => write!(formatter, "{error}"),
-            Self::UniformSlots {
-                required,
-                capacity,
-            } => write!(
+            Self::UniformSlots { required, capacity } => write!(
                 formatter,
                 "gesture canvas update needs {required} uniform slots; capacity is {capacity}"
             ),

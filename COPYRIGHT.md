@@ -208,14 +208,13 @@ decision, not a cleanup.
 
 ## External dependencies
 
-All **564** resolved packages in `Cargo.lock` (563 dependencies plus the root
-crate) were audited against their declared `license` fields, with none guessed
-and none unresolved. There is no AGPL, no MPL, no proprietary term, and no
-crate missing a licence field. Every dependency's **code** is inbound-compatible
-with GPLv3 — 270 are `MIT OR Apache-2.0`, 117 are `MIT`, and the remainder are
-BSD, ISC, Zlib, BSL-1.0, Unicode-3.0, CC0, and WTFPL variants. The only terms
-anywhere in the graph that are not GPLv3-compatible are the two font licences
-above, which cover data rather than code and are excluded from the GPL grant.
+Every release regenerates a path-free `cargo deny list --format json` inventory
+from its exact `Cargo.lock`, rejects an unlicensed package, and publishes that
+inventory beside the SBOM, checksums, and attributed review record. The
+mechanical result is intentionally not presented as legal advice. It avoids
+embedding package counts here because they become false as soon as a lockfile
+changes; `dependency-license-inventory.json` in each release is the exact
+machine-readable authority for that artifact.
 
 Three details worth writing down, because each is a trap for the next audit:
 
@@ -230,11 +229,22 @@ Three details worth writing down, because each is a trap for the next audit:
   is built without its `static` feature, so it dynamically links whatever
   FFmpeg the operator installed. See below.
 
-**FFmpeg is not bundled.** The program links the FFmpeg 8 libraries through
-`ffmpeg-next` (the binding crates are WTFPL, which imposes nothing, and which
-says nothing about the C libraries' own terms — a common confusion) and
-separately invokes the `ffmpeg` and `ffprobe` command-line tools. Both are
-installed by the operator; see the build instructions in `README.md`.
+Ordinary source builds do not bundle FFmpeg. The program links the FFmpeg 8
+libraries through `ffmpeg-next` (the binding crates are WTFPL, which imposes
+nothing, and which says nothing about the C libraries' own terms — a common
+confusion) and separately invokes the `ffmpeg` and `ffprobe` command-line
+tools. Those are installed by the operator; see the build instructions in
+`README.md`.
+
+The official Windows release archive is the deliberate exception. Its pinned
+release-trust workflow bundles the exact checksum-verified
+`Gyan.FFmpeg.Shared` 8.1.2 tools and DLLs needed by the executable. The archive
+also carries the Gyan distribution's GPL text as
+`LICENSES/FFmpeg-GPL-3.0-or-later.txt`, its `FFMPEG-README.txt` build/source
+record, and the executable's reported `FFMPEG-BUILDCONF.txt`. Their hashes,
+the upstream binary archive hash, and the runtime-reported license identity
+are bound into the signed release evidence. This is a technical provenance
+record, not a substitute for distribution-specific legal review.
 
 FFmpeg has three licence tiers, not two: `LGPL-2.1-or-later` by default,
 `GPL-2.0-or-later` with `--enable-gpl`, and `GPL-3.0-or-later` with

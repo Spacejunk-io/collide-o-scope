@@ -8,15 +8,13 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ffmpeg_next::format::context::Input;
 
-use crate::media_safety::{ReverseCacheLease, ReverseCacheLedger};
-
 use super::codec_motion::CodecFrameIdentity;
 use super::codec_motion_sequence::CodecMotionProduct;
+use super::payload::{DecodedImagePayload, DecodedPayloadOwner};
 
 /// Hard entry bound for one source's in-memory keyframe index.
 pub const MAX_KEYFRAME_INDEX_ENTRIES: usize = 4_096;
@@ -87,7 +85,7 @@ impl Default for FrameMetadata {
 /// Metadata-rich result returned by indexed decoder entry points.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedVideoFrame {
-    pub rgba: Vec<u8>,
+    pub rgba: DecodedImagePayload,
     pub metadata: FrameMetadata,
     /// Sparse codec records paired with this exact image/generation. Still
     /// sources and reverse-cache hits are explicitly absent.
@@ -225,23 +223,21 @@ impl KeyframeIndex {
 
 #[derive(Debug)]
 struct CachedFrame {
-    rgba: Vec<u8>,
+    rgba: DecodedImagePayload,
     metadata: FrameMetadata,
-    _lease: ReverseCacheLease,
+    codec_motion: Option<CodecMotionProduct>,
 }
 
 /// One decoder's bounded decoded-frame cache. It retains a GOP-sized recent
-/// source-time window when practical and evicts oldest frames first. Codec
-/// motion is deliberately noncached: entries lease/account only RGBA bytes,
-/// and retrieval returns `codec_motion: None`. The live decoder and depth-one
-/// threaded mailbox remain the only bounded owners of codec records.
+/// source-time window when practical and evicts oldest frames first. Entries
+/// are logical cache owners of the same immutable payload delivered forward;
+/// the payload's sole physical ledger lease remains attached to its allocation.
 #[derive(Debug)]
 pub struct ReverseFrameCache {
     frames: VecDeque<CachedFrame>,
     bytes: usize,
     max_bytes: usize,
     max_frames: usize,
-    ledger: Arc<ReverseCacheLedger>,
 }
 
 impl Default for ReverseFrameCache {
@@ -252,25 +248,11 @@ impl Default for ReverseFrameCache {
 
 impl ReverseFrameCache {
     pub fn new(max_bytes: usize, max_frames: usize) -> Self {
-        let aggregate_bytes = u64::try_from(max_bytes).unwrap_or(u64::MAX);
-        Self::with_ledger(
-            max_bytes,
-            max_frames,
-            ReverseCacheLedger::new(aggregate_bytes),
-        )
-    }
-
-    pub(crate) fn with_ledger(
-        max_bytes: usize,
-        max_frames: usize,
-        ledger: Arc<ReverseCacheLedger>,
-    ) -> Self {
         Self {
             frames: VecDeque::new(),
             bytes: 0,
             max_bytes,
             max_frames,
-            ledger,
         }
     }
 
@@ -293,22 +275,8 @@ impl ReverseFrameCache {
                 break;
             };
             self.bytes = self.bytes.saturating_sub(evicted.rgba.len());
+            evicted.rgba.record_invalidation();
         }
-        let lease = match u64::try_from(frame_bytes)
-            .map_err(|_| "reverse-frame cache entry size does not fit u64".to_string())
-            .and_then(|bytes| self.ledger.try_reserve(bytes).map_err(str::to_string))
-        {
-            Ok(lease) => lease,
-            // Reverse caching is an optimization. Another decoder may own the
-            // remaining aggregate budget; declining this entry must never turn
-            // successful source decoding into an audience-visible failure.
-            Err(error) if error == "aggregate reverse cache budget exceeded" => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        let mut rgba = Vec::new();
-        rgba.try_reserve_exact(frame_bytes)
-            .map_err(|error| format!("could not reserve reverse-frame cache entry: {error}"))?;
-        rgba.extend_from_slice(&frame.rgba);
         self.bytes = self.bytes.checked_add(frame_bytes).ok_or_else(|| {
             "reverse-frame cache byte accounting overflowed unexpectedly".to_string()
         })?;
@@ -322,10 +290,17 @@ impl ReverseFrameCache {
             }),
             ..frame.metadata
         };
+        let codec_motion = frame.codec_motion.clone().filter(|motion| {
+            motion.source_generation == metadata.source_generation
+                && (motion.latest().status != crate::video::CodecMotionStatus::Available
+                    || motion.exact_identity().is_some_and(|identity| {
+                        Some(identity.latest_destination) == metadata.codec_identity
+                    }))
+        });
         self.frames.push_back(CachedFrame {
-            rgba,
+            rgba: frame.rgba.share_as(DecodedPayloadOwner::ReverseCache),
             metadata,
-            _lease: lease,
+            codec_motion,
         });
         Ok(())
     }
@@ -345,16 +320,9 @@ impl ReverseFrameCache {
         }) else {
             return Ok(None);
         };
-        let mut rgba = Vec::new();
-        rgba.try_reserve_exact(frame.rgba.len()).map_err(|error| {
-            format!(
-                "could not reserve {} bytes for reverse-frame cache retrieval: {error}",
-                frame.rgba.len()
-            )
-        })?;
-        rgba.extend_from_slice(&frame.rgba);
+        let same_generation = source_generation == frame.metadata.source_generation;
         Ok(Some(DecodedVideoFrame {
-            rgba,
+            rgba: frame.rgba.share_as(DecodedPayloadOwner::Forward),
             metadata: FrameMetadata {
                 source_generation,
                 codec_identity: frame.metadata.codec_identity.map(|mut identity| {
@@ -363,11 +331,20 @@ impl ReverseFrameCache {
                 }),
                 ..frame.metadata
             },
-            codec_motion: None,
+            // Motion records embed exact source-generation identities. A
+            // same-generation cache hit can share that exact pairing; a
+            // discontinuity may retag request metadata but must not launder
+            // stale codec motion into the new generation.
+            codec_motion: same_generation
+                .then(|| frame.codec_motion.clone())
+                .flatten(),
         }))
     }
 
     pub fn clear(&mut self) {
+        for frame in &self.frames {
+            frame.rgba.record_invalidation();
+        }
         self.frames.clear();
         self.bytes = 0;
     }
@@ -400,7 +377,7 @@ mod tests {
 
     fn frame(id: u8, seconds: f64, bytes: usize) -> DecodedVideoFrame {
         DecodedVideoFrame {
-            rgba: vec![id; bytes],
+            rgba: DecodedImagePayload::from_owned_rgba(vec![id; bytes]),
             metadata: FrameMetadata::sanitized(7, Some(i64::from(id)), seconds, 10.0),
             codec_motion: None,
         }
@@ -423,7 +400,21 @@ mod tests {
                 provenance: crate::video::CodecMotionProvenance::FfmpegExportMvs,
                 frame_type: crate::video::CodecMotionFrameType::Predictive,
                 status: crate::video::CodecMotionStatus::Available,
-                past_reference_proof: None,
+                past_reference_proof: Some(crate::video::CodecPastReferenceProof {
+                    policy: crate::video::AdjacentReferencePolicy::Mpeg4Part2SimpleProgressiveIp,
+                    reference: CodecFrameIdentity {
+                        source_generation: 7,
+                        pts: i64::from(id).saturating_sub(1),
+                        presentation_ordinal: u64::from(id).saturating_sub(1),
+                    },
+                    destination: CodecFrameIdentity {
+                        source_generation: 7,
+                        pts: i64::from(id),
+                        presentation_ordinal: u64::from(id),
+                    },
+                    elapsed_ticks: 1,
+                    time_base: crate::video::CodecTimeBase::new(1, 30).unwrap(),
+                }),
                 vectors: vec![crate::motion::CodecMotionVector {
                     destination: [16, 16],
                     block: [8, 8],
@@ -440,15 +431,19 @@ mod tests {
     }
 
     #[test]
-    fn reverse_cache_leases_only_rgba_and_never_retains_codec_motion() {
-        let ledger = ReverseCacheLedger::new(16);
-        let mut cache = ReverseFrameCache::with_ledger(16, 2, ledger.clone());
-        cache
-            .insert(&frame_with_motion(1, 1.0, 12))
-            .expect("RGBA cache admission");
+    fn reverse_cache_shares_exact_pixels_and_never_launders_codec_motion() {
+        let mut cache = ReverseFrameCache::new(16, 2);
+        let forward = frame_with_motion(1, 1.0, 12);
+        let payload_id = forward.rgba.identity();
+        cache.insert(&forward).expect("RGBA cache admission");
         assert_eq!(cache.bytes(), 12);
-        assert_eq!(ledger.reserved_bytes(), 12);
+        assert_eq!(forward.rgba.owner_snapshot().reverse_cache, 1);
+
+        let exact = cache.near_at_or_before(1.0, 7, 0.1).unwrap().unwrap();
+        assert_eq!(exact.rgba.identity(), payload_id);
+        assert!(exact.codec_motion.is_some());
         let retrieved = cache.near_at_or_before(1.0, 99, 0.1).unwrap().unwrap();
+        assert_eq!(retrieved.rgba.identity(), payload_id);
         assert_eq!(retrieved.metadata.source_generation, 99);
         assert_eq!(
             retrieved.metadata.codec_identity,
@@ -459,7 +454,7 @@ mod tests {
             })
         );
         assert!(retrieved.codec_motion.is_none());
-        assert_eq!(cache.bytes(), 12, "motion bytes entered the RGBA lease");
+        assert_eq!(cache.bytes(), 12);
     }
 
     #[test]
@@ -476,13 +471,14 @@ mod tests {
                 presentation_ordinal: 1,
             },
         ] {
-            let mut hostile = frame(1, 1.0, 4);
+            let mut hostile = frame_with_motion(1, 1.0, 4);
             hostile.metadata.codec_identity = Some(hostile_identity);
             let mut cache = ReverseFrameCache::new(8, 1);
             cache.insert(&hostile).unwrap();
             let retrieved = cache.near_at_or_before(1.0, 99, 0.1).unwrap().unwrap();
             assert_eq!(retrieved.metadata.source_generation, 99);
             assert_eq!(retrieved.metadata.codec_identity, None);
+            assert!(retrieved.codec_motion.is_none());
         }
     }
 
@@ -514,68 +510,51 @@ mod tests {
     }
 
     #[test]
-    fn six_caches_share_one_aggregate_budget_and_release_for_reuse() {
-        let ledger = ReverseCacheLedger::new(128);
-        let mut caches: Vec<_> = (0..6)
-            .map(|_| ReverseFrameCache::with_ledger(32, 512, ledger.clone()))
-            .collect();
-
-        for (index, cache) in caches.iter_mut().enumerate() {
-            cache
-                .insert(&frame(index as u8 + 1, index as f64, 32))
-                .unwrap();
+    fn six_caches_share_one_payload_without_reference_byte_charges() {
+        let mut caches: Vec<_> = (0..6).map(|_| ReverseFrameCache::new(32, 512)).collect();
+        let forward = frame(1, 1.0, 32);
+        let identity = forward.rgba.identity();
+        for cache in &mut caches {
+            cache.insert(&forward).unwrap();
         }
-
-        assert_eq!(ledger.max_bytes(), 128);
-        assert_eq!(ledger.reserved_bytes(), 128);
-        assert!(caches[..4].iter().all(|cache| cache.len() == 1));
-        assert!(caches[4..].iter().all(|cache| cache.len() == 0));
-
-        caches[1].clear();
-        assert_eq!(ledger.reserved_bytes(), 96);
-        caches[4].insert(&frame(9, 9.0, 32)).unwrap();
-        assert_eq!(caches[4].len(), 1);
-        assert_eq!(ledger.reserved_bytes(), 128);
-
+        assert!(caches.iter().all(|cache| cache.len() == 1));
+        assert!(caches.iter().all(|cache| {
+            cache
+                .near_at_or_before(1.0, 7, 0.1)
+                .unwrap()
+                .unwrap()
+                .rgba
+                .identity()
+                == identity
+        }));
+        assert_eq!(forward.rgba.owner_snapshot().reverse_cache, 6);
         drop(caches);
-        assert_eq!(ledger.reserved_bytes(), 0);
+        assert_eq!(forward.rgba.owner_snapshot().reverse_cache, 0);
     }
 
     #[test]
-    fn cache_move_transfers_leases_and_eviction_releases_exact_bytes() {
-        let ledger = ReverseCacheLedger::new(64);
-        let mut cache = ReverseFrameCache::with_ledger(24, 2, ledger.clone());
-        cache.insert(&frame(1, 1.0, 12)).unwrap();
-        cache.insert(&frame(2, 2.0, 12)).unwrap();
-        assert_eq!(ledger.reserved_bytes(), 24);
+    fn cache_move_transfers_logical_owner_and_eviction_releases_it() {
+        let mut cache = ReverseFrameCache::new(24, 2);
+        let first = frame(1, 1.0, 12);
+        let second = frame(2, 2.0, 12);
+        cache.insert(&first).unwrap();
+        cache.insert(&second).unwrap();
+        assert_eq!(first.rgba.owner_snapshot().reverse_cache, 1);
+        assert_eq!(second.rgba.owner_snapshot().reverse_cache, 1);
 
-        cache.insert(&frame(3, 3.0, 12)).unwrap();
+        let third = frame(3, 3.0, 12);
+        cache.insert(&third).unwrap();
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.bytes(), 24);
-        assert_eq!(ledger.reserved_bytes(), 24);
+        assert_eq!(first.rgba.owner_snapshot().reverse_cache, 0);
+        assert_eq!(third.rgba.owner_snapshot().reverse_cache, 1);
 
         let transferred = cache;
         assert_eq!(transferred.bytes(), 24);
-        assert_eq!(ledger.reserved_bytes(), 24);
+        assert_eq!(third.rgba.owner_snapshot().reverse_cache, 1);
         drop(transferred);
-        assert_eq!(ledger.reserved_bytes(), 0);
-    }
-
-    #[test]
-    fn aggregate_ledger_rejects_checked_add_overflow_and_recovers_on_drop() {
-        let ledger = ReverseCacheLedger::new(u64::MAX);
-        let all = ledger.try_reserve(u64::MAX).unwrap();
-        assert_eq!(ledger.reserved_bytes(), u64::MAX);
-        assert_eq!(
-            ledger.try_reserve(1).unwrap_err(),
-            "reverse cache byte accounting overflow"
-        );
-        drop(all);
-        assert_eq!(ledger.reserved_bytes(), 0);
-        let one = ledger.try_reserve(1).unwrap();
-        assert_eq!(ledger.reserved_bytes(), 1);
-        drop(one);
-        assert_eq!(ledger.reserved_bytes(), 0);
+        assert_eq!(second.rgba.owner_snapshot().reverse_cache, 0);
+        assert_eq!(third.rgba.owner_snapshot().reverse_cache, 0);
     }
 
     #[test]

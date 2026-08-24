@@ -1,6 +1,6 @@
 # Precision and scale
 
-Milestone 6 is grounded in measurement and bounded contracts, not feature claims. The current implementation can identify when a proxy may help, encode and serve a content-addressed FFV1/Matroska proxy behind that measurement, execute and account for the Advanced precision path, validate a data-only Study, and describe evidence required by external capabilities. It does not add a hardware decoder, zero-copy path, Syphon, NDI, capture backend, or mesh-warp renderer.
+Milestone 6 is grounded in measurement and bounded contracts, not feature claims. The current implementation can identify when a proxy may help, encode and serve a content-addressed FFV1/Matroska proxy behind that measurement, execute and account for the Advanced precision path, validate a data-only Study, and describe evidence required by external capabilities. D3D11VA exists only as an evaluation probe and is not a live hardware-decoding path; zero-copy, Syphon, NDI, capture, and mesh-warp backends remain absent.
 
 ## Settled precision law
 
@@ -140,7 +140,11 @@ The plan's ordering clause — an FFV1/Matroska worker only after defining bound
 
 Patch load consults the cache for content-referenced video sources: a validated artifact backs the decoder while the layer keeps the original's identity, so a proxy can never enter a patch, an export, Dice, or a Morph — export's digest-gated hint rejects the artifact path and re-resolves the original by content. The HUD layer status reports the whole lifecycle (requested, running, ready, refused, active), and once a proxy is active it reports the measured decode p95 beside the p95 recorded when the encode was requested — the decoder A/B, honest about being a session-local before/after rather than a controlled experiment.
 
-Two edges stay open, stated rather than implied: only sources with a verified `cos-sha256` identity can be proxied, because the key is content-addressed; and the browser panel has no proxy surface — request and status are native. The third edge recorded here previously — adoption at patch (re)apply only — was closed by the S8 hot-adoption tranche: an encode completion now captures per-layer claims, a one-slot adoption worker prepares a playhead-seeded decoder off the render thread through the same consultation law patch load uses, and the per-frame drain installs it only after every claim re-validates, so the audience keeps the exact playhead while the decoder underneath moves to the artifact. The hosted CI FFmpeg build on Unix carries `--disable-programs`, so the end-to-end encode fixtures are opt-in like the effects audit, and hosted three-platform CI proves the CLI-free cache half: the commit law, crash recovery, seals, eviction, and refusals.
+<!-- BEGIN GENERATED PROXY CAPABILITY -->
+Registry key `proxy_browser_surface`: **Implemented**. The browser and native surfaces both request proxy encoding and report lifecycle status. Evidence receipt: `s8c-browser-proxy-surface-note`.
+<!-- END GENERATED PROXY CAPABILITY -->
+
+One edge stays open, stated rather than implied: only sources with a verified `cos-sha256` identity can be proxied, because the key is content-addressed. The earlier adoption-at-patch-only edge was closed by the S8 hot-adoption tranche: an encode completion now captures per-layer claims, a one-slot adoption worker prepares a playhead-seeded decoder off the render thread through the same consultation law patch load uses, and the per-frame drain installs it only after every claim re-validates, so the audience keeps the exact playhead while the decoder underneath moves to the artifact. The hosted CI FFmpeg build on Unix carries `--disable-programs`, so the end-to-end encode fixtures are opt-in like the effects audit, and hosted three-platform CI proves the CLI-free cache half: the commit law, crash recovery, seals, eviction, and refusals.
 
 **Operator observation, 2026-08-18.** The complete loop was run by hand on the development host (AMD Radeon RX 6950 XT, Windows 11, FFmpeg 8.1.2): a content-referenced piece generated from `audit.mp4`, a Y-key encode under default settings (Half scale, source timing, audio carried), and a patch reload to adopt. The HUD reported `proxy active (bfc1add0…): decode p95 7489 us vs 62692 us before` — an 8.4× decode improvement, from roughly four times over the 16.7 ms frame budget to comfortably inside it — with the key prefix matching the published artifact (`bfc1add0….mkv`, 965,036 bytes, plus its 64-byte seal) and nothing else in the cache. This is one clip on one host, and the A/B is the session-local before/after the HUD is documented to be, not a controlled benchmark; it is recorded because it is the first time the recommendation, the encode, the sealed publication, the adoption, and the measured gain were observed end to end by an operator rather than a test.
 
@@ -148,14 +152,21 @@ Two edges stay open, stated rather than implied: only sources with a verified `c
 
 ## Data-only Study ABI
 
-Study schema 1 / ABI 1.0 is closed, typed data with these hard boundaries:
+Study schema 1 / ABI 1.0 and additive ABI 1.1 are closed, typed data with these
+hard boundaries:
 
 - at most 1 MiB per JSON or YAML document;
 - at most 256 SSA instructions, 64 registers, and 16 declared capabilities;
 - bounded metadata and license strings;
-- fixed instructions for current color, bounded history, motion, audio bands, beat phase, deterministic random input, finite constants, arithmetic, mix, clamp, hue rotation, and one final color output;
+- fixed instructions for current color, bounded history, motion, audio bands, beat phase, deterministic random input, finite constants, arithmetic, mix, clamp, hue rotation, and one final color output; ABI 1.1 only appends typed vector component/magnitude/normalized-direction/dot-constant and bounded scalar-to-color operations;
 - definition-before-use, single assignment, exact value types, one final output, and a unique sorted capability list exactly matching instruction use; and
 - unknown fields, versions, operations, oversized lists, non-finite values, and inconsistent capabilities rejected atomically.
+
+ABI 1.0's opcode numbers, canonical hashes, errors, and deliberately dead
+`Vector2` motion result remain exact. ABI 1.1 selects its own explicit opcode
+table and makes motion observable without implicit coercion. CPU and the fixed
+GPU interpreter share the finite/clamp law and existing 256-instruction,
+64-register, and per-pixel load ceilings.
 
 The authority record is permanently false for native code, shader-source injection, filesystem access, network access, process launch, device access, and host mutation. A Study cannot enlarge its authority by declaring a capability; capabilities only name fixed read-only creative inputs.
 

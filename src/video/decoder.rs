@@ -15,6 +15,11 @@ use crate::video::indexed::{
     finite_nonnegative, timestamp_to_source_seconds, DecodeWorkError, DecodedVideoFrame,
     FrameMetadata, KeyframeIndex, ReverseFrameCache,
 };
+use crate::video::payload::{DecodedImagePayload, DecodedRasterLayout, DecodedRasterPool};
+use crate::video::source_descriptor::{
+    configure_sws_conversion, descriptors_from_ffmpeg, merge_first_ffmpeg_frame,
+    ConversionPolicyKind, SourceColorDescriptor, SourceConversionPolicy, SourceDisplayDescriptor,
+};
 use crate::video::{
     AdjacentReferencePolicy, CodecFrameIdentity, CodecMotionFrame, CodecMotionFrameType,
     CodecMotionProduct, CodecMotionSequence, CodecPastReferenceProof, CodecTimeBase,
@@ -215,6 +220,18 @@ pub struct VideoDecoder {
     stream_index: usize,
     decoder: ffmpeg::decoder::Video,
     scaler: ScalerContext,
+    /// Reused scaler destination; `ScalerContext::run` overwrites this only on
+    /// the decoder worker, so selected-frame conversion does not allocate a
+    /// fresh FFmpeg output image after warm-up.
+    scaled_rgba_frame: VideoFrame,
+    packed_rgba_pool: DecodedRasterPool,
+    source_color_descriptor: SourceColorDescriptor,
+    source_display_descriptor: SourceDisplayDescriptor,
+    conversion_policy: SourceConversionPolicy,
+    /// The first decoded picture may carry declarations absent from codec
+    /// parameters. Freeze exactly once, before its first RGBA conversion, so
+    /// live and offline open the same immutable source law.
+    source_descriptor_frozen: bool,
     pub width: u32,
     pub height: u32,
     /// Source stream's average frame rate. Falls back to 30 when the
@@ -405,6 +422,9 @@ impl VideoDecoder {
                 finite_nonnegative(container_duration_seconds)
             };
 
+        let (source_color_descriptor, source_display_descriptor) =
+            descriptors_from_ffmpeg(&stream, &decoder);
+
         let scaler = ScalerContext::get(
             decoder.format(),
             width,
@@ -415,6 +435,19 @@ impl VideoDecoder {
             Flags::BILINEAR,
         )
         .map_err(|e| format!("Scaler: {e}"))?;
+        let packed_layout = DecodedRasterLayout::packed_rgba8(width, height)?;
+        let packed_bytes = u64::try_from(packed_layout.byte_len()?)
+            .map_err(|_| "packed RGBA byte count does not fit u64".to_string())?;
+        let reverse_bytes = media_policy.reverse_cache_bytes_per_decoder();
+        let pool_bytes = reverse_bytes
+            .checked_add(packed_bytes.saturating_mul(2))
+            .ok_or_else(|| "decoded image pool byte limit overflows".to_string())?;
+        let packed_rgba_pool = DecodedRasterPool::new(
+            packed_layout,
+            2,
+            pool_bytes.max(packed_bytes),
+            media_policy.decoded_image_ledger(),
+        )?;
 
         Ok(Self {
             path: path.to_string(),
@@ -422,6 +455,12 @@ impl VideoDecoder {
             stream_index,
             decoder,
             scaler,
+            scaled_rgba_frame: VideoFrame::empty(),
+            packed_rgba_pool,
+            source_color_descriptor,
+            source_display_descriptor,
+            conversion_policy: SourceConversionPolicy::legacy_video(),
+            source_descriptor_frozen: false,
             width,
             height,
             fps,
@@ -438,11 +477,10 @@ impl VideoDecoder {
             _media_reservation: media_reservation,
             media_plan,
             keyframe_index: KeyframeIndex::fallback(stream_start_pts)?,
-            reverse_cache: ReverseFrameCache::with_ledger(
+            reverse_cache: ReverseFrameCache::new(
                 usize::try_from(media_policy.reverse_cache_bytes_per_decoder())
                     .unwrap_or(usize::MAX),
                 super::indexed::MAX_REVERSE_CACHE_FRAMES,
-                media_policy.reverse_cache_ledger(),
             ),
             seek_stats: DecoderSeekStats::default(),
             codec_motion_previous_anchor_law,
@@ -460,6 +498,18 @@ impl VideoDecoder {
     ) -> Result<DecodedVideoFrame, String> {
         self.next_timed_frame_interruptible(source_generation, || true)
             .map_err(|error| error.to_string())
+    }
+
+    pub const fn source_color_descriptor(&self) -> SourceColorDescriptor {
+        self.source_color_descriptor
+    }
+
+    pub const fn source_display_descriptor(&self) -> SourceDisplayDescriptor {
+        self.source_display_descriptor
+    }
+
+    pub const fn conversion_policy(&self) -> SourceConversionPolicy {
+        self.conversion_policy
     }
 
     /// Generation-aware sequential decode. `is_current` is checked between
@@ -1148,7 +1198,7 @@ impl VideoDecoder {
 
     fn finish_materialized_frame(
         &mut self,
-        rgba: Vec<u8>,
+        rgba: DecodedImagePayload,
         metadata: FrameMetadata,
         codec_motion: Option<CodecMotionProduct>,
     ) -> DecodedVideoFrame {
@@ -1306,20 +1356,53 @@ impl VideoDecoder {
         self.codec_previous_anchor = None;
     }
 
-    fn scale_frame(&mut self, frame: &VideoFrame) -> Result<Vec<u8>, String> {
-        let mut rgb_frame = VideoFrame::empty();
-        self.scaler.run(frame, &mut rgb_frame).map_err(|e| {
-            format!(
-                "Failed to scale decoded frame from {} ({}x{} to RGBA): {e}",
-                self.path, self.width, self.height
-            )
-        })?;
-        repack_rgba_plane(
-            rgb_frame.data(0),
-            rgb_frame.stride(0),
-            self.width,
-            self.height,
+    fn scale_frame(&mut self, frame: &VideoFrame) -> Result<DecodedImagePayload, String> {
+        self.freeze_source_descriptor_before_first_conversion(frame)?;
+        self.scaler
+            .run(frame, &mut self.scaled_rgba_frame)
+            .map_err(|e| {
+                format!(
+                    "Failed to scale decoded frame from {} ({}x{} to RGBA): {e}",
+                    self.path, self.width, self.height
+                )
+            })?;
+        self.packed_rgba_pool.materialize_plane(
+            self.scaled_rgba_frame.data(0),
+            self.scaled_rgba_frame.stride(0),
         )
+    }
+
+    fn freeze_source_descriptor_before_first_conversion(
+        &mut self,
+        frame: &VideoFrame,
+    ) -> Result<(), String> {
+        if self.source_descriptor_frozen {
+            return Ok(());
+        }
+        merge_first_ffmpeg_frame(
+            &mut self.source_color_descriptor,
+            &mut self.source_display_descriptor,
+            frame,
+        );
+        self.conversion_policy =
+            configure_sws_conversion(&mut self.scaler, self.source_color_descriptor);
+        if self.conversion_policy.kind == ConversionPolicyKind::LegacyConfigurationRejected {
+            // A rejected details setter is not allowed to leave an ambiguous
+            // partially configured context. Rebuild through the exact old
+            // constructor and publish that actual fallback policy.
+            self.scaler = ScalerContext::get(
+                self.decoder.format(),
+                self.width,
+                self.height,
+                ffmpeg::format::Pixel::RGBA,
+                self.width,
+                self.height,
+                Flags::BILINEAR,
+            )
+            .map_err(|error| format!("Scaler fallback after color configuration: {error}"))?;
+        }
+        self.source_descriptor_frozen = true;
+        Ok(())
     }
 
     fn next_video_packet_interruptible<F>(
@@ -1879,6 +1962,7 @@ pub fn validate_media_dimensions_with_policy(
 /// FFmpeg aligns decoded planes for SIMD, so `stride` is often larger than
 /// `width * 4`. wgpu uploads use tightly packed rows; copying the padded plane
 /// verbatim would make every row after the first begin at the wrong byte.
+#[cfg(test)]
 fn repack_rgba_plane(
     data: &[u8],
     stride: usize,
@@ -1917,6 +2001,7 @@ fn repack_rgba_plane(
     Ok(packed)
 }
 
+#[cfg(test)]
 fn reserve_packed_rgba(output_len: usize) -> Result<Vec<u8>, String> {
     let mut packed = Vec::new();
     packed.try_reserve_exact(output_len).map_err(|error| {
@@ -3042,7 +3127,7 @@ mod tests {
                 presentation_ordinal: ordinal.saturating_sub(1),
             };
             crate::video::DecodedVideoFrame {
-                rgba: vec![0; 64 * 64 * 4],
+                rgba: crate::video::DecodedImagePayload::from_owned_rgba(vec![0; 64 * 64 * 4]),
                 metadata: crate::video::FrameMetadata::sanitized(
                     7,
                     Some(ordinal as i64),
@@ -3128,7 +3213,7 @@ mod tests {
     #[test]
     fn bounded_seek_exhaustion_never_returns_an_unreached_frame() {
         let wrong = crate::video::DecodedVideoFrame {
-            rgba: vec![1, 2, 3, 4],
+            rgba: crate::video::DecodedImagePayload::from_owned_rgba(vec![1, 2, 3, 4]),
             metadata: crate::video::FrameMetadata::sanitized(1, Some(0), 0.0, 1000.0),
             codec_motion: None,
         };
@@ -3144,7 +3229,7 @@ mod tests {
         assert!(error.to_string().contains("bounded forward-decode window"));
 
         let terminal = crate::video::DecodedVideoFrame {
-            rgba: vec![9],
+            rgba: crate::video::DecodedImagePayload::from_owned_rgba(vec![9]),
             metadata: crate::video::FrameMetadata::sanitized(1, Some(99), 9.9, 10.0),
             codec_motion: None,
         };
@@ -3158,8 +3243,9 @@ mod tests {
                 "terminal.mp4",
             )
             .unwrap()
-            .rgba,
-            vec![9]
+            .rgba
+            .as_slice(),
+            &[9]
         );
     }
 }
