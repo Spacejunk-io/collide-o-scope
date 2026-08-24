@@ -1406,8 +1406,14 @@ mod tests {
         let mut candidate = make_scaler();
         let policy = configure_sws_conversion(&mut candidate, SourceColorDescriptor::default());
         assert_eq!(policy.kind, ConversionPolicyKind::LegacyUnspecified);
-        let mut historical_rgba = ffmpeg::frame::Video::empty();
-        let mut candidate_rgba = ffmpeg::frame::Video::empty();
+        // libswscale writes the active RGBA width but is allowed to leave each
+        // AVFrame row's alignment padding untouched. Initialize both complete
+        // buffers identically so the whole-frame comparison remains byte-exact
+        // without reading allocator residue on platforms with a padded stride.
+        let mut historical_rgba = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::RGBA, 4, 4);
+        let mut candidate_rgba = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::RGBA, 4, 4);
+        historical_rgba.data_mut(0).fill(0xa5);
+        candidate_rgba.data_mut(0).fill(0xa5);
         historical.run(&source, &mut historical_rgba).unwrap();
         candidate.run(&source, &mut candidate_rgba).unwrap();
         assert_eq!(historical_rgba.stride(0), candidate_rgba.stride(0));

@@ -102,8 +102,11 @@ jobs:
               iproute2 \
               libasound2-dev \
               libclang-dev \
+              libvulkan1 \
+              mesa-vulkan-drivers \
               pkg-config \
               tcpdump \
+              vulkan-tools \
               xz-utils; then
               break
             elif [ "$attempt" -eq 3 ]; then
@@ -114,6 +117,32 @@ jobs:
               sleep "$((attempt * 10))"
             fi
           done
+
+          # The persistent-object acceptance tests intentionally exercise real
+          # wgpu allocations. Hosted Linux runners have no physical adapter, so
+          # provide Mesa's bounded CPU Vulkan implementation instead of skipping
+          # the tests or depending on whatever graphics stack the image happens
+          # to contain.
+          runtime_dir="$RUNNER_TEMP/xdg-runtime"
+          mkdir -p "$runtime_dir"
+          chmod 700 "$runtime_dir"
+          mapfile -t lvp_icds < <(
+            dpkg-query -L mesa-vulkan-drivers |
+              grep -E '/lvp_icd[^/]*\.json$'
+          )
+          if [ "${#lvp_icds[@]}" -ne 1 ] || [ ! -f "${lvp_icds[0]:-}" ]; then
+            echo "::error::expected exactly one installed Mesa lavapipe ICD manifest" >&2
+            printf '%s\n' "${lvp_icds[@]:-}" >&2
+            exit 1
+          fi
+          lvp_icd="${lvp_icds[0]}"
+          export XDG_RUNTIME_DIR="$runtime_dir"
+          export WGPU_BACKEND="vulkan"
+          export VK_DRIVER_FILES="$lvp_icd"
+          echo "XDG_RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
+          echo "WGPU_BACKEND=vulkan" >> "$GITHUB_ENV"
+          echo "VK_DRIVER_FILES=$lvp_icd" >> "$GITHUB_ENV"
+          vulkaninfo --summary
 
       - name: Verify macOS native prerequisites
         if: runner.os == 'macOS'

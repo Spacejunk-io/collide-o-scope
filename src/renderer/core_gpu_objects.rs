@@ -555,7 +555,10 @@ mod tests {
     use super::*;
 
     fn gpu_device() -> (wgpu::Device, wgpu::Queue) {
-        let instance = wgpu::Instance::default();
+        // CI pins this test-only instance to its provisioned Vulkan driver.
+        // Other hosts retain wgpu's defaults when no backend override is set.
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
