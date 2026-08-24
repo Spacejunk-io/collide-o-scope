@@ -18,13 +18,13 @@ REVIEWED_PINNED_LLVM_STEP_SHA256 = (
     "350df6cb05ff8a9ec6eb61963784afafb454a586314569c27961374880f61484"
 )
 REVIEWED_UNEQUAL_PREPARE_STEP_SHA256 = (
-    "4448f99dacab37f4314f561f7e5a667e12bc5b9ad463493f7b193e1decd31469"
+    "aac71777897fef9c04aa898322c62ad24fd70638091ee595fd88c5cafe3a3efc"
 )
 REVIEWED_UNEQUAL_BUILD_STEP_SHA256 = (
     "d4ab78f545f3eb0a23a93f303b7fc8b492c6d832904d0e305344eef997e335f7"
 )
 REVIEWED_UNEQUAL_CONTIGUOUS_REGION_SHA256 = (
-    "1898e012ed7d41c3a057872131789bc17b0448fa356c532684eb405eb4b8a4f2"
+    "73ae6a31bbed06c823e157ecfd3571c5e289f34274e37b598569672311f05ad1"
 )
 
 
@@ -1371,6 +1371,12 @@ def unequal_reproducibility_workflow_fragments() -> tuple[tuple[str, int], ...]:
         ("cargo-seed-b-with-deliberately-different-physical-path-length", 1),
         ("$targetA = Join-Path $env:RUNNER_TEMP 'ta'", 1),
         ("target-b-with-deliberately-different-physical-path-length", 1),
+        ("$robocopyExit = $LASTEXITCODE", 1),
+        (
+            'if ($robocopyExit -ge 8) { throw "Cargo seed copy failed with exit code $robocopyExit" }',
+            1,
+        ),
+        ("$global:LASTEXITCODE = 0", 1),
         ("Copy-SeedTree (Join-Path $defaultCargoHome 'registry\\cache')", 1),
         ("Copy-SeedTree (Join-Path $defaultCargoHome 'registry\\index')", 1),
         ("Copy-SeedTree (Join-Path $defaultCargoHome 'git\\db')", 1),
@@ -1455,6 +1461,10 @@ def validate_unequal_reproducibility_workflow(release: str) -> None:
         "path: source-a",
         "path: source-b-with-deliberately-different-path-length",
         "- name: Prepare unequal physical reproducibility roots",
+        "& robocopy.exe $Source $Destination",
+        "$robocopyExit = $LASTEXITCODE",
+        'if ($robocopyExit -ge 8) { throw "Cargo seed copy failed with exit code $robocopyExit" }',
+        "$global:LASTEXITCODE = 0",
         "$cargoA = Join-Path $env:RUNNER_TEMP 'ca'",
         "$cargoB = Join-Path $env:RUNNER_TEMP",
         "$manifestA = Get-ManifestDigest $cargoA",
@@ -1485,6 +1495,9 @@ def self_test_unequal_reproducibility_workflow(release: str) -> None:
         ("source-b-with-deliberately-different-path-length", "source-b"),
         ("$cargoB = Join-Path $env:RUNNER_TEMP", "$cargoB = $cargoA # "),
         ("$targetB = Join-Path $env:RUNNER_TEMP", "$targetB = $targetA # "),
+        ("$robocopyExit = $LASTEXITCODE", "$robocopyExit = 0 # $LASTEXITCODE"),
+        ("if ($robocopyExit -ge 8)", "if ($robocopyExit -ge 16)"),
+        ("$global:LASTEXITCODE = 0", "$global:LASTEXITCODE = $robocopyExit"),
         ("Independent Cargo seed manifests differ", "Cargo seed mismatch ignored"),
         (
             "if ($manifestA -cne $manifestB) { throw 'Independent Cargo seed manifests differ' }",
