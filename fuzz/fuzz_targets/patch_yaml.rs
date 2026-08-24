@@ -16,7 +16,13 @@ fuzz_target!(|data: &[u8]| {
     let Ok(value) = yaml_boundary::parse_patch_yaml_value(data) else {
         return;
     };
-    let canonical = serde_yaml::to_string(&value).expect("bounded YAML value serializes");
+    // `serde_yaml::Value` accepts tagged mapping keys that its fallible emitter
+    // cannot represent. Production converts this bounded tree directly into a
+    // typed `PatchState`; only exercise round-trip laws for emitter-supported
+    // values instead of turning an ordinary dependency error into a fuzz crash.
+    let Ok(canonical) = serde_yaml::to_string(&value) else {
+        return;
+    };
     assert!(canonical.len() <= yaml_boundary::MAX_PATCH_FILE_BYTES);
     let reparsed = yaml_boundary::parse_patch_yaml_value(canonical.as_bytes())
         .expect("canonical bounded YAML reparses");

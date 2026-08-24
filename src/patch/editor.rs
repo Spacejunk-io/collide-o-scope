@@ -745,6 +745,24 @@ mod tests {
     }
 
     #[test]
+    fn tagged_mapping_key_is_rejected_as_an_ordinary_patch_error() {
+        // Adversarial run 32785701007 found that serde_yaml can parse this
+        // tagged mapping key into Value even though its emitter cannot write
+        // it. Cover both the exact crash and its globally minimized form; the
+        // typed production boundary must reject each without panicking.
+        for input in [b"! :".as_slice(), b"!+.mys: :\n".as_slice()] {
+            let error = parse_patch_bytes(input)
+                .err()
+                .expect("tagged mapping key must not form a PatchState");
+            assert!(error.starts_with("parse PatchState:"), "{error}");
+            assert!(
+                error.contains("invalid type: unit value, expected field identifier"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn yaml_collection_and_scalar_boundaries_are_deterministic() {
         let limits = YamlLimits {
             max_depth: 8,
