@@ -45,7 +45,7 @@ REVIEWED_SBOM_POLICY_SHA256 = (
     "7eda89a96a6a1d0870f95e5fc3453d9a61eff9880b95202c32bc38c75bf9b244"
 )
 REVIEWED_RELEASE_VERIFIER_SHA256 = (
-    "0cda39350d38d5b7d65caa3b697a02fc3c44c8b626e55f8ad772ac27f4ed0337"
+    "4d530b6ca33abee923eb30fb5142c091d70932cc0bffa10d8e22f4ab7d745258"
 )
 
 
@@ -2392,6 +2392,7 @@ def validate_versioned_release_receipts(finalizer: str) -> None:
         "v1.7.1-release-recovery-receipt.md",
         "v1.7.2-release-recovery-receipt.md",
         "v1.7.3-release-recovery-receipt.md",
+        "v1.7.4-release-recovery-receipt.md",
     )
     for name in names:
         if (
@@ -2408,6 +2409,7 @@ def self_test_versioned_release_receipts(finalizer: str) -> None:
         "v1.7.1-release-recovery-receipt.md",
         "v1.7.2-release-recovery-receipt.md",
         "v1.7.3-release-recovery-receipt.md",
+        "v1.7.4-release-recovery-receipt.md",
     )
     for name in names:
         for literal in (f'"{name}",', f'"docs/evidence/{name}"'):

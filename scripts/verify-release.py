@@ -175,6 +175,8 @@ def shader_bundle_digest(root: Path) -> str:
 
 def create_source_archive(destination: Path, tag: str, commit: str) -> None:
     prefix = f"collide-o-scope-{tag}-source/"
+    archive_environment = os.environ.copy()
+    archive_environment["TZ"] = "UTC"
     try:
         subprocess.run(
             [
@@ -183,6 +185,7 @@ def create_source_archive(destination: Path, tag: str, commit: str) -> None:
             ],
             check=True,
             capture_output=True,
+            env=archive_environment,
             timeout=60,
         )
     except (OSError, subprocess.SubprocessError) as error:
@@ -1590,9 +1593,31 @@ def self_test() -> None:
             "{}\n", encoding="utf-8", newline="\n"
         )
         validate_release_directory_inventory(directory, {"artifact.bin"}, True)
+    with tempfile.TemporaryDirectory(prefix="cos-source-timezone-self-test-") as temp:
+        directory = Path(temp)
+        current_commit = git_text("rev-parse", "HEAD")
+        original_timezone = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "America/New_York"
+            first_archive = directory / "first.zip"
+            create_source_archive(first_archive, tag, current_commit)
+            if os.environ.get("TZ") != "America/New_York":
+                raise ReleaseError("source archive creation mutated the caller timezone")
+            os.environ["TZ"] = "Pacific/Honolulu"
+            second_archive = directory / "second.zip"
+            create_source_archive(second_archive, tag, current_commit)
+            if os.environ.get("TZ") != "Pacific/Honolulu":
+                raise ReleaseError("source archive creation mutated the caller timezone")
+        finally:
+            if original_timezone is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = original_timezone
+        if digest(first_archive) != digest(second_archive):
+            raise ReleaseError("source archive bytes depend on the caller timezone")
     print(
         "release verifier self-test valid: create-only preflight, provenance, "
-        "and exact asset inventory fail closed"
+        "timezone-independent source archive, and exact asset inventory fail closed"
     )
 
 
