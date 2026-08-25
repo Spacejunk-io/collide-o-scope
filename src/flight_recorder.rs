@@ -1349,28 +1349,51 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
 
-        // Let any already-admitted facts drain before creating the active tail;
-        // the 30-second period then leaves a deterministic kill window.
-        thread::sleep(Duration::from_millis(50));
-        assert!(matches!(
-            recorder.try_record(error_event(count)),
-            RecordDisposition::Queued { .. }
-        ));
+        // A timed sleep cannot prove that the writer drained every previously
+        // admitted fact. Queue a unique sentinel instead and wait until its
+        // bytes are observable in the active tail. Once observed, every older
+        // fact has been handled and no later event can race the parent's kill.
+        const ACTIVE_TAIL_SENTINEL: u32 = u32::MAX;
+        let sentinel_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match recorder.try_record(error_event(ACTIVE_TAIL_SENTINEL)) {
+                RecordDisposition::Queued { .. } => break,
+                RecordDisposition::DroppedFull { .. } => {
+                    assert!(
+                        Instant::now() < sentinel_deadline,
+                        "active-tail sentinel could not enter the bounded queue"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                RecordDisposition::WorkerUnavailable { .. } => {
+                    panic!("flight-recorder worker stopped before the kill sentinel")
+                }
+            }
+        }
         let directory = recorder_directory_at(&root);
         let active_deadline = Instant::now() + Duration::from_secs(5);
+        let sentinel = format!(r#""occurrence_count":{ACTIVE_TAIL_SENTINEL}"#);
         loop {
-            let active_exists = fs::read_dir(&directory).unwrap().any(|entry| {
-                entry
-                    .ok()
-                    .and_then(|entry| entry.file_name().into_string().ok())
-                    .is_some_and(|name| name.starts_with(ACTIVE_PREFIX))
+            let sentinel_is_active = fs::read_dir(&directory).unwrap().any(|entry| {
+                let Ok(entry) = entry else {
+                    return false;
+                };
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    return false;
+                };
+                name.starts_with(ACTIVE_PREFIX)
+                    && fs::read(entry.path()).ok().is_some_and(|bytes| {
+                        bytes
+                            .windows(sentinel.len())
+                            .any(|part| part == sentinel.as_bytes())
+                    })
             });
-            if active_exists {
+            if sentinel_is_active {
                 break;
             }
             assert!(
                 Instant::now() < active_deadline,
-                "next active rotation did not open"
+                "active-tail sentinel did not reach the uncommitted rotation"
             );
             thread::sleep(Duration::from_millis(5));
         }
