@@ -42,7 +42,7 @@ REVIEWED_PACKAGE_ASSEMBLY_STEP_SHA256 = (
     "f327da1c8f9029e9b224bffe95b1d5713b9cee875428c56733ff04f15e468cbb"
 )
 REVIEWED_SBOM_POLICY_SHA256 = (
-    "7eda89a96a6a1d0870f95e5fc3453d9a61eff9880b95202c32bc38c75bf9b244"
+    "320e07d4dc3e8b159361e08e4ccd199bd9a8f881a1225faec1d34da2ef06d5d6"
 )
 REVIEWED_RELEASE_VERIFIER_SHA256 = (
     "4d530b6ca33abee923eb30fb5142c091d70932cc0bffa10d8e22f4ab7d745258"
@@ -2046,7 +2046,7 @@ def validate_reviewed_sbom_policy_digest(policy: str) -> None:
         or 'EXPECTED_ROOT_EDGES = 36' not in policy
         or 'EXPECTED_REWRITTEN_REFERENCES = 13' not in policy
         or 'EXPECTED_SEMANTIC_PROFILE_SHA256 = (' not in policy
-        or '"40e4ad0e01855d4eeddbf9c6364f92729b997a7bb07acb0e5e899161d9ce1d01"' not in policy
+        or '"c21e9f97f2cfb147df4fe9bd90c046ea59b429922059d2342366049c9074671b"' not in policy
         or 'object_pairs_hook=_reject_duplicate_keys' not in policy
         or 'parse_constant=_reject_nonfinite_constant' not in policy
         or 'if observed_changes != changed_paths:' not in policy
