@@ -9,7 +9,7 @@ on:
       release_tag:
         description: Candidate tag whose version must match Cargo.toml
         required: true
-        default: v1.7.1
+        default: v1.7.2
 
 permissions:
   contents: read
@@ -43,28 +43,63 @@ jobs:
       - name: Check out candidate tag verifier
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || env.RELEASE_TAG }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Resolve one immutable candidate commit
         id: source
         shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           commit="$(git rev-parse 'HEAD^{commit}')"
+          event_commit="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          if [ "$event_commit" != "$commit" ]; then
+            echo "Workflow event SHA and checked-out candidate disagree" >&2
+            exit 1
+          fi
           if [ "$GITHUB_EVENT_NAME" = "push" ]; then
-            event_commit="$(git rev-parse "$GITHUB_SHA^{commit}")"
-            if [ "$event_commit" != "$commit" ]; then
-              echo "Tag-push event SHA and candidate tag disagree" >&2
+            python scripts/verify-release.py annotated-tag \
+              --tag "$RELEASE_TAG" \
+              --commit "$commit" \
+              --remote origin \
+              --github-output "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ -z "$DEFAULT_BRANCH" ] || [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+              echo "Pre-tag qualification must be dispatched from the repository default branch" >&2
               exit 1
             fi
+            remote_default_rows="$(git ls-remote --heads origin "refs/heads/$DEFAULT_BRANCH")"
+            remote_default_commit="$(printf '%s\n' "$remote_default_rows" | awk 'NF == 2 { print $1 }')"
+            remote_default_ref="$(printf '%s\n' "$remote_default_rows" | awk 'NF == 2 { print $2 }')"
+            if [ "$(printf '%s\n' "$remote_default_rows" | awk 'NF == 2 { count += 1 } END { print count + 0 }')" -ne 1 ] || \
+               [ "$remote_default_ref" != "refs/heads/$DEFAULT_BRANCH" ] || \
+               [ "$remote_default_commit" != "$commit" ]; then
+              echo "Dispatched candidate is not the exact remote default-branch head" >&2
+              exit 1
+            fi
+            version="$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+            if [ "$RELEASE_TAG" != "v$version" ]; then
+              echo "Planned tag $RELEASE_TAG does not match Cargo version $version" >&2
+              exit 1
+            fi
+            remote_rows="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")"
+            if [ -n "$remote_rows" ]; then
+              echo "Pre-tag qualification requires the planned tag to be absent" >&2
+              exit 1
+            fi
+            python scripts/verify-release.py release-absent \
+              --repository "$GITHUB_REPOSITORY" \
+              --tag "$RELEASE_TAG"
+            echo "tag_object=" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unsupported Release trust event: $GITHUB_EVENT_NAME" >&2
+            exit 1
           fi
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          python scripts/verify-release.py annotated-tag \
-            --tag "$RELEASE_TAG" \
-            --commit "$commit" \
-            --remote origin \
-            --github-output "$GITHUB_OUTPUT"
 
       - name: Prove the required-workflow gate rejects stale status
         run: |
@@ -90,6 +125,7 @@ jobs:
 
   reproduce-sign-publish:
     name: Reproduce, attest, and sign
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: verification-gate
     runs-on: windows-2022
     timeout-minutes: 90
@@ -103,20 +139,14 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-    steps:
-      - name: Check out independent source A
+    steps: &windows_release_steps
+      - name: Check out dependency-policy source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.verification-gate.outputs.commit }}
-          path: source-a
+          path: policy-source
           fetch-depth: 0
-
-      - name: Check out independent source B
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          ref: ${{ needs.verification-gate.outputs.commit }}
-          path: source-b-with-deliberately-different-path-length
-          fetch-depth: 0
+          persist-credentials: false
 
       - name: Install pinned Rust
         shell: pwsh
@@ -138,7 +168,7 @@ jobs:
             ~/.cargo/bin
             ~/.cargo/registry
             ~/.cargo/git
-          key: release-tools-windows-auditable-0.7.5-cyclonedx-0.5.9-deny-0.20.2-audit-0.22.2-${{ hashFiles('source-a/Cargo.lock') }}
+          key: release-tools-windows-auditable-0.7.5-cyclonedx-0.5.9-deny-0.20.2-audit-0.22.2-${{ hashFiles('policy-source/Cargo.lock') }}
 
       - name: Download and verify pinned LLVM toolchain
         shell: pwsh
@@ -250,7 +280,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          Push-Location source-a
+          Push-Location policy-source
           cargo fetch --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/verify-vendored-wgpu-hal.py --self-test
@@ -267,6 +297,22 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Pop-Location
 
+      - name: Check out independent source A
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.verification-gate.outputs.commit }}
+          path: source-a
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out independent source B
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.verification-gate.outputs.commit }}
+          path: source-b-with-deliberately-different-path-length
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Validate tag and derive deterministic epoch
         id: source
         shell: pwsh
@@ -280,15 +326,53 @@ jobs:
           if ($sourceA -ne $commit -or $sourceB -ne $commit) {
             throw "Independent sources and verified commit are not identical"
           }
-          python source-a\scripts\verify-release.py annotated-tag `
-            --tag "$env:RELEASE_TAG" `
-            --commit $commit `
-            --tag-object "${{ needs.verification-gate.outputs.tag_object }}" `
-            --remote origin
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($env:GITHUB_EVENT_NAME -eq 'push') {
+            python source-a\scripts\verify-release.py annotated-tag `
+              --tag "$env:RELEASE_TAG" `
+              --commit $commit `
+              --tag-object "${{ needs.verification-gate.outputs.tag_object }}" `
+              --remote origin
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            $remoteRows = @(git -C source-a ls-remote --tags origin "refs/tags/$env:RELEASE_TAG" "refs/tags/$env:RELEASE_TAG^{}")
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($remoteRows.Count -ne 0) {
+              throw "Pre-tag qualification requires the planned tag to remain absent"
+            }
+          }
           $epoch = (git -C source-a show -s --format=%ct HEAD).Trim()
           "commit=$commit" >> $env:GITHUB_OUTPUT
           "epoch=$epoch" >> $env:GITHUB_OUTPUT
+
+      - name: Prove reproducibility checkouts are pristine
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:GIT_CONFIG_NOSYSTEM = '1'
+          $env:GIT_CONFIG_GLOBAL = 'NUL'
+          $env:GIT_CONFIG_COUNT = '0'
+          $env:GIT_ATTR_NOSYSTEM = '1'
+          $expected = "${{ needs.verification-gate.outputs.commit }}".ToLowerInvariant()
+          foreach ($source in @('source-a', 'source-b-with-deliberately-different-path-length')) {
+            $head = (git -c core.fsmonitor=false -c core.hooksPath=NUL -C $source rev-parse 'HEAD^{commit}').Trim().ToLowerInvariant()
+            if ($LASTEXITCODE -ne 0 -or $head -cne $expected) {
+              throw "Reproducibility checkout does not match the verified commit: $source"
+            }
+            $dirty = @(git -c core.fsmonitor=false -c core.hooksPath=NUL -C $source status --porcelain=v1 --untracked-files=all)
+            $statusExit = $LASTEXITCODE
+            if ($statusExit -ne 0) {
+              throw "Reproducibility checkout status failed: $source exit=$statusExit"
+            }
+            if ($dirty.Count -ne 0) {
+              $boundedRows = @(
+                $dirty | Select-Object -First 32 | ForEach-Object {
+                  if ($_.Length -le 512) { $_ } else { $_.Substring(0, 512) + '<truncated>' }
+                }
+              )
+              $details = $boundedRows | ConvertTo-Json -Compress
+              throw "Reproducibility checkout is not pristine: $source rows=$($dirty.Count) first_rows_json=$details"
+            }
+          }
 
       - name: Prepare unequal physical reproducibility roots
         shell: pwsh
@@ -512,7 +596,42 @@ jobs:
         with:
           cosign-release: v2.6.0
 
+      - name: Revalidate pre-tag absence after qualification
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $expected = "${{ needs.verification-gate.outputs.commit }}".ToLowerInvariant()
+          if ([string]::IsNullOrWhiteSpace($env:DEFAULT_BRANCH) -or
+              $env:GITHUB_REF -cne "refs/heads/$env:DEFAULT_BRANCH") {
+            throw "Pre-tag qualification is no longer bound to the repository default branch"
+          }
+          $defaultRows = @(git -C source-a ls-remote --heads origin "refs/heads/$env:DEFAULT_BRANCH")
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($defaultRows.Count -ne 1) {
+            throw "Remote default branch did not resolve exactly once"
+          }
+          $defaultColumns = @($defaultRows[0] -split "`t")
+          if ($defaultColumns.Count -ne 2 -or
+              $defaultColumns[0].ToLowerInvariant() -cne $expected -or
+              $defaultColumns[1] -cne "refs/heads/$env:DEFAULT_BRANCH") {
+            throw "Remote default-branch head changed during pre-tag qualification"
+          }
+          $tagRows = @(git -C source-a ls-remote --tags origin "refs/tags/$env:RELEASE_TAG" "refs/tags/$env:RELEASE_TAG^{}")
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($tagRows.Count -ne 0) {
+            throw "Pre-tag qualification requires the planned tag to remain absent"
+          }
+          python source-a\scripts\verify-release.py release-absent `
+            --repository "${{ github.repository }}" `
+            --tag "$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Keyless-sign the checksum manifest
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
           cosign sign-blob --yes --bundle release\SHA256SUMS.sigstore.json release\SHA256SUMS
@@ -527,11 +646,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Attest release evidence
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
           subject-path: release/*
 
       - name: Upload release evidence
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ env.RELEASE_TAG }}
@@ -606,6 +727,17 @@ jobs:
             throw "Initial upload is no longer bound to the created draft"
           }
 
+  reproduce-qualify:
+    name: Qualify reproducible release without publication authority
+    if: github.event_name == 'workflow_dispatch'
+    needs: verification-gate
+    runs-on: windows-2022
+    timeout-minutes: 90
+    permissions:
+      attestations: read
+      contents: read
+    steps: *windows_release_steps
+
   redownload-verify:
     name: Verify draft and publish only after persistence checks
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -628,6 +760,7 @@ jobs:
         with:
           ref: ${{ needs.reproduce-sign-publish.outputs.commit }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install pinned cosign
         uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0

@@ -1,5 +1,6 @@
 # Keep source and contract assets byte-stable across Windows and Unix checkouts.
 .gitattributes text eol=lf
+.gitignore text eol=lf
 *.rs text eol=lf
 *.wgsl text eol=lf
 *.js text eol=lf
@@ -12,6 +13,8 @@
 *.md text eol=lf
 *.json text eol=lf
 *.patch text eol=lf
+*.tldr text eol=lf
+*.dict text eol=lf
 
 # License texts are conveyed verbatim; keep them byte-stable on every checkout.
 LICENSE text eol=lf
@@ -27,3 +30,6 @@ third_party/wgpu-hal-29.0.3/** text eol=lf
 *.plist text eol=lf
 *.py text eol=lf
 *.ps1 text eol=lf
+
+# Fuzz corpora are opaque bytes even when a seed happens to look textual.
+fuzz/corpus/** -text

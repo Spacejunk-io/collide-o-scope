@@ -17,6 +17,15 @@ REVIEWED_REPRODUCIBLE_BUILD_SHA256 = (
 REVIEWED_PINNED_LLVM_STEP_SHA256 = (
     "350df6cb05ff8a9ec6eb61963784afafb454a586314569c27961374880f61484"
 )
+REVIEWED_RELEASE_SOURCE_RESOLUTION_STEP_SHA256 = (
+    "a4b91f799b9d142edb172702358d5c6000cd4b2432bde901db7809020bd77d62"
+)
+REVIEWED_PRISTINE_CHECKOUT_STEP_SHA256 = (
+    "42a4f40c3a227af08e26c3d8b39fe2ae1eb43cd0632303dde434f2bd0ad996a4"
+)
+REVIEWED_PRETAG_FINAL_ABSENCE_STEP_SHA256 = (
+    "166d8802ecf67c23a3116a65eddfce7e3df06bf832442693391da73362641e51"
+)
 REVIEWED_UNEQUAL_PREPARE_STEP_SHA256 = (
     "aac71777897fef9c04aa898322c62ad24fd70638091ee595fd88c5cafe3a3efc"
 )
@@ -1362,10 +1371,289 @@ def self_test_pinned_llvm_workflow(release: str) -> None:
         fail("pinned LLVM checker accepted braced-variable installer execution")
 
 
+def validate_release_checkout_isolation_and_pretag(release: str) -> None:
+    exact = {
+        "ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || env.RELEASE_TAG }}": 1,
+        'elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then': 1,
+        'if [ -z "$DEFAULT_BRANCH" ] || [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then': 1,
+        'remote_default_rows="$(git ls-remote --heads origin "refs/heads/$DEFAULT_BRANCH")"': 1,
+        "Dispatched candidate is not the exact remote default-branch head": 1,
+        'if [ "$RELEASE_TAG" != "v$version" ]; then': 1,
+        'remote_rows="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")"': 1,
+        "Pre-tag qualification requires the planned tag to be absent": 1,
+        "python scripts/verify-release.py release-absent \\": 1,
+        'echo "tag_object=" >> "$GITHUB_OUTPUT"': 1,
+        "- name: Check out dependency-policy source": 1,
+        "path: policy-source": 1,
+        "persist-credentials: false": 5,
+        "hashFiles('policy-source/Cargo.lock')": 1,
+        "Push-Location policy-source": 1,
+        "- name: Check out independent source A": 1,
+        "- name: Check out independent source B": 1,
+        "- name: Prove reproducibility checkouts are pristine": 1,
+        "$env:GIT_CONFIG_NOSYSTEM = '1'": 1,
+        "$env:GIT_CONFIG_GLOBAL = 'NUL'": 1,
+        "$env:GIT_CONFIG_COUNT = '0'": 1,
+        "$env:GIT_ATTR_NOSYSTEM = '1'": 1,
+        "status --porcelain=v1 --untracked-files=all": 1,
+        "if ($statusExit -ne 0) {": 1,
+        "if ($dirty.Count -ne 0) {": 1,
+        "Reproducibility checkout is not pristine: $source": 1,
+        "Pre-tag qualification requires the planned tag to remain absent": 2,
+        "- name: Revalidate pre-tag absence after qualification": 1,
+        "if: github.event_name == 'workflow_dispatch'": 2,
+        "Remote default-branch head changed during pre-tag qualification": 1,
+        "steps: &windows_release_steps": 1,
+        "steps: *windows_release_steps": 1,
+    }
+    if any(release.count(fragment) != count for fragment, count in exact.items()):
+        fail("release pre-tag or checkout-isolation contract changed")
+
+    resolve_marker = "      - name: Resolve one immutable candidate commit"
+    resolve_start = release.index(resolve_marker)
+    resolve_end = release.index("\n      - name:", resolve_start + 1)
+    resolve_step = release[resolve_start:resolve_end]
+    if (
+        hashlib.sha256(resolve_step.encode("utf-8")).hexdigest()
+        != REVIEWED_RELEASE_SOURCE_RESOLUTION_STEP_SHA256
+    ):
+        fail("release candidate resolution differs from its reviewed bytes")
+
+    order = (
+        "- name: Check out dependency-policy source",
+        "- name: Enforce dependency, license, and vendor gates",
+        "Push-Location policy-source",
+        "- name: Check out independent source A",
+        "- name: Check out independent source B",
+        "- name: Validate tag and derive deterministic epoch",
+        "- name: Prove reproducibility checkouts are pristine",
+        "- name: Prepare unequal physical reproducibility roots",
+        "- name: Build twice from clean independent unequal roots",
+    )
+    positions = [_unique_index(release, marker) for marker in order]
+    if positions != sorted(positions) or len(set(positions)) != len(positions):
+        fail("policy work and fresh reproducibility checkouts are out of order")
+
+    gate_start = release.index("      - name: Enforce dependency, license, and vendor gates")
+    gate_end = release.index("\n      - name:", gate_start + 1)
+    gate = release[gate_start:gate_end]
+    if "Push-Location policy-source" not in gate or "source-a" in gate or "source-b" in gate:
+        fail("mutable policy tooling can contaminate a reproducibility checkout")
+
+    pristine_start = release.index("      - name: Prove reproducibility checkouts are pristine")
+    pristine_end = release.index("\n      - name:", pristine_start + 1)
+    pristine = release[pristine_start:pristine_end]
+    pristine_digest = hashlib.sha256(pristine.encode("utf-8")).hexdigest()
+    if (
+        pristine_digest != REVIEWED_PRISTINE_CHECKOUT_STEP_SHA256
+        or pristine.count("git -c core.fsmonitor=false -c core.hooksPath=NUL -C $source") != 2
+        or "Select-Object -First 32" not in pristine
+        or ".Substring(0, 512) + '<truncated>'" not in pristine
+        or "$boundedRows | ConvertTo-Json -Compress" not in pristine
+        or "rows=$($dirty.Count) first_rows_json=$details" not in pristine
+        or "--untracked-files=no" in pristine
+        or "$dirty -join" in pristine
+        or "git clean" in pristine
+        or "git reset" in pristine
+        or "Remove-Item" in pristine
+    ):
+        fail("fresh-checkout proof can hide, omit, or repair dirty state")
+
+    cosign_marker = "      - name: Install pinned cosign"
+    cosign_start = release.index(cosign_marker)
+    cosign_end = release.index("\n      - name:", cosign_start + 1)
+    pretag_cosign = release[cosign_start:cosign_end]
+    if "\n        if:" in pretag_cosign:
+        fail("pre-tag qualification skips the safe pinned-cosign installation proof")
+
+    final_absence_marker = "      - name: Revalidate pre-tag absence after qualification"
+    final_absence_start = release.index(final_absence_marker)
+    final_absence_end = release.index("\n      - name:", final_absence_start + 1)
+    final_absence = release[final_absence_start:final_absence_end]
+    final_absence_digest = hashlib.sha256(final_absence.encode("utf-8")).hexdigest()
+    final_absence_required = (
+        "if: github.event_name == 'workflow_dispatch'",
+        "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+        '$env:GITHUB_REF -cne "refs/heads/$env:DEFAULT_BRANCH"',
+        'git -C source-a ls-remote --heads origin "refs/heads/$env:DEFAULT_BRANCH"',
+        'git -C source-a ls-remote --tags origin "refs/tags/$env:RELEASE_TAG"',
+        "python source-a\\scripts\\verify-release.py release-absent `",
+    )
+    if (
+        final_absence_digest != REVIEWED_PRETAG_FINAL_ABSENCE_STEP_SHA256
+        or any(final_absence.count(fragment) != 1 for fragment in final_absence_required)
+    ):
+        fail("pre-tag completion can rely on stale branch, tag, or release state")
+
+    qualification_tail = (
+        "      - name: Assemble deterministic package and provenance",
+        cosign_marker,
+        final_absence_marker,
+        "      - name: Keyless-sign the checksum manifest",
+    )
+    tail_positions = [release.index(marker) for marker in qualification_tail]
+    if tail_positions != sorted(tail_positions):
+        fail("final pre-tag absence check does not follow complete safe qualification")
+
+    tag_only_condition = "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
+    for step_name in (
+        "Keyless-sign the checksum manifest",
+        "Attest release evidence",
+        "Upload release evidence",
+        "Revalidate the live tag before publication",
+        "Create release and upload initial assets once",
+    ):
+        marker = f"      - name: {step_name}"
+        step_start = release.index(marker)
+        step_end = release.find("\n      - name:", step_start + 1)
+        if step_end < 0:
+            step_end = len(release)
+        if tag_only_condition not in release[step_start:step_end]:
+            fail(f"workflow dispatch can execute tag-only step: {step_name}")
+
+    redownload_header = (
+        "  redownload-verify:\n"
+        "    name: Verify draft and publish only after persistence checks\n"
+        "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')\n"
+    )
+    if release.count(redownload_header) != 1:
+        fail("workflow dispatch can enter the draft verification/publication job")
+
+    tag_job_header = (
+        "  reproduce-sign-publish:\n"
+        "    name: Reproduce, attest, and sign\n"
+        "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')\n"
+    )
+    qualify_job_header = (
+        "  reproduce-qualify:\n"
+        "    name: Qualify reproducible release without publication authority\n"
+        "    if: github.event_name == 'workflow_dispatch'\n"
+    )
+    if release.count(tag_job_header) != 1 or release.count(qualify_job_header) != 1:
+        fail("privileged tag job and read-only dispatch job are not event-exclusive")
+    tag_job = release.split("  reproduce-sign-publish:\n", 1)[1].split(
+        "  reproduce-qualify:\n", 1
+    )[0]
+    qualify_job = release.split("  reproduce-qualify:\n", 1)[1].split(
+        "  redownload-verify:\n", 1
+    )[0]
+    tag_permissions = (
+        "    permissions:\n"
+        "      contents: write\n"
+        "      id-token: write\n"
+        "      attestations: write\n"
+        "    steps: &windows_release_steps\n"
+    )
+    qualify_permissions = (
+        "    permissions:\n"
+        "      attestations: read\n"
+        "      contents: read\n"
+        "    steps: *windows_release_steps\n"
+    )
+    if tag_job.count(tag_permissions) != 1 or qualify_job.count(qualify_permissions) != 1:
+        fail("release job permissions or anchored step ownership changed")
+    if "write" in qualify_job or "id-token" in qualify_job or "outputs:" in qualify_job:
+        fail("pre-tag qualification retains publication or identity-token authority")
+
+    dispatch_start = release.index('elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then')
+    dispatch_end = release.index("\n          else", dispatch_start + 1)
+    dispatch = release[dispatch_start:dispatch_end]
+    if (
+        "release-absent" not in dispatch
+        or "ls-remote --tags" not in dispatch
+        or "tag_object=" not in dispatch
+        or "gh release create" in dispatch
+        or "gh release upload" in dispatch
+        or "gh release edit" in dispatch
+    ):
+        fail("workflow dispatch can skip absence gates or mutate a release")
+
+
+def self_test_release_checkout_isolation_and_pretag(release: str) -> None:
+    validate_release_checkout_isolation_and_pretag(release)
+    mutations = (
+        release.replace("Push-Location policy-source", "Push-Location source-a", 1),
+        release.replace(
+            "ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || env.RELEASE_TAG }}",
+            "ref: ${{ env.RELEASE_TAG }}",
+            1,
+        ),
+        release.replace("status --porcelain=v1 --untracked-files=all", "status --porcelain=v1 --untracked-files=no", 1),
+        release.replace("if ($statusExit -ne 0) {", "if ($statusExit -lt 0) {", 1),
+        release.replace("if ($dirty.Count -ne 0) {", "if ($dirty.Count -lt 0) {", 1),
+        release.replace("$head -cne $expected", "$head -ceq $expected", 1),
+        release.replace(
+            "$dirty = @(git -c core.fsmonitor=false",
+            "$dirty = @() # git -c core.fsmonitor=false",
+            1,
+        ),
+        release.replace("python scripts/verify-release.py release-absent \\", "python scripts/verify-release.py verify \\", 1),
+        release.replace('echo "tag_object=" >> "$GITHUB_OUTPUT"', 'echo "tag_object=unchecked" >> "$GITHUB_OUTPUT"', 1),
+        release.replace("Pre-tag qualification requires the planned tag to be absent", "tag may already exist", 1),
+        release.replace("persist-credentials: false", "persist-credentials: true", 1),
+        release.replace(
+            'if [ -z "$DEFAULT_BRANCH" ] || [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then',
+            'if [ -z "$DEFAULT_BRANCH" ] || [ "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH" ]; then',
+            1,
+        ),
+        release.replace(
+            "      - name: Revalidate pre-tag absence after qualification\n"
+            "        if: github.event_name == 'workflow_dispatch'",
+            "      - name: Revalidate pre-tag absence after qualification",
+            1,
+        ),
+        release.replace(
+            "python source-a\\scripts\\verify-release.py release-absent `",
+            "python source-a\\scripts\\verify-release.py verify `",
+            1,
+        ),
+        release.replace(
+            "  redownload-verify:\n"
+            "    name: Verify draft and publish only after persistence checks\n"
+            "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')\n",
+            "  redownload-verify:\n"
+            "    name: Verify draft and publish only after persistence checks\n",
+            1,
+        ),
+        release.replace(
+            "  reproduce-sign-publish:\n"
+            "    name: Reproduce, attest, and sign\n"
+            "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')\n",
+            "  reproduce-sign-publish:\n"
+            "    name: Reproduce, attest, and sign\n",
+            1,
+        ),
+        release.replace(
+            "      contents: read\n    steps: *windows_release_steps",
+            "      contents: write\n    steps: *windows_release_steps",
+            1,
+        ),
+        release.replace(
+            "      contents: read\n    steps: *windows_release_steps",
+            "      contents: read\n      id-token: write\n    steps: *windows_release_steps",
+            1,
+        ),
+        release.replace("steps: *windows_release_steps", "steps: &windows_release_steps", 1),
+        release.replace(
+            "      - name: Keyless-sign the checksum manifest\n"
+            "        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')",
+            "      - name: Keyless-sign the checksum manifest",
+            1,
+        ),
+    )
+    for mutation in mutations:
+        try:
+            validate_release_checkout_isolation_and_pretag(mutation)
+        except ValueError:
+            pass
+        else:
+            fail("release checkout-isolation or pre-tag mutation escaped policy")
+
+
 def unequal_reproducibility_workflow_fragments() -> tuple[tuple[str, int], ...]:
     return (
         ("path: source-b-with-deliberately-different-path-length", 1),
-        ("source-b-with-deliberately-different-path-length", 3),
+        ("source-b-with-deliberately-different-path-length", 4),
         ("- name: Prepare unequal physical reproducibility roots", 1),
         ("$cargoA = Join-Path $env:RUNNER_TEMP 'ca'", 1),
         ("cargo-seed-b-with-deliberately-different-physical-path-length", 1),
@@ -1561,17 +1849,36 @@ def self_test_unequal_reproducibility_workflow(release: str) -> None:
 
 def validate_reproducible_checkout_attributes(attributes: str) -> None:
     required = [
+        ".gitignore text eol=lf",
+        "*.tldr text eol=lf",
+        "*.dict text eol=lf",
         "*.lock text eol=lf",
         "*.ps1 text eol=lf",
+        "fuzz/corpus/** -text",
     ]
     lines = attributes.splitlines()
     if any(lines.count(rule) != 1 for rule in required):
         fail("raw-hashed lockfiles and release PowerShell must be LF-stable")
+    corpus_index = lines.index("fuzz/corpus/** -text")
+    later_attribute_rules = [
+        line
+        for line in lines[corpus_index + 1 :]
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if later_attribute_rules:
+        fail("opaque fuzz-corpus rule must be the final non-comment attribute rule")
 
 
 def self_test_reproducible_checkout_attributes(attributes: str) -> None:
     validate_reproducible_checkout_attributes(attributes)
-    for rule in ["*.lock text eol=lf", "*.ps1 text eol=lf"]:
+    for rule in [
+        ".gitignore text eol=lf",
+        "*.tldr text eol=lf",
+        "*.dict text eol=lf",
+        "*.lock text eol=lf",
+        "*.ps1 text eol=lf",
+        "fuzz/corpus/** -text",
+    ]:
         mutation = attributes.replace(rule, "", 1)
         try:
             validate_reproducible_checkout_attributes(mutation)
@@ -1579,6 +1886,53 @@ def self_test_reproducible_checkout_attributes(attributes: str) -> None:
             pass
         else:
             fail("checkout-attribute self-test accepted a byte-unstable release input")
+    reordered = attributes.replace("fuzz/corpus/** -text\n", "", 1)
+    reordered = "fuzz/corpus/** -text\n" + reordered
+    try:
+        validate_reproducible_checkout_attributes(reordered)
+    except ValueError:
+        pass
+    else:
+        fail("checkout-attribute self-test accepted an overridden fuzz-corpus rule")
+    tabbed_override = attributes + "*.json\ttext eol=lf\n"
+    try:
+        validate_reproducible_checkout_attributes(tabbed_override)
+    except ValueError:
+        pass
+    else:
+        fail("checkout-attribute self-test accepted a tabbed corpus override")
+
+
+def validate_versioned_release_receipts(finalizer: str) -> None:
+    names = (
+        "v1.7.0-improvement-audit-release-receipt.md",
+        "v1.7.1-release-recovery-receipt.md",
+        "v1.7.2-release-recovery-receipt.md",
+    )
+    for name in names:
+        if (
+            finalizer.count(f'"{name}",') != 1
+            or finalizer.count(f'"docs/evidence/{name}"') != 1
+        ):
+            fail(f"final receipt does not bind versioned source evidence: {name}")
+
+
+def self_test_versioned_release_receipts(finalizer: str) -> None:
+    validate_versioned_release_receipts(finalizer)
+    names = (
+        "v1.7.0-improvement-audit-release-receipt.md",
+        "v1.7.1-release-recovery-receipt.md",
+        "v1.7.2-release-recovery-receipt.md",
+    )
+    for name in names:
+        for literal in (f'"{name}",', f'"docs/evidence/{name}"'):
+            mutation = finalizer.replace(literal, "", 1)
+            try:
+                validate_versioned_release_receipts(mutation)
+            except ValueError:
+                pass
+            else:
+                fail("versioned-receipt self-test accepted missing source evidence")
 
 
 def validate_required_workflow_transport(workflow_gate: str) -> None:
@@ -1653,6 +2007,7 @@ def main() -> int:
         self_test_attestation_identity_policy(release)
         self_test_draft_publish_last(release)
         self_test_pinned_llvm_workflow(release)
+        self_test_release_checkout_isolation_and_pretag(release)
         self_test_unequal_reproducibility_workflow(release)
         ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self_test_ci_gate_bodies(ci)
@@ -1671,6 +2026,7 @@ def main() -> int:
         final_receipt = (ROOT / "scripts/finalize-release-receipt.py").read_text(
             encoding="utf-8"
         )
+        self_test_versioned_release_receipts(final_receipt)
         workflow_gate = (ROOT / "scripts/wait-required-workflows.py").read_text(
             encoding="utf-8"
         )
@@ -1788,7 +2144,7 @@ def main() -> int:
             "python scripts/finalize-release-receipt.py self-test",
         ]
         if (
-            release.count("ref: ${{ needs.verification-gate.outputs.commit }}") != 2
+            release.count("ref: ${{ needs.verification-gate.outputs.commit }}") != 3
             or release.count("python scripts/verify-release.py annotated-tag \\") != 1
             or release.count("verify-release.py annotated-tag `") != 5
             or release.count('--tag-object "${{ needs.verification-gate.outputs.tag_object }}"') != 6
