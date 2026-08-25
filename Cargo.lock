@@ -909,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "collide-o-scope"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "ab_glyph",
  "axum",
@@ -947,6 +947,7 @@ dependencies = [
  "tokio-tungstenite",
  "tower-http",
  "trash",
+ "unsafe-libyaml",
  "wgpu",
  "windows-sys 0.61.2",
  "winit",

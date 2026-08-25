@@ -1,6 +1,6 @@
 [package]
 name = "collide-o-scope"
-version = "1.7.2"
+version = "1.7.3"
 edition = "2021"
 default-run = "collide-o-scope"
 license = "GPL-3.0-or-later"
@@ -24,6 +24,7 @@ rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+unsafe-libyaml = "=0.2.11"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "macros", "fs", "io-util", "time"] }
 axum = { version = "0.7", features = ["ws"] }

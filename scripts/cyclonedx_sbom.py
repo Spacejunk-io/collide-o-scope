@@ -39,12 +39,12 @@ EXPECTED_TARGET_COMPONENTS = 6
 EXPECTED_REGISTRY_COMPONENTS = 362
 EXPECTED_GIT_COMPONENTS = 1
 EXPECTED_DEPENDENCY_ROWS = 365
-EXPECTED_DEPENDENCY_EDGES = 872
-EXPECTED_ROOT_EDGES = 35
+EXPECTED_DEPENDENCY_EDGES = 873
+EXPECTED_ROOT_EDGES = 36
 EXPECTED_LOCAL_DECLARATIONS = 8
 EXPECTED_REWRITTEN_REFERENCES = 13
 EXPECTED_SEMANTIC_PROFILE_SHA256 = (
-    "a20879074f7dd5bf92c8061b4c8bd18fbde134c83e67c6b7c49b6f5818b2b029"
+    "40e4ad0e01855d4eeddbf9c6364f92729b997a7bb07acb0e5e899161d9ce1d01"
 )
 SEMANTIC_SOURCE_PLACEHOLDER = "<exact-collide-o-scope-source-commit>"
 SEMANTIC_TIMESTAMP_PLACEHOLDER = "<exact-source-date-epoch>"
@@ -1002,7 +1002,7 @@ def fixture_document(
     dependencies: list[dict[str, Any]] = [
         {
             "ref": root_ref,
-            "dependsOn": [vendor_ref, target_refs[0], *registry_refs[:33]],
+            "dependsOn": [vendor_ref, target_refs[0], *registry_refs[:34]],
         },
         {
             "ref": vendor_ref,

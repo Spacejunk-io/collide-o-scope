@@ -724,6 +724,24 @@ mod tests {
     }
 
     #[test]
+    fn patch_save_preflight_round_trips_plain_paths_with_embedded_quotes() {
+        let filename = "O'Brien \"final\".mov";
+        let source_path = "C:/media/O'Brien \"final\".mov";
+        let authored = format!(
+            "master: {{}}\nlayers:\n  - filename: {filename}\n    source_path: {source_path}\n"
+        );
+        let patch = parse_patch_bytes(authored.as_bytes()).expect("authored patch parses");
+        assert_eq!(patch.layers[0].filename, filename);
+        assert_eq!(patch.layers[0].source_path, source_path);
+
+        let canonical = serialize_patch_preflight(&patch)
+            .expect("the exact bytes selected for publication pass preflight");
+        let restored = parse_patch_bytes(&canonical).expect("published bytes reload");
+        assert_eq!(restored.layers[0].filename, filename);
+        assert_eq!(restored.layers[0].source_path, source_path);
+    }
+
+    #[test]
     fn metadata_cap_is_checked_before_a_bounded_read() {
         let path = TempPatch::new();
         std::fs::write(&path.0, vec![b'x'; 65]).unwrap();
@@ -741,7 +759,9 @@ mod tests {
         deep.extend(std::iter::repeat_n(b'[', MAX_PATCH_YAML_DEPTH + 1));
         deep.extend(std::iter::repeat_n(b']', MAX_PATCH_YAML_DEPTH + 1));
         let error = parse_patch_bytes(&deep).err().expect("deep flow must fail");
-        assert!(error.contains("flow depth"), "{error}");
+        // The root block mapping already occupies one syntax level, so the
+        // combined block/flow guard correctly fires before the flow-only cap.
+        assert!(error.contains("syntax depth"), "{error}");
     }
 
     #[test]

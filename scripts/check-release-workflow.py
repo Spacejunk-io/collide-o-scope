@@ -42,7 +42,7 @@ REVIEWED_PACKAGE_ASSEMBLY_STEP_SHA256 = (
     "f327da1c8f9029e9b224bffe95b1d5713b9cee875428c56733ff04f15e468cbb"
 )
 REVIEWED_SBOM_POLICY_SHA256 = (
-    "8a3207cf33e434a9946fb8d135d859bc52ffb26f5b65f3c6f2c6219b9b1de1d9"
+    "7eda89a96a6a1d0870f95e5fc3453d9a61eff9880b95202c32bc38c75bf9b244"
 )
 REVIEWED_RELEASE_VERIFIER_SHA256 = (
     "0cda39350d38d5b7d65caa3b697a02fc3c44c8b626e55f8ad772ac27f4ed0337"
@@ -2042,9 +2042,11 @@ def validate_reviewed_sbom_policy_digest(policy: str) -> None:
         != REVIEWED_SBOM_POLICY_SHA256
         or 'EXPECTED_REPOSITORY_URL = "https://github.com/Spacejunk-io/collide-o-scope"' not in policy
         or 'return f"{EXPECTED_REPOSITORY_URL}/tree/{commit}"' not in policy
+        or 'EXPECTED_DEPENDENCY_EDGES = 873' not in policy
+        or 'EXPECTED_ROOT_EDGES = 36' not in policy
         or 'EXPECTED_REWRITTEN_REFERENCES = 13' not in policy
         or 'EXPECTED_SEMANTIC_PROFILE_SHA256 = (' not in policy
-        or '"a20879074f7dd5bf92c8061b4c8bd18fbde134c83e67c6b7c49b6f5818b2b029"' not in policy
+        or '"40e4ad0e01855d4eeddbf9c6364f92729b997a7bb07acb0e5e899161d9ce1d01"' not in policy
         or 'object_pairs_hook=_reject_duplicate_keys' not in policy
         or 'parse_constant=_reject_nonfinite_constant' not in policy
         or 'if observed_changes != changed_paths:' not in policy
@@ -2389,6 +2391,7 @@ def validate_versioned_release_receipts(finalizer: str) -> None:
         "v1.7.0-improvement-audit-release-receipt.md",
         "v1.7.1-release-recovery-receipt.md",
         "v1.7.2-release-recovery-receipt.md",
+        "v1.7.3-release-recovery-receipt.md",
     )
     for name in names:
         if (
@@ -2404,6 +2407,7 @@ def self_test_versioned_release_receipts(finalizer: str) -> None:
         "v1.7.0-improvement-audit-release-receipt.md",
         "v1.7.1-release-recovery-receipt.md",
         "v1.7.2-release-recovery-receipt.md",
+        "v1.7.3-release-recovery-receipt.md",
     )
     for name in names:
         for literal in (f'"{name}",', f'"docs/evidence/{name}"'):
