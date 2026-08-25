@@ -38,8 +38,14 @@ REVIEWED_UNEQUAL_CONTIGUOUS_REGION_SHA256 = (
 REVIEWED_REPRODUCIBLE_SBOM_STEP_SHA256 = (
     "58576a9f07f6a9a6c3fcb8c7fdbb49a13a6eb15993550cb0a9679a21d2372833"
 )
+REVIEWED_PACKAGE_ASSEMBLY_STEP_SHA256 = (
+    "f327da1c8f9029e9b224bffe95b1d5713b9cee875428c56733ff04f15e468cbb"
+)
 REVIEWED_SBOM_POLICY_SHA256 = (
     "8a3207cf33e434a9946fb8d135d859bc52ffb26f5b65f3c6f2c6219b9b1de1d9"
+)
+REVIEWED_RELEASE_VERIFIER_SHA256 = (
+    "0cda39350d38d5b7d65caa3b697a02fc3c44c8b626e55f8ad772ac27f4ed0337"
 )
 
 
@@ -2134,6 +2140,194 @@ def self_test_shared_sbom_verifier(verifier: str) -> None:
         fail("shared SBOM verifier mutation escaped the policy gate")
 
 
+def validate_pretag_package_tag_state(release: str, verifier: str) -> None:
+    if hashlib.sha256(verifier.encode("utf-8")).hexdigest() != REVIEWED_RELEASE_VERIFIER_SHA256:
+        fail("release verifier differs from its reviewed bytes")
+    assembly_marker = "      - name: Assemble deterministic package and provenance"
+    assembly_successor = "      - name: Install pinned cosign"
+    if release.count(assembly_marker) != 1 or assembly_successor not in release:
+        fail("reviewed release package-assembly workflow boundary is not unique")
+    assembly_start = release.index(assembly_marker)
+    assembly_end = release.index(assembly_successor, assembly_start + 1)
+    assembly_step = release[assembly_start:assembly_end]
+    if (
+        hashlib.sha256(assembly_step.encode("utf-8")).hexdigest()
+        != REVIEWED_PACKAGE_ASSEMBLY_STEP_SHA256
+    ):
+        fail("release package-assembly workflow differs from its reviewed bytes")
+    tag_state_assignment = (
+        "$tagState = if ($env:GITHUB_EVENT_NAME -ceq 'push') {\n"
+        "            'annotated'\n"
+        "          } elseif ($env:GITHUB_EVENT_NAME -ceq 'workflow_dispatch') {\n"
+        "            'absent'\n"
+        "          } else {\n"
+        "            throw 'Unsupported release workflow event'\n"
+        "          }"
+    )
+    if (
+        release.count(tag_state_assignment) != 1
+        or release.count("--tag-state $tagState") != 2
+        or release.count("--tag-state annotated") != 3
+        or "--tag-state absent" in release
+    ):
+        fail("release package verification does not bind explicit pre-tag/tagged state")
+    verifier_contract = (
+        "def local_ref_sha(reference: str) -> str | None:",
+        '"rev-parse",',
+        '"--verify",',
+        '"--quiet",',
+        "if completed.returncode == 1 and not stdout and not stderr:",
+        "def validate_resolved_tag_state(",
+        'if tag_state not in {"absent", "annotated"}:',
+        'if tag_state == "absent":',
+        'local_tag_type != "tag"',
+        'raise ReleaseError("pre-tag qualification requires the local release tag to be absent")',
+        'raise ReleaseError("tagged release verification requires the exact annotated tag")',
+        "def validate_tag_binding(tag: str, commit: str, tag_state: str) -> None:",
+        'git_text("cat-file", "-t", tag_ref)',
+        'git_text("rev-parse", f"{tag_ref}^{{commit}}").lower()',
+        "def validate_identity(identity: dict, tag: str, commit: str, tag_state: str) -> None:",
+        "validate_tag_binding(tag, commit, tag_state)",
+        "validate_identity(identity, args.tag, args.commit, args.tag_state)",
+        'add_argument("--tag-state", choices=("absent", "annotated"), required=True)',
+        'validate_resolved_tag_state("absent", None, None, None, commit)',
+        'validate_resolved_tag_state("annotated", "2" * 40, "tag", commit, commit)',
+        "def validate_signature_tag_state(require_signature: bool, tag_state: str) -> None:",
+        'if require_signature and tag_state != "annotated":',
+        "validate_signature_tag_state(args.require_signature, args.tag_state)",
+        'lambda: validate_signature_tag_state(True, "absent")',
+        "license_path: Path | None = None,",
+        "readme_path: Path | None = None,",
+        'license_path=extracted / "LICENSES/FFmpeg-GPL-3.0-or-later.txt",',
+        'readme_path=extracted / "FFMPEG-README.txt",',
+    )
+    expected_counts = {
+        "validate_identity(identity, args.tag, args.commit, args.tag_state)": 2,
+        'add_argument("--tag-state", choices=("absent", "annotated"), required=True)': 2,
+    }
+    tag_binding_parts = verifier.split(
+        "def validate_tag_binding(tag: str, commit: str, tag_state: str) -> None:",
+        1,
+    )
+    tag_binding = (
+        ""
+        if len(tag_binding_parts) != 2
+        else tag_binding_parts[1].split("\n\n\ndef validate_identity(", 1)[0]
+    )
+    verify_prefix = (
+        "def verify(args: argparse.Namespace) -> dict:\n"
+        "    validate_signature_tag_state(args.require_signature, args.tag_state)\n"
+        "    directory = args.directory.resolve()"
+    )
+    ffmpeg_override_defaults = (
+        '    if license_path is None:\n'
+        '        license_path = root / "LICENSE"\n'
+        '    if readme_path is None:\n'
+        '        readme_path = root / "README.txt"\n'
+        '    if not license_path.is_file() or not readme_path.is_file():'
+    )
+    if (
+        any(fragment not in verifier for fragment in verifier_contract)
+        or any(verifier.count(fragment) != count for fragment, count in expected_counts.items())
+        or tag_binding.count('git_text("cat-file", "-t", tag_ref)') != 1
+        or tag_binding.count('git_text("rev-parse", f"{tag_ref}^{{commit}}").lower()') != 1
+        or tag_binding.count("local_tag_sha = local_ref_sha(tag_ref)") != 1
+        or verifier.count(verify_prefix) != 1
+        or verifier.count(ffmpeg_override_defaults) != 1
+    ):
+        fail("release verifier lacks the fail-closed absent/annotated tag-state contract")
+
+
+def self_test_pretag_package_tag_state(release: str, verifier: str) -> None:
+    validate_pretag_package_tag_state(release, verifier)
+    release_mutations = (
+        release.replace("--tag-state $tagState", "--tag-state annotated", 1),
+        release.replace("--tag-state annotated", "--tag-state absent", 1),
+        release.replace("-ceq 'workflow_dispatch'", "-ceq 'push'", 1),
+        release.replace("throw 'Unsupported release workflow event'", "'absent'", 1),
+    )
+    for mutation in release_mutations:
+        try:
+            validate_pretag_package_tag_state(mutation, verifier)
+        except ValueError:
+            continue
+        fail("pre-tag workflow tag-state mutation escaped the policy gate")
+    verifier_mutations = (
+        verifier.replace("local_tag_type != \"tag\"", "local_tag_type != \"commit\"", 1),
+        verifier.replace(
+            "validate_tag_binding(tag, commit, tag_state)",
+            "pass  # tag binding skipped",
+            1,
+        ),
+        verifier.replace(
+            'choices=("absent", "annotated"), required=True',
+            'choices=("absent", "annotated"), required=False',
+            1,
+        ),
+        verifier.replace(
+            "if completed.returncode == 1 and not stdout and not stderr:",
+            "if completed.returncode != 0:",
+            1,
+        ),
+        verifier.replace(
+            '        git_text("cat-file", "-t", tag_ref),',
+            '        "tag",',
+            1,
+        ),
+        verifier.replace(
+            '        git_text("rev-parse", f"{tag_ref}^{{commit}}").lower(),',
+            "        commit.lower(),",
+            1,
+        ),
+        verifier.replace(
+            "    local_tag_sha = local_ref_sha(tag_ref)",
+            "    local_tag_sha = None",
+            1,
+        ),
+        verifier.replace(
+            'if require_signature and tag_state != "annotated":',
+            "if False:",
+            1,
+        ),
+        verifier.replace(
+            "    validate_signature_tag_state(args.require_signature, args.tag_state)\n"
+            "    directory = args.directory.resolve()",
+            "    if args.tag_state == 'annotated':\n"
+            "        validate_signature_tag_state(args.require_signature, args.tag_state)\n"
+            "    directory = args.directory.resolve()",
+            1,
+        ),
+        verifier.replace(
+            'license_path=extracted / "LICENSES/FFmpeg-GPL-3.0-or-later.txt",',
+            'license_path=extracted / "LICENSE",',
+            1,
+        ),
+        verifier.replace(
+            'readme_path=extracted / "FFMPEG-README.txt",',
+            'readme_path=extracted / "README.txt",',
+            1,
+        ),
+        verifier.replace(
+            '    if license_path is None:\n'
+            '        license_path = root / "LICENSE"',
+            '    license_path = root / "LICENSE"',
+            1,
+        ),
+        verifier.replace(
+            '    if readme_path is None:\n'
+            '        readme_path = root / "README.txt"',
+            '    readme_path = root / "README.txt"',
+            1,
+        ),
+    )
+    for mutation in verifier_mutations:
+        try:
+            validate_pretag_package_tag_state(release, mutation)
+        except ValueError:
+            continue
+        fail("release-verifier tag-state mutation escaped the policy gate")
+
+
 def validate_reproducible_checkout_attributes(attributes: str) -> None:
     required = [
         ".gitignore text eol=lf",
@@ -2316,6 +2510,7 @@ def main() -> int:
             encoding="utf-8"
         )
         self_test_shared_sbom_verifier(release_verifier)
+        self_test_pretag_package_tag_state(release, release_verifier)
         final_receipt = (ROOT / "scripts/finalize-release-receipt.py").read_text(
             encoding="utf-8"
         )

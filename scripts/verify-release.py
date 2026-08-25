@@ -203,6 +203,34 @@ def git_text(*arguments: str) -> str:
     return completed.stdout.strip()
 
 
+def local_ref_sha(reference: str) -> str | None:
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(ROOT),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                reference,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ReleaseError(f"inspect release Git reference: {error}") from error
+    stdout = completed.stdout.strip()
+    stderr = completed.stderr.strip()
+    if completed.returncode == 1 and not stdout and not stderr:
+        return None
+    if completed.returncode != 0 or stderr or GIT_SHA.fullmatch(stdout) is None:
+        raise ReleaseError("release Git reference query returned an unsupported result")
+    return stdout.lower()
+
+
 def parse_annotated_tag_rows(rows: list[str], tag: str) -> tuple[str, str]:
     tag_ref = f"refs/tags/{tag}"
     peeled_ref = f"{tag_ref}^{{}}"
@@ -343,6 +371,9 @@ def ffmpeg_distribution_evidence(
     ffmpeg_bin: Path,
     version: str,
     source_commit: str,
+    *,
+    license_path: Path | None = None,
+    readme_path: Path | None = None,
 ) -> tuple[str, dict]:
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ReleaseError("FFmpeg version must be semantic numeric text")
@@ -361,8 +392,10 @@ def ffmpeg_distribution_evidence(
     ):
         raise ReleaseError("FFmpeg runtime does not report GPL version 3-or-later")
     root = ffmpeg_bin.parent
-    license_path = root / "LICENSE"
-    readme_path = root / "README.txt"
+    if license_path is None:
+        license_path = root / "LICENSE"
+    if readme_path is None:
+        readme_path = root / "README.txt"
     if not license_path.is_file() or not readme_path.is_file():
         raise ReleaseError("FFmpeg distribution license or README is missing")
     if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
@@ -589,7 +622,48 @@ def identity_payload(identity: dict) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def validate_identity(identity: dict, tag: str, commit: str) -> None:
+def validate_resolved_tag_state(
+    tag_state: str,
+    local_tag_sha: str | None,
+    local_tag_type: str | None,
+    peeled_commit: str | None,
+    commit: str,
+) -> None:
+    if tag_state not in {"absent", "annotated"}:
+        raise ReleaseError("release tag state is not absent or annotated")
+    if tag_state == "absent":
+        if any(value is not None for value in (local_tag_sha, local_tag_type, peeled_commit)):
+            raise ReleaseError("pre-tag qualification requires the local release tag to be absent")
+        return
+    if (
+        local_tag_sha is None
+        or GIT_SHA.fullmatch(local_tag_sha) is None
+        or local_tag_type != "tag"
+        or peeled_commit != commit.lower()
+    ):
+        raise ReleaseError("tagged release verification requires the exact annotated tag")
+
+
+def validate_tag_binding(tag: str, commit: str, tag_state: str) -> None:
+    if tag_state not in {"absent", "annotated"}:
+        validate_resolved_tag_state(tag_state, None, None, None, commit)
+    tag_ref = f"refs/tags/{tag}"
+    local_tag_sha = local_ref_sha(tag_ref)
+    if tag_state == "absent":
+        validate_resolved_tag_state(tag_state, local_tag_sha, None, None, commit)
+        return
+    if local_tag_sha is None:
+        validate_resolved_tag_state(tag_state, None, None, None, commit)
+    validate_resolved_tag_state(
+        tag_state,
+        local_tag_sha,
+        git_text("cat-file", "-t", tag_ref),
+        git_text("rev-parse", f"{tag_ref}^{{commit}}").lower(),
+        commit,
+    )
+
+
+def validate_identity(identity: dict, tag: str, commit: str, tag_state: str) -> None:
     match = TAG.fullmatch(tag)
     if match is None:
         raise ReleaseError(f"release tag is not vMAJOR.MINOR.PATCH: {tag!r}")
@@ -599,9 +673,7 @@ def validate_identity(identity: dict, tag: str, commit: str) -> None:
         raise ReleaseError("Cargo version, BuildIdentity, and release tag disagree")
     if identity.get("git_sha") != commit.lower() or not re.fullmatch(r"[0-9a-f]{40}", commit.lower()):
         raise ReleaseError("BuildIdentity Git SHA does not match the release commit")
-    tagged_commit = git_text("rev-parse", f"refs/tags/{tag}^{{commit}}").lower()
-    if tagged_commit != commit.lower():
-        raise ReleaseError("release tag does not resolve to the declared commit")
+    validate_tag_binding(tag, commit, tag_state)
     if identity.get("git_dirty") is not False or identity.get("published_artifact") is not True:
         raise ReleaseError("a dirty/local BuildIdentity cannot carry a published release badge")
     if identity.get("profile") != "release" or identity.get("target") != "x86_64-pc-windows-msvc":
@@ -649,6 +721,11 @@ def validate_identity(identity: dict, tag: str, commit: str) -> None:
         raise ReleaseError("BuildIdentity Cargo.lock digest does not match release source")
     if identity["shader_bundle_sha256"] != shader_bundle_digest(ROOT):
         raise ReleaseError("BuildIdentity shader digest does not match release source")
+
+
+def validate_signature_tag_state(require_signature: bool, tag_state: str) -> None:
+    if require_signature and tag_state != "annotated":
+        raise ReleaseError("signed release verification requires the annotated tag state")
 
 
 def executable_identity(executable: Path, ffmpeg_bin: Path) -> dict:
@@ -746,7 +823,7 @@ def prepare(args: argparse.Namespace) -> None:
     second_identity = executable_identity(args.second_executable, args.ffmpeg_bin)
     if identity != second_identity:
         raise ReleaseError("independent builds expose different BuildIdentity documents")
-    validate_identity(identity, args.tag, args.commit)
+    validate_identity(identity, args.tag, args.commit, args.tag_state)
     commit_epoch = int(git_text("show", "-s", "--format=%ct", args.commit))
     if args.source_date_epoch != commit_epoch:
         raise ReleaseError("SOURCE_DATE_EPOCH does not match the tagged commit timestamp")
@@ -994,6 +1071,7 @@ def write_new_json(path: Path, document: dict, maximum_bytes: int) -> None:
 
 
 def verify(args: argparse.Namespace) -> dict:
+    validate_signature_tag_state(args.require_signature, args.tag_state)
     directory = args.directory.resolve()
     checksums = parse_checksums(directory / "SHA256SUMS")
     package_name = f"collide-o-scope-{args.tag}-windows-x86_64.zip"
@@ -1020,7 +1098,7 @@ def verify(args: argparse.Namespace) -> dict:
     identity = provenance.get("build_identity")
     if not isinstance(identity, dict):
         raise ReleaseError("provenance has no BuildIdentity")
-    validate_identity(identity, args.tag, args.commit)
+    validate_identity(identity, args.tag, args.commit, args.tag_state)
     commit_epoch = int(git_text("show", "-s", "--format=%ct", args.commit))
     if provenance.get("source_date_epoch") != commit_epoch:
         raise ReleaseError("provenance timestamp does not match the tagged commit")
@@ -1128,7 +1206,11 @@ def verify(args: argparse.Namespace) -> dict:
                     raise ReleaseError(f"packaged notice differs or is missing: {name}")
             version, archive_sha256, source_commit = pinned_ffmpeg_distribution()
             observed_buildconf, observed_ffmpeg = ffmpeg_distribution_evidence(
-                extracted, version, source_commit
+                extracted,
+                version,
+                source_commit,
+                license_path=extracted / "LICENSES/FFmpeg-GPL-3.0-or-later.txt",
+                readme_path=extracted / "FFMPEG-README.txt",
             )
             observed_ffmpeg["archive_sha256"] = archive_sha256
             if observed_buildconf != ffmpeg_buildconf_path.read_text(encoding="utf-8"):
@@ -1218,6 +1300,28 @@ def self_test() -> None:
         lambda: validate_sbom({}, "9.8.7", commit, 1_700_000_000),
         "SBOM release-profile",
     )
+    validate_resolved_tag_state("absent", None, None, None, commit)
+    validate_resolved_tag_state("annotated", "2" * 40, "tag", commit, commit)
+    validate_signature_tag_state(False, "absent")
+    validate_signature_tag_state(True, "annotated")
+    expect_release_error(
+        lambda: validate_signature_tag_state(True, "absent"),
+        "requires the annotated tag state",
+    )
+    for hostile_tag_state in (
+        ("unexpected", None, None, None, "not absent or annotated"),
+        ("absent", "2" * 40, None, None, "local release tag"),
+        ("annotated", None, None, None, "exact annotated tag"),
+        ("annotated", "2" * 40, "commit", commit, "exact annotated tag"),
+        ("annotated", "2" * 40, "tag", "3" * 40, "exact annotated tag"),
+    ):
+        state, tag_sha, tag_type, peeled, expected = hostile_tag_state
+        expect_release_error(
+            lambda state=state, tag_sha=tag_sha, tag_type=tag_type, peeled=peeled: validate_resolved_tag_state(
+                state, tag_sha, tag_type, peeled, commit
+            ),
+            expected,
+        )
     tag_ref = f"refs/tags/{tag}"
     assert parse_annotated_tag_rows(
         [f"{'2' * 40}\t{tag_ref}", f"{commit}\t{tag_ref}^{{}}"], tag
@@ -1512,12 +1616,14 @@ def parser() -> argparse.ArgumentParser:
     prepare_command.add_argument("--sbom", type=Path, required=True)
     prepare_command.add_argument("--dependency-inventory", type=Path, required=True)
     prepare_command.add_argument("--tag", required=True)
+    prepare_command.add_argument("--tag-state", choices=("absent", "annotated"), required=True)
     prepare_command.add_argument("--commit", required=True)
     prepare_command.add_argument("--source-date-epoch", required=True, type=int)
     prepare_command.add_argument("--output", required=True, type=Path)
     verify_command = commands.add_parser("verify")
     verify_command.add_argument("--directory", type=Path, required=True)
     verify_command.add_argument("--tag", required=True)
+    verify_command.add_argument("--tag-state", choices=("absent", "annotated"), required=True)
     verify_command.add_argument("--commit", required=True)
     verify_command.add_argument("--require-signature", action="store_true")
     verify_command.add_argument("--report-output", type=Path)

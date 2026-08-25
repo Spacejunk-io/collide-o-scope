@@ -663,6 +663,13 @@ jobs:
       - name: Assemble deterministic package and provenance
         shell: pwsh
         run: |
+          $tagState = if ($env:GITHUB_EVENT_NAME -ceq 'push') {
+            'annotated'
+          } elseif ($env:GITHUB_EVENT_NAME -ceq 'workflow_dispatch') {
+            'absent'
+          } else {
+            throw 'Unsupported release workflow event'
+          }
           New-Item -ItemType Directory -Path release | Out-Null
           python source-a\scripts\verify-release.py prepare `
             --executable "$env:REPRO_TARGET_A\release\collide-o-scope.exe" `
@@ -674,11 +681,12 @@ jobs:
             --sbom "$env:RUNNER_TEMP\collide-o-scope.cdx.json" `
             --dependency-inventory "$env:RUNNER_TEMP\dependency-license-inventory.json" `
             --tag "$env:RELEASE_TAG" `
+            --tag-state $tagState `
             --commit "${{ steps.source.outputs.commit }}" `
             --source-date-epoch "${{ steps.source.outputs.epoch }}" `
             --output release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python source-a\scripts\verify-release.py verify --directory release --tag "$env:RELEASE_TAG" --commit "${{ steps.source.outputs.commit }}"
+          python source-a\scripts\verify-release.py verify --directory release --tag "$env:RELEASE_TAG" --tag-state $tagState --commit "${{ steps.source.outputs.commit }}"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Install pinned cosign
@@ -732,7 +740,7 @@ jobs:
             --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/release-trust.yml@refs/.*$" `
             release\SHA256SUMS
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python source-a\scripts\verify-release.py verify --directory release --tag "$env:RELEASE_TAG" --commit "${{ steps.source.outputs.commit }}" --require-signature
+          python source-a\scripts\verify-release.py verify --directory release --tag "$env:RELEASE_TAG" --tag-state annotated --commit "${{ steps.source.outputs.commit }}" --require-signature
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Attest release evidence
@@ -904,6 +912,7 @@ jobs:
           python scripts\verify-release.py verify `
             --directory downloaded `
             --tag "$env:RELEASE_TAG" `
+            --tag-state annotated `
             --commit $expected `
             --require-signature `
             --report-output "$env:RUNNER_TEMP\downloaded-verification.json"
@@ -1124,6 +1133,7 @@ jobs:
           python scripts\verify-release.py verify `
             --directory published-initial `
             --tag "$env:RELEASE_TAG" `
+            --tag-state annotated `
             --commit "${{ needs.reproduce-sign-publish.outputs.commit }}" `
             --require-signature
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
