@@ -16,9 +16,17 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
-  FFMPEG_VERSION: 8.1.2
-  FFMPEG_SOURCE_SHA256: 464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
-  FFMPEG_WINDOWS_SHA256: 274923c68904a9b76c73b908f57923dafba81155856cd742138515ded570d066
+  FFMPEG_VERSION: 9.0.1
+  FFMPEG_SOURCE_SHA256: cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635
+  FFMPEG_SOURCE_SIZE: "12036420"
+  FFMPEG_SOURCE_SIGNATURE_SHA256: b613a00005232a1245ace7080088781ac23a916119d3e5b0d6c042368eee0177
+  FFMPEG_SOURCE_SIGNATURE_SIZE: "520"
+  FFMPEG_SIGNING_KEY_SHA256: 397b3becedcd5a98769967ff1ff8501ddc89f8368b8f766e4701377d7dbaabe5
+  FFMPEG_SIGNING_KEY_SIZE: "1709"
+  FFMPEG_SIGNING_KEY_FINGERPRINT: FCF986EA15E6E293A5644F10B4322F04D67658D8
+  FFMPEG_SOURCE_COMMIT: bf1b838f2ab88b4f8fd83443325c782ea0e0f7fa
+  FFMPEG_WINDOWS_SHA256: 6fd54b3b4f49117a307877b570f5e1659090f178973298658b41f5c559b5b5ab
+  FFMPEG_WINDOWS_SIZE: "97261187"
 
 jobs:
   test:
@@ -99,6 +107,7 @@ jobs:
               build-essential \
               clang \
               curl \
+              gnupg \
               iproute2 \
               libasound2-dev \
               libclang-dev \
@@ -154,25 +163,71 @@ jobs:
           test -f "$llvm_prefix/lib/libclang.dylib"
           echo "LIBCLANG_PATH=$llvm_prefix/lib" >> "$GITHUB_ENV"
 
-      - name: Cache FFmpeg 8.1.2 libraries on Unix
+      - name: Verify FFmpeg 9.0.1 source signature and identity on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/ffmpeg-$FFMPEG_VERSION.tar.xz"
+          signature="$archive.asc"
+          signing_key="$RUNNER_TEMP/ffmpeg-devel.asc"
+
+          curl --fail --location --retry 3 \
+            --output "$archive" \
+            "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz"
+          curl --fail --location --retry 3 \
+            --output "$signature" \
+            "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz.asc"
+          curl --fail --location --retry 3 \
+            --output "$signing_key" \
+            "https://ffmpeg.org/ffmpeg-devel.asc"
+
+          sha256_file() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | awk '{print $1}'
+            else
+              shasum -a 256 "$1" | awk '{print $1}'
+            fi
+          }
+          test "$(sha256_file "$archive")" = "$FFMPEG_SOURCE_SHA256"
+          test "$(wc -c < "$archive" | tr -d ' ')" = "$FFMPEG_SOURCE_SIZE"
+          test "$(sha256_file "$signature")" = "$FFMPEG_SOURCE_SIGNATURE_SHA256"
+          test "$(wc -c < "$signature" | tr -d ' ')" = "$FFMPEG_SOURCE_SIGNATURE_SIZE"
+          test "$(sha256_file "$signing_key")" = "$FFMPEG_SIGNING_KEY_SHA256"
+          test "$(wc -c < "$signing_key" | tr -d ' ')" = "$FFMPEG_SIGNING_KEY_SIZE"
+
+          # One hosted Linux gate verifies the detached OpenPGP signature with
+          # an isolated keyring. macOS independently authenticates the same
+          # source, signature, and key bytes by their pinned hashes.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            command -v gpg
+            export GNUPGHOME="$RUNNER_TEMP/ffmpeg-gnupg"
+            install -d -m 700 "$GNUPGHOME"
+            fingerprint="$(
+              gpg --batch --with-colons --import-options show-only \
+                --import "$signing_key" |
+                awk -F: '$1 == "fpr" { print $10; exit }'
+            )"
+            test "$fingerprint" = "$FFMPEG_SIGNING_KEY_FINGERPRINT"
+            gpg --batch --import "$signing_key"
+            gpg --batch --verify "$signature" "$archive"
+          fi
+
+      - name: Cache FFmpeg 9.0.1 libraries on Unix
         if: runner.os != 'Windows'
         id: ffmpeg-unix-cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ${{ runner.temp }}/ffmpeg-8.1.2
-          key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-8.1.2-shared-v1
+          path: ${{ runner.temp }}/ffmpeg-9.0.1
+          key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-9.0.1-shared-v2
 
-      - name: Build FFmpeg 8.1.2 libraries on Unix
+      - name: Build FFmpeg 9.0.1 libraries on Unix
         if: runner.os != 'Windows' && steps.ffmpeg-unix-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/ffmpeg-$FFMPEG_VERSION.tar.xz"
           source_root="$RUNNER_TEMP/ffmpeg-source"
           prefix="$RUNNER_TEMP/ffmpeg-$FFMPEG_VERSION"
-
-          curl --fail --location --retry 3 \
-            --output "$archive" \
-            "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz"
 
           if command -v sha256sum >/dev/null 2>&1; then
             actual="$(sha256sum "$archive" | awk '{print $1}')"
@@ -202,7 +257,7 @@ jobs:
           make -j"$jobs"
           make install
 
-      - name: Configure FFmpeg 8.1.2 on Unix
+      - name: Configure FFmpeg 9.0.1 on Unix
         if: runner.os != 'Windows'
         run: |
           prefix="$RUNNER_TEMP/ffmpeg-$FFMPEG_VERSION"
@@ -215,15 +270,15 @@ jobs:
             echo "LD_LIBRARY_PATH=$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           fi
 
-      - name: Cache FFmpeg 8.1.2 shared build on Windows
+      - name: Cache FFmpeg 9.0.1 shared build on Windows
         if: runner.os == 'Windows'
         id: ffmpeg-windows-cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ${{ runner.temp }}/ffmpeg-8.1.2-windows
-          key: ffmpeg-Windows-${{ runner.arch }}-8.1.2-shared-v1
+          path: ${{ runner.temp }}/ffmpeg-9.0.1-windows
+          key: ffmpeg-Windows-${{ runner.arch }}-9.0.1-shared-v2
 
-      - name: Download FFmpeg 8.1.2 shared build on Windows
+      - name: Download FFmpeg 9.0.1 shared build on Windows
         if: runner.os == 'Windows' && steps.ffmpeg-windows-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
@@ -233,6 +288,9 @@ jobs:
           $url = "https://github.com/GyanD/codexffmpeg/releases/download/$env:FFMPEG_VERSION/ffmpeg-$env:FFMPEG_VERSION-full_build-shared.zip"
 
           Invoke-WebRequest -Uri $url -OutFile $archive -MaximumRetryCount 3 -RetryIntervalSec 5
+          if ((Get-Item -LiteralPath $archive).Length -ne [long]$env:FFMPEG_WINDOWS_SIZE) {
+            throw "FFmpeg size mismatch"
+          }
           $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
           if ($actual -ne $env:FFMPEG_WINDOWS_SHA256) {
             throw "FFmpeg checksum mismatch: expected $env:FFMPEG_WINDOWS_SHA256, got $actual"
@@ -274,6 +332,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo fmt --all -- --check
+          python scripts/verify-ffmpeg-software-differential.py --self-test
           node --check static/app.js
           node --check docs/ui-ux/wireframe.js
 

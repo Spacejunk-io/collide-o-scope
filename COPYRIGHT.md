@@ -229,7 +229,7 @@ Three details worth writing down, because each is a trap for the next audit:
   is built without its `static` feature, so it dynamically links whatever
   FFmpeg the operator installed. See below.
 
-Ordinary source builds do not bundle FFmpeg. The program links the FFmpeg 8
+Ordinary source builds do not bundle FFmpeg. The program links the FFmpeg 9
 libraries through `ffmpeg-next` (the binding crates are WTFPL, which imposes
 nothing, and which says nothing about the C libraries' own terms — a common
 confusion) and separately invokes the `ffmpeg` and `ffprobe` command-line
@@ -238,13 +238,18 @@ tools. Those are installed by the operator; see the build instructions in
 
 The official Windows release archive is the deliberate exception. Its pinned
 release-trust workflow bundles the exact checksum-verified
-`Gyan.FFmpeg.Shared` 8.1.2 tools and DLLs needed by the executable. The archive
+`Gyan.FFmpeg.Shared` 9.0.1 tools and seven ABI-major DLLs needed by the
+executable. The archive
 also carries the Gyan distribution's GPL text as
 `LICENSES/FFmpeg-GPL-3.0-or-later.txt`, its `FFMPEG-README.txt` build/source
 record, and the executable's reported `FFMPEG-BUILDCONF.txt`. Their hashes,
 the upstream binary archive hash, and the runtime-reported license identity
-are bound into the signed release evidence. This is a technical provenance
-record, not a substitute for distribution-specific legal review.
+are bound into the signed release evidence. The checked review also records the
+complete Gyan external-library version inventory, including AMF
+v1.5.2-2-gc35f613 and ffnvcodec n13.1.15.0-1-geddcea9. Their presence in the
+distribution does not enable a Collide-o-Scope hardware path. This is a
+technical provenance record, not a substitute for distribution-specific legal
+review.
 
 FFmpeg has three licence tiers, not two: `LGPL-2.1-or-later` by default,
 `GPL-2.0-or-later` with `--enable-gpl`, and `GPL-3.0-or-later` with
@@ -257,7 +262,7 @@ the option of GPL-3. A `GPL-2.0-only` component would have no upgrade path and
 would be fatally incompatible, but FFmpeg ships none — its GPL-only externals
 (x264, x265, Xvid, frei0r, vidstab, rubberband) are all `GPL-2.0-or-later`.
 
-The documented Windows build, `Gyan.FFmpeg.Shared` 8.1.2, self-reports
+The documented Windows build, `Gyan.FFmpeg.Shared` 9.0.1, self-reports
 `--enable-gpl --enable-version3`, i.e. `GPL-3.0-or-later` — an exact match with
 this program, requiring no version-bridging argument at all — and carries no
 `--enable-nonfree`.

@@ -762,7 +762,7 @@ try {
     Set-ProcessEnvironmentValue -Name 'COLLIDE_BUILD_GIT_DIRTY' -Value 'false'
     Set-ProcessEnvironmentValue -Name 'COLLIDE_PUBLISHED_ARTIFACT' -Value 'true'
     Set-ProcessEnvironmentValue -Name 'FFMPEG_DIR' -Value $ffmpeg
-    Set-ProcessEnvironmentValue -Name 'FFMPEG_VERSION' -Value '8.1.2'
+    Set-ProcessEnvironmentValue -Name 'FFMPEG_VERSION' -Value '9.0.1'
     Set-ProcessEnvironmentValue -Name 'SOURCE_DATE_EPOCH' -Value $SourceDateEpoch
     Set-ProcessEnvironmentValue -Name 'TEMP' -Value $canonicalTemp
     Set-ProcessEnvironmentValue -Name 'TMP' -Value $canonicalTemp
@@ -938,6 +938,7 @@ try {
     $cargoLockHash = (Get-FileHash -LiteralPath (Join-Path $source 'Cargo.lock') -Algorithm SHA256).Hash.ToLowerInvariant()
     $ffmpegBinaryHash = (Get-FileHash -LiteralPath (Join-Path $ffmpeg 'bin\ffmpeg.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
     $ffprobeBinaryHash = (Get-FileHash -LiteralPath (Join-Path $ffmpeg 'bin\ffprobe.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+    $expectedFfmpegLibraries = 'avcodec-63.dll,avdevice-63.dll,avfilter-12.dll,avformat-63.dll,avutil-61.dll,ffmpeg=9.0.1,swresample-7.dll,swscale-10.dll'
     $identityRustcVv = [regex]::Replace($rustcVersion, '(?m)^rustc 1\.98\.0 .+$', 'rustc 1.98.0')
     if (
         $identity.schema_version -ne 1 -or
@@ -947,9 +948,10 @@ try {
         $identity.git_dirty -or $identity.profile -cne 'release' -or
         $identity.target -cne $nativeTarget -or $identity.enabled_features -cne '(none)' -or
         $identity.rustc_vv -cne $identityRustcVv -or $identity.cargo_version -cne 'cargo 1.98.0' -or
-        $identity.ffmpeg_binary_version -cne 'ffmpeg version 8.1.2' -or
+        $identity.ffmpeg_libraries -cne $expectedFfmpegLibraries -or
+        $identity.ffmpeg_binary_version -cne 'ffmpeg version 9.0.1' -or
         $identity.ffmpeg_binary_sha256 -cne $ffmpegBinaryHash -or
-        $identity.ffprobe_binary_version -cne 'ffprobe version 8.1.2' -or
+        $identity.ffprobe_binary_version -cne 'ffprobe version 9.0.1' -or
         $identity.ffprobe_binary_sha256 -cne $ffprobeBinaryHash -or
         $identity.cargo_lock_sha256 -cne $cargoLockHash -or
         -not $identity.published_artifact
@@ -1007,7 +1009,7 @@ try {
         cargo_manifest_exclusions = @($cargoBookkeepingExclusions)
         cargo_auditable_sha256 = $cargoAuditableSha256
         ffmpeg_manifest_sha256 = $ffmpegManifestSha256
-        ffmpeg_version = '8.1.2'
+        ffmpeg_version = '9.0.1'
         rustc_version = '1.98.0'
         rustc_commit = '88d9e12ae178fab0fb5cc050a94da85685d449ea'
         cargo_version = '1.98.0'

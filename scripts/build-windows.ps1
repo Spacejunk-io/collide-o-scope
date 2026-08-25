@@ -1,7 +1,7 @@
 # Windows build helper for collide-o-scope.
 #
 # Prerequisites (one-time, all via winget):
-#   winget install -e --id Gyan.FFmpeg.Shared --version 8.1.2   # ffmpeg 8.x shared dev libs (must match ffmpeg-next major)
+#   winget install -e --id Gyan.FFmpeg.Shared --version 9.0.1   # exact FFmpeg 9 shared SDK
 #   winget install -e --id LLVM.LLVM                            # libclang for bindgen
 #   Visual Studio 2022 with the "Desktop development with C++" workload
 #
@@ -23,17 +23,71 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $projectRoot
 Write-Host "Project root  = $projectRoot"
 
-# --- Locate ffmpeg shared dev libs (winget install location) ---
-$ffmpegPkg = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Filter "Gyan.FFmpeg.Shared_*" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($null -eq $ffmpegPkg) {
-    Write-Error "ffmpeg shared package not found. Run: winget install -e --id Gyan.FFmpeg.Shared --version 8.1.2"
+# --- Locate the exact FFmpeg shared SDK ---
+$expectedFfmpegVersion = "9.0.1"
+$expectedFfmpegDirectory = "ffmpeg-$expectedFfmpegVersion-full_build-shared"
+if (-not [string]::IsNullOrWhiteSpace($env:FFMPEG_DIR)) {
+    $ffmpegDir = Get-Item -LiteralPath ([IO.Path]::GetFullPath($env:FFMPEG_DIR)) -ErrorAction Stop
+    if (-not $ffmpegDir.PSIsContainer) {
+        throw "FFMPEG_DIR must identify an FFmpeg SDK directory: $($ffmpegDir.FullName)"
+    }
+} else {
+    $wingetPackages = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages"
+    $ffmpegDirs = @(
+        Get-ChildItem -LiteralPath $wingetPackages -Filter "Gyan.FFmpeg.Shared_*" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Get-ChildItem -LiteralPath $_.FullName -Filter $expectedFfmpegDirectory -Directory -Recurse -ErrorAction SilentlyContinue
+            } |
+            Sort-Object FullName -Unique
+    )
+    if ($ffmpegDirs.Count -eq 0) {
+        throw "The exact FFmpeg $expectedFfmpegVersion shared SDK was not found. Run: winget install -e --id Gyan.FFmpeg.Shared --version $expectedFfmpegVersion"
+    }
+    if ($ffmpegDirs.Count -ne 1) {
+        $locations = ($ffmpegDirs.FullName | ForEach-Object { "  $_" }) -join "`n"
+        throw "Multiple exact FFmpeg $expectedFfmpegVersion SDKs were found. Set FFMPEG_DIR to one reviewed directory:`n$locations"
+    }
+    $ffmpegDir = $ffmpegDirs[0]
 }
-$ffmpegDir = Get-ChildItem $ffmpegPkg.FullName -Filter "ffmpeg-*-shared" -Directory | Select-Object -First 1
-if ($null -eq $ffmpegDir) {
-    Write-Error "ffmpeg build directory not found inside $($ffmpegPkg.FullName)"
+
+$requiredFfmpegPaths = @(
+    "include\libavcodec\avcodec.h",
+    "lib\avcodec.lib",
+    "bin\ffmpeg.exe",
+    "bin\ffprobe.exe"
+)
+foreach ($relativePath in $requiredFfmpegPaths) {
+    if (-not (Test-Path -LiteralPath (Join-Path $ffmpegDir.FullName $relativePath) -PathType Leaf)) {
+        throw "FFMPEG_DIR is not a complete shared SDK; missing $relativePath under $($ffmpegDir.FullName)"
+    }
 }
-if ($ffmpegDir.Name -notmatch "^ffmpeg-8\.") {
-    Write-Warning "Found $($ffmpegDir.Name) but Cargo.toml pins ffmpeg-next = `"8`" (needs ffmpeg 8.x). Install with: winget install -e --id Gyan.FFmpeg.Shared --version 8.1.2"
+$expectedFfmpegDlls = @(
+    "avcodec-63.dll",
+    "avdevice-63.dll",
+    "avfilter-12.dll",
+    "avformat-63.dll",
+    "avutil-61.dll",
+    "swresample-7.dll",
+    "swscale-10.dll"
+)
+$observedFfmpegDlls = @(
+    Get-ChildItem -LiteralPath (Join-Path $ffmpegDir.FullName "bin") -File |
+        Where-Object { $_.Extension -ieq ".dll" } |
+        ForEach-Object Name |
+        Sort-Object
+)
+if (@(Compare-Object $expectedFfmpegDlls $observedFfmpegDlls -SyncWindow 0).Count -ne 0) {
+    throw "FFMPEG_DIR must contain exactly the seven FFmpeg 9.0.1 ABI DLLs"
+}
+$ffmpegExecutable = Join-Path $ffmpegDir.FullName "bin\ffmpeg.exe"
+$ffmpegVersionLine = (& $ffmpegExecutable -hide_banner -version 2>&1 | Select-Object -First 1).ToString().Trim()
+if ($LASTEXITCODE -ne 0 -or $ffmpegVersionLine -notmatch '^ffmpeg version 9\.0\.1(?:[- ].*)?$') {
+    throw "FFMPEG_DIR must contain FFmpeg 9.0.1; observed '$ffmpegVersionLine'"
+}
+$ffprobeExecutable = Join-Path $ffmpegDir.FullName "bin\ffprobe.exe"
+$ffprobeVersionLine = (& $ffprobeExecutable -hide_banner -version 2>&1 | Select-Object -First 1).ToString().Trim()
+if ($LASTEXITCODE -ne 0 -or $ffprobeVersionLine -notmatch '^ffprobe version 9\.0\.1(?:[- ].*)?$') {
+    throw "FFMPEG_DIR must contain ffprobe 9.0.1; observed '$ffprobeVersionLine'"
 }
 
 # --- Locate libclang ---
@@ -155,5 +209,9 @@ Write-Host "FFMPEG_DIR    = $($ffmpegDir.FullName)"
 Write-Host "LIBCLANG_PATH = $libclang"
 Write-Host "Building via  : $vcvars"
 
-cmd /c "`"$vcvars`" >nul && set FFMPEG_DIR=$($ffmpegDir.FullName)&& set LIBCLANG_PATH=$libclang&& $cargoCmd"
+$env:FFMPEG_DIR = $ffmpegDir.FullName
+$env:FFMPEG_VERSION = $expectedFfmpegVersion
+$env:LIBCLANG_PATH = $libclang
+$env:PATH = (Join-Path $ffmpegDir.FullName "bin") + ";" + $env:PATH
+cmd /d /s /c "`"$vcvars`" >nul && $cargoCmd"
 exit $LASTEXITCODE

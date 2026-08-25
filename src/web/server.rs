@@ -355,6 +355,7 @@ pub fn restart_with_backoff(
 
 /// Hidden packet-test fixture: the caller supplies an isolated identity root
 /// and a deterministic non-production token, but receives no token in output.
+#[cfg(debug_assertions)]
 pub(crate) fn spawn_fixture(
     state: Arc<WebState>,
     port: u16,

@@ -12,7 +12,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 REVIEWED_REPRODUCIBLE_BUILD_SHA256 = (
-    "e22e2ef4daa0e997e36626d4d86df50fec7a2164e32ac7a276cff3d8475b58c5"
+    "a2059888b1d9f29cac96491f840c71afba27fd0192ff72412a56cd5c29416e2c"
 )
 REVIEWED_PINNED_LLVM_STEP_SHA256 = (
     "350df6cb05ff8a9ec6eb61963784afafb454a586314569c27961374880f61484"
@@ -42,10 +42,10 @@ REVIEWED_PACKAGE_ASSEMBLY_STEP_SHA256 = (
     "f327da1c8f9029e9b224bffe95b1d5713b9cee875428c56733ff04f15e468cbb"
 )
 REVIEWED_SBOM_POLICY_SHA256 = (
-    "320e07d4dc3e8b159361e08e4ccd199bd9a8f881a1225faec1d34da2ef06d5d6"
+    "03f8a1b6f98a1930cc7110368bd8973d7f497d5349aa0f13839855dfa1e32fde"
 )
 REVIEWED_RELEASE_VERIFIER_SHA256 = (
-    "4d530b6ca33abee923eb30fb5142c091d70932cc0bffa10d8e22f4ab7d745258"
+    "875815fee3c45fd0d17c7a1da0f4e509d0e6fdfe3a6aad6eb1f06a412c614ba4"
 )
 
 
@@ -117,6 +117,7 @@ def expected_ci_gate_steps() -> dict[str, dict[str, tuple[str | None, str | None
                 None,
                 "set -euo pipefail\n"
                 "cargo fmt --all -- --check\n"
+                "python scripts/verify-ffmpeg-software-differential.py --self-test\n"
                 "node --check static/app.js\n"
                 "node --check docs/ui-ux/wireframe.js\n",
             ),
@@ -760,6 +761,7 @@ def canonical_reproducible_build_fragments() -> tuple[tuple[str, int], ...]:
         ("canonical release directory contains a PDB despite /DEBUG:NONE", 1),
         ("Assert-PortableExecutableHasNoCodeView -Executable $executable", 1),
         ("release executable contains a builder-specific path", 1),
+        ("avcodec-63.dll,avdevice-63.dll,avfilter-12.dll,avformat-63.dll,avutil-61.dll,ffmpeg=9.0.1,swresample-7.dll,swscale-10.dll", 1),
         ("release executable embeds an incomplete or unexpected BuildIdentity", 1),
         ("[Security.Cryptography.SHA256]::HashData($executableBytes)", 1),
         ("reviewed LLVM inputs changed during the build", 1),
@@ -847,7 +849,7 @@ def validate_canonical_reproducible_build(build_script: str) -> None:
             "Set-ProcessEnvironmentValue -Name 'COLLIDE_BUILD_GIT_DIRTY' -Value 'false'",
             "Set-ProcessEnvironmentValue -Name 'COLLIDE_PUBLISHED_ARTIFACT' -Value 'true'",
             "Set-ProcessEnvironmentValue -Name 'FFMPEG_DIR' -Value $ffmpeg",
-            "Set-ProcessEnvironmentValue -Name 'FFMPEG_VERSION' -Value '8.1.2'",
+            "Set-ProcessEnvironmentValue -Name 'FFMPEG_VERSION' -Value '9.0.1'",
             "Set-ProcessEnvironmentValue -Name 'SOURCE_DATE_EPOCH' -Value $SourceDateEpoch",
             "Set-ProcessEnvironmentValue -Name 'TEMP' -Value $canonicalTemp",
             "Set-ProcessEnvironmentValue -Name 'TMP' -Value $canonicalTemp",
@@ -2046,7 +2048,7 @@ def validate_reviewed_sbom_policy_digest(policy: str) -> None:
         or 'EXPECTED_ROOT_EDGES = 36' not in policy
         or 'EXPECTED_REWRITTEN_REFERENCES = 13' not in policy
         or 'EXPECTED_SEMANTIC_PROFILE_SHA256 = (' not in policy
-        or '"c21e9f97f2cfb147df4fe9bd90c046ea59b429922059d2342366049c9074671b"' not in policy
+        or '"c1d433f8cf2d592f686d042e96703ef238b137a45ffa895bbe1d88f44c8d1331"' not in policy
         or 'object_pairs_hook=_reject_duplicate_keys' not in policy
         or 'parse_constant=_reject_nonfinite_constant' not in policy
         or 'if observed_changes != changed_paths:' not in policy
@@ -2393,6 +2395,7 @@ def validate_versioned_release_receipts(finalizer: str) -> None:
         "v1.7.2-release-recovery-receipt.md",
         "v1.7.3-release-recovery-receipt.md",
         "v1.7.4-release-recovery-receipt.md",
+        "v1.8.0-ffmpeg-9-software-baseline-receipt.md",
     )
     for name in names:
         if (
@@ -2410,6 +2413,7 @@ def self_test_versioned_release_receipts(finalizer: str) -> None:
         "v1.7.2-release-recovery-receipt.md",
         "v1.7.3-release-recovery-receipt.md",
         "v1.7.4-release-recovery-receipt.md",
+        "v1.8.0-ffmpeg-9-software-baseline-receipt.md",
     )
     for name in names:
         for literal in (f'"{name}",', f'"docs/evidence/{name}"'):
@@ -2587,14 +2591,46 @@ def main() -> int:
             fail("release Rust install does not match rust-toolchain.toml")
         with (ROOT / "policy/windows-release-license-review.toml").open("rb") as source:
             review = tomllib.load(source)
-        pins = {
+        release_pins = {
             "FFMPEG_VERSION": review["ffmpeg"]["version"],
             "FFMPEG_WINDOWS_SHA256": review["ffmpeg"]["archive_sha256"],
+            "FFMPEG_WINDOWS_SIZE": review["ffmpeg"]["archive_size"],
             "FFMPEG_SOURCE_COMMIT": review["ffmpeg"]["source_commit"],
         }
-        for name, value in pins.items():
-            if not re.search(rf"^\s*{name}:\s*{re.escape(value)}\s*$", release, re.MULTILINE):
+        ci_pins = {
+            **release_pins,
+            "FFMPEG_SOURCE_SHA256": review["ffmpeg"]["source_archive_sha256"],
+            "FFMPEG_SOURCE_SIZE": review["ffmpeg"]["source_archive_size"],
+            "FFMPEG_SOURCE_SIGNATURE_SHA256": review["ffmpeg"]["source_signature_sha256"],
+            "FFMPEG_SOURCE_SIGNATURE_SIZE": review["ffmpeg"]["source_signature_size"],
+            "FFMPEG_SIGNING_KEY_SHA256": review["ffmpeg"]["signing_key_sha256"],
+            "FFMPEG_SIGNING_KEY_SIZE": review["ffmpeg"]["signing_key_size"],
+            "FFMPEG_SIGNING_KEY_FINGERPRINT": review["ffmpeg"]["signing_key_fingerprint"],
+        }
+        for name, value in release_pins.items():
+            rendered = re.escape(str(value))
+            if not re.search(rf'^\s*{name}:\s*"?{rendered}"?\s*$', release, re.MULTILINE):
                 fail(f"release workflow {name} disagrees with checked-in review")
+        for name, value in ci_pins.items():
+            rendered = re.escape(str(value))
+            if not re.search(rf'^\s*{name}:\s*"?{rendered}"?\s*$', ci, re.MULTILINE):
+                fail(f"CI workflow {name} disagrees with checked-in review")
+        if review["ffmpeg"].get("source_tag") != f'n{review["ffmpeg"]["version"]}':
+            fail("checked-in FFmpeg source tag disagrees with its version")
+        source_identity_fragments = (
+            "Verify FFmpeg 9.0.1 source signature and identity on Unix",
+            '"https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz.asc"',
+            '"https://ffmpeg.org/ffmpeg-devel.asc"',
+            'test "$(sha256_file "$archive")" = "$FFMPEG_SOURCE_SHA256"',
+            'test "$(sha256_file "$signature")" = "$FFMPEG_SOURCE_SIGNATURE_SHA256"',
+            'test "$(sha256_file "$signing_key")" = "$FFMPEG_SIGNING_KEY_SHA256"',
+            'test "$fingerprint" = "$FFMPEG_SIGNING_KEY_FINGERPRINT"',
+            'gpg --batch --verify "$signature" "$archive"',
+        )
+        if any(ci.count(fragment) != 1 for fragment in source_identity_fragments):
+            fail("CI lacks the exact FFmpeg source hash, key, and signature gate")
+        if ci.index('gpg --batch --verify "$signature" "$archive"') > ci.index('tar -xJf "$archive"'):
+            fail("CI extracts FFmpeg before detached-signature verification")
         exact_ci_jobs = {
             "Linux (Ubuntu 24.04)",
             "macOS 15",

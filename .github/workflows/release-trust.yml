@@ -9,7 +9,7 @@ on:
       release_tag:
         description: Candidate tag whose version must match Cargo.toml
         required: true
-        default: v1.7.4
+        default: v1.8.0
 
 permissions:
   contents: read
@@ -18,9 +18,10 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   PYTHONDONTWRITEBYTECODE: "1"
-  FFMPEG_VERSION: 8.1.2
-  FFMPEG_WINDOWS_SHA256: 274923c68904a9b76c73b908f57923dafba81155856cd742138515ded570d066
-  FFMPEG_SOURCE_COMMIT: 38b88335f99e76ed89ff3c93f877fdefce736c13
+  FFMPEG_VERSION: 9.0.1
+  FFMPEG_WINDOWS_SHA256: 6fd54b3b4f49117a307877b570f5e1659090f178973298658b41f5c559b5b5ab
+  FFMPEG_WINDOWS_SIZE: "97261187"
+  FFMPEG_SOURCE_COMMIT: bf1b838f2ab88b4f8fd83443325c782ea0e0f7fa
   LLVM_VERSION: 22.1.8
   LLVM_WINDOWS_INSTALLER_SHA256: 16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c
   LLVM_SOURCE_COMMIT: ca7933e47d3a3451d81e72ac174dcb5aa28b59d1
@@ -231,6 +232,9 @@ jobs:
           $destination = Join-Path $env:RUNNER_TEMP "ffmpeg-$env:FFMPEG_VERSION-windows"
           $url = "https://github.com/GyanD/codexffmpeg/releases/download/$env:FFMPEG_VERSION/ffmpeg-$env:FFMPEG_VERSION-full_build-shared.zip"
           Invoke-WebRequest -Uri $url -OutFile $archive -MaximumRetryCount 3 -RetryIntervalSec 5
+          if ((Get-Item -LiteralPath $archive).Length -ne [long]$env:FFMPEG_WINDOWS_SIZE) {
+            throw "FFmpeg archive size mismatch"
+          }
           $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
           if ($actual -ne $env:FFMPEG_WINDOWS_SHA256) { throw "FFmpeg archive checksum mismatch" }
           Expand-Archive -LiteralPath $archive -DestinationPath $destination
