@@ -21,6 +21,14 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+from cyclonedx_sbom import (
+    EXPECTED_PACKAGE_NAME as SBOM_PACKAGE_NAME,
+    SbomPolicyError,
+    read_json as read_cyclonedx_json,
+    self_test as self_test_cyclonedx_policy,
+    validate_normalized_sbom,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_JSON_BYTES = 32 * 1024 * 1024
@@ -710,14 +718,19 @@ def assemble_package(
             zip_entry(archive, name, path.read_bytes(), is_executable)
 
 
-def validate_sbom(sbom: dict, version: str) -> None:
-    if sbom.get("bomFormat") != "CycloneDX":
-        raise ReleaseError("SBOM is not CycloneDX JSON")
-    component = sbom.get("metadata", {}).get("component", {})
-    if component.get("name") != "collide-o-scope" or component.get("version") != version:
-        raise ReleaseError("SBOM root component does not match the release")
-    if not isinstance(sbom.get("components"), list) or not sbom["components"]:
-        raise ReleaseError("SBOM has no dependency components")
+def validate_sbom(
+    sbom: dict, version: str, commit: str, source_date_epoch: int
+) -> dict:
+    try:
+        return validate_normalized_sbom(
+            sbom,
+            package_name=SBOM_PACKAGE_NAME,
+            package_version=version,
+            commit=commit.lower(),
+            source_date_epoch=source_date_epoch,
+        )
+    except SbomPolicyError as error:
+        raise ReleaseError(f"SBOM release-profile validation failed: {error}") from error
 
 
 def prepare(args: argparse.Namespace) -> None:
@@ -745,8 +758,16 @@ def prepare(args: argparse.Namespace) -> None:
         args.ffmpeg_source_commit,
     ) != pinned_ffmpeg_distribution():
         raise ReleaseError("FFmpeg arguments do not match the release workflow pins")
-    sbom = read_json(args.sbom)
-    validate_sbom(sbom, identity["version"])
+    try:
+        sbom = read_cyclonedx_json(args.sbom)
+    except SbomPolicyError as error:
+        raise ReleaseError(f"read strict SBOM JSON: {error}") from error
+    validate_sbom(
+        sbom,
+        identity["version"],
+        args.commit,
+        args.source_date_epoch,
+    )
     dependency_inventory = read_json(args.dependency_inventory)
     validate_dependency_inventory(dependency_inventory, identity["cargo_lock_sha256"])
     checked_review = checked_release_review()
@@ -1024,7 +1045,11 @@ def verify(args: argparse.Namespace) -> dict:
         if digest(reproduced_source) != checksums[source_name]:
             raise ReleaseError("published source archive does not reproduce from the tagged commit")
     sbom_path = directory / "collide-o-scope.cdx.json"
-    validate_sbom(read_json(sbom_path), identity["version"])
+    try:
+        sbom = read_cyclonedx_json(sbom_path)
+    except SbomPolicyError as error:
+        raise ReleaseError(f"read strict SBOM JSON: {error}") from error
+    validate_sbom(sbom, identity["version"], args.commit, commit_epoch)
     dependency_inventory_path = directory / "dependency-license-inventory.json"
     validate_dependency_inventory(
         read_json(dependency_inventory_path), identity["cargo_lock_sha256"]
@@ -1188,6 +1213,11 @@ def expect_release_error(action, expected_fragment: str) -> None:
 def self_test() -> None:
     tag = "v9.8.7"
     commit = "1" * 40
+    self_test_cyclonedx_policy()
+    expect_release_error(
+        lambda: validate_sbom({}, "9.8.7", commit, 1_700_000_000),
+        "SBOM release-profile",
+    )
     tag_ref = f"refs/tags/{tag}"
     assert parse_annotated_tag_rows(
         [f"{'2' * 40}\t{tag_ref}", f"{commit}\t{tag_ref}^{{}}"], tag

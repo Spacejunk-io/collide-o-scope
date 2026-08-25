@@ -17,6 +17,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  PYTHONDONTWRITEBYTECODE: "1"
   FFMPEG_VERSION: 8.1.2
   FFMPEG_WINDOWS_SHA256: 274923c68904a9b76c73b908f57923dafba81155856cd742138515ded570d066
   FFMPEG_SOURCE_COMMIT: 38b88335f99e76ed89ff3c93f877fdefce736c13
@@ -563,12 +564,101 @@ jobs:
       - name: Generate reproducible CycloneDX SBOM
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $env:SOURCE_DATE_EPOCH = "${{ steps.source.outputs.epoch }}"
-          Push-Location source-a
-          cargo cyclonedx --format json --spec-version 1.5 --override-filename collide-o-scope.cdx.json
+          $env:GIT_CONFIG_NOSYSTEM = '1'
+          $env:GIT_CONFIG_GLOBAL = 'NUL'
+          $env:GIT_CONFIG_COUNT = '0'
+          $env:GIT_ATTR_NOSYSTEM = '1'
+          $expectedName = 'collide-o-scope.cdx.json'
+          $normalizedA = Join-Path $env:RUNNER_TEMP $expectedName
+          $normalizedB = Join-Path $env:RUNNER_TEMP 'collide-o-scope-b.cdx.json'
+          $policyScript = Join-Path $env:REPRO_SOURCE_A 'scripts\cyclonedx_sbom.py'
+          foreach ($path in @($normalizedA, $normalizedB)) {
+            if (Test-Path -LiteralPath $path) { throw 'Normalized SBOM output must be absent' }
+          }
+          python $policyScript self-test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Pop-Location
-          if (-not (Test-Path -LiteralPath source-a\collide-o-scope.cdx.json)) { throw "SBOM was not generated" }
+
+          function New-NormalizedSbom {
+            param(
+              [Parameter(Mandatory = $true)][string]$SourceLiteral,
+              [Parameter(Mandatory = $true)][string]$Normalized,
+              [Parameter(Mandatory = $true)][string]$Label
+            )
+            $sourceItem = Get-Item -LiteralPath $SourceLiteral -Force
+            if (
+              -not $sourceItem.PSIsContainer -or
+              $null -ne $sourceItem.LinkType -or
+              ($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+            ) { throw "SBOM source $Label is not one exact ordinary directory" }
+            $source = $sourceItem.FullName
+            $before = @(git -c core.fsmonitor=false -c core.hooksPath=NUL -C $source status --porcelain=v1 --untracked-files=all)
+            $beforeExit = $LASTEXITCODE
+            if ($beforeExit -ne 0 -or $before.Count -ne 0) { throw "SBOM source $Label must be pristine before generation" }
+            $preexisting = @(Get-ChildItem -LiteralPath $source -Force | Where-Object { $_.Name -like 'collide-o-scope.cdx*' })
+            if ($preexisting.Count -ne 0) { throw "SBOM output path $Label must be absent before generation" }
+            Push-Location $source
+            try {
+              cargo cyclonedx --format json --spec-version 1.5 --override-filename collide-o-scope.cdx | Out-Host
+              $cargoExit = $LASTEXITCODE
+            } finally {
+              Pop-Location
+            }
+            if ($cargoExit -ne 0) { exit $cargoExit }
+            $outputs = @(Get-ChildItem -LiteralPath $source -Force | Where-Object { $_.Name -like 'collide-o-scope.cdx*' })
+            if (
+              $outputs.Count -ne 1 -or
+              $outputs[0].Name -cne $expectedName -or
+              $outputs[0].PSIsContainer -or
+              $null -ne $outputs[0].LinkType -or
+              ($outputs[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+            ) { throw "SBOM output inventory $Label is not one exact ordinary file" }
+            $after = @(git -c core.fsmonitor=false -c core.hooksPath=NUL -C $source status --porcelain=v1 --untracked-files=all)
+            $afterExit = $LASTEXITCODE
+            if ($afterExit -ne 0 -or $after.Count -ne 1 -or $after[0] -cne "?? $expectedName") {
+              throw "SBOM generation $Label changed an unexpected source path"
+            }
+            python $policyScript normalize `
+              --input $outputs[0].FullName `
+              --source-root $source `
+              --output $Normalized `
+              --source-date-epoch "${{ steps.source.outputs.epoch }}" `
+              --commit "${{ steps.source.outputs.commit }}" | Out-Host
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $normalizedItem = Get-Item -LiteralPath $Normalized -Force
+            if (
+              $normalizedItem.Name -cne [IO.Path]::GetFileName($Normalized) -or
+              $normalizedItem.PSIsContainer -or
+              $null -ne $normalizedItem.LinkType -or
+              ($normalizedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+            ) { throw "Normalized SBOM $Label is not one exact ordinary file" }
+            return [pscustomobject]@{
+              Label = $Label
+              Raw = $outputs[0].FullName
+              Normalized = $normalizedItem.FullName
+              Length = $normalizedItem.Length
+              Sha256 = (Get-FileHash -LiteralPath $normalizedItem.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          }
+
+          $sbomA = New-NormalizedSbom $env:REPRO_SOURCE_A $normalizedA 'A'
+          $sbomB = New-NormalizedSbom $env:REPRO_SOURCE_B $normalizedB 'B'
+          $bytesA = [IO.File]::ReadAllBytes($sbomA.Normalized)
+          $bytesB = [IO.File]::ReadAllBytes($sbomB.Normalized)
+          if (
+            $sbomA.Length -ne $sbomB.Length -or
+            $sbomA.Sha256 -cne $sbomB.Sha256 -or
+            [Convert]::ToBase64String($bytesA) -cne [Convert]::ToBase64String($bytesB)
+          ) { throw 'Independent unequal-root normalized SBOMs are not byte-identical' }
+          Remove-Item -LiteralPath $sbomA.Raw
+          Remove-Item -LiteralPath $sbomB.Raw
+          foreach ($source in @($env:REPRO_SOURCE_A, $env:REPRO_SOURCE_B)) {
+            $final = @(git -c core.fsmonitor=false -c core.hooksPath=NUL -C $source status --porcelain=v1 --untracked-files=all)
+            $finalExit = $LASTEXITCODE
+            if ($finalExit -ne 0 -or $final.Count -ne 0) { throw 'SBOM source did not return to pristine state' }
+          }
+          Write-Output "Unequal-root normalized SBOM: $($sbomA.Length) bytes $($sbomA.Sha256)"
 
       - name: Assemble deterministic package and provenance
         shell: pwsh
@@ -581,7 +671,7 @@ jobs:
             --ffmpeg-version "$env:FFMPEG_VERSION" `
             --ffmpeg-archive-sha256 "$env:FFMPEG_WINDOWS_SHA256" `
             --ffmpeg-source-commit "$env:FFMPEG_SOURCE_COMMIT" `
-            --sbom source-a\collide-o-scope.cdx.json `
+            --sbom "$env:RUNNER_TEMP\collide-o-scope.cdx.json" `
             --dependency-inventory "$env:RUNNER_TEMP\dependency-license-inventory.json" `
             --tag "$env:RELEASE_TAG" `
             --commit "${{ steps.source.outputs.commit }}" `

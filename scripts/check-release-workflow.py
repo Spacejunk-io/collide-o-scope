@@ -35,6 +35,12 @@ REVIEWED_UNEQUAL_BUILD_STEP_SHA256 = (
 REVIEWED_UNEQUAL_CONTIGUOUS_REGION_SHA256 = (
     "73ae6a31bbed06c823e157ecfd3571c5e289f34274e37b598569672311f05ad1"
 )
+REVIEWED_REPRODUCIBLE_SBOM_STEP_SHA256 = (
+    "58576a9f07f6a9a6c3fcb8c7fdbb49a13a6eb15993550cb0a9679a21d2372833"
+)
+REVIEWED_SBOM_POLICY_SHA256 = (
+    "8a3207cf33e434a9946fb8d135d859bc52ffb26f5b65f3c6f2c6219b9b1de1d9"
+)
 
 
 def fail(message: str) -> None:
@@ -1391,11 +1397,11 @@ def validate_release_checkout_isolation_and_pretag(release: str) -> None:
         "- name: Check out independent source A": 1,
         "- name: Check out independent source B": 1,
         "- name: Prove reproducibility checkouts are pristine": 1,
-        "$env:GIT_CONFIG_NOSYSTEM = '1'": 1,
-        "$env:GIT_CONFIG_GLOBAL = 'NUL'": 1,
-        "$env:GIT_CONFIG_COUNT = '0'": 1,
-        "$env:GIT_ATTR_NOSYSTEM = '1'": 1,
-        "status --porcelain=v1 --untracked-files=all": 1,
+        "$env:GIT_CONFIG_NOSYSTEM = '1'": 2,
+        "$env:GIT_CONFIG_GLOBAL = 'NUL'": 2,
+        "$env:GIT_CONFIG_COUNT = '0'": 2,
+        "$env:GIT_ATTR_NOSYSTEM = '1'": 2,
+        "status --porcelain=v1 --untracked-files=all": 4,
         "if ($statusExit -ne 0) {": 1,
         "if ($dirty.Count -ne 0) {": 1,
         "Reproducibility checkout is not pristine: $source": 1,
@@ -1847,6 +1853,287 @@ def self_test_unequal_reproducibility_workflow(release: str) -> None:
         fail("unequal-root workflow accepted an interstitial root-collapse step")
 
 
+def validate_reproducible_sbom_workflow(release: str) -> None:
+    marker = "      - name: Generate reproducible CycloneDX SBOM"
+    successor = "      - name: Assemble deterministic package and provenance"
+    if release.count(marker) != 1 or release.count(successor) != 1:
+        fail("reviewed reproducible SBOM workflow boundary is not unique")
+    step_start = release.index(marker)
+    step_end = release.index(successor, step_start + 1)
+    step = release[step_start:step_end]
+    observed_digest = hashlib.sha256(step.encode("utf-8")).hexdigest()
+    required = (
+        '$ErrorActionPreference = "Stop"',
+        '$env:SOURCE_DATE_EPOCH = "${{ steps.source.outputs.epoch }}"',
+        "$env:GIT_CONFIG_NOSYSTEM = '1'",
+        "$env:GIT_CONFIG_GLOBAL = 'NUL'",
+        "$env:GIT_CONFIG_COUNT = '0'",
+        "$env:GIT_ATTR_NOSYSTEM = '1'",
+        "$expectedName = 'collide-o-scope.cdx.json'",
+        "$normalizedA = Join-Path $env:RUNNER_TEMP $expectedName",
+        "$normalizedB = Join-Path $env:RUNNER_TEMP 'collide-o-scope-b.cdx.json'",
+        "$policyScript = Join-Path $env:REPRO_SOURCE_A 'scripts\\cyclonedx_sbom.py'",
+        "foreach ($path in @($normalizedA, $normalizedB))",
+        "python $policyScript self-test",
+        "function New-NormalizedSbom",
+        "[Parameter(Mandatory = $true)][string]$SourceLiteral",
+        "$sourceItem = Get-Item -LiteralPath $SourceLiteral -Force",
+        "$null -ne $sourceItem.LinkType",
+        "($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0",
+        "$before = @(git -c core.fsmonitor=false -c core.hooksPath=NUL -C $source status --porcelain=v1 --untracked-files=all)",
+        "$beforeExit = $LASTEXITCODE",
+        '$beforeExit -ne 0 -or $before.Count -ne 0',
+        "$preexisting = @(Get-ChildItem -LiteralPath $source -Force | Where-Object { $_.Name -like 'collide-o-scope.cdx*' })",
+        '$preexisting.Count -ne 0',
+        "Push-Location $source",
+        "try {",
+        "cargo cyclonedx --format json --spec-version 1.5 --override-filename collide-o-scope.cdx",
+        "$cargoExit = $LASTEXITCODE",
+        "} finally {",
+        "Pop-Location",
+        "if ($cargoExit -ne 0) { exit $cargoExit }",
+        "$outputs = @(Get-ChildItem -LiteralPath $source -Force | Where-Object { $_.Name -like 'collide-o-scope.cdx*' })",
+        "$outputs.Count -ne 1",
+        "$outputs[0].Name -cne $expectedName",
+        "$outputs[0].PSIsContainer",
+        "$null -ne $outputs[0].LinkType",
+        "($outputs[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0",
+        "$after = @(git -c core.fsmonitor=false -c core.hooksPath=NUL -C $source status --porcelain=v1 --untracked-files=all)",
+        "$afterExit = $LASTEXITCODE",
+        '$after[0] -cne "?? $expectedName"',
+        "python $policyScript normalize `",
+        "--input $outputs[0].FullName",
+        "--source-root $source",
+        "--output $Normalized",
+        '--source-date-epoch "${{ steps.source.outputs.epoch }}"',
+        '--commit "${{ steps.source.outputs.commit }}"',
+        "$normalizedItem = Get-Item -LiteralPath $Normalized -Force",
+        "$normalizedItem.Name -cne [IO.Path]::GetFileName($Normalized)",
+        "$normalizedItem.PSIsContainer",
+        "$null -ne $normalizedItem.LinkType",
+        "($normalizedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0",
+        "$sbomA = New-NormalizedSbom $env:REPRO_SOURCE_A $normalizedA 'A'",
+        "$sbomB = New-NormalizedSbom $env:REPRO_SOURCE_B $normalizedB 'B'",
+        "$bytesA = [IO.File]::ReadAllBytes($sbomA.Normalized)",
+        "$bytesB = [IO.File]::ReadAllBytes($sbomB.Normalized)",
+        "$sbomA.Length -ne $sbomB.Length",
+        "$sbomA.Sha256 -cne $sbomB.Sha256",
+        "[Convert]::ToBase64String($bytesA) -cne [Convert]::ToBase64String($bytesB)",
+        "throw 'Independent unequal-root normalized SBOMs are not byte-identical'",
+        "Remove-Item -LiteralPath $sbomA.Raw",
+        "Remove-Item -LiteralPath $sbomB.Raw",
+        "foreach ($source in @($env:REPRO_SOURCE_A, $env:REPRO_SOURCE_B))",
+        "$final = @(git -c core.fsmonitor=false -c core.hooksPath=NUL -C $source status --porcelain=v1 --untracked-files=all)",
+        "$finalExit = $LASTEXITCODE",
+        "$finalExit -ne 0 -or $final.Count -ne 0",
+    )
+    downstream = release[step_end : release.find("\n      - name:", step_end + 1)]
+    if (
+        observed_digest != REVIEWED_REPRODUCIBLE_SBOM_STEP_SHA256
+        or any(step.count(fragment) != 1 for fragment in required)
+        or step.count("if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }") != 2
+        or release.count('  PYTHONDONTWRITEBYTECODE: "1"') != 1
+        or "--override-filename collide-o-scope.cdx.json" in step
+        or "ContinueOnError" in step
+        or downstream.count('--sbom "$env:RUNNER_TEMP\\collide-o-scope.cdx.json" `') != 1
+    ):
+        fail("reproducible SBOM generation differs from its reviewed output contract")
+
+
+def self_test_reproducible_sbom_workflow(release: str) -> None:
+    validate_reproducible_sbom_workflow(release)
+    marker = "      - name: Generate reproducible CycloneDX SBOM"
+    successor = "      - name: Assemble deterministic package and provenance"
+    step_start = release.index(marker)
+    step_end = release.index(successor, step_start + 1)
+    step = release[step_start:step_end]
+    hostile = (
+        (
+            "--override-filename collide-o-scope.cdx",
+            "--override-filename collide-o-scope.cdx.json",
+        ),
+        ("--spec-version 1.5", "--spec-version 1.4"),
+        (
+            "$normalizedB = Join-Path $env:RUNNER_TEMP 'collide-o-scope-b.cdx.json'",
+            "$normalizedB = $normalizedA",
+        ),
+        (
+            "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            "if ($LASTEXITCODE -ne 0 -and $false) { exit $LASTEXITCODE }",
+        ),
+        (
+            "$preexisting.Count -ne 0",
+            "if ($preexisting.Count -lt 0)",
+        ),
+        (
+            "$outputs.Count -ne 1",
+            "$outputs.Count -lt 1",
+        ),
+        (
+            "$after.Count -ne 1",
+            "$after.Count -lt 1",
+        ),
+        (
+            "python $policyScript self-test",
+            "Write-Output 'SBOM policy self-test skipped'",
+        ),
+        (
+            "$sbomB = New-NormalizedSbom $env:REPRO_SOURCE_B $normalizedB 'B'",
+            "$sbomB = New-NormalizedSbom $env:REPRO_SOURCE_A $normalizedB 'B'",
+        ),
+        (
+            "[Convert]::ToBase64String($bytesA) -cne [Convert]::ToBase64String($bytesB)",
+            "$false",
+        ),
+        (
+            '--commit "${{ steps.source.outputs.commit }}"',
+            '--commit "0000000000000000000000000000000000000000"',
+        ),
+        (
+            "Remove-Item -LiteralPath $sbomB.Raw",
+            "Write-Output 'raw B retained'",
+        ),
+    )
+    for original, replacement in hostile:
+        mutated_step = step.replace(original, replacement, 1)
+        if mutated_step == step:
+            fail(f"reproducible SBOM self-test fixture is absent: {original}")
+        mutation = release[:step_start] + mutated_step + release[step_end:]
+        try:
+            validate_reproducible_sbom_workflow(mutation)
+        except ValueError:
+            continue
+        fail(f"reproducible SBOM hostile mutation was not rejected: {original}")
+
+    bytecode_mutation = release.replace(
+        '  PYTHONDONTWRITEBYTECODE: "1"',
+        '  PYTHONDONTWRITEBYTECODE: "0"',
+        1,
+    )
+    try:
+        validate_reproducible_sbom_workflow(bytecode_mutation)
+    except ValueError:
+        pass
+    else:
+        fail("reproducible SBOM policy accepted source-tree bytecode writes")
+
+    downstream_mutation = release.replace(
+        '--sbom "$env:RUNNER_TEMP\\collide-o-scope.cdx.json" `',
+        "--sbom source-a\\collide-o-scope.cdx.json `",
+        1,
+    )
+    try:
+        validate_reproducible_sbom_workflow(downstream_mutation)
+    except ValueError:
+        pass
+    else:
+        fail("reproducible SBOM downstream-path mutation was not rejected")
+
+
+def validate_reviewed_sbom_policy_digest(policy: str) -> None:
+    if (
+        hashlib.sha256(policy.encode("utf-8")).hexdigest()
+        != REVIEWED_SBOM_POLICY_SHA256
+        or 'EXPECTED_REPOSITORY_URL = "https://github.com/Spacejunk-io/collide-o-scope"' not in policy
+        or 'return f"{EXPECTED_REPOSITORY_URL}/tree/{commit}"' not in policy
+        or 'EXPECTED_REWRITTEN_REFERENCES = 13' not in policy
+        or 'EXPECTED_SEMANTIC_PROFILE_SHA256 = (' not in policy
+        or '"a20879074f7dd5bf92c8061b4c8bd18fbde134c83e67c6b7c49b6f5818b2b029"' not in policy
+        or 'object_pairs_hook=_reject_duplicate_keys' not in policy
+        or 'parse_constant=_reject_nonfinite_constant' not in policy
+        or 'if observed_changes != changed_paths:' not in policy
+        or 'def semantic_profile_digest(' not in policy
+        or 'if observed_semantic_sha256 != expected_semantic_sha256:' not in policy
+        or 'fail("SBOM string uses excessive nested percent-encoding")' not in policy
+        or '"substituted-component"' not in policy
+        or 'replacement_edge' not in policy
+        or "def validate_reference_graph(" not in policy
+        or "def validate_normalized_sbom(" not in policy
+        or "def self_test()" not in policy
+    ):
+        fail("CycloneDX SBOM policy differs from its reviewed bytes or contract")
+
+
+def validate_shared_sbom_verifier(verifier: str) -> None:
+    required = (
+        "from cyclonedx_sbom import (",
+        "SbomPolicyError,",
+        "read_json as read_cyclonedx_json,",
+        "self_test as self_test_cyclonedx_policy,",
+        "validate_normalized_sbom,",
+        "def validate_sbom(",
+        "return validate_normalized_sbom(",
+        "package_name=SBOM_PACKAGE_NAME,",
+        "package_version=version,",
+        "commit=commit.lower(),",
+        "source_date_epoch=source_date_epoch,",
+        'raise ReleaseError(f"SBOM release-profile validation failed: {error}")',
+        "sbom = read_cyclonedx_json(args.sbom)",
+        "sbom = read_cyclonedx_json(sbom_path)",
+        "self_test_cyclonedx_policy()",
+        'lambda: validate_sbom({}, "9.8.7", commit, 1_700_000_000)',
+    )
+    prepare_call = (
+        "validate_sbom(\n"
+        "        sbom,\n"
+        '        identity["version"],\n'
+        "        args.commit,\n"
+        "        args.source_date_epoch,\n"
+        "    )"
+    )
+    verify_call = (
+        'validate_sbom(sbom, identity["version"], args.commit, commit_epoch)'
+    )
+    if (
+        any(verifier.count(fragment) != 1 for fragment in required)
+        or verifier.count(prepare_call) != 1
+        or verifier.count(verify_call) != 1
+        or verifier.count("except SbomPolicyError as error:") != 3
+        or 'sbom.get("bomFormat")' in verifier
+    ):
+        fail("release prepare/verify do not share the reviewed SBOM policy")
+
+
+def self_test_shared_sbom_verifier(verifier: str) -> None:
+    validate_shared_sbom_verifier(verifier)
+    mutations = (
+        verifier.replace(
+            "sbom = read_cyclonedx_json(args.sbom)",
+            "sbom = read_json(args.sbom)",
+            1,
+        ),
+        verifier.replace(
+            "sbom = read_cyclonedx_json(sbom_path)",
+            "sbom = read_json(sbom_path)",
+            1,
+        ),
+        verifier.replace("commit=commit.lower(),", "commit='0' * 40,", 1),
+        verifier.replace(
+            "        args.source_date_epoch,\n    )",
+            "        0,\n    )",
+            1,
+        ),
+        verifier.replace(
+            'validate_sbom(sbom, identity["version"], args.commit, commit_epoch)',
+            'validate_sbom(sbom, identity["version"], args.commit, 0)',
+            1,
+        ),
+        verifier.replace(
+            "self_test_cyclonedx_policy()",
+            "pass  # shared SBOM policy self-test skipped",
+            1,
+        ),
+    )
+    for mutation in mutations:
+        if mutation == verifier:
+            fail("shared SBOM verifier self-test fixture is absent")
+        try:
+            validate_shared_sbom_verifier(mutation)
+        except ValueError:
+            continue
+        fail("shared SBOM verifier mutation escaped the policy gate")
+
+
 def validate_reproducible_checkout_attributes(attributes: str) -> None:
     required = [
         ".gitignore text eol=lf",
@@ -2009,6 +2296,11 @@ def main() -> int:
         self_test_pinned_llvm_workflow(release)
         self_test_release_checkout_isolation_and_pretag(release)
         self_test_unequal_reproducibility_workflow(release)
+        self_test_reproducible_sbom_workflow(release)
+        sbom_policy = (ROOT / "scripts/cyclonedx_sbom.py").read_text(
+            encoding="utf-8"
+        )
+        validate_reviewed_sbom_policy_digest(sbom_policy)
         ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self_test_ci_gate_bodies(ci)
         adversarial = (ROOT / ".github/workflows/adversarial.yml").read_text(
@@ -2023,6 +2315,7 @@ def main() -> int:
         release_verifier = (ROOT / "scripts/verify-release.py").read_text(
             encoding="utf-8"
         )
+        self_test_shared_sbom_verifier(release_verifier)
         final_receipt = (ROOT / "scripts/finalize-release-receipt.py").read_text(
             encoding="utf-8"
         )
