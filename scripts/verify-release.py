@@ -42,6 +42,30 @@ EXPECTED_CARGO_DENY_VERSION = "cargo-deny 0.20.2"
 CANONICAL_VENDOR_SOURCE = "path+third_party/wgpu-hal-29.0.3"
 CANONICAL_ROOT_SOURCE = "path+."
 RELEASE_REVIEW_PATH = ROOT / "policy" / "windows-release-license-review.toml"
+EXPECTED_FFMPEG_WINDOWS_DLL_SHA256 = {
+    "avcodec-63.dll": "f958e8ae31ce50b58e228c354411e406cd46c0021a6d250e90cf007fe65740d3",
+    "avdevice-63.dll": "cc2de2187efd18aed52d3021d90934337bfe0e8ec60d988797b87ae7664f5ee0",
+    "avfilter-12.dll": "8f8e2d63f6658450169d7fe2f5696fa9b01df3c1d3820cf706e142ba80758924",
+    "avformat-63.dll": "8c0615789d41737051cf082351d4b9c869dd2f0abac4b792ff838041638752e5",
+    "avutil-61.dll": "e289456490e190e0d74aa34980aeaa68903a6656248e2e7ef830e17acd80eb49",
+    "swresample-7.dll": "d240955beb927ff2fb46cc4f80f83db20a10a9b9032f4092a10f492836fb0213",
+    "swscale-10.dll": "89df1925fc718639cb13e849bc940dca114a10e97d93f8fdfd6c14369941a964",
+}
+EXPECTED_FFMPEG_WINDOWS_DLLS = tuple(EXPECTED_FFMPEG_WINDOWS_DLL_SHA256)
+EXPECTED_FFMPEG_EXTERNAL_LIBRARY_VERSIONS_SHA256 = (
+    "a99c7c74f9dc649795b436603585e461315febbe6760d1187653750420d4843c"
+)
+FFMPEG_REVIEW_ONLY_FIELDS = (
+    "archive_size",
+    "source_archive_sha256",
+    "source_archive_size",
+    "source_signature_sha256",
+    "source_signature_size",
+    "signing_key_sha256",
+    "signing_key_size",
+    "signing_key_fingerprint",
+    "source_tag",
+)
 WINDOWS_RESERVED_BASENAMES = {
     "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$",
     *(f"COM{index}" for index in range(1, 10)),
@@ -158,6 +182,48 @@ def digest(path: Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             hasher.update(block)
     return hasher.hexdigest()
+
+
+def validate_ffmpeg_windows_dll_names(names: list[str] | tuple[str, ...]) -> None:
+    observed = list(names)
+    if any(not isinstance(name, str) or not name for name in observed):
+        raise ReleaseError("FFmpeg runtime DLL inventory contains a malformed name")
+    folded = [name.casefold() for name in observed]
+    if len(folded) != len(set(folded)):
+        raise ReleaseError("FFmpeg runtime DLL inventory contains duplicate names")
+    expected = list(EXPECTED_FFMPEG_WINDOWS_DLLS)
+    if sorted(observed) != expected:
+        missing = sorted(set(expected) - set(observed))
+        unexpected = sorted(set(observed) - set(expected))
+        raise ReleaseError(
+            "FFmpeg runtime DLL inventory differs from the reviewed FFmpeg 9 set: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+
+def ffmpeg_windows_dll_evidence(ffmpeg_bin: Path) -> dict[str, str]:
+    try:
+        observed = sorted(
+            path.name
+            for path in ffmpeg_bin.iterdir()
+            if path.suffix.casefold() == ".dll"
+        )
+    except OSError as error:
+        raise ReleaseError(f"inspect FFmpeg runtime DLL directory: {error}") from error
+    validate_ffmpeg_windows_dll_names(observed)
+    evidence: dict[str, str] = {}
+    for name in EXPECTED_FFMPEG_WINDOWS_DLLS:
+        path = ffmpeg_bin / name
+        if not path.is_file():
+            raise ReleaseError(f"FFmpeg runtime DLL is not a regular file: {name}")
+        actual = digest(path)
+        expected = EXPECTED_FFMPEG_WINDOWS_DLL_SHA256[name]
+        if actual != expected:
+            raise ReleaseError(
+                f"FFmpeg runtime DLL hash differs from the reviewed distribution: {name}"
+            )
+        evidence[name] = actual
+    return evidence
 
 
 def shader_bundle_digest(root: Path) -> str:
@@ -415,6 +481,29 @@ def ffmpeg_distribution_evidence(
         or not source_commit.startswith(source_match.group(1))
     ):
         raise ReleaseError("FFmpeg README lacks the pinned build, license, or source identity")
+    marker = "release-full external libraries' versions:"
+    readme_lines = readme.splitlines()
+    try:
+        marker_index = next(
+            index for index, line in enumerate(readme_lines) if line.strip() == marker
+        )
+    except StopIteration as error:
+        raise ReleaseError("FFmpeg README lacks its external-library version inventory") from error
+    external_library_versions: list[str] = []
+    for line in readme_lines[marker_index + 1 :]:
+        value = line.strip()
+        if not value:
+            if external_library_versions:
+                break
+            continue
+        external_library_versions.append(value)
+    external_inventory_text = "\n".join(external_library_versions) + "\n"
+    external_inventory_sha256 = hashlib.sha256(
+        external_inventory_text.encode("utf-8")
+    ).hexdigest()
+    if external_inventory_sha256 != EXPECTED_FFMPEG_EXTERNAL_LIBRARY_VERSIONS_SHA256:
+        raise ReleaseError("FFmpeg external-library version inventory is not the reviewed set")
+    windows_runtime_dll_sha256 = ffmpeg_windows_dll_evidence(ffmpeg_bin)
     return buildconf, {
         "version": version,
         "distribution": "Gyan full shared Windows build",
@@ -423,6 +512,10 @@ def ffmpeg_distribution_evidence(
         "runtime_license_text_sha256": hashlib.sha256(license_text.encode("utf-8")).hexdigest(),
         "distribution_license_sha256": digest(license_path),
         "distribution_readme_sha256": digest(readme_path),
+        "external_library_versions": external_library_versions,
+        "external_library_versions_sha256": external_inventory_sha256,
+        "windows_runtime_dlls": list(EXPECTED_FFMPEG_WINDOWS_DLLS),
+        "windows_runtime_dll_sha256": windows_runtime_dll_sha256,
         "source_commit": source_commit,
         "source_url": f"https://github.com/FFmpeg/FFmpeg/commit/{source_commit}",
         "source_identity_recorded_in": "FFMPEG-README.txt",
@@ -466,6 +559,7 @@ def checked_release_review() -> dict:
         "version": version,
         "distribution": "Gyan full shared Windows build",
         "archive_sha256": archive_sha256,
+        "source_tag": f"n{version}",
         "source_commit": source_commit,
         "source_url": f"https://github.com/FFmpeg/FFmpeg/commit/{source_commit}",
         "runtime_license": "GPL-3.0-or-later",
@@ -475,13 +569,44 @@ def checked_release_review() -> dict:
     ):
         raise ReleaseError("checked-in release review disagrees with FFmpeg workflow pins")
     for field in (
+        "source_archive_sha256",
+        "source_signature_sha256",
+        "signing_key_sha256",
         "buildconf_sha256",
         "runtime_license_text_sha256",
         "distribution_license_sha256",
         "distribution_readme_sha256",
+        "external_library_versions_sha256",
     ):
         if not isinstance(ffmpeg.get(field), str) or SHA256.fullmatch(ffmpeg[field]) is None:
             raise ReleaseError(f"checked-in release review FFmpeg field {field} is invalid")
+    for field, expected in (
+        ("archive_size", 97_261_187),
+        ("source_archive_size", 12_036_420),
+        ("source_signature_size", 520),
+        ("signing_key_size", 1_709),
+    ):
+        if ffmpeg.get(field) != expected:
+            raise ReleaseError(f"checked-in release review FFmpeg field {field} is invalid")
+    if ffmpeg.get("signing_key_fingerprint") != "FCF986EA15E6E293A5644F10B4322F04D67658D8":
+        raise ReleaseError("checked-in release review has the wrong FFmpeg signing key")
+    if ffmpeg.get("windows_runtime_dlls") != list(EXPECTED_FFMPEG_WINDOWS_DLLS):
+        raise ReleaseError("checked-in release review has the wrong FFmpeg DLL inventory")
+    if ffmpeg.get("windows_runtime_dll_sha256") != EXPECTED_FFMPEG_WINDOWS_DLL_SHA256:
+        raise ReleaseError("checked-in release review has the wrong FFmpeg DLL hashes")
+    external_versions = ffmpeg.get("external_library_versions")
+    if (
+        not isinstance(external_versions, list)
+        or any(not isinstance(value, str) or not value for value in external_versions)
+        or len(external_versions) != 82
+        or hashlib.sha256(("\n".join(external_versions) + "\n").encode("utf-8")).hexdigest()
+        != EXPECTED_FFMPEG_EXTERNAL_LIBRARY_VERSIONS_SHA256
+        or ffmpeg.get("external_library_versions_sha256")
+        != EXPECTED_FFMPEG_EXTERNAL_LIBRARY_VERSIONS_SHA256
+        or "AMF v1.5.2-2-gc35f613" not in external_versions
+        or "ffnvcodec n13.1.15.0-1-geddcea9" not in external_versions
+    ):
+        raise ReleaseError("checked-in release review has the wrong external-library inventory")
     if (
         ffmpeg.get("required_build_flags")
         != ["--enable-gpl", "--enable-version3", "--enable-shared"]
@@ -601,6 +726,14 @@ def validate_dependency_review(
             raise ReleaseError(f"dependency review FFmpeg field {field} is not SHA-256")
         if ffmpeg[field] != checked["ffmpeg"][field]:
             raise ReleaseError(f"dependency review FFmpeg field {field} was not reviewed")
+    for field in FFMPEG_REVIEW_ONLY_FIELDS + (
+        "external_library_versions",
+        "external_library_versions_sha256",
+        "windows_runtime_dlls",
+        "windows_runtime_dll_sha256",
+    ):
+        if ffmpeg.get(field) != checked["ffmpeg"].get(field):
+            raise ReleaseError(f"dependency review FFmpeg field {field} was not reviewed")
     if review.get("authenticode") != checked["authenticode"]:
         raise ReleaseError("dependency review misstates the Authenticode stop disposition")
 
@@ -699,11 +832,11 @@ def validate_identity(identity: dict, tag: str, commit: str, tag_state: str) -> 
         raise ReleaseError("BuildIdentity lacks the Windows linker or SDK identity")
     ffmpeg_version, _, _ = pinned_ffmpeg_distribution()
     ffmpeg_libraries = str(identity.get("ffmpeg_libraries", ""))
-    for library in ("avcodec", "avdevice", "avfilter", "avformat", "avutil", "swresample", "swscale"):
-        if library not in ffmpeg_libraries.lower():
-            raise ReleaseError(f"BuildIdentity lacks FFmpeg ABI library {library}")
-    if f"ffmpeg={ffmpeg_version}" not in ffmpeg_libraries.split(","):
-        raise ReleaseError("BuildIdentity lacks the pinned FFmpeg library version")
+    expected_ffmpeg_libraries = ",".join(
+        sorted((*EXPECTED_FFMPEG_WINDOWS_DLLS, f"ffmpeg={ffmpeg_version}"))
+    )
+    if ffmpeg_libraries != expected_ffmpeg_libraries:
+        raise ReleaseError("BuildIdentity lacks the exact reviewed FFmpeg DLL identity")
     if identity.get("ffmpeg_binary_version") != f"ffmpeg version {ffmpeg_version}":
         raise ReleaseError("BuildIdentity has the wrong FFmpeg binary version")
     if identity.get("ffprobe_binary_version") != f"ffprobe version {ffmpeg_version}":
@@ -769,12 +902,8 @@ def assemble_package(
         "collide-o-scope.exe": (executable, True),
     }
     tools = [ffmpeg_bin / "ffmpeg.exe", ffmpeg_bin / "ffprobe.exe"]
-    libraries = sorted(ffmpeg_bin.glob("*.dll"), key=lambda path: path.name.lower())
-    required_stems = ("avcodec", "avformat", "avutil", "swresample", "swscale")
-    lower_names = [path.name.lower() for path in libraries]
-    for stem in required_stems:
-        if not any(name.startswith(stem) for name in lower_names):
-            raise ReleaseError(f"FFmpeg runtime library {stem}*.dll is missing")
+    ffmpeg_windows_dll_evidence(ffmpeg_bin)
+    libraries = [ffmpeg_bin / name for name in EXPECTED_FFMPEG_WINDOWS_DLLS]
     for path in tools + libraries:
         if not path.is_file():
             raise ReleaseError(f"release runtime file is missing: {path}")
@@ -860,6 +989,8 @@ def prepare(args: argparse.Namespace) -> None:
         args.ffmpeg_bin, args.ffmpeg_version, args.ffmpeg_source_commit
     )
     ffmpeg_distribution["archive_sha256"] = args.ffmpeg_archive_sha256
+    for field in FFMPEG_REVIEW_ONLY_FIELDS:
+        ffmpeg_distribution[field] = checked_review["ffmpeg"][field]
     for field, expected in checked_review["ffmpeg"].items():
         if field in {"required_build_flags", "forbidden_build_flags"}:
             continue
@@ -1169,6 +1300,13 @@ def verify(args: argparse.Namespace) -> dict:
             if info.date_time != FIXED_ZIP_TIME:
                 raise ReleaseError(f"unsafe or nondeterministic package entry {info.filename!r}")
             validated_infos.append((info, parts))
+        validate_ffmpeg_windows_dll_names(
+            [
+                info.filename
+                for info, _parts in validated_infos
+                if PurePosixPath(info.filename).suffix.casefold() == ".dll"
+            ]
+        )
         with tempfile.TemporaryDirectory(prefix="cos-release-verify-") as temp:
             extracted = Path(temp)
             extraction_root = extracted.resolve()
@@ -1216,6 +1354,8 @@ def verify(args: argparse.Namespace) -> dict:
                 readme_path=extracted / "FFMPEG-README.txt",
             )
             observed_ffmpeg["archive_sha256"] = archive_sha256
+            for field in FFMPEG_REVIEW_ONLY_FIELDS:
+                observed_ffmpeg[field] = checked_review["ffmpeg"][field]
             if observed_buildconf != ffmpeg_buildconf_path.read_text(encoding="utf-8"):
                 raise ReleaseError("packaged FFmpeg build configuration differs from evidence")
             if observed_ffmpeg != dependency_review["ffmpeg_distribution"]:
@@ -1298,6 +1438,37 @@ def expect_release_error(action, expected_fragment: str) -> None:
 def self_test() -> None:
     tag = "v9.8.7"
     commit = "1" * 40
+    canonical_dlls = list(EXPECTED_FFMPEG_WINDOWS_DLLS)
+    validate_ffmpeg_windows_dll_names(canonical_dlls)
+    hostile_dll_inventories = (
+        (canonical_dlls[:-1], "differs"),
+        (canonical_dlls + ["unreviewed.dll"], "differs"),
+        (canonical_dlls + [canonical_dlls[0]], "duplicate"),
+        (["avcodec-62.dll", *canonical_dlls[1:]], "differs"),
+        ([canonical_dlls[0].upper(), *canonical_dlls[1:]], "differs"),
+        ([f"nested/{canonical_dlls[0]}", *canonical_dlls[1:]], "differs"),
+    )
+    for inventory, expected in hostile_dll_inventories:
+        expect_release_error(
+            lambda inventory=inventory: validate_ffmpeg_windows_dll_names(inventory),
+            expected,
+        )
+    with tempfile.TemporaryDirectory(prefix="cos-ffmpeg-dll-self-test-") as temp:
+        dll_root = Path(temp)
+        for name in canonical_dlls:
+            (dll_root / name).write_bytes(b"seeded altered DLL")
+        expect_release_error(
+            lambda: ffmpeg_windows_dll_evidence(dll_root),
+            "hash differs",
+        )
+    with tempfile.TemporaryDirectory(prefix="cos-ffmpeg-dll-dir-self-test-") as temp:
+        dll_root = Path(temp)
+        for name in canonical_dlls:
+            (dll_root / name).mkdir()
+        expect_release_error(
+            lambda: ffmpeg_windows_dll_evidence(dll_root),
+            "not a regular file",
+        )
     self_test_cyclonedx_policy()
     expect_release_error(
         lambda: validate_sbom({}, "9.8.7", commit, 1_700_000_000),

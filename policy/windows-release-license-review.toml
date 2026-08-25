@@ -2,26 +2,138 @@
 # `.github/workflows/release-trust.yml`. This is provenance and policy evidence,
 # not legal advice or an Authenticode signature.
 schema_version = 1
-review_id = "windows-ffmpeg-8.1.2-2026-08-24"
+review_id = "windows-ffmpeg-9.0.1-2026-08-25"
 review_owner = "release-engineering"
-reviewed = 2026-08-24
+reviewed = 2026-08-25
 scope = "Mechanical review of the pinned Windows native runtime, repository notices, Cargo license inventory, and packaging boundary"
 legal_conclusion = false
 decision = "admit_only_the_exact_reviewed_distribution"
 
 [ffmpeg]
-version = "8.1.2"
+version = "9.0.1"
 distribution = "Gyan full shared Windows build"
-archive_sha256 = "274923c68904a9b76c73b908f57923dafba81155856cd742138515ded570d066"
-source_commit = "38b88335f99e76ed89ff3c93f877fdefce736c13"
-source_url = "https://github.com/FFmpeg/FFmpeg/commit/38b88335f99e76ed89ff3c93f877fdefce736c13"
+archive_sha256 = "6fd54b3b4f49117a307877b570f5e1659090f178973298658b41f5c559b5b5ab"
+archive_size = 97261187
+source_archive_sha256 = "cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635"
+source_archive_size = 12036420
+source_signature_sha256 = "b613a00005232a1245ace7080088781ac23a916119d3e5b0d6c042368eee0177"
+source_signature_size = 520
+signing_key_sha256 = "397b3becedcd5a98769967ff1ff8501ddc89f8368b8f766e4701377d7dbaabe5"
+signing_key_size = 1709
+signing_key_fingerprint = "FCF986EA15E6E293A5644F10B4322F04D67658D8"
+source_tag = "n9.0.1"
+source_commit = "bf1b838f2ab88b4f8fd83443325c782ea0e0f7fa"
+source_url = "https://github.com/FFmpeg/FFmpeg/commit/bf1b838f2ab88b4f8fd83443325c782ea0e0f7fa"
 runtime_license = "GPL-3.0-or-later"
-buildconf_sha256 = "c6bda1522d327c29f4834ef68d8749b0de94029678b5d34ad444e9a6b77520ec"
+buildconf_sha256 = "5d16b09d4ba374711788d446cfb09c302d8593041f068de77f8ddea3e563d2dd"
 runtime_license_text_sha256 = "040708d6a654aed3dbc2bc4fae8f247ba2817ebe08898042b601016e9fe870ac"
 distribution_license_sha256 = "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
-distribution_readme_sha256 = "8672bfd3c809f7813176307ff87f084f4847bc894729879f2875739ec28aec8c"
+distribution_readme_sha256 = "9b4da8b6d2d28594d4f1dce98153708e4b1bd3bc37107e737bd4da5f1ca970f2"
+external_library_versions_sha256 = "a99c7c74f9dc649795b436603585e461315febbe6760d1187653750420d4843c"
 required_build_flags = ["--enable-gpl", "--enable-version3", "--enable-shared"]
 forbidden_build_flags = ["--enable-nonfree"]
+windows_runtime_dlls = [
+  "avcodec-63.dll",
+  "avdevice-63.dll",
+  "avfilter-12.dll",
+  "avformat-63.dll",
+  "avutil-61.dll",
+  "swresample-7.dll",
+  "swscale-10.dll",
+]
+external_library_versions = [
+  "AMF v1.5.2-2-gc35f613",
+  "aom v3.14.1-147-gec0dedc1a2",
+  "aribb24 v1.0.3-5-g5e9be27",
+  "aribcaption 1.1.2",
+  "AviSynthPlus v3.7.5-362-gf4628d0a",
+  "bs2b 3.1.0",
+  "bzip2 1.0.8-3",
+  "cairo 1.18.5",
+  "chromaprint 1.6.1",
+  "codec2 1.2.0-108-g310777b1",
+  "dav1d 1.5.4",
+  "davs2 1.7-1-gb41cf11",
+  "dvdnav 7.0.0-16-g2ffc50b",
+  "dvdread 7.1.1-92-g50009a0",
+  "ffnvcodec n13.1.15.0-1-geddcea9",
+  "flite v2.2-55-g6c9f20d",
+  "fontconfig 2.18.3",
+  "freetype VER-2-14-3",
+  "frei0r v3.2.3",
+  "fribidi v1.0.16-5-g069a7e3",
+  "gmp 6.3.0-2",
+  "gnutls 3.8.13-1",
+  "gsm 1.0.24",
+  "harfbuzz 14.3.0-10-g9f2f0317",
+  "ladspa-sdk 1.17",
+  "lame 3.100",
+  "lc3 1.1.3",
+  "lcms2 2.16",
+  "lensfun v0.3.95-1996-g6804b5f5",
+  "libass 0.17.5-3-g89cc0f4",
+  "libcdio-paranoia 10.2",
+  "libgme 0.6.6",
+  "libiconv 1.19-1",
+  "libilbc v3.0.4-346-g6adb26d4a4",
+  "libjxl v0.12-snapshot-3-ge8ff0976",
+  "libopencore-amrnb 0.1.6",
+  "libopencore-amrwb 0.1.6",
+  "libplacebo v7.360.0-109-g4d82c68",
+  "libsoxr 0.1.3",
+  "libssh 0.12.0",
+  "libtheora v1.2.0",
+  "libwebp v1.6.0-199-g94d3c4a",
+  "libxml2 v2.15.0-122-gddcb79dc",
+  "openAL 1.25.2",
+  "openapv v0.3.0.0-9-ga5312e4",
+  "openjpeg2 2.5.4",
+  "openmpt libopenmpt-0.6.28-40-gefc11a27",
+  "opus v1.6.1-50-g3da9f7a6",
+  "qrencode 4.1.1",
+  "quirc 1.2",
+  "rav1e p20250624-3-g564ae3b",
+  "rist 0.2.20",
+  "rubberband v4.0.0",
+  "SDL release-2.32.0-228-ga2e7c76bd",
+  "shaderc v2026.3-9-g7060a66",
+  "shine 3.1.1",
+  "snappy 1.2.2",
+  "speex Speex-1.2.1-51-g0589522",
+  "srt v1.5.6-2-gfcae571",
+  "SVT-AV1 v4.2.0-72-gae2658e53",
+  "SVT-JPEG-XS v0.9.0-78-g8056642",
+  "twolame 0.4.0",
+  "uavs3d v1.1-50-g0e20d2c",
+  "VAAPI 2.25.0.",
+  "vidstab v1.1.2-105-gc7a720a",
+  "vmaf v3.2.0-9-g4991d2b5",
+  "vo-amrwbenc 0.1.3",
+  "vorbis v1.3.7-37-g1b75110b",
+  "VPL 2.17",
+  "vpx v1.16.0-184-g0cfc6da39",
+  "vulkan-loader v1.4.359",
+  "vvenc v1.14.0-160-ga03b882",
+  "whisper.cpp 1.9.1",
+  "x264 v0.165.3223",
+  "x265 4.3-6-g9ddc216",
+  "xavs2 1.4",
+  "xevd 0.5.0",
+  "xeve 0.5.1",
+  "xvid v1.3.7",
+  "zeromq 4.3.5",
+  "zimg release-3.0.6-252-gf6cc75a",
+  "zvbi v0.2.44-8-g4e222f9",
+]
+
+[ffmpeg.windows_runtime_dll_sha256]
+"avcodec-63.dll" = "f958e8ae31ce50b58e228c354411e406cd46c0021a6d250e90cf007fe65740d3"
+"avdevice-63.dll" = "cc2de2187efd18aed52d3021d90934337bfe0e8ec60d988797b87ae7664f5ee0"
+"avfilter-12.dll" = "8f8e2d63f6658450169d7fe2f5696fa9b01df3c1d3820cf706e142ba80758924"
+"avformat-63.dll" = "8c0615789d41737051cf082351d4b9c869dd2f0abac4b792ff838041638752e5"
+"avutil-61.dll" = "e289456490e190e0d74aa34980aeaa68903a6656248e2e7ef830e17acd80eb49"
+"swresample-7.dll" = "d240955beb927ff2fb46cc4f80f83db20a10a9b9032f4092a10f492836fb0213"
+"swscale-10.dll" = "89df1925fc718639cb13e849bc940dca114a10e97d93f8fdfd6c14369941a964"
 
 [packaging]
 required_package_notices = [

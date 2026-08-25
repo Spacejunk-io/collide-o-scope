@@ -365,13 +365,13 @@ mod tests {
     fn a_pinned_ffmpeg_dir_is_searched_before_path() {
         // The libraries were linked from this prefix, so tools shipped beside
         // them are the version-matched ones.
-        let pinned = Path::new("/pinned/8.1.2/bin").join(&candidate_file_names("ffmpeg")[0]);
+        let pinned = Path::new("/pinned/9.0.1/bin").join(&candidate_file_names("ffmpeg")[0]);
         let on_path = Path::new("/usr/bin").join(&candidate_file_names("ffmpeg")[0]);
         let expected = pinned.clone();
         let resolved = resolve_tool_from(
             FfmpegTool::Ffmpeg,
             None,
-            Some(&os("/pinned/8.1.2")),
+            Some(&os("/pinned/9.0.1")),
             Some(&os("/usr/bin")),
             &[],
             &move |path| path == pinned || path == on_path,
@@ -388,7 +388,7 @@ mod tests {
         let resolved = resolve_tool_from(
             FfmpegTool::Ffmpeg,
             None,
-            Some(&os("/pinned/8.1.2")),
+            Some(&os("/pinned/9.0.1")),
             Some(&os("/usr/bin")),
             &[],
             &move |path| path == on_path,

@@ -457,9 +457,14 @@ fn flush_resampler(
             Err(ffmpeg::Error::OutputChanged) => return Ok(()),
             Err(error) => return Err(format!("cannot flush audio conversion for {path}: {error}")),
         };
-        if converted.samples() > 0 {
-            push_converted(&converted, samples, path)?;
+        // ffmpeg-next 9 correctly reports sub-second residual filter delay.
+        // That delay may stay positive after libswresample has emitted every
+        // retrievable sample, so a zero-length flush is the terminal signal.
+        // With no new input, another call cannot make progress.
+        if converted.samples() == 0 {
+            return Ok(());
         }
+        push_converted(&converted, samples, path)?;
         if delay.is_none() {
             return Ok(());
         }
@@ -672,6 +677,19 @@ mod tests {
         let clip = AudioClip::open(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(clip.info().sample_rate, CLIP_SAMPLE_RATE);
+        assert_eq!(
+            clip.info().sample_count,
+            (source_samples as u64 * CLIP_SAMPLE_RATE as u64 / source_rate as u64) as usize,
+            "resampler flush duplicated or dropped the PCM tail"
+        );
+        assert!(
+            clip.samples
+                .iter()
+                .rev()
+                .take(64)
+                .any(|sample| sample.abs() > 0.01),
+            "resampler flush replaced the PCM tail with silence"
+        );
         assert!(
             (clip.info().duration_secs - 0.1).abs() < 0.01,
             "decoded duration was {}",

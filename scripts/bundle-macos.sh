@@ -14,7 +14,7 @@
 #   scripts/bundle-macos.sh [--debug] [--output DIR]
 #
 # Environment:
-#   FFMPEG_DIR   Prefix of the FFmpeg 8 build the program was linked against.
+#   FFMPEG_DIR   Prefix of the FFmpeg 9.0.1 build the program was linked against.
 #                When set, its dylibs are copied into the bundle and the binary
 #                is repointed at them, so the app runs from Finder without any
 #                DYLD_* variable. See the macOS section of README.md.
@@ -107,7 +107,7 @@ iconutil --convert icns "$iconset" --output "$resources_dir/collide-o-scope.icns
 # ---------------------------------------------------------------------------
 # FFmpeg libraries
 #
-# `ffmpeg-next` links the FFmpeg 8 shared libraries by their install names,
+# `ffmpeg-next` links the FFmpeg 9 shared libraries by their install names,
 # which point at the prefix they were built in. A Finder launch inherits none of
 # the DYLD_* variables that make that prefix findable, so the dylibs are copied
 # in and every reference — the binary's, and the libraries' references to each
@@ -166,7 +166,7 @@ if [[ -n "${FFMPEG_DIR:-}" && -d "${FFMPEG_DIR}/lib" ]]; then
 	fi
 else
 	echo "==> FFMPEG_DIR unset; not vendoring FFmpeg libraries"
-	echo "    The app will only launch where the FFmpeg 8 dylibs are already"
+	echo "    The app will only launch where the FFmpeg 9 dylibs are already"
 	echo "    on the default search path."
 fi
 

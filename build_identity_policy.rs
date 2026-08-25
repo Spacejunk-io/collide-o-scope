@@ -234,17 +234,17 @@ AUTH_TOKEN: should-not-survive\n";
     fn tool_output_must_use_an_expected_path_free_prefix() {
         assert_eq!(
             tool_version_line(
-                "noise\nffmpeg version 8.1.2 Copyright",
+                "noise\nffmpeg version 9.0.1 Copyright",
                 &["ffmpeg version "]
             ),
-            Some("ffmpeg version 8.1.2".into())
+            Some("ffmpeg version 9.0.1".into())
         );
         assert_eq!(
             tool_version_line(
-                "ffmpeg version 8.1.2-full_build-www.gyan.dev Copyright (c) 2000-2026",
+                "ffmpeg version 9.0.1-full_build-www.gyan.dev Copyright (c) 2000-2026",
                 &["ffmpeg version "]
             ),
-            Some("ffmpeg version 8.1.2".into())
+            Some("ffmpeg version 9.0.1".into())
         );
         assert_eq!(
             tool_version_line("ffmpeg version C:\\secret\\build", &["ffmpeg version "]),
@@ -252,10 +252,10 @@ AUTH_TOKEN: should-not-survive\n";
         );
         assert_eq!(
             tool_version_line(
-                "ffmpeg version 8.1.2 seeded-auth-token authored text",
+                "ffmpeg version 9.0.1 seeded-auth-token authored text",
                 &["ffmpeg version "]
             ),
-            Some("ffmpeg version 8.1.2".into())
+            Some("ffmpeg version 9.0.1".into())
         );
     }
 }

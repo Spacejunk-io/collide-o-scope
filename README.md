@@ -32,7 +32,7 @@ control panel.
 ### Windows
 
 ```powershell
-winget install -e --id Gyan.FFmpeg.Shared --version 8.1.2
+winget install -e --id Gyan.FFmpeg.Shared --version 9.0.1
 winget install -e --id LLVM.LLVM
 # plus Visual Studio 2022 "Desktop development with C++"
 powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
@@ -40,51 +40,65 @@ powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
 
 ### macOS
 
-Two different FFmpeg pieces are needed, and they are allowed to be different
-versions, because they are used in two different ways:
+Two FFmpeg surfaces are used, and they may be supplied separately because they
+have different integration boundaries:
 
-- **The FFmpeg 8 shared libraries**, linked into the program through
-  `ffmpeg-next`. The major must be 8.
+- **The exact FFmpeg 9.0.1 shared libraries**, linked into the program through
+  `ffmpeg-next` 9.0.0. CI builds these libraries from the authenticated upstream
+  source archive.
 - **An `ffmpeg` / `ffprobe` command line built with `libx264`**, run as a
   separate process for thumbnails, proxy encodes, and the final H.264/AAC mux.
-  Any recent major is fine here.
+  A compatible FFmpeg 9 build is recommended here too.
 
-Homebrew no longer packages FFmpeg 8 — `ffmpeg` is 9.x and there is no
-`ffmpeg@8` formula — so the libraries are built from source, exactly as CI
-does:
+An exact source build gives development the same native ABI and source identity
+as CI. Authenticate the archive before extracting it:
 
 ```sh
-brew install llvm@18 pkg-config make xz
+set -euo pipefail
+brew install gnupg llvm@18 pkg-config make xz
 export LIBCLANG_PATH="$(brew --prefix llvm@18)/lib"
 
-FFMPEG_VERSION=8.1.2
+export FFMPEG_VERSION=9.0.1
 PREFIX="$HOME/.local/ffmpeg-$FFMPEG_VERSION"
-curl -fL "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" | tar -xJ
+curl -fLO "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz"
+curl -fLO "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz.asc"
+curl -fLo ffmpeg-devel.asc "https://ffmpeg.org/ffmpeg-devel.asc"
+test "$(shasum -a 256 "ffmpeg-$FFMPEG_VERSION.tar.xz" | awk '{print $1}')" = \
+  cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635
+test "$(shasum -a 256 "ffmpeg-$FFMPEG_VERSION.tar.xz.asc" | awk '{print $1}')" = \
+  b613a00005232a1245ace7080088781ac23a916119d3e5b0d6c042368eee0177
+test "$(shasum -a 256 ffmpeg-devel.asc | awk '{print $1}')" = \
+  397b3becedcd5a98769967ff1ff8501ddc89f8368b8f766e4701377d7dbaabe5
+test "$(gpg --batch --with-colons --import-options show-only --import ffmpeg-devel.asc |
+  awk -F: '$1 == "fpr" { print $10; exit }')" = \
+  FCF986EA15E6E293A5644F10B4322F04D67658D8
+gpg --batch --import ffmpeg-devel.asc
+gpg --batch --verify "ffmpeg-$FFMPEG_VERSION.tar.xz.asc" \
+  "ffmpeg-$FFMPEG_VERSION.tar.xz"
+tar -xJf "ffmpeg-$FFMPEG_VERSION.tar.xz"
 cd "ffmpeg-$FFMPEG_VERSION"
 ./configure --prefix="$PREFIX" --disable-autodetect --disable-doc \
-  --disable-programs --disable-static --enable-pic --enable-shared
+  --disable-programs --disable-static --disable-x86asm --enable-pic --enable-shared
 make -j"$(sysctl -n hw.logicalcpu)"
 make install
 cd ..
 
 export FFMPEG_DIR="$PREFIX"
-export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
-export DYLD_FALLBACK_LIBRARY_PATH="$PREFIX/lib:$DYLD_FALLBACK_LIBRARY_PATH"
+export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+export DYLD_FALLBACK_LIBRARY_PATH="$PREFIX/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
 ```
 
-Then the command-line tools, which may be Homebrew's current build:
+Then install the separately invoked command-line tools if they are not already
+available:
 
 ```sh
-brew install ffmpeg   # 9.x is fine: it is run as a separate process
+brew install ffmpeg
 cargo build
 ```
 
-Setting `FFMPEG_DIR` and `PKG_CONFIG_PATH` explicitly stops being optional the
-moment Homebrew's FFmpeg is installed. `ffmpeg-sys-next` probes with no minimum
-version, and its feature table stops at 8.1 — so it will happily build against
-9.x headers while still claiming the 8.1 feature set.
-`DYLD_FALLBACK_LIBRARY_PATH` keeps the running program on the 8.x dylibs for
-the same reason.
+Keep `FFMPEG_DIR` and `PKG_CONFIG_PATH` explicit whenever another FFmpeg is also
+installed. `DYLD_FALLBACK_LIBRARY_PATH` keeps the running program on the exact
+9.0.1 dylibs used at link time.
 
 If the command-line tools are somewhere the process cannot see, set `COS_FFMPEG`
 and `COS_FFPROBE` to absolute paths. This matters on macOS specifically: an app
@@ -116,12 +130,13 @@ an unavailable status instead of pretending to provide either.
 ### Linux
 
 ```sh
-# ffmpeg 8 development libraries (libav*-dev), clang, pkg-config
+# FFmpeg 9 development libraries (libav*-dev), clang, pkg-config
 cargo build
 ```
 
-Where a distribution ships a different FFmpeg major, build 8.1.2 from source as
-above and export `FFMPEG_DIR`, `PKG_CONFIG_PATH`, and `LD_LIBRARY_PATH`.
+Where a distribution ships another FFmpeg version, build the authenticated
+9.0.1 source above and export `FFMPEG_DIR`, `PKG_CONFIG_PATH`, and
+`LD_LIBRARY_PATH`.
 
 ## Run
 
