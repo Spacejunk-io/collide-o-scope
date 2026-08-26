@@ -824,18 +824,22 @@ pub struct CpuPlanarConversion {
     pub policy: CpuPlanarConversionPolicy,
 }
 
-struct CpuConversionContract {
-    bit_depth: u8,
-    range: SourceColorRange,
-    matrix: MatrixCoefficients,
-    transfer: TransferCharacteristic,
-    chroma_location: ChromaLocation,
-    kr: f64,
-    kb: f64,
+/// The one conversion contract. The CPU oracle consumes it directly and the
+/// evaluation-only GPU twin (`super::planar_gpu`) derives its uniforms from
+/// this same derivation, so the two paths cannot disagree about admission,
+/// coefficients, or siting by construction.
+pub(crate) struct CpuConversionContract {
+    pub(crate) bit_depth: u8,
+    pub(crate) range: SourceColorRange,
+    pub(crate) matrix: MatrixCoefficients,
+    pub(crate) transfer: TransferCharacteristic,
+    pub(crate) chroma_location: ChromaLocation,
+    pub(crate) kr: f64,
+    pub(crate) kb: f64,
 }
 
 impl CpuConversionContract {
-    fn from_descriptor(
+    pub(crate) fn from_descriptor(
         format: PlanarPixelFormat,
         color: SourceColorDescriptor,
     ) -> Result<Self, PlanarConversionError> {
@@ -1029,7 +1033,9 @@ fn supported_sdr_transfer(transfer: TransferCharacteristic) -> bool {
     )
 }
 
-fn chroma_sample_offset(location: ChromaLocation) -> Result<(f64, f64), PlanarConversionError> {
+pub(crate) fn chroma_sample_offset(
+    location: ChromaLocation,
+) -> Result<(f64, f64), PlanarConversionError> {
     match location {
         ChromaLocation::Left => Ok((0.0, 0.5)),
         ChromaLocation::Center => Ok((0.5, 0.5)),
