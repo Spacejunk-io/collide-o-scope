@@ -24,10 +24,10 @@
 	<string>6.0</string>
 
 	<key>CFBundleShortVersionString</key>
-	<string>1.8.0</string>
+	<string>1.8.1</string>
 
 	<key>CFBundleVersion</key>
-	<string>1.8.0</string>
+	<string>1.8.1</string>
 
 	<!-- wgpu selects Metal on macOS; Retina output must not be upscaled from a
 	     1x backing store. -->

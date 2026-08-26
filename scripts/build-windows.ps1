@@ -80,13 +80,19 @@ if (@(Compare-Object $expectedFfmpegDlls $observedFfmpegDlls -SyncWindow 0).Coun
     throw "FFMPEG_DIR must contain exactly the seven FFmpeg 9.0.1 ABI DLLs"
 }
 $ffmpegExecutable = Join-Path $ffmpegDir.FullName "bin\ffmpeg.exe"
-$ffmpegVersionLine = (& $ffmpegExecutable -hide_banner -version 2>&1 | Select-Object -First 1).ToString().Trim()
-if ($LASTEXITCODE -ne 0 -or $ffmpegVersionLine -notmatch '^ffmpeg version 9\.0\.1(?:[- ].*)?$') {
+# Preserve the native exit code before any pipeline runs. Windows PowerShell 5.1
+# can replace it when Select-Object consumes the native command directly.
+$ffmpegVersionOutput = @(& $ffmpegExecutable -hide_banner -version 2>&1)
+$ffmpegExitCode = $LASTEXITCODE
+$ffmpegVersionLine = ($ffmpegVersionOutput | Select-Object -First 1).ToString().Trim()
+if ($ffmpegExitCode -ne 0 -or $ffmpegVersionLine -notmatch '^ffmpeg version 9\.0\.1(?:[- ].*)?$') {
     throw "FFMPEG_DIR must contain FFmpeg 9.0.1; observed '$ffmpegVersionLine'"
 }
 $ffprobeExecutable = Join-Path $ffmpegDir.FullName "bin\ffprobe.exe"
-$ffprobeVersionLine = (& $ffprobeExecutable -hide_banner -version 2>&1 | Select-Object -First 1).ToString().Trim()
-if ($LASTEXITCODE -ne 0 -or $ffprobeVersionLine -notmatch '^ffprobe version 9\.0\.1(?:[- ].*)?$') {
+$ffprobeVersionOutput = @(& $ffprobeExecutable -hide_banner -version 2>&1)
+$ffprobeExitCode = $LASTEXITCODE
+$ffprobeVersionLine = ($ffprobeVersionOutput | Select-Object -First 1).ToString().Trim()
+if ($ffprobeExitCode -ne 0 -or $ffprobeVersionLine -notmatch '^ffprobe version 9\.0\.1(?:[- ].*)?$') {
     throw "FFMPEG_DIR must contain ffprobe 9.0.1; observed '$ffprobeVersionLine'"
 }
 

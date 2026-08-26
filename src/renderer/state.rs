@@ -1332,12 +1332,12 @@ mod temporal_state_tests {
             "the crates-io patch section must exist"
         );
         assert!(
-            manifest.contains("wgpu-hal = { path = \"third_party/wgpu-hal-29.0.3\" }"),
+            manifest.contains("wgpu-hal = { path = \"third_party/wgpu-hal-29.0.4\" }"),
             "wgpu-hal must resolve to the vendored copy, not crates.io"
         );
 
         let swapchain =
-            include_str!("../../third_party/wgpu-hal-29.0.3/src/vulkan/swapchain/native.rs");
+            include_str!("../../third_party/wgpu-hal-29.0.4/src/vulkan/swapchain/native.rs");
         assert_eq!(
             swapchain
                 .matches("Err(vk::Result::TIMEOUT) => return Err(crate::SurfaceError::Lost)")
@@ -1349,11 +1349,28 @@ mod temporal_state_tests {
             swapchain.contains("LOCAL PATCH (collide-o-scope)"),
             "the patch must stay labelled so a future vendor refresh cannot drop it silently"
         );
-        let mapper = include_str!("../../third_party/wgpu-hal-29.0.3/src/vulkan/mod.rs");
+        let mapper = include_str!("../../third_party/wgpu-hal-29.0.4/src/vulkan/mod.rs");
         assert!(
             mapper.contains("fn map_host_device_oom_and_lost_err"),
             "the mapper the patch exists because of must still be there"
         );
+
+        // gpu-allocator 0.28 accepts windows 0.53 through 0.62. Cargo otherwise
+        // reuses cpal's locked windows 0.54, which is type-incompatible with
+        // wgpu-hal 29.0.4's windows 0.62 DX12 interfaces.
+        let lock = include_str!("../../Cargo.lock");
+        let allocator = lock
+            .split_once("name = \"gpu-allocator\"")
+            .expect("gpu-allocator must remain locked")
+            .1
+            .split_once("[[package]]")
+            .expect("gpu-allocator lock entry must be bounded")
+            .0;
+        assert!(
+            allocator.contains("\"windows 0.62.2\""),
+            "gpu-allocator must share wgpu-hal's windows 0.62 types"
+        );
+        assert!(!allocator.contains("\"windows 0.54.0\""));
     }
     use crate::effects::params::TEMPORAL_REFERENCE_FPS;
     use crate::temporal::{

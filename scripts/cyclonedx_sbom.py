@@ -34,22 +34,22 @@ EXPECTED_TOOL = [{"vendor": "CycloneDX", "name": "cargo-cyclonedx", "version": "
 EXPECTED_TARGET_PROPERTY = [
     {"name": "cdx:rustc:sbom:target:triple", "value": "x86_64-pc-windows-msvc"}
 ]
-EXPECTED_TOP_COMPONENTS = 364
+EXPECTED_TOP_COMPONENTS = 367
 EXPECTED_TARGET_COMPONENTS = 6
-EXPECTED_REGISTRY_COMPONENTS = 362
+EXPECTED_REGISTRY_COMPONENTS = 365
 EXPECTED_GIT_COMPONENTS = 1
-EXPECTED_DEPENDENCY_ROWS = 365
-EXPECTED_DEPENDENCY_EDGES = 873
+EXPECTED_DEPENDENCY_ROWS = 368
+EXPECTED_DEPENDENCY_EDGES = 885
 EXPECTED_ROOT_EDGES = 36
 EXPECTED_LOCAL_DECLARATIONS = 8
 EXPECTED_REWRITTEN_REFERENCES = 13
 EXPECTED_SEMANTIC_PROFILE_SHA256 = (
-    "c1d433f8cf2d592f686d042e96703ef238b137a45ffa895bbe1d88f44c8d1331"
+    "1605dc0f7f64c42735728495f8a42f85cfb8613c9606311fbe58608a4841ce00"
 )
 SEMANTIC_SOURCE_PLACEHOLDER = "<exact-collide-o-scope-source-commit>"
 SEMANTIC_TIMESTAMP_PLACEHOLDER = "<exact-source-date-epoch>"
 EXPECTED_VENDOR_PURL = (
-    "pkg:cargo/wgpu-hal@29.0.3?download_url=file://third_party\\wgpu-hal-29.0.3"
+    "pkg:cargo/wgpu-hal@29.0.4?download_url=file://third_party\\wgpu-hal-29.0.4"
 )
 MAX_SBOM_BYTES = 8 * 1024 * 1024
 ALLOWED_TOP_LEVEL_KEYS = {
@@ -476,7 +476,7 @@ def validate_component_references(
         target_references.append(expected)
 
     vendor_reference = (
-        f"{source_base}/third_party/wgpu-hal-29.0.3#wgpu-hal@29.0.3"
+        f"{source_base}/third_party/wgpu-hal-29.0.4#wgpu-hal@29.0.4"
     )
     vendor_count = 0
     registry_count = 0
@@ -487,7 +487,7 @@ def validate_component_references(
             fail(f"SBOM component lacks bom-ref: {_json_path(locations[id(component)])}")
         if reference == vendor_reference:
             vendor_count += 1
-            if component.get("name") != "wgpu-hal" or component.get("version") != "29.0.3":
+            if component.get("name") != "wgpu-hal" or component.get("version") != "29.0.4":
                 fail("SBOM vendored wgpu-hal identity is unexpected")
         elif REGISTRY_REFERENCE.fullmatch(reference):
             registry_count += 1
@@ -565,7 +565,7 @@ def validate_path_policy(
         ("components", index, "purl")
         for index, component in enumerate(top_components)
         if component.get("bom-ref")
-        == f"{source_base}/third_party/wgpu-hal-29.0.3#wgpu-hal@29.0.3"
+        == f"{source_base}/third_party/wgpu-hal-29.0.4#wgpu-hal@29.0.4"
         and component.get("purl") == EXPECTED_VENDOR_PURL
     }
     for path, value in iter_string_paths(document):
@@ -951,7 +951,7 @@ def fixture_document(
     source_base = canonical_source_uri(commit) if normalized else source_uri(source_root)
     root_ref = f"{source_base}#{EXPECTED_PACKAGE_NAME}@{version}"
     target_refs = [f"{root_ref} bin-target-{index}" for index in range(6)]
-    vendor_ref = f"{source_base}/third_party/wgpu-hal-29.0.3#wgpu-hal@29.0.3"
+    vendor_ref = f"{source_base}/third_party/wgpu-hal-29.0.4#wgpu-hal@29.0.4"
     git_ref = (
         "git+https://github.com/ntsc-rs/ntsc-rs?rev="
         "4b79500dfac64efcfb393eebc89f5c75565ee5ae#0.1.2"
@@ -978,7 +978,7 @@ def fixture_document(
             "type": "library",
             "bom-ref": vendor_ref,
             "name": "wgpu-hal",
-            "version": "29.0.3",
+            "version": "29.0.4",
             "purl": EXPECTED_VENDOR_PURL,
         },
         {
@@ -1012,7 +1012,7 @@ def fixture_document(
     remaining_rows = [git_ref, *registry_refs]
     nonlocal_pool = [git_ref, *registry_refs]
     for row_index, reference in enumerate(remaining_rows):
-        wanted = 3 if row_index < 108 else 2
+        wanted = 3 if row_index < 114 else 2
         edges: list[str] = []
         cursor = row_index + 1
         while len(edges) < wanted:

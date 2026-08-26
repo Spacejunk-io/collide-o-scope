@@ -1,6 +1,6 @@
 [package]
 name = "collide-o-scope"
-version = "1.8.0"
+version = "1.8.1"
 edition = "2021"
 default-run = "collide-o-scope"
 license = "GPL-3.0-or-later"
@@ -83,8 +83,8 @@ opt-level = 3
 # wgpu-core escalates that into a permanent device loss. That wait exists for
 # Windows hosts whose Vulkan driver presents through DXGI, which is every AMD
 # Windows host, and a borderless-fullscreen transition reaches it. The vendored
-# copy is wgpu-hal 29.0.3 with exactly that one arm added; see
-# third_party/wgpu-hal-29.0.3/src/vulkan/swapchain/native.rs. Vendored rather
+# copy is wgpu-hal 29.0.4 with exactly that one arm added; see
+# third_party/wgpu-hal-29.0.4/src/vulkan/swapchain/native.rs. Vendored rather
 # than pointed at a fork so the build stays offline and `--locked` honest.
 [patch.crates-io]
-wgpu-hal = { path = "third_party/wgpu-hal-29.0.3" }
+wgpu-hal = { path = "third_party/wgpu-hal-29.0.4" }

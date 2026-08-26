@@ -42,10 +42,10 @@ REVIEWED_PACKAGE_ASSEMBLY_STEP_SHA256 = (
     "f327da1c8f9029e9b224bffe95b1d5713b9cee875428c56733ff04f15e468cbb"
 )
 REVIEWED_SBOM_POLICY_SHA256 = (
-    "03f8a1b6f98a1930cc7110368bd8973d7f497d5349aa0f13839855dfa1e32fde"
+    "775741aeb0e652e52a83c59364a27f543ef58ca51b486ed48e127d76f57769e9"
 )
 REVIEWED_RELEASE_VERIFIER_SHA256 = (
-    "875815fee3c45fd0d17c7a1da0f4e509d0e6fdfe3a6aad6eb1f06a412c614ba4"
+    "904cfa1fac528996daca88ac17799cf0a1f06652cb621a26f6f477f4207801a4"
 )
 
 
@@ -2044,11 +2044,11 @@ def validate_reviewed_sbom_policy_digest(policy: str) -> None:
         != REVIEWED_SBOM_POLICY_SHA256
         or 'EXPECTED_REPOSITORY_URL = "https://github.com/Spacejunk-io/collide-o-scope"' not in policy
         or 'return f"{EXPECTED_REPOSITORY_URL}/tree/{commit}"' not in policy
-        or 'EXPECTED_DEPENDENCY_EDGES = 873' not in policy
+        or 'EXPECTED_DEPENDENCY_EDGES = 885' not in policy
         or 'EXPECTED_ROOT_EDGES = 36' not in policy
         or 'EXPECTED_REWRITTEN_REFERENCES = 13' not in policy
         or 'EXPECTED_SEMANTIC_PROFILE_SHA256 = (' not in policy
-        or '"c1d433f8cf2d592f686d042e96703ef238b137a45ffa895bbe1d88f44c8d1331"' not in policy
+        or '"1605dc0f7f64c42735728495f8a42f85cfb8613c9606311fbe58608a4841ce00"' not in policy
         or 'object_pairs_hook=_reject_duplicate_keys' not in policy
         or 'parse_constant=_reject_nonfinite_constant' not in policy
         or 'if observed_changes != changed_paths:' not in policy
@@ -2062,6 +2062,43 @@ def validate_reviewed_sbom_policy_digest(policy: str) -> None:
         or "def self_test()" not in policy
     ):
         fail("CycloneDX SBOM policy differs from its reviewed bytes or contract")
+
+
+def validate_adversarial_patch_trigger(adversarial: str) -> None:
+    """Require every production patch parser/schema change to run fuzz CI."""
+    try:
+        trigger = adversarial.split("\npermissions:", 1)[0]
+        push = trigger.split("  push:\n", 1)[1].split("  pull_request:\n", 1)[0]
+        pull_request = trigger.split("  pull_request:\n", 1)[1].split(
+            "  workflow_dispatch:\n", 1
+        )[0]
+    except IndexError as error:
+        raise ValueError("adversarial workflow trigger structure is unexpected") from error
+
+    patch_glob = '      - "src/patch/**"'
+    if push.count(patch_glob) != 1 or pull_request.count(patch_glob) != 1:
+        fail(
+            "adversarial push and pull-request filters must each cover all src/patch paths"
+        )
+
+
+def self_test_adversarial_patch_trigger(adversarial: str) -> None:
+    validate_adversarial_patch_trigger(adversarial)
+    patch_glob = '      - "src/patch/**"'
+    narrowed = '      - "src/patch/editor.rs"'
+    pull_head, pull_tail = adversarial.rsplit(patch_glob, 1)
+    for mutation in (
+        adversarial.replace(patch_glob, narrowed, 1),
+        pull_head + narrowed + pull_tail,
+    ):
+        try:
+            validate_adversarial_patch_trigger(mutation)
+        except ValueError:
+            pass
+        else:
+            fail(
+                "narrowed adversarial patch path escaped the workflow policy gate"
+            )
 
 
 def validate_shared_sbom_verifier(verifier: str) -> None:
@@ -2396,6 +2433,7 @@ def validate_versioned_release_receipts(finalizer: str) -> None:
         "v1.7.3-release-recovery-receipt.md",
         "v1.7.4-release-recovery-receipt.md",
         "v1.8.0-ffmpeg-9-software-baseline-receipt.md",
+        "v1.8.1-patch-refresh-receipt.md",
     )
     for name in names:
         if (
@@ -2414,6 +2452,7 @@ def self_test_versioned_release_receipts(finalizer: str) -> None:
         "v1.7.3-release-recovery-receipt.md",
         "v1.7.4-release-recovery-receipt.md",
         "v1.8.0-ffmpeg-9-software-baseline-receipt.md",
+        "v1.8.1-patch-refresh-receipt.md",
     )
     for name in names:
         for literal in (f'"{name}",', f'"docs/evidence/{name}"'):
@@ -2510,6 +2549,7 @@ def main() -> int:
         adversarial = (ROOT / ".github/workflows/adversarial.yml").read_text(
             encoding="utf-8"
         )
+        self_test_adversarial_patch_trigger(adversarial)
         reproducible_build = (ROOT / "scripts/build-reproducible-windows.ps1").read_text(
             encoding="utf-8"
         )
@@ -2539,7 +2579,7 @@ def main() -> int:
         expected_actions = {
             "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
             "actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830",
-            "sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62",
+            "sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5",
             "actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a",
             "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
         }
@@ -2927,7 +2967,7 @@ def main() -> int:
             signing_body,
         ):
             fail("checksum signing commands do not fail immediately on native errors")
-        if release.count("cosign-release: v2.6.0") != 2:
+        if release.count("cosign-release: v2.6.5") != 2:
             fail("both signing and redownload jobs must pin the cosign binary")
         if (
             release.count("actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a") != 2

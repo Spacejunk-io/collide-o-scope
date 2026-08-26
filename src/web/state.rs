@@ -9756,6 +9756,29 @@ mod protocol_tests {
     }
 
     #[test]
+    fn windows_build_helper_preserves_native_version_exit_codes() {
+        let script = include_str!("../../scripts/build-windows.ps1");
+        for contract in [
+            "$ffmpegVersionOutput = @(& $ffmpegExecutable -hide_banner -version 2>&1)",
+            "$ffmpegExitCode = $LASTEXITCODE",
+            "$ffmpegVersionLine = ($ffmpegVersionOutput | Select-Object -First 1)",
+            "$ffprobeVersionOutput = @(& $ffprobeExecutable -hide_banner -version 2>&1)",
+            "$ffprobeExitCode = $LASTEXITCODE",
+            "$ffprobeVersionLine = ($ffprobeVersionOutput | Select-Object -First 1)",
+        ] {
+            assert!(
+                script.contains(contract),
+                "missing native version-probe contract: {contract}"
+            );
+        }
+        assert!(!script
+            .contains("(& $ffmpegExecutable -hide_banner -version 2>&1 | Select-Object -First 1)"));
+        assert!(!script.contains(
+            "(& $ffprobeExecutable -hide_banner -version 2>&1 | Select-Object -First 1)"
+        ));
+    }
+
+    #[test]
     fn persistent_layer_cards_toggle_from_the_latest_snapshot() {
         let js = include_str!("../../static/app.js");
         assert!(js.contains("card._layerState = layer"));

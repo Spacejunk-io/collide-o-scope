@@ -9,7 +9,7 @@ on:
       release_tag:
         description: Candidate tag whose version must match Cargo.toml
         required: true
-        default: v1.8.0
+        default: v1.8.1
 
 permissions:
   contents: read
@@ -694,9 +694,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Install pinned cosign
-        uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
         with:
-          cosign-release: v2.6.0
+          cosign-release: v2.6.5
 
       - name: Revalidate pre-tag absence after qualification
         if: github.event_name == 'workflow_dispatch'
@@ -865,9 +865,9 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned cosign
-        uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
         with:
-          cosign-release: v2.6.0
+          cosign-release: v2.6.5
 
       - name: Redownload published assets
         shell: pwsh

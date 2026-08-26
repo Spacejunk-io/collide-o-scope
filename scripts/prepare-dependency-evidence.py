@@ -17,7 +17,7 @@ import urllib.parse
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_CARGO_DENY_VERSION = "cargo-deny 0.20.2"
 PATH_SOURCE = re.compile(r"^(?P<package>[^\r\n]+) path\+file://(?P<path>[^\r\n]+)$")
-CANONICAL_VENDOR_SOURCE = "path+third_party/wgpu-hal-29.0.3"
+CANONICAL_VENDOR_SOURCE = "path+third_party/wgpu-hal-29.0.4"
 CANONICAL_ROOT_SOURCE = "path+."
 MAX_INVENTORY_BYTES = 4 * 1024 * 1024
 
@@ -109,13 +109,13 @@ def normalize_string(value: str, normalized_sources: list[str]) -> str:
     if package == root_identity and paths_equal:
         normalized_sources.append(value)
         return f"{package} {CANONICAL_ROOT_SOURCE}"
-    expected_vendor = (ROOT / "third_party" / "wgpu-hal-29.0.3").as_posix().rstrip("/")
+    expected_vendor = (ROOT / "third_party" / "wgpu-hal-29.0.4").as_posix().rstrip("/")
     vendor_paths_equal = (
         decoded_path.casefold() == expected_vendor.casefold()
         if re.match(r"^[A-Za-z]:/", expected_vendor)
         else decoded_path == expected_vendor
     )
-    if package != "wgpu-hal 29.0.3" or not vendor_paths_equal:
+    if package != "wgpu-hal 29.0.4" or not vendor_paths_equal:
         raise EvidenceError(f"undeclared path dependency in inventory: {value!r}")
     normalized_sources.append(value)
     return f"{package} {CANONICAL_VENDOR_SOURCE}"
@@ -141,7 +141,7 @@ def prepare(output: Path) -> dict:
         for value in normalized_sources
     )
     vendor_occurrences = sum(
-        value.startswith("wgpu-hal 29.0.3 path+file://")
+        value.startswith("wgpu-hal 29.0.4 path+file://")
         for value in normalized_sources
     )
     if root_occurrences != 1 or vendor_occurrences < 1:
@@ -180,7 +180,7 @@ def self_test() -> None:
         "licenses": [["MIT", [
             "example 1.0.0 registry+https://github.com/rust-lang/crates.io-index",
             f"{root_package['name']} {root_package['version']} path+{ROOT.as_uri()}",
-            f"wgpu-hal 29.0.3 path+{(ROOT / 'third_party' / 'wgpu-hal-29.0.3').as_uri()}",
+            f"wgpu-hal 29.0.4 path+{(ROOT / 'third_party' / 'wgpu-hal-29.0.4').as_uri()}",
         ]]],
         "unlicensed": [],
     }
