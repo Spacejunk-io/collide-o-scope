@@ -23,11 +23,16 @@ use crate::transport::{
     ClipTransportState, CueId, FrameSelection, NormalizedTime, PlaybackDirection,
     ProgramTransportTick, TransportTimeline,
 };
+use crate::video::planar::{PlanarConversionRecipe, PlanarDeliveryPolicy, PlanarImageLayout};
+use crate::video::planar_gpu::{
+    planar_convert_uniforms_from_recipe, PlanarGpuConverter, PlanarPlaneTextures,
+};
 use crate::video::threaded::{DecoderHealth, DecoderTelemetry, ReadyFrame};
 use crate::video::{
     decode_still_image_with_media_policy, CodecMotionFrame, CodecMotionProduct,
-    DecodedImagePayload, DecodedPayloadOwner, SourceColorDescriptor, SourceConversionPolicy,
-    SourceDisplayDescriptor, StillImage, ThreadedDecoder,
+    DecodedImagePayload, DecodedPayloadOwner, DecodedPixelFormat, PlanarPixelFormat,
+    SourceColorDescriptor, SourceConversionPolicy, SourceDisplayDescriptor, StillImage,
+    ThreadedDecoder,
 };
 use crate::visual_rack::{LegacyRackScope, RuntimeVisualRack};
 
@@ -601,8 +606,11 @@ impl LayerSourceActivation {
         render_generation: u64,
     ) -> Result<Self, String> {
         let (texture, texture_view) =
-            create_layer_texture(device, width, height, "Prepared Layer Texture")?;
+            create_video_layer_texture(device, width, height, "Prepared Layer Texture")?;
         let mut upload_validation = UploadValidationEpoch::default();
+        // Prepared seeds come from dedicated legacy-policy decoders and are
+        // packed by construction; a planar frame here is a routing defect and
+        // the seam refuses it by name.
         enqueue_layer_texture_upload(
             &mut upload_validation,
             device,
@@ -615,6 +623,7 @@ impl LayerSourceActivation {
             layer_id,
             source_generation,
             render_generation,
+            None,
         )?;
         Ok(Self {
             source_path,
@@ -757,6 +766,17 @@ pub struct Layer {
     /// by `texture`. Runtime-only: patches and prepared authoring never see it.
     codec_motion: Option<CodecMotionProduct>,
     upload_validation: UploadValidationEpoch,
+    /// The authored P4c delivery policy for this layer's video decoder.
+    /// Legacy is the default and the exact prior byte path; the value is
+    /// meaningful only for video sources and persists through the layer's
+    /// patch config, never through live decoder identity.
+    delivery_policy: PlanarDeliveryPolicy,
+    /// Lazy per-layer conversion state for admitted planar frames. Dropped
+    /// whenever the texture identity changes; absent on legacy layers.
+    planar_delivery_gpu: Option<LayerPlanarDelivery>,
+    /// Whether the pixels currently in `texture` arrived through the planar
+    /// path — the truthful per-layer delivery fact for snapshots.
+    delivery_active_planar: bool,
     /// Conservative CPU/GPU working-set charge used while this source is an
     /// inactive prepared slot. Active sources are deliberately outside that
     /// evictable ledger, but the exact charge follows ownership on a swap.
@@ -835,7 +855,8 @@ impl Layer {
             "video",
             media_policy,
         )?;
-        let (texture, texture_view) = create_layer_texture(device, width, height, "Layer Texture")?;
+        let (texture, texture_view) =
+            create_video_layer_texture(device, width, height, "Layer Texture")?;
 
         // Preserve a stable path independently from the short display label.
         // Canonicalization makes relative drag/drop and file-dialog paths
@@ -893,6 +914,9 @@ impl Layer {
             source_frame_initialized: false,
             codec_motion: None,
             upload_validation: UploadValidationEpoch::default(),
+            delivery_policy: PlanarDeliveryPolicy::default(),
+            planar_delivery_gpu: None,
+            delivery_active_planar: false,
             source_preload_bytes,
             speed: 1.0,
             fps,
@@ -980,6 +1004,9 @@ impl Layer {
             source_frame_initialized: false,
             codec_motion: None,
             upload_validation: UploadValidationEpoch::default(),
+            delivery_policy: PlanarDeliveryPolicy::default(),
+            planar_delivery_gpu: None,
+            delivery_active_planar: false,
             source_preload_bytes,
             speed: 1.0,
             // A still has no source cadence. Retaining the conventional value
@@ -1079,6 +1106,9 @@ impl Layer {
             source_frame_initialized: false,
             codec_motion: None,
             upload_validation: UploadValidationEpoch::default(),
+            delivery_policy: PlanarDeliveryPolicy::default(),
+            planar_delivery_gpu: None,
+            delivery_active_planar: false,
             source_preload_bytes,
             speed: 1.0,
             fps: 30.0,
@@ -1156,6 +1186,9 @@ impl Layer {
             source_frame_initialized: false,
             codec_motion: None,
             upload_validation: UploadValidationEpoch::default(),
+            delivery_policy: PlanarDeliveryPolicy::default(),
+            planar_delivery_gpu: None,
+            delivery_active_planar: false,
             source_preload_bytes,
             speed: 1.0,
             fps: 30.0,
@@ -1233,6 +1266,9 @@ impl Layer {
             source_frame_initialized: false,
             codec_motion: None,
             upload_validation: UploadValidationEpoch::default(),
+            delivery_policy: PlanarDeliveryPolicy::default(),
+            planar_delivery_gpu: None,
+            delivery_active_planar: false,
             source_preload_bytes,
             speed: 1.0,
             fps: 30.0,
@@ -1617,6 +1653,15 @@ impl Layer {
         self.height = height;
         self.proxy_backing = proxy_backing;
         self.source_resource_epoch = self.source_resource_epoch.wrapping_add(1).max(1);
+        // The conversion state binds the displaced texture identity; a new
+        // texture must rebuild it on the next admitted planar frame.
+        self.planar_delivery_gpu = None;
+        self.delivery_active_planar = false;
+        // A freshly staged decoder opens under the legacy default; the
+        // layer's authored policy carries across the swap.
+        if let LayerSource::Video(decoder) = &self.source {
+            decoder.set_delivery_policy(self.delivery_policy);
+        }
         self.effects.resolution = [width as f32, height as f32];
         self.source_frame_initialized = source_frame_initialized;
         self.source_preload_bytes = preload_bytes;
@@ -1711,6 +1756,15 @@ impl Layer {
         self.height = height;
         self.proxy_backing = Some(key);
         self.source_resource_epoch = self.source_resource_epoch.wrapping_add(1).max(1);
+        // The conversion state binds the displaced texture identity; a new
+        // texture must rebuild it on the next admitted planar frame.
+        self.planar_delivery_gpu = None;
+        self.delivery_active_planar = false;
+        // The adopted proxy decoder opens under the legacy default; the
+        // layer's authored policy carries across the install.
+        if let LayerSource::Video(decoder) = &self.source {
+            decoder.set_delivery_policy(self.delivery_policy);
+        }
         self.effects.resolution = [width as f32, height as f32];
         self.source_frame_initialized = source_frame_initialized;
         self.source_preload_bytes = preload_bytes;
@@ -1750,6 +1804,28 @@ impl Layer {
 
     pub fn is_video(&self) -> bool {
         matches!(self.source, LayerSource::Video(_))
+    }
+
+    /// The authored P4c delivery policy for this layer.
+    pub fn delivery_policy(&self) -> PlanarDeliveryPolicy {
+        self.delivery_policy
+    }
+
+    /// Author the delivery policy. Legacy is the exact prior byte path;
+    /// managed lets the decoder deliver admitted progressive 8-bit 4:2:0
+    /// frames as planes converted on the GPU. Effective from the next
+    /// materialized frame; non-video sources retain the value inertly.
+    pub fn set_delivery_policy(&mut self, policy: PlanarDeliveryPolicy) {
+        self.delivery_policy = policy;
+        if let LayerSource::Video(decoder) = &self.source {
+            decoder.set_delivery_policy(policy);
+        }
+    }
+
+    /// Whether the pixels currently on the GPU arrived through the planar
+    /// path — the truthful per-layer delivery fact for snapshots.
+    pub fn delivery_active_planar(&self) -> bool {
+        self.delivery_active_planar
     }
 
     /// Persisted sources that can be reconstructed for deterministic offline
@@ -1864,9 +1940,14 @@ impl Layer {
             self.layer_id,
             frame.source_generation,
             render_generation,
+            Some(&mut self.planar_delivery_gpu),
         );
         let upload_duration = upload_started.elapsed();
         if upload_result.is_ok() {
+            self.delivery_active_planar = matches!(
+                frame.rgba.layout().format,
+                DecodedPixelFormat::PlanarYuv420p8
+            );
             if let LayerSource::Video(decoder) = &mut self.source {
                 decoder.record_accepted_upload(
                     frame.source_generation,
@@ -1905,8 +1986,11 @@ impl Layer {
     /// accurately named `take_ready_media_frame` wrapper above.
     #[allow(dead_code)]
     pub fn take_ready_video_frame(&mut self) -> Result<Option<Vec<u8>>, String> {
-        self.take_ready_media_frame()
-            .map(|ready| ready.map(|frame| frame.rgba.into_vec()))
+        self.take_ready_media_frame().and_then(|ready| {
+            ready
+                .map(|frame| frame.rgba.expect_packed_rgba8().map(<[u8]>::to_vec))
+                .transpose()
+        })
     }
 
     /// Stable video decoder health for state snapshots.
@@ -2040,6 +2124,7 @@ impl Layer {
                 self.layer_id,
                 0,
                 render_generation,
+                None,
             ) {
                 self.source_error.clone_from(&error);
                 return Err(error);
@@ -2047,6 +2132,10 @@ impl Layer {
             self.texture = texture;
             self.texture_view = texture_view;
             self.source_resource_epoch = self.source_resource_epoch.wrapping_add(1).max(1);
+            // The conversion state binds the displaced texture identity; a new
+            // texture must rebuild it on the next admitted planar frame.
+            self.planar_delivery_gpu = None;
+            self.delivery_active_planar = false;
             self.width = frame.width;
             self.height = frame.height;
             self.effects.resolution = [frame.width as f32, frame.height as f32];
@@ -2118,6 +2207,7 @@ impl Layer {
             self.layer_id,
             0,
             render_generation,
+            Some(&mut self.planar_delivery_gpu),
         ) {
             Ok(()) => {
                 self.source_frame_initialized = true;
@@ -2208,8 +2298,24 @@ fn enqueue_layer_texture_upload(
     layer_id: u64,
     source_generation: u64,
     render_generation: u64,
+    planar: Option<&mut Option<LayerPlanarDelivery>>,
 ) -> Result<(), String> {
-    let expected = checked_upload_len(width, height, label)?;
+    let format = payload.layout().format;
+    let expected = match format {
+        DecodedPixelFormat::PackedRgba8 => checked_upload_len(width, height, label)?,
+        DecodedPixelFormat::PlanarYuv420p8 => {
+            let layout = payload.layout();
+            if layout.width != width || layout.height != height {
+                return Err(format!(
+                    "{label} planar upload is {}x{}; expected {width}x{height}",
+                    layout.width, layout.height
+                ));
+            }
+            layout
+                .byte_len()
+                .map_err(|error| format!("{label} planar upload: {error}"))?
+        }
+    };
     if payload.len() != expected {
         return Err(format!(
             "{label} upload has {} bytes; expected {expected} for {width}x{height}",
@@ -2230,28 +2336,43 @@ fn enqueue_layer_texture_upload(
     let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
     let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        payload.as_slice(),
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(4 * width),
-            rows_per_image: Some(height),
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
+    let body_result: Result<(), String> = match format {
+        DecodedPixelFormat::PackedRgba8 => {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                payload.as_slice(),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * width),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            Ok(())
+        }
+        DecodedPixelFormat::PlanarYuv420p8 => planar
+            .ok_or_else(|| {
+                format!("{label} cannot accept a planar frame: no conversion state at this seam")
+            })
+            .and_then(|state_slot| {
+                convert_planar_into_layer_texture(
+                    state_slot, device, queue, texture, payload, width, height, label,
+                )
+            }),
+    };
     let out_of_memory = out_of_memory.pop();
     let internal = internal.pop();
     let validation = validation.pop();
+    body_result?;
     let future: UploadScopeFuture = Box::pin(async move {
         let (out_of_memory, internal, validation) =
             futures::join!(out_of_memory, internal, validation);
@@ -2380,6 +2501,140 @@ fn create_renderable_layer_texture(
         ));
     }
     Ok((texture, texture_view))
+}
+
+/// The video layer's texture: the ordinary layer texture plus
+/// `RENDER_ATTACHMENT` and the non-sRGB twin view format, because an admitted
+/// planar frame's producer is the P4c conversion pass rather than an upload.
+/// The extra usage and view format cost nothing when the policy stays legacy;
+/// packed uploads into this texture are byte-identical to the plain one.
+fn create_video_layer_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    label: &str,
+) -> Result<(wgpu::Texture, wgpu::TextureView), String> {
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        // COPY_SRC serves the seam-proof fixtures' byte readback; usage
+        // flags cost nothing at rest.
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+    });
+    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let errors = [
+        pollster::block_on(out_of_memory.pop()),
+        pollster::block_on(internal.pop()),
+        pollster::block_on(validation.pop()),
+    ];
+    if let Some(error) = errors.into_iter().flatten().next() {
+        return Err(format!(
+            "could not allocate {label} at {width}x{height}: {error}"
+        ));
+    }
+    Ok((texture, texture_view))
+}
+
+/// Per-layer lazy P4c conversion state: the pipeline, the pooled plane
+/// textures, the prepared bind group, and the layer texture's non-sRGB
+/// target view. Created on the first admitted planar upload and dropped
+/// whenever the layer texture identity changes; a legacy-policy layer never
+/// allocates it. The charge per planar-active layer is one small pipeline,
+/// one 48-byte uniform, and 1.5 bytes per pixel of plane textures.
+pub(crate) struct LayerPlanarDelivery {
+    converter: PlanarGpuConverter,
+    textures: PlanarPlaneTextures,
+    bind_group: wgpu::BindGroup,
+    target_view: wgpu::TextureView,
+    /// The recipe last written into the uniform buffer, so ordinary frames
+    /// write planes only.
+    written_recipe: Option<PlanarConversionRecipe>,
+}
+
+impl LayerPlanarDelivery {
+    fn build(
+        device: &wgpu::Device,
+        layer_texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
+        let layout = PlanarImageLayout::new(PlanarPixelFormat::Yuv420p8, width, height)
+            .map_err(|error| format!("planar delivery layout refused: {error}"))?;
+        let converter = PlanarGpuConverter::new(device);
+        let textures = converter.plane_textures(device, layout);
+        let bind_group = converter.bind_group(device, &textures);
+        let target_view = layer_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("Layer planar convert target"),
+            format: Some(wgpu::TextureFormat::Rgba8Unorm),
+            ..Default::default()
+        });
+        Ok(Self {
+            converter,
+            textures,
+            bind_group,
+            target_view,
+            written_recipe: None,
+        })
+    }
+}
+
+/// The one planar-conversion application, shared verbatim by the live upload
+/// seam and the offline export upload so the two cannot drift: ensure the
+/// per-layer conversion state against this texture, write the frame's recipe
+/// when it changes, write the planes, and encode the single conversion pass
+/// into the texture's non-sRGB twin view.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn convert_planar_into_layer_texture(
+    state_slot: &mut Option<LayerPlanarDelivery>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    payload: &DecodedImagePayload,
+    width: u32,
+    height: u32,
+    label: &str,
+) -> Result<(), String> {
+    let recipe = payload
+        .conversion_recipe()
+        .ok_or_else(|| format!("{label} planar upload is missing its conversion recipe"))?;
+    if state_slot.is_none() {
+        *state_slot = Some(LayerPlanarDelivery::build(device, texture, width, height)?);
+    }
+    let state = state_slot.as_mut().expect("planar state built above");
+    if state.written_recipe != Some(recipe) {
+        state.converter.write_uniforms(
+            queue,
+            planar_convert_uniforms_from_recipe(width, height, recipe),
+        );
+        state.written_recipe = Some(recipe);
+    }
+    state
+        .converter
+        .upload_plane_bytes(queue, &state.textures, payload.as_slice())
+        .map_err(|error| format!("{label} planar upload: {error}"))?;
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Layer planar convert"),
+    });
+    state
+        .converter
+        .encode_convert(&mut encoder, &state.bind_group, &state.target_view);
+    queue.submit(std::iter::once(encoder.finish()));
+    Ok(())
 }
 
 #[allow(dead_code)] // Compatibility Safe wrapper for legacy validation call sites.

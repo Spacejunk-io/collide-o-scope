@@ -647,6 +647,40 @@ pub enum PlanarDeliveryPolicy {
     MetadataManaged,
 }
 
+impl PlanarDeliveryPolicy {
+    /// Stable wire/panel tokens; identical to the serde spelling.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::LegacyRgba => "legacy_rgba",
+            Self::MetadataManaged => "metadata_managed",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "legacy_rgba" => Some(Self::LegacyRgba),
+            "metadata_managed" => Some(Self::MetadataManaged),
+            _ => None,
+        }
+    }
+
+    /// Atomic-cell encoding for the live decoder's shared policy. Unknown
+    /// values decode to the legacy default, never to the managed path.
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::LegacyRgba => 0,
+            Self::MetadataManaged => 1,
+        }
+    }
+
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::MetadataManaged,
+            _ => Self::LegacyRgba,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PlanarDeliverySettings {
@@ -822,6 +856,41 @@ pub struct CpuPlanarConversionPolicy {
 pub struct CpuPlanarConversion {
     pub rgba: Vec<u8>,
     pub policy: CpuPlanarConversionPolicy,
+}
+
+/// The frame-local conversion law a planar payload carries with its pixels.
+///
+/// The decoder derives this once from the frozen source descriptor — through
+/// the same [`CpuConversionContract`] the CPU oracle consumes — and attaches
+/// it to the payload at materialization, so the upload seam converts under
+/// exactly the truth the decoder admitted. Nothing downstream re-derives
+/// color from telemetry, which is what makes the conversion race-free across
+/// source-generation boundaries: the recipe travels with the frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlanarConversionRecipe {
+    pub bit_depth: u8,
+    pub full_range: bool,
+    /// Chroma sample offset in luma pixels, from the declared siting.
+    pub chroma_offset: [f32; 2],
+    pub kr: f32,
+    pub kb: f32,
+}
+
+/// Derive the frame-local recipe from the one shared conversion contract.
+/// Every refusal the CPU oracle makes is this function's refusal too.
+pub(crate) fn planar_conversion_recipe(
+    format: PlanarPixelFormat,
+    color: SourceColorDescriptor,
+) -> Result<PlanarConversionRecipe, PlanarConversionError> {
+    let contract = CpuConversionContract::from_descriptor(format, color)?;
+    let (offset_x, offset_y) = chroma_sample_offset(contract.chroma_location)?;
+    Ok(PlanarConversionRecipe {
+        bit_depth: contract.bit_depth,
+        full_range: contract.range == SourceColorRange::Full,
+        chroma_offset: [offset_x as f32, offset_y as f32],
+        kr: contract.kr as f32,
+        kb: contract.kb as f32,
+    })
 }
 
 /// The one conversion contract. The CPU oracle consumes it directly and the

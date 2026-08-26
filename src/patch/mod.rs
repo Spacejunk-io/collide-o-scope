@@ -41,6 +41,7 @@ use crate::temporal::{
     CollisionScoreLoopDriver, RefreshGardenMatteRoute, RefreshGardenMotionRoute,
     TemporalEventResetMode, TemporalResetPolicy,
 };
+use crate::video::PlanarDeliveryPolicy;
 use crate::visual_rack::{
     EdgeTiming, GroupId, ImageDependency, ImageDependencyGraph, ImageGraphMode, ImageOrderingEdge,
     LegacyRackScope, MaskParams, NodeId, RuntimeImageMatte, RuntimeVisualRack, SavedImageSource,
@@ -127,6 +128,10 @@ fn default_bitcrush_dither() -> f32 {
 fn is_zero_f32(value: &f32) -> bool {
     *value == 0.0
 }
+fn is_default_delivery(policy: &PlanarDeliveryPolicy) -> bool {
+    *policy == PlanarDeliveryPolicy::LegacyRgba
+}
+
 fn is_one_f32(value: &f32) -> bool {
     *value == 1.0
 }
@@ -3306,6 +3311,13 @@ pub struct LayerConfig {
     pub bypass_temporal_fx: bool,
     #[serde(default)]
     pub reroll_on_loop: bool,
+    /// P4c authored delivery policy for this layer's video decoder. Absent
+    /// in legacy patches and skip-serialized at the legacy default, which is
+    /// the exact prior packed byte path; `metadata_managed` lets the decoder
+    /// deliver admitted progressive 8-bit 4:2:0 frames as planes converted
+    /// on the GPU under the frozen declared color truth.
+    #[serde(default, skip_serializing_if = "is_default_delivery")]
+    pub delivery: PlanarDeliveryPolicy,
     #[serde(default)]
     pub effects: EffectsConfig,
     /// Per-layer authored geometry. Missing data in old patches must resolve
@@ -3379,6 +3391,8 @@ impl<'de> Deserialize<'de> for LayerConfig {
             #[serde(default)]
             reroll_on_loop: bool,
             #[serde(default)]
+            delivery: PlanarDeliveryPolicy,
+            #[serde(default)]
             effects: EffectsConfig,
             #[serde(default)]
             transform: SpatialTransform,
@@ -3427,6 +3441,7 @@ impl<'de> Deserialize<'de> for LayerConfig {
             bypass_master_fx: raw.bypass_master_fx,
             bypass_temporal_fx: raw.bypass_temporal_fx,
             reroll_on_loop: raw.reroll_on_loop,
+            delivery: raw.delivery,
             effects: raw.effects,
             transform: raw.transform,
             motion: raw.motion.map(MotionConfig::sanitized),
@@ -4704,6 +4719,7 @@ impl LayerConfig {
             bypass_master_fx: layer.bypass_master_fx,
             bypass_temporal_fx: layer.bypass_temporal_fx,
             reroll_on_loop: layer.reroll_on_loop,
+            delivery: layer.delivery_policy(),
             effects: EffectsConfig::from_uniforms(&layer.effects),
             transform: layer.transform.sanitized(),
             motion: {
@@ -4794,6 +4810,7 @@ impl LayerConfig {
         layer.bypass_master_fx = self.bypass_master_fx;
         layer.bypass_temporal_fx = self.bypass_temporal_fx;
         layer.reroll_on_loop = self.reroll_on_loop;
+        layer.set_delivery_policy(self.delivery);
         self.effects.apply_to_uniforms(&mut layer.effects);
         // The B13 optics author at master scope only; a hostile or hand-edited
         // layer section cannot install one on a layer copy.
@@ -6794,6 +6811,7 @@ mod tests {
         LayerConfig {
             filename: filename.to_string(),
             source_path: source_path.clone(),
+            delivery: Default::default(),
             opacity,
             mosh_send: 1.0,
             blend_mode: blend_mode.to_string(),
@@ -7557,6 +7575,7 @@ autopilot:
             layers: vec![LayerConfig {
                 filename: "clip.mp4".to_string(),
                 source_path: String::new(),
+                delivery: Default::default(),
                 opacity: 1.0,
                 mosh_send: 1.0,
                 blend_mode: "normal".to_string(),
@@ -11461,12 +11480,42 @@ lfos:
     }
 
     #[test]
+    fn delivery_policy_round_trips_and_stays_absent_at_the_legacy_default() {
+        // A legacy patch has no `delivery` field and must keep its exact
+        // bytes; the default therefore serializes to nothing.
+        let config: LayerConfig = serde_yaml::from_str("filename: clip.mp4").unwrap();
+        assert_eq!(config.delivery, PlanarDeliveryPolicy::LegacyRgba);
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(
+            !yaml.contains("delivery"),
+            "legacy default must stay skip-serialized:\n{yaml}"
+        );
+
+        let mut managed = config.clone();
+        managed.delivery = PlanarDeliveryPolicy::MetadataManaged;
+        let yaml = serde_yaml::to_string(&managed).unwrap();
+        assert!(
+            yaml.contains("delivery: metadata_managed"),
+            "authored policy must persist:\n{yaml}"
+        );
+        let round: LayerConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(round.delivery, PlanarDeliveryPolicy::MetadataManaged);
+
+        // An unknown token is a deserialization rejection, never a silent
+        // fallback onto either policy.
+        assert!(
+            serde_yaml::from_str::<LayerConfig>("filename: clip.mp4\ndelivery: chunky").is_err()
+        );
+    }
+
+    #[test]
     fn generator_sections_round_trip_and_absent_sections_keep_old_bytes() {
         // An ordinary layer serializes without either generator section, so
         // every pre-B7 patch keeps its bytes and canonical hashes.
         let plain = LayerConfig {
             filename: "clip.mp4".into(),
             source_path: String::new(),
+            delivery: Default::default(),
             opacity: 1.0,
             mosh_send: 1.0,
             blend_mode: "normal".into(),

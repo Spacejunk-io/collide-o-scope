@@ -3,7 +3,7 @@ use ffmpeg_next::format::{context::Input, input_with_interrupt};
 use ffmpeg_next::media::Type;
 use ffmpeg_next::software::scaling::{context::Context as ScalerContext, flag::Flags};
 use ffmpeg_next::util::frame::video::Video as VideoFrame;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,10 @@ use crate::video::indexed::{
     FrameMetadata, KeyframeIndex, ReverseFrameCache,
 };
 use crate::video::payload::{DecodedImagePayload, DecodedRasterLayout, DecodedRasterPool};
+use crate::video::planar::{
+    planar_conversion_recipe, prototype_delivery_decision, PlanarConversionRecipe,
+    PlanarDeliveryDecision, PlanarDeliveryPolicy, PlanarPixelFormat,
+};
 use crate::video::source_descriptor::{
     configure_sws_conversion, descriptors_from_ffmpeg, merge_first_ffmpeg_frame,
     ConversionPolicyKind, SourceColorDescriptor, SourceConversionPolicy, SourceDisplayDescriptor,
@@ -225,6 +229,20 @@ pub struct VideoDecoder {
     /// fresh FFmpeg output image after warm-up.
     scaled_rgba_frame: VideoFrame,
     packed_rgba_pool: DecodedRasterPool,
+    /// The P4c authored delivery policy, shared with the owning handle so a
+    /// live edit reaches the worker without a command-ordering question:
+    /// policy is a per-materialization law, not a selection. Legacy is the
+    /// default and the exact prior byte path.
+    delivery_policy: Arc<AtomicU8>,
+    /// Lazily created on the first admitted planar materialization; sized
+    /// and ledgered exactly like the packed pool. A legacy-policy session
+    /// never allocates it.
+    planar_pool: Option<DecodedRasterPool>,
+    /// Frame-local conversion law derived once from the frozen descriptor.
+    planar_recipe: Option<PlanarConversionRecipe>,
+    /// The reverse-cache byte allowance captured at open, reused to bound
+    /// the lazy planar pool under the same formula as the packed one.
+    reverse_cache_pool_bytes: u64,
     source_color_descriptor: SourceColorDescriptor,
     source_display_descriptor: SourceDisplayDescriptor,
     conversion_policy: SourceConversionPolicy,
@@ -457,6 +475,10 @@ impl VideoDecoder {
             scaler,
             scaled_rgba_frame: VideoFrame::empty(),
             packed_rgba_pool,
+            delivery_policy: Arc::new(AtomicU8::new(PlanarDeliveryPolicy::LegacyRgba.as_u8())),
+            planar_pool: None,
+            planar_recipe: None,
+            reverse_cache_pool_bytes: reverse_bytes,
             source_color_descriptor,
             source_display_descriptor,
             conversion_policy: SourceConversionPolicy::legacy_video(),
@@ -1156,7 +1178,7 @@ impl VideoDecoder {
         codec_motion: Option<CodecMotionProduct>,
     ) -> Result<DecodedVideoFrame, String> {
         Ok(DecodedVideoFrame {
-            rgba: self.scale_frame(&raw.frame)?,
+            rgba: self.materialize_source_image(&raw.frame)?,
             metadata,
             codec_motion,
         })
@@ -1186,7 +1208,7 @@ impl VideoDecoder {
         // Scaling is intentionally paid only for an image the caller can
         // receive. Intermediate codec outputs still advance reference state
         // below, but never allocate RGBA or enter the reverse cache.
-        let rgba = self.scale_frame(frame)?;
+        let rgba = self.materialize_source_image(frame)?;
         let (metadata, codec_motion) = self.observe_decoded_frame(
             frame,
             source_generation,
@@ -1356,8 +1378,26 @@ impl VideoDecoder {
         self.codec_previous_anchor = None;
     }
 
-    fn scale_frame(&mut self, frame: &VideoFrame) -> Result<DecodedImagePayload, String> {
+    /// The one image-materialization seam. The frozen-descriptor law runs
+    /// first on both branches; the admitted planar path then skips swscale
+    /// entirely and row-copies the decoder's own planes, while every other
+    /// frame takes the exact legacy packed path byte for byte.
+    fn materialize_source_image(
+        &mut self,
+        frame: &VideoFrame,
+    ) -> Result<DecodedImagePayload, String> {
         self.freeze_source_descriptor_before_first_conversion(frame)?;
+        if self.planar_delivery_admits(frame) {
+            match self.materialize_planar_yuv420p(frame) {
+                Ok(payload) => return Ok(payload),
+                Err(error) => {
+                    // Planar delivery is an optimization. A pool or recipe
+                    // fault falls back to the packed truth for this frame
+                    // rather than failing the decode.
+                    log::warn!("planar delivery fell back to packed RGBA: {error}");
+                }
+            }
+        }
         self.scaler
             .run(frame, &mut self.scaled_rgba_frame)
             .map_err(|e| {
@@ -1370,6 +1410,92 @@ impl VideoDecoder {
             self.scaled_rgba_frame.data(0),
             self.scaled_rgba_frame.stride(0),
         )
+    }
+
+    /// The complete per-frame planar admission law: authored policy, the
+    /// decoder's actual output format and geometry, and the frozen declared
+    /// truth through the shared `prototype_delivery_decision` ladder.
+    fn planar_delivery_admits(&self, frame: &VideoFrame) -> bool {
+        if self.delivery_policy() != PlanarDeliveryPolicy::MetadataManaged {
+            return false;
+        }
+        if !self.source_descriptor_frozen
+            || frame.format() != ffmpeg::format::Pixel::YUV420P
+            || frame.width() != self.width
+            || frame.height() != self.height
+        {
+            return false;
+        }
+        matches!(
+            prototype_delivery_decision(
+                PlanarDeliveryPolicy::MetadataManaged,
+                PlanarPixelFormat::Yuv420p8,
+                self.source_color_descriptor,
+                self.source_display_descriptor.field_order.value,
+            ),
+            PlanarDeliveryDecision::PrototypePlanar(PlanarPixelFormat::Yuv420p8)
+        )
+    }
+
+    fn materialize_planar_yuv420p(
+        &mut self,
+        frame: &VideoFrame,
+    ) -> Result<DecodedImagePayload, String> {
+        let recipe = match self.planar_recipe {
+            Some(recipe) => recipe,
+            None => {
+                let recipe = planar_conversion_recipe(
+                    PlanarPixelFormat::Yuv420p8,
+                    self.source_color_descriptor,
+                )
+                .map_err(|error| format!("planar conversion recipe refused: {error}"))?;
+                self.planar_recipe = Some(recipe);
+                recipe
+            }
+        };
+        if self.planar_pool.is_none() {
+            let layout = DecodedRasterLayout::planar_yuv420p8(self.width, self.height)?;
+            let frame_bytes = u64::try_from(layout.byte_len()?)
+                .map_err(|_| "planar frame byte count does not fit u64".to_string())?;
+            let pool_bytes = self
+                .reverse_cache_pool_bytes
+                .checked_add(frame_bytes.saturating_mul(2))
+                .ok_or_else(|| "planar image pool byte limit overflows".to_string())?;
+            self.planar_pool = Some(DecodedRasterPool::new(
+                layout,
+                2,
+                pool_bytes.max(frame_bytes),
+                self.packed_rgba_pool.ledger(),
+            )?);
+        }
+        let pool = self
+            .planar_pool
+            .as_ref()
+            .expect("planar pool created above");
+        pool.materialize_yuv420p_planes(
+            (frame.data(0), frame.stride(0)),
+            (frame.data(1), frame.stride(1)),
+            (frame.data(2), frame.stride(2)),
+            recipe,
+        )
+    }
+
+    /// The authored delivery policy this decoder currently applies.
+    pub fn delivery_policy(&self) -> PlanarDeliveryPolicy {
+        PlanarDeliveryPolicy::from_u8(self.delivery_policy.load(Ordering::Acquire))
+    }
+
+    /// Set the authored delivery policy. Effective from the next
+    /// materialized frame; already-delivered frames keep their format.
+    pub fn set_delivery_policy(&self, policy: PlanarDeliveryPolicy) {
+        self.delivery_policy
+            .store(policy.as_u8(), Ordering::Release);
+    }
+
+    /// The shared policy cell, cloned by the threaded handle before the
+    /// decoder moves onto its worker thread's side of the channel.
+    pub fn delivery_policy_cell(&self) -> Arc<AtomicU8> {
+        self.delivery_policy.clone()
     }
 
     fn freeze_source_descriptor_before_first_conversion(

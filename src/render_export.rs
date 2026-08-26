@@ -2123,6 +2123,9 @@ struct ExportLayer {
     /// `Some` iff this layer is a pattern layer. The per-frame GPU pass is
     /// its only pixel producer offline exactly as live.
     pattern: Option<crate::pattern_synth::PatternSynthParams>,
+    /// Lazy P4c conversion state, mirroring the live layer's exactly; built
+    /// on the first admitted planar frame under a `metadata_managed` config.
+    planar_gpu: Option<crate::layers::LayerPlanarDelivery>,
 }
 
 fn motion_field_source_key(value: crate::motion::MotionFieldSource) -> &'static str {
@@ -3042,8 +3045,12 @@ fn create_export_source_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
+        // RENDER_ATTACHMENT plus the non-sRGB twin serve the P4c planar
+        // conversion pass; both cost nothing while a source stays packed.
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
     });
     let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let errors = [
@@ -3223,6 +3230,44 @@ fn active_export_clip_source(layer: &crate::patch::LayerConfig) -> (&str, &str) 
         )
 }
 
+/// Upload one decoded source payload into an export layer texture under the
+/// same per-format law the live seam applies: packed frames take the exact
+/// legacy `write_texture` path, admitted planar frames take the shared
+/// conversion pass through the texture's non-sRGB twin view.
+#[allow(clippy::too_many_arguments)]
+fn upload_export_source_payload(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    payload: &crate::video::DecodedImagePayload,
+    planar: &mut Option<crate::layers::LayerPlanarDelivery>,
+    width: u32,
+    height: u32,
+    label: &'static str,
+) -> Result<(), String> {
+    match payload.layout().format {
+        crate::video::DecodedPixelFormat::PackedRgba8 => upload_export_texture_checked(
+            device,
+            queue,
+            texture,
+            payload.as_slice(),
+            width,
+            height,
+            label,
+        ),
+        crate::video::DecodedPixelFormat::PlanarYuv420p8 => scoped_export_gpu_operation(
+            device,
+            format!("could not convert {label} at {width}x{height}"),
+            || {
+                crate::layers::convert_planar_into_layer_texture(
+                    planar, device, queue, texture, payload, width, height, label,
+                )
+            },
+        )
+        .and_then(std::convert::identity),
+    }
+}
+
 fn upload_export_texture_checked(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -3343,6 +3388,7 @@ fn black_placeholder_layer(
         width,
         height,
         pattern: None,
+        planar_gpu: None,
     })
 }
 
@@ -3437,6 +3483,7 @@ fn pattern_export_layer(
         width,
         height,
         pattern: Some(params),
+        planar_gpu: None,
     })
 }
 
@@ -3524,6 +3571,7 @@ fn text_page_export_layer(
         width,
         height,
         pattern: None,
+        planar_gpu: None,
     })
 }
 
@@ -3598,6 +3646,7 @@ fn still_export_layer(
         width,
         height,
         pattern: None,
+        planar_gpu: None,
     })
 }
 
@@ -5959,6 +6008,11 @@ fn run_export(
             }
         };
 
+        // Offline delivery obeys the exact authored policy the live path
+        // obeys, so a managed layer decodes and converts under one law in
+        // both worlds.
+        decoder.set_delivery_policy(layer_cfg.delivery);
+
         let lw = decoder.width;
         let lh = decoder.height;
 
@@ -6032,11 +6086,13 @@ fn run_export(
             }
         };
         check_cancelled(progress)?;
-        upload_export_texture_checked(
+        let mut planar_gpu = None;
+        upload_export_source_payload(
             &device,
             &queue,
             &texture,
             &first_frame.rgba,
+            &mut planar_gpu,
             lw,
             lh,
             "Export Video Layer",
@@ -6093,6 +6149,7 @@ fn run_export(
             width: lw,
             height: lh,
             pattern: None,
+            planar_gpu,
         });
     }
 
@@ -6710,11 +6767,12 @@ fn run_export(
                                 frame.metadata.source_generation,
                                 [layer.width, layer.height],
                             );
-                            if let Err(error) = upload_export_texture_checked(
+                            if let Err(error) = upload_export_source_payload(
                                 &device,
                                 &queue,
                                 &layer.texture,
                                 &frame.rgba,
+                                &mut layer.planar_gpu,
                                 layer.width,
                                 layer.height,
                                 "Export Indexed Video Frame",
@@ -15534,6 +15592,7 @@ layers:
             };
             Ok(ExportLayer {
                 source_index,
+                planar_gpu: None,
                 motion_source: ExportMotionSourceRecord {
                     kind: ExportMotionSourceKind::Still,
                     logical_name: format!("fixture-{source_index}"),
@@ -19613,6 +19672,7 @@ layers:
             .map(|filename| LayerConfig {
                 filename: filename.to_string(),
                 source_path: String::new(),
+                delivery: Default::default(),
                 opacity: 1.0,
                 mosh_send: 1.0,
                 blend_mode: "normal".to_string(),
@@ -19751,6 +19811,7 @@ mod effects_audit {
             layers: vec![LayerConfig {
                 filename: "audit.mp4".to_string(),
                 source_path: String::new(),
+                delivery: Default::default(),
                 opacity: 1.0,
                 mosh_send: 1.0,
                 blend_mode: "normal".to_string(),
@@ -19829,6 +19890,104 @@ mod effects_audit {
         let err = job.progress.error.lock().unwrap().clone();
         assert!(err.is_empty(), "{label}: export failed: {err}");
         output_path
+    }
+
+    /// Render into `renders/audit_<label>.mp4` resolving sources from an
+    /// explicit library directory — for cases that generate their own
+    /// declared-metadata sources instead of consuming `videos/`.
+    fn render_from_library(label: &str, patch: PatchState, library: &str) {
+        let config = ExportConfig {
+            width: 320,
+            height: 180,
+            fps: 24,
+            duration_secs: 1.0,
+            output_path: format!("renders/audit_{label}.mp4"),
+            audio_path: None,
+            audio_path_hint: None,
+            layer_source_hints: Vec::new(),
+            analysis_audio_path_hint: None,
+            ntsc_quality: NtscExportQuality::LiveParity,
+            shutter_samples: ExportShutterSamples::Authored,
+            media_safety_policy: MediaSafetyPolicy::default(),
+            temporal_event_track: crate::temporal::TemporalEventTrack::default(),
+            gesture_track: None,
+            performance_take: None,
+        };
+        let job = ExportJob::start(patch, config, library);
+        while !job.is_done() {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let err = job.progress.error.lock().unwrap().clone();
+        assert!(err.is_empty(), "{label}: export failed: {err}");
+    }
+
+    /// The P4c Phase B labeled export case: one video layer whose authored
+    /// delivery policy is `metadata_managed`, decoded from a source carrying
+    /// complete declared color truth, rendered through the real export path.
+    ///
+    /// The `_legacy` twin is the identical patch under the legacy policy and
+    /// must decode differently — that difference *is* the admission proof,
+    /// because the managed path converts under the CPU oracle's declared-
+    /// truth law while legacy converts through swscale, and a silent
+    /// fallback would collapse the two into identical files. The `_repeat`
+    /// render must decode identically, so the GPU conversion is proven
+    /// deterministic through the complete offline pipeline.
+    #[test]
+    #[ignore = "requires GPU + FFmpeg; renders the P4c planar-delivery labeled case"]
+    fn render_planar_delivery_pipeline() {
+        std::fs::create_dir_all("renders").ok();
+        let root = std::env::temp_dir().join(format!(
+            "collideoscope-planar-delivery-audit-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("fixture library root");
+        let clip = root.join("planar_delivery.mp4");
+        crate::video::planar_gpu::write_declared_test_clip(&clip, 320, 180, 2.0)
+            .expect("declared source clip");
+        let library = root.to_string_lossy().into_owned();
+
+        let patch = |delivery: crate::video::PlanarDeliveryPolicy| {
+            let mut patch = base_patch();
+            patch.layers[0].filename = "planar_delivery.mp4".to_string();
+            patch.layers[0].delivery = delivery;
+            patch.layers[0].clip_slots = crate::performance::ClipSlots::singleton(
+                crate::performance::ClipSlotConfig::from_legacy(
+                    "planar_delivery.mp4".to_string(),
+                    String::new(),
+                    1.0,
+                    30.0,
+                ),
+            );
+            patch
+        };
+        render_from_library(
+            "planar_delivery",
+            patch(crate::video::PlanarDeliveryPolicy::MetadataManaged),
+            &library,
+        );
+        render_from_library(
+            "planar_delivery_legacy",
+            patch(crate::video::PlanarDeliveryPolicy::LegacyRgba),
+            &library,
+        );
+        assert_ne!(
+            decoded_framemd5("renders/audit_planar_delivery.mp4"),
+            decoded_framemd5("renders/audit_planar_delivery_legacy.mp4"),
+            "managed planar delivery converts under the declared-truth law \
+             and must decode differently from the swscale legacy path; \
+             identical files mean admission silently fell back"
+        );
+        render_from_library(
+            "planar_delivery_repeat",
+            patch(crate::video::PlanarDeliveryPolicy::MetadataManaged),
+            &library,
+        );
+        assert_eq!(
+            decoded_framemd5("renders/audit_planar_delivery.mp4"),
+            decoded_framemd5("renders/audit_planar_delivery_repeat.mp4"),
+            "the managed conversion must replay deterministically offline"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The S6 labeled export case: a transform authored by the preview gizmo,

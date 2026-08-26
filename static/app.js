@@ -5204,6 +5204,15 @@ function createLayerCard(layer, index) {
         </select>
         <span id="${blendDescriptionId}" class="visually-hidden blend-mode-description">${escapeHtml(blendMode.description)}</span>
       </div>
+      ${layer.source_kind === 'video' ? `
+      <div class="param-row select-row" data-layer="${index}" data-param="delivery" title="Decode delivery: Legacy RGBA is the exact prior software path; Managed planar delivers admitted progressive 8-bit 4:2:0 frames as planes converted on the GPU under the source's declared color truth. Sources the law does not admit fall back per frame.">
+        <label for="layer-delivery-${index}">Delivery</label>
+        <select id="layer-delivery-${index}" aria-label="Layer ${index + 1} decode delivery policy">
+          <option value="legacy_rgba" ${(layer.delivery || 'legacy_rgba') === 'legacy_rgba' ? 'selected' : ''}>Legacy RGBA</option>
+          <option value="metadata_managed" ${layer.delivery === 'metadata_managed' ? 'selected' : ''}>Managed planar</option>
+        </select>
+        <span class="value layer-delivery-active" role="status" aria-label="Layer ${index + 1} active delivery">${layer.delivery_active_planar ? 'planar' : 'packed'}</span>
+      </div>` : ''}
       ${layerPerformanceHtml(layer, index)}
       <div class="layer-transform-heading">
         <button class="layer-transform-toggle" type="button" aria-expanded="false" aria-controls="layer-transform-body-${index}">
@@ -5584,6 +5593,14 @@ function updateLayerCard(card, layer, index) {
       select.value = layerBlendModeInfo(layer.blend_mode).key;
       syncLayerBlendDescription(blendRow, select.value);
     }
+  }
+
+  const deliveryRow = card.querySelector('.param-row[data-param="delivery"]');
+  if (deliveryRow) {
+    const select = deliveryRow.querySelector('select');
+    if (select && canSync(select)) select.value = layer.delivery || 'legacy_rgba';
+    const active = deliveryRow.querySelector('.layer-delivery-active');
+    if (active) active.textContent = layer.delivery_active_planar ? 'planar' : 'packed';
   }
 
   const keyModeRow = card.querySelector('.param-row[data-param="key_mode"]');
