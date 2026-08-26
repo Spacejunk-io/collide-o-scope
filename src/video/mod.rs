@@ -6,6 +6,7 @@ pub mod hw_decode;
 pub mod indexed;
 pub mod payload;
 pub mod planar;
+pub mod planar_gpu;
 pub mod retirement;
 pub mod source_descriptor;
 pub mod still;
