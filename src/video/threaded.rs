@@ -923,6 +923,10 @@ pub struct ThreadedDecoder {
     source_color_descriptor: SourceColorDescriptor,
     source_display_descriptor: SourceDisplayDescriptor,
     conversion_policy: SourceConversionPolicy,
+    /// The worker decoder's shared P4c delivery-policy cell. Policy is a
+    /// per-materialization law, so an edit needs no command ordering: it
+    /// simply governs the next frame the worker materializes.
+    delivery_policy: Arc<std::sync::atomic::AtomicU8>,
     #[allow(dead_code)]
     pub duration_seconds: f64,
     media_plan: MediaAllocationPlan,
@@ -982,6 +986,7 @@ impl ThreadedDecoder {
                     SourceColorDescriptor,
                     SourceDisplayDescriptor,
                     SourceConversionPolicy,
+                    Arc<std::sync::atomic::AtomicU8>,
                 ),
                 String,
             >,
@@ -1064,6 +1069,7 @@ impl ThreadedDecoder {
                         decoder.source_color_descriptor(),
                         decoder.source_display_descriptor(),
                         decoder.conversion_policy(),
+                        decoder.delivery_policy_cell(),
                     );
                     let mut seeded = SharedState::healthy_with_seed(seed);
                     seeded.record_seed_decode(seed_decode_duration);
@@ -1156,6 +1162,7 @@ impl ThreadedDecoder {
             source_color_descriptor,
             source_display_descriptor,
             conversion_policy,
+            delivery_policy,
         ) = match meta_rx.recv_timeout(DECODER_OPEN_TIMEOUT) {
             Ok(result) => result?,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -1182,6 +1189,7 @@ impl ThreadedDecoder {
             source_color_descriptor,
             source_display_descriptor,
             conversion_policy,
+            delivery_policy,
             duration_seconds,
             media_plan,
             progress: 0.0,
@@ -1388,12 +1396,32 @@ impl ThreadedDecoder {
 
     #[allow(dead_code)]
     pub fn try_next_frame_result(&mut self) -> Result<Option<Vec<u8>>, String> {
-        self.try_next_ready_frame_result()
-            .map(|ready| ready.map(|frame| frame.rgba.into_vec()))
+        self.try_next_ready_frame_result().and_then(|ready| {
+            ready
+                .map(|frame| frame.rgba.expect_packed_rgba8().map(<[u8]>::to_vec))
+                .transpose()
+        })
     }
 
     pub fn progress(&self) -> f32 {
         self.progress
+    }
+
+    /// The authored P4c delivery policy currently governing this decoder.
+    #[allow(
+        dead_code,
+        reason = "truth accessor beside the setter; the layer publishes its own authored copy"
+    )]
+    pub fn delivery_policy(&self) -> super::planar::PlanarDeliveryPolicy {
+        super::planar::PlanarDeliveryPolicy::from_u8(self.delivery_policy.load(Ordering::Acquire))
+    }
+
+    /// Set the authored delivery policy. Effective from the next frame the
+    /// worker materializes; frames already delivered keep their format and
+    /// the upload seam handles each by its own layout.
+    pub fn set_delivery_policy(&self, policy: super::planar::PlanarDeliveryPolicy) {
+        self.delivery_policy
+            .store(policy.as_u8(), Ordering::Release);
     }
 
     pub fn media_allocation_plan(&self) -> &MediaAllocationPlan {
@@ -1731,6 +1759,7 @@ mod tests {
             mailbox,
             cancel: Arc::new(AtomicBool::new(false)),
             worker: None,
+            delivery_policy: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             shared: Arc::new(Mutex::new(SharedState::healthy_with_seed_at(
                 seed,
                 published_at,

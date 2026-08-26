@@ -13,17 +13,28 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use crate::media_safety::{DecodedImageLease, DecodedImageLedger};
 
+use super::planar::PlanarConversionRecipe;
+
 static NEXT_PAYLOAD_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The bounded decoded-image vocabulary. `PackedRgba8` is the exact legacy
+/// delivery; `PlanarYuv420p8` is the P4c admitted planar delivery — tightly
+/// packed Y, U, V planes in one allocation, converted on the GPU at the
+/// upload seam under the recipe the payload carries. Every byte-consuming
+/// site must dispatch on this format; [`DecodedImagePayload::expect_packed_rgba8`]
+/// is the fail-closed accessor for paths that can only mean packed pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DecodedPixelFormat {
     PackedRgba8,
+    PlanarYuv420p8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DecodedRasterLayout {
     pub width: u32,
     pub height: u32,
+    /// Luma/packed row bytes. For `PlanarYuv420p8` this is the Y plane's
+    /// row width; chroma geometry derives from the frame dimensions.
     pub stride: usize,
     pub format: DecodedPixelFormat,
 }
@@ -45,13 +56,53 @@ impl DecodedRasterLayout {
         })
     }
 
+    pub fn planar_yuv420p8(width: u32, height: u32) -> Result<Self, String> {
+        if width == 0 || height == 0 {
+            return Err("planar decoded image dimensions cannot be zero".to_string());
+        }
+        let stride = usize::try_from(width)
+            .map_err(|_| "decoded image width does not fit this platform".to_string())?;
+        let layout = Self {
+            width,
+            height,
+            stride,
+            format: DecodedPixelFormat::PlanarYuv420p8,
+        };
+        // Validate the complete plane arithmetic once at construction.
+        let _ = layout.byte_len()?;
+        Ok(layout)
+    }
+
+    /// Chroma plane texel dimensions for the 4:2:0 family (ceil halves).
+    pub fn chroma_dimensions(self) -> (usize, usize) {
+        let half = |value: u32| {
+            let value = usize::try_from(value).unwrap_or(usize::MAX);
+            value / 2 + value % 2
+        };
+        (half(self.width), half(self.height))
+    }
+
     pub fn byte_len(self) -> Result<usize, String> {
-        self.stride
-            .checked_mul(
-                usize::try_from(self.height)
-                    .map_err(|_| "decoded image height does not fit this platform".to_string())?,
-            )
-            .ok_or_else(|| "decoded image byte count overflows".to_string())
+        let height = usize::try_from(self.height)
+            .map_err(|_| "decoded image height does not fit this platform".to_string())?;
+        match self.format {
+            DecodedPixelFormat::PackedRgba8 => self
+                .stride
+                .checked_mul(height)
+                .ok_or_else(|| "decoded image byte count overflows".to_string()),
+            DecodedPixelFormat::PlanarYuv420p8 => {
+                let (chroma_width, chroma_height) = self.chroma_dimensions();
+                self.stride
+                    .checked_mul(height)
+                    .and_then(|luma| {
+                        chroma_width
+                            .checked_mul(chroma_height)
+                            .and_then(|chroma| chroma.checked_mul(2))
+                            .and_then(|chroma| luma.checked_add(chroma))
+                    })
+                    .ok_or_else(|| "decoded image byte count overflows".to_string())
+            }
+        }
     }
 }
 
@@ -198,7 +249,83 @@ impl DecodedRasterPool {
             layout,
             &self.inner,
             DecodedPayloadOwner::Forward,
+            None,
         ))
+    }
+
+    /// Repack the decoder's three yuv420p planes into one exclusive pooled
+    /// allocation (tightly packed Y, then U, then V — the P4c contract
+    /// packing), then freeze it with its conversion recipe attached. Same
+    /// recycling, ledger, and ownership law as the packed materializer; the
+    /// only pixel copies are the stride-dropping row copies.
+    pub(crate) fn materialize_yuv420p_planes(
+        &self,
+        luma: (&[u8], usize),
+        chroma_u: (&[u8], usize),
+        chroma_v: (&[u8], usize),
+        recipe: PlanarConversionRecipe,
+    ) -> Result<DecodedImagePayload, String> {
+        let layout = self.inner.layout;
+        if layout.format != DecodedPixelFormat::PlanarYuv420p8 {
+            return Err("this pool does not materialize planar frames".to_string());
+        }
+        let output_len = layout.byte_len()?;
+        let height = usize::try_from(layout.height)
+            .map_err(|_| "decoded image height does not fit this platform".to_string())?;
+        let (chroma_width, chroma_height) = layout.chroma_dimensions();
+
+        let validate = |label: &str,
+                        (data, stride): (&[u8], usize),
+                        row_bytes: usize,
+                        rows: usize|
+         -> Result<(), String> {
+            let required = stride
+                .checked_mul(rows.saturating_sub(1))
+                .and_then(|prefix| prefix.checked_add(row_bytes))
+                .ok_or_else(|| format!("decoded {label} plane byte count overflows"))?;
+            if stride < row_bytes || data.len() < required {
+                return Err(format!(
+                    "invalid decoded {label} plane: stride={stride}, row_bytes={row_bytes}, rows={rows}, data_len={}",
+                    data.len()
+                ));
+            }
+            Ok(())
+        };
+        validate("luma", luma, layout.stride, height)?;
+        validate("chroma-u", chroma_u, chroma_width, chroma_height)?;
+        validate("chroma-v", chroma_v, chroma_width, chroma_height)?;
+
+        let mut raster = self.acquire(output_len)?;
+        raster.bytes.clear();
+        let mut pack = |(data, stride): (&[u8], usize), row_bytes: usize, rows: usize| {
+            if stride == row_bytes {
+                raster
+                    .bytes
+                    .extend_from_slice(&data[..row_bytes.saturating_mul(rows)]);
+            } else {
+                for row in data.chunks(stride).take(rows) {
+                    raster.bytes.extend_from_slice(&row[..row_bytes]);
+                }
+            }
+        };
+        pack(luma, layout.stride, height);
+        pack(chroma_u, chroma_width, chroma_height);
+        pack(chroma_v, chroma_width, chroma_height);
+        debug_assert_eq!(raster.bytes.len(), output_len);
+        self.inner
+            .ledger
+            .record_materialization_copy(u64::try_from(output_len).unwrap_or(u64::MAX));
+        Ok(DecodedImagePayload::from_recycled(
+            raster,
+            layout,
+            &self.inner,
+            DecodedPayloadOwner::Forward,
+            Some(recipe),
+        ))
+    }
+
+    pub(crate) fn ledger(&self) -> Arc<DecodedImageLedger> {
+        self.inner.ledger.clone()
     }
 
     fn acquire(&self, output_len: usize) -> Result<RecycledRaster, String> {
@@ -270,6 +397,9 @@ struct DecodedImagePayloadInner {
     pool: Weak<RasterPoolInner>,
     owners: [AtomicU64; 4],
     ledger: Option<Arc<DecodedImageLedger>>,
+    /// Present exactly on planar payloads: the frame-local conversion law
+    /// the upload seam applies. Packed payloads carry `None`.
+    conversion_recipe: Option<PlanarConversionRecipe>,
 }
 
 impl Drop for DecodedImagePayloadInner {
@@ -304,6 +434,7 @@ impl DecodedImagePayload {
         layout: DecodedRasterLayout,
         pool: &Arc<RasterPoolInner>,
         owner: DecodedPayloadOwner,
+        conversion_recipe: Option<PlanarConversionRecipe>,
     ) -> Self {
         let ledger = Some(pool.ledger.clone());
         let inner = Arc::new(DecodedImagePayloadInner {
@@ -313,6 +444,7 @@ impl DecodedImagePayload {
             pool: Arc::downgrade(pool),
             owners: std::array::from_fn(|_| AtomicU64::new(0)),
             ledger,
+            conversion_recipe,
         });
         let payload = Self { inner, owner };
         payload.add_owner();
@@ -339,6 +471,7 @@ impl DecodedImagePayload {
             pool: Weak::new(),
             owners: std::array::from_fn(|_| AtomicU64::new(0)),
             ledger: None,
+            conversion_recipe: None,
         });
         let payload = Self {
             inner,
@@ -363,6 +496,23 @@ impl DecodedImagePayload {
 
     pub fn layout(&self) -> DecodedRasterLayout {
         self.inner.layout
+    }
+
+    /// The frame-local conversion law of a planar payload; `None` for packed.
+    pub fn conversion_recipe(&self) -> Option<PlanarConversionRecipe> {
+        self.inner.conversion_recipe
+    }
+
+    /// Fail-closed accessor for paths whose bytes can only mean packed RGBA.
+    /// A planar payload reaching such a path is a routing defect, and this
+    /// turns it into a typed refusal instead of silently misread pixels.
+    pub fn expect_packed_rgba8(&self) -> Result<&[u8], String> {
+        match self.inner.layout.format {
+            DecodedPixelFormat::PackedRgba8 => Ok(self.as_slice()),
+            DecodedPixelFormat::PlanarYuv420p8 => {
+                Err("planar decoded frame reached a packed-RGBA-only consumer".to_string())
+            }
+        }
     }
 
     pub fn owner_snapshot(&self) -> DecodedPayloadOwnerSnapshot {
@@ -564,6 +714,63 @@ mod tests {
         assert_eq!(snapshot.cache_owners, 0);
         assert_eq!(snapshot.upload_owners, 0);
         assert_eq!(snapshot.readonly_owners, 0);
+    }
+
+    #[test]
+    fn planar_pool_materializes_strided_planes_with_recipe_and_honest_bytes() {
+        let recipe = PlanarConversionRecipe {
+            bit_depth: 8,
+            full_range: false,
+            chroma_offset: [0.0, 0.5],
+            kr: 0.2126,
+            kb: 0.0722,
+        };
+        let layout = DecodedRasterLayout::planar_yuv420p8(4, 2).unwrap();
+        assert_eq!(layout.byte_len().unwrap(), 12);
+        assert_eq!(layout.chroma_dimensions(), (2, 1));
+
+        let ledger = DecodedImageLedger::new(64);
+        let planar_pool = DecodedRasterPool::new(layout, 2, 64, ledger.clone()).unwrap();
+        // Strided planes: padding bytes (99) must not be retained.
+        let luma = [1, 2, 3, 4, 99, 99, 5, 6, 7, 8, 99, 99];
+        let chroma_u = [110, 111, 99];
+        let chroma_v = [120, 121, 99];
+        let payload = planar_pool
+            .materialize_yuv420p_planes((&luma, 6), (&chroma_u, 3), (&chroma_v, 3), recipe)
+            .unwrap();
+        assert_eq!(
+            payload.as_slice(),
+            &[1, 2, 3, 4, 5, 6, 7, 8, 110, 111, 120, 121]
+        );
+        assert_eq!(payload.layout().format, DecodedPixelFormat::PlanarYuv420p8);
+        assert_eq!(payload.conversion_recipe(), Some(recipe));
+        // The ledger charges the actual planar bytes — 1.5 per pixel, not 4.
+        assert_eq!(ledger.snapshot().physical_bytes, 12);
+
+        // A planar payload can never be misread as packed pixels.
+        assert!(payload.expect_packed_rgba8().is_err());
+        let clone = payload.clone();
+        assert_eq!(payload.identity(), clone.identity());
+
+        // Recycling: dropping the final handle returns the allocation.
+        drop(payload);
+        drop(clone);
+        let allocations = ledger.snapshot().allocations;
+        let second = planar_pool
+            .materialize_yuv420p_planes((&luma, 6), (&chroma_u, 3), (&chroma_v, 3), recipe)
+            .unwrap();
+        assert_eq!(ledger.snapshot().allocations, allocations);
+        assert_eq!(second.as_slice()[..4], [1, 2, 3, 4]);
+
+        // A short plane is a typed refusal before any allocation.
+        assert!(planar_pool
+            .materialize_yuv420p_planes((&luma[..7], 6), (&chroma_u, 3), (&chroma_v, 3), recipe)
+            .is_err());
+        // The packed pool refuses planar materialization outright.
+        let packed_pool = pool(DecodedImageLedger::new(64), 64);
+        assert!(packed_pool
+            .materialize_yuv420p_planes((&luma, 6), (&chroma_u, 3), (&chroma_v, 3), recipe)
+            .is_err());
     }
 
     #[test]

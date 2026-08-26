@@ -1,19 +1,19 @@
-//! The evaluation-only GPU twin of the P4c planar CPU oracle.
+//! The P4c planar-conversion GPU executor: the CPU oracle's production twin.
 //!
-//! This module reopens P4c exactly the way its stop receipt prescribed: "a
-//! dedicated renderer branch and the audit's 720p/1080p two-source CPU/GPU
-//! equality plus p95/p99 fixture" — and deliberately nothing further. It is
-//! the `hw_decode`/full-16 shape: **measurement-only**. No production decode,
-//! upload, or render path constructs a converter; the only constructors are
-//! the opt-in equality battery, the opt-in candidate-measurement fixture
-//! (which regenerates the tracked
-//! `docs/evidence/p4c-planar-gpu-candidate-receipt.json` under the S2-receipt
-//! law), and the hosted contract tests. Promotion — a decoder that selects
-//! planar delivery, pooled staging, patch policy, ledger accounting — remains
-//! a separate operator-decided tranche taken after reading the receipt.
+//! This began as the measurement-only candidate the P4c stop receipt
+//! prescribed, and the tracked
+//! `docs/evidence/p4c-planar-gpu-candidate-receipt.json` is the measurement
+//! that promoted it: 62.5% staging reduction, delivery p95 down roughly 70%,
+//! upload p95 down 14–28% on the 720p/1080p two-source matrix, with CPU/GPU
+//! equality within one 8-bit code on real decoded frames. Its production
+//! consumer is the layer upload seam (`layers::mod`), which converts an
+//! admitted planar frame into the layer's source texture through one pass;
+//! the opt-in equality battery and the candidate fixture remain as the
+//! executor's standing proof.
 //!
 //! The conversion law is not restated here. The GPU uniforms derive from the
-//! exact [`CpuConversionContract`] the CPU oracle consumes, so admission,
+//! exact [`CpuConversionContract`] the CPU oracle consumes — live frames
+//! carry it as the payload's [`PlanarConversionRecipe`] — so admission,
 //! matrix coefficients, range normalization, and chroma siting cannot drift
 //! between the two paths: there is one derivation, consumed twice. The WGSL
 //! follows `PlanarImagePayload::to_rgba8_cpu_reference` expression for
@@ -24,27 +24,20 @@
 //! tolerance is one 8-bit code value per channel: the oracle computes in
 //! `f64` and rounds half away from zero, the GPU computes in `f32` and the
 //! `Rgba8Unorm` store rounds to nearest, so exact half-codes may land one
-//! apart and nothing else may.
+//! apart and nothing else may. The conversion writes source-encoded bytes,
+//! so the production target is the layer texture's **non-sRGB twin view**:
+//! stored bytes equal what `write_texture` of packed values would store.
 //!
 //! The shader is embedded as a module constant rather than a file under
-//! `src/shaders/`, deliberately: `build.rs` hashes that directory into the
-//! production shader-bundle identity, and an evaluation-only shader is not
-//! part of the production bundle. Validation happens where the shader runs —
-//! at pipeline creation inside the opt-in fixtures.
-
-// The converter's only constructors are the opt-in fixtures and the hosted
-// contract tests — the S10a discipline: name the consumer honestly rather
-// than fake a premature integration.
-#![allow(
-    dead_code,
-    reason = "P4c stays measured-before-promotion; production consumers are forbidden until the candidate receipt clears the audit's promotion gate"
-)]
+//! `src/shaders/`: `build.rs` hashes that directory into the frozen
+//! production shader-bundle identity, and this executor landed after that
+//! identity was pinned; its own proof is the equality battery.
 
 use bytemuck::{Pod, Zeroable};
 
 use super::planar::{
-    chroma_sample_offset, CpuConversionContract, PlanarConversionError, PlanarImageLayout,
-    PlanarImagePayload, PlanarPixelFormat, PlanarPlaneKind,
+    chroma_sample_offset, CpuConversionContract, PlanarConversionError, PlanarConversionRecipe,
+    PlanarImageLayout, PlanarImagePayload, PlanarPixelFormat, PlanarPlaneKind,
 };
 use super::{SourceColorDescriptor, SourceColorRange};
 
@@ -213,6 +206,13 @@ impl From<PlanarConversionError> for PlanarGpuError {
 /// Every refusal the CPU oracle makes — unspecified metadata, PQ/HLG,
 /// unsupported matrix, descriptor mismatch — is therefore this function's
 /// refusal too, by construction rather than by a parallel table.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the descriptor-based derivation is the equality fixtures' door; production frames arrive with a recipe"
+    )
+)]
 pub fn planar_convert_uniforms(
     layout: PlanarImageLayout,
     color: SourceColorDescriptor,
@@ -234,6 +234,27 @@ pub fn planar_convert_uniforms(
         kb: contract.kb as f32,
         _pad1: [0.0, 0.0],
     })
+}
+
+/// The production uniform derivation: a live planar frame carries its recipe
+/// with the pixels, so the upload seam never re-derives color from telemetry.
+/// Production delivery admits `Yuv420p8` only; the format code is fixed.
+pub fn planar_convert_uniforms_from_recipe(
+    width: u32,
+    height: u32,
+    recipe: PlanarConversionRecipe,
+) -> PlanarConvertUniforms {
+    PlanarConvertUniforms {
+        size: [width, height],
+        format: 0,
+        bit_depth: u32::from(recipe.bit_depth),
+        range_full: u32::from(recipe.full_range),
+        _pad0: 0,
+        chroma_offset: recipe.chroma_offset,
+        kr: recipe.kr,
+        kb: recipe.kb,
+        _pad1: [0.0, 0.0],
+    }
 }
 
 /// The wgpu texture format each admitted plane uploads into. Integer formats
@@ -258,12 +279,6 @@ pub struct PlanarPlaneTextures {
     layout: PlanarImageLayout,
     textures: Vec<wgpu::Texture>,
     views: Vec<wgpu::TextureView>,
-}
-
-impl PlanarPlaneTextures {
-    pub const fn layout(&self) -> PlanarImageLayout {
-        self.layout
-    }
 }
 
 pub struct PlanarGpuConverter {
@@ -406,6 +421,13 @@ impl PlanarGpuConverter {
     /// Upload every tightly packed plane of one payload. This is the
     /// staging-byte side of the candidate claim: for 8-bit 4:2:0 these
     /// writes move 1.5 bytes per pixel where the packed path moves 4.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the prototype-payload door remains the equality fixtures'; production uploads take the byte-blob door"
+        )
+    )]
     pub fn upload_planes(
         &self,
         queue: &wgpu::Queue,
@@ -424,6 +446,49 @@ impl PlanarGpuConverter {
                     aspect: wgpu::TextureAspect::All,
                 },
                 data.data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(plane.row_bytes as u32),
+                    rows_per_image: Some(plane.height),
+                },
+                wgpu::Extent3d {
+                    width: plane.width,
+                    height: plane.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// The production upload: one tightly packed plane blob (the P4a planar
+    /// payload's exact packing, which is the [`PlanarImageLayout`] packing)
+    /// written plane by plane. Byte length is validated against the layout
+    /// before any write.
+    pub fn upload_plane_bytes(
+        &self,
+        queue: &wgpu::Queue,
+        textures: &PlanarPlaneTextures,
+        bytes: &[u8],
+    ) -> Result<(), PlanarGpuError> {
+        if bytes.len() != textures.layout.byte_len() {
+            return Err(PlanarGpuError::Conversion(
+                PlanarConversionError::DescriptorMismatch,
+            ));
+        }
+        for (index, plane) in textures.layout.planes().iter().enumerate() {
+            let end = plane.offset.saturating_add(plane.byte_len);
+            let data = bytes
+                .get(plane.offset..end)
+                .ok_or(PlanarGpuError::MissingPlane(plane.kind))?;
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &textures.textures[index],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(plane.row_bytes as u32),
@@ -505,6 +570,10 @@ impl PlanarGpuConverter {
 
     /// The whole equality path in one call: plane textures, uploads, one
     /// pass, one submit; returns the `Rgba8Unorm` target for readback.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the equality fixtures' complete conversion door")
+    )]
     pub fn convert_to_texture(
         &self,
         device: &wgpu::Device,
@@ -541,6 +610,57 @@ impl PlanarGpuConverter {
     }
 }
 
+/// Generate one H.264 yuv420p test clip whose color truth is completely
+/// declared (tv/bt709/bt709/left), so the planar admission ladder admits it.
+/// Shared by the equality/candidate fixtures here and the labeled export
+/// case; the generic `-color_*` options reach the container while libx264's
+/// VUI needs its own parameter surface — without `-x264-params` the decoder
+/// honestly reports primaries/transfer unspecified and admission refuses.
+#[cfg(test)]
+pub(crate) fn write_declared_test_clip(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    duration_seconds: f64,
+) -> Result<(), String> {
+    let output = std::process::Command::new(crate::host_paths::ffmpeg())
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc2=size={width}x{height}:rate=30:duration={duration_seconds}"),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-color_range",
+            "tv",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-chroma_sample_location",
+            "left",
+            "-x264-params",
+            "colorprim=bt709:transfer=bt709:colormatrix=bt709",
+            "-y",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::planar::{
@@ -554,6 +674,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn color(
         bits: u8,
@@ -683,41 +804,25 @@ mod tests {
         assert_eq!(hd_p010.byte_len(), 6_220_800);
     }
 
-    /// The S10a discipline as a source audit: the prototype has no
-    /// production consumer, and a reference appearing anywhere else in the
-    /// tree is a promotion that must instead go through the audit's gate.
+    /// The recipe-based production derivation must agree exactly with the
+    /// descriptor-based fixture derivation — one contract, two doors.
     #[test]
-    fn no_production_module_consumes_the_planar_gpu_prototype() {
-        let mut pending = vec![std::path::PathBuf::from("src")];
-        let mut offenders = Vec::new();
-        while let Some(directory) = pending.pop() {
-            for entry in std::fs::read_dir(&directory).expect("walk src") {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
-                    pending.push(path);
-                    continue;
-                }
-                if path.extension().is_none_or(|extension| extension != "rs") {
-                    continue;
-                }
-                let relative = path.to_string_lossy().replace('\\', "/");
-                // The prototype itself, its module declaration, and the
-                // contract module whose documentation names its GPU twin.
-                if relative == "src/video/planar_gpu.rs"
-                    || relative == "src/video/mod.rs"
-                    || relative == "src/video/planar.rs"
-                {
-                    continue;
-                }
-                let source = std::fs::read_to_string(&path).expect("read source");
-                if source.contains("planar_gpu") {
-                    offenders.push(relative);
-                }
-            }
-        }
-        assert!(
-            offenders.is_empty(),
-            "planar_gpu is measurement-only; production references found in {offenders:?}"
+    fn recipe_uniforms_agree_with_the_descriptor_derivation() {
+        let layout = PlanarImageLayout::new(PlanarPixelFormat::Yuv420p8, 6, 4).unwrap();
+        let descriptor = color(
+            8,
+            SourceColorRange::Limited,
+            MatrixCoefficients::Bt709,
+            TransferCharacteristic::Bt709,
+            ChromaLocation::Left,
+        );
+        let from_descriptor = planar_convert_uniforms(layout, descriptor).unwrap();
+        let recipe =
+            crate::video::planar::planar_conversion_recipe(PlanarPixelFormat::Yuv420p8, descriptor)
+                .unwrap();
+        assert_eq!(
+            planar_convert_uniforms_from_recipe(6, 4, recipe),
+            from_descriptor
         );
     }
 
@@ -1160,45 +1265,7 @@ mod tests {
             let mut sources = Vec::new();
             for (label, width, height) in [("720p", 1280_u32, 720_u32), ("1080p", 1920, 1080)] {
                 let path = root.join(format!("candidate-{label}.mp4"));
-                let output = std::process::Command::new(crate::host_paths::ffmpeg())
-                    .args([
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-f",
-                        "lavfi",
-                        "-i",
-                        &format!("testsrc2=size={width}x{height}:rate=30:duration=8.5"),
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "veryfast",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-color_range",
-                        "tv",
-                        "-colorspace",
-                        "bt709",
-                        "-color_primaries",
-                        "bt709",
-                        "-color_trc",
-                        "bt709",
-                        "-chroma_sample_location",
-                        "left",
-                        // The generic -color_* options reach the container,
-                        // but libx264's VUI carries primaries/transfer only
-                        // through its own parameter surface; without these
-                        // the decoder honestly reports them unspecified and
-                        // admission fails.
-                        "-x264-params",
-                        "colorprim=bt709:transfer=bt709:colormatrix=bt709",
-                        "-y",
-                    ])
-                    .arg(&path)
-                    .output()
-                    .map_err(|error| error.to_string())?;
-                if !output.status.success() {
-                    let error = String::from_utf8_lossy(&output.stderr).into_owned();
+                if let Err(error) = super::write_declared_test_clip(&path, width, height, 8.5) {
                     let _ = std::fs::remove_dir_all(&root);
                     return Err(error);
                 }
@@ -1220,7 +1287,6 @@ mod tests {
     }
 
     struct SourceMeasurement {
-        label: String,
         width: u32,
         height: u32,
         measured_frames: usize,
@@ -1286,7 +1352,6 @@ mod tests {
         let spot_ordinals = [0_usize, frames_to_measure / 2, frames_to_measure - 1];
 
         let mut measurement = SourceMeasurement {
-            label: label.to_owned(),
             width: 0,
             height: 0,
             measured_frames: 0,
@@ -1410,6 +1475,182 @@ mod tests {
             "{label}: candidate source decoded too few frames"
         );
         measurement
+    }
+
+    /// The Phase B live-seam proof: a real `Layer` over a real threaded
+    /// decoder, driven through the production harvest/upload path.
+    ///
+    /// Three claims in one fixture. Legacy first: a packed frame uploaded
+    /// through the real seam stores exactly its payload bytes — the legacy
+    /// byte law at the integrated seam, not merely at the decoder. Managed
+    /// next: after `set_delivery_policy(MetadataManaged)` the decoder
+    /// delivers a planar frame whose recipe rides the payload, the upload
+    /// converts it in place, the layer publishes `delivery_active_planar`,
+    /// and the texture agrees with the CPU oracle within one code. Legacy
+    /// again: flipping back mid-session restores the exact packed store, so
+    /// the policy is live in both directions.
+    #[test]
+    #[ignore = "requires a GPU adapter and an ffmpeg executable; proves the live planar upload seam"]
+    fn gpu_planar_integration_layer_upload_matches_the_cpu_oracle_and_legacy_stays_exact() {
+        use crate::layers::LayerSource;
+        use crate::video::planar::PlanarDeliveryPolicy;
+
+        ffmpeg_next::init().ok();
+        let Some((device, queue, _info)) = acquire_device() else {
+            panic!("the live-seam fixture requires a GPU adapter");
+        };
+        let root = std::env::temp_dir().join(format!(
+            "collideoscope-p4c-live-seam-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).expect("fixture root");
+        let clip = root.join("live-seam.mp4");
+        super::write_declared_test_clip(&clip, 128, 72, 4.0).expect("declared clip");
+        let clip_text = clip.to_string_lossy().into_owned();
+
+        // The frozen declared truth for the oracle, from the production
+        // sync decoder.
+        let mut sync = crate::video::VideoDecoder::open(&clip_text).expect("sync open");
+        sync.next_timed_frame_result(1).expect("sync first frame");
+        let descriptor = sync.source_color_descriptor();
+        drop(sync);
+
+        let mut layer = crate::layers::Layer::new_with_media_policy(
+            &clip_text,
+            &device,
+            &crate::media_safety::MediaSafetyPolicy::safe(),
+        )
+        .expect("layer open");
+
+        let pump = |layer: &mut crate::layers::Layer| -> crate::video::threaded::ReadyFrame {
+            let started = std::time::Instant::now();
+            loop {
+                if let Some(frame) = layer.take_ready_media_frame().expect("harvest") {
+                    return frame;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "no frame arrived within the harvest deadline"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let request = |layer: &mut crate::layers::Layer, seconds: f64| {
+            let LayerSource::Video(decoder) = &mut layer.source else {
+                panic!("fixture layer must be video");
+            };
+            decoder.request_seek(seconds).expect("seek request");
+        };
+        // The production loop drains completed upload validations once per
+        // event-loop turn after a device poll; the fixture does the same so
+        // the bounded pending queue never fills between uploads.
+        let drain_validation = |layer: &mut crate::layers::Layer| {
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("GPU wait");
+            for _ in 0..4 {
+                assert!(
+                    layer.poll_upload_validation(1).is_none(),
+                    "an upload raised a GPU validation fault"
+                );
+            }
+        };
+
+        // 1. Legacy byte law at the integrated seam.
+        let mut seed = pump(&mut layer);
+        assert_eq!(
+            seed.rgba.layout().format,
+            crate::video::DecodedPixelFormat::PackedRgba8,
+            "the open seed decodes under the legacy default"
+        );
+        layer
+            .upload_ready_media_frame(&device, &queue, 1, &mut seed)
+            .expect("legacy upload");
+        drain_validation(&mut layer);
+        assert!(!layer.delivery_active_planar());
+        let stored = read_rgba8(&device, &queue, &layer.texture, 128, 72);
+        assert_eq!(
+            stored,
+            seed.rgba.as_slice(),
+            "a packed upload must store exactly its payload bytes"
+        );
+
+        // 2. Managed planar delivery through the same seam.
+        layer.set_delivery_policy(PlanarDeliveryPolicy::MetadataManaged);
+        request(&mut layer, 1.0);
+        let mut planar_frame = pump(&mut layer);
+        for _ in 0..100 {
+            if planar_frame.rgba.layout().format == crate::video::DecodedPixelFormat::PlanarYuv420p8
+            {
+                break;
+            }
+            // An in-flight packed completion may land first; keep pumping.
+            request(&mut layer, 1.5);
+            planar_frame = pump(&mut layer);
+        }
+        assert_eq!(
+            planar_frame.rgba.layout().format,
+            crate::video::DecodedPixelFormat::PlanarYuv420p8,
+            "the managed policy must deliver a planar frame"
+        );
+        assert!(planar_frame.rgba.conversion_recipe().is_some());
+        layer
+            .upload_ready_media_frame(&device, &queue, 2, &mut planar_frame)
+            .expect("planar upload");
+        drain_validation(&mut layer);
+        assert!(layer.delivery_active_planar());
+
+        // Oracle agreement on the exact delivered planes.
+        let blob = planar_frame.rgba.as_slice();
+        let budget = PlanarAllocationBudget::new(4 * 1024 * 1024).unwrap();
+        let layout = PlanarImageLayout::new(PlanarPixelFormat::Yuv420p8, 128, 72).unwrap();
+        let luma_len = 128 * 72;
+        let chroma_len = 64 * 36;
+        let oracle_payload = PlanarImagePayload::from_planes(
+            layout,
+            PlanarPlaneInputs::Yuv420p8 {
+                y: PlanarPlaneInput::new(&blob[..luma_len], 128),
+                u: PlanarPlaneInput::new(&blob[luma_len..luma_len + chroma_len], 64),
+                v: PlanarPlaneInput::new(&blob[luma_len + chroma_len..], 64),
+            },
+            &budget,
+        )
+        .unwrap();
+        let cpu = oracle_payload
+            .to_rgba8_cpu_reference(descriptor)
+            .expect("CPU oracle");
+        let gpu = read_rgba8(&device, &queue, &layer.texture, 128, 72);
+        assert_within_one_code("live planar upload", &gpu, &cpu.rgba);
+
+        // 3. Flipping back restores the exact packed store.
+        layer.set_delivery_policy(PlanarDeliveryPolicy::LegacyRgba);
+        request(&mut layer, 2.0);
+        let mut packed_again = pump(&mut layer);
+        for _ in 0..100 {
+            if packed_again.rgba.layout().format == crate::video::DecodedPixelFormat::PackedRgba8 {
+                break;
+            }
+            request(&mut layer, 2.5);
+            packed_again = pump(&mut layer);
+        }
+        assert_eq!(
+            packed_again.rgba.layout().format,
+            crate::video::DecodedPixelFormat::PackedRgba8
+        );
+        layer
+            .upload_ready_media_frame(&device, &queue, 3, &mut packed_again)
+            .expect("legacy upload after flip");
+        drain_validation(&mut layer);
+        assert!(!layer.delivery_active_planar());
+        let stored = read_rgba8(&device, &queue, &layer.texture, 128, 72);
+        assert_eq!(stored, packed_again.rgba.as_slice());
+
+        drop(layer);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The reopened P4c candidate measurement: the audit's 720p/1080p

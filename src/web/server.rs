@@ -3120,6 +3120,12 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                         .as_str()
                         .and_then(crate::layers::BlendMode::from_key)
                         .is_some(),
+                    // P4c delivery policy: a closed token vocabulary; an
+                    // unknown token is a gate refusal, never a default.
+                    "delivery" => value
+                        .as_str()
+                        .and_then(crate::video::PlanarDeliveryPolicy::from_key)
+                        .is_some(),
                     "mosh_send" => number_in(value, 0.0, 1.0),
                     _ => true,
                 }
@@ -7000,6 +7006,32 @@ mod tests {
                 value,
             };
             assert!(!valid_action(&action, 0));
+        }
+    }
+
+    #[test]
+    fn layer_delivery_ingress_accepts_the_closed_vocabulary_and_rejects_aliases() {
+        let action = |value| WebAction::SetLayerParam {
+            index: 0,
+            layer_id: Some("17".into()),
+            param: "delivery".into(),
+            value,
+        };
+        for token in ["legacy_rgba", "metadata_managed"] {
+            assert!(
+                valid_action(&action(serde_json::json!(token)), 0),
+                "server rejected exact delivery token {token}"
+            );
+        }
+        for value in [
+            serde_json::json!("planar"),
+            serde_json::json!("LegacyRgba"),
+            serde_json::json!("metadata-managed"),
+            serde_json::json!(1),
+            serde_json::Value::Bool(true),
+            serde_json::Value::Null,
+        ] {
+            assert!(!valid_action(&action(value), 0));
         }
     }
 

@@ -4143,6 +4143,7 @@ mod tests {
             layers: vec![LayerConfig {
                 filename: "clip.mp4".to_string(),
                 source_path: String::new(),
+                delivery: Default::default(),
                 opacity: 1.0,
                 mosh_send: 1.0,
                 blend_mode: "normal".to_string(),

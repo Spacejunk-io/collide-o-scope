@@ -23240,6 +23240,16 @@ impl App {
                                 layer.blend_mode = blend_mode;
                             }
                         }
+                        // P4c delivery policy: a source contract, outside
+                        // Morph ownership, Looks, Dice, and modulation.
+                        "delivery" => {
+                            if let Some(policy) = value
+                                .as_str()
+                                .and_then(crate::video::PlanarDeliveryPolicy::from_key)
+                            {
+                                layer.set_delivery_policy(policy);
+                            }
+                        }
                         "key_mode" => {
                             if let Some(v) = value.as_u64() {
                                 layer.effects.key_mode = (v.min(4)) as f32;
@@ -25644,6 +25654,8 @@ impl App {
                         speed: layer.speed,
                         fps: layer.fps,
                         blend_mode: layer.blend_mode.key().to_string(),
+                        delivery: layer.delivery_policy().key().to_string(),
+                        delivery_active_planar: layer.delivery_active_planar(),
                         bypass_master_fx: layer.bypass_master_fx,
                         bypass_temporal_fx: layer.bypass_temporal_fx,
                         reroll_on_loop: layer.reroll_on_loop,

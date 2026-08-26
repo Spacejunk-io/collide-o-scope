@@ -4036,6 +4036,14 @@ pub struct LayerSnapshot {
     #[serde(default = "default_layer_fps")]
     pub fps: f32,
     pub blend_mode: String,
+    /// P4c authored delivery policy token (`legacy_rgba` default, or
+    /// `metadata_managed`). Additive: legacy clients ignore it.
+    #[serde(default = "default_layer_delivery")]
+    pub delivery: String,
+    /// Whether the pixels currently on the GPU arrived through the planar
+    /// path — the truthful delivery fact, distinct from the authored ask.
+    #[serde(default)]
+    pub delivery_active_planar: bool,
     pub progress: f32,
     #[serde(default)]
     pub key_mode: u32,
@@ -4098,6 +4106,12 @@ pub struct LayerSnapshot {
     /// B7 text-page authored state, present only on a text layer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_page: Option<crate::patch::TextPageConfig>,
+}
+
+fn default_layer_delivery() -> String {
+    crate::video::PlanarDeliveryPolicy::LegacyRgba
+        .key()
+        .to_string()
 }
 
 fn default_layer_fps() -> f32 {
@@ -8922,6 +8936,8 @@ mod protocol_tests {
         let current = LayerSnapshot {
             layer_id: "17".into(),
             filename: "plate.png".into(),
+            delivery: "legacy_rgba".into(),
+            delivery_active_planar: false,
             visible: true,
             bypass_master_fx: true,
             bypass_temporal_fx: true,
