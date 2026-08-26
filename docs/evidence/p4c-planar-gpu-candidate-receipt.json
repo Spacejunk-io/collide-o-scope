@@ -1,0 +1,123 @@
+{
+  "adapter": {
+    "backend": "Vulkan",
+    "driver": "AMD proprietary driver",
+    "driver_info": "26.8.1 (AMD proprietary shader compiler)",
+    "name": "AMD Radeon RX 6950 XT"
+  },
+  "command": "cargo test --locked --release gpu_planar_delivery_candidate_measures_conversion_upload_and_writes_the_receipt -- --ignored --nocapture",
+  "conversion_law": "source_encoded_sdr_rgba8_no_gamut_mapping — the CPU oracle's law; the GPU twin derives uniforms from the same CpuConversionContract",
+  "host": {
+    "arch": "x86_64",
+    "build_profile": "release",
+    "os": "windows"
+  },
+  "measured_at": {
+    "branch": "feat/p4c-planar-delivery",
+    "commit": "2b7dfb55f3cea0f3df61c583293a35816379bacf",
+    "tree": "dirty"
+  },
+  "schema": "collide-o-scope-p4c-planar-gpu-candidate-receipt/1",
+  "scope": "evaluation-only: the GPU converter is constructed by the opt-in fixtures alone; no decoder selects planar delivery, no patch surface changed, and promotion remains gated on the audit's integrated two-source matrix without worsening total-frame p99",
+  "sources": "two generated H.264 yuv420p clips (testsrc2, 30 fps) with declared tv/bt709/bt709/left metadata; the real decoder's frozen descriptor drives admission and conversion",
+  "sources_measured": [
+    {
+      "admission": "PrototypePlanar(Yuv420p8) through prototype_delivery_decision on the production-frozen descriptor",
+      "bytes_per_frame": {
+        "packed_rgba8": 3686400,
+        "planar_yuv420p8": 1382400,
+        "staging_reduction_percent": 62.5
+      },
+      "delivery_ns": {
+        "law": "packed = one swscale run plus stride-aware repack into a fresh allocation; planar = row-copy of the decoder's planes into one immutable planar allocation; decode excluded from both",
+        "packed": {
+          "p50_ns": 648000,
+          "p95_ns": 726200,
+          "p99_ns": 1015600
+        },
+        "planar": {
+          "p50_ns": 197200,
+          "p95_ns": 245800,
+          "p99_ns": 318800
+        },
+        "planar_p95_improvement_percent": 66.15257504819608
+      },
+      "equality": {
+        "max_channel_delta": 1,
+        "spot_frames": [
+          0,
+          120,
+          239
+        ],
+        "tolerance": "one 8-bit code value per channel; alpha exact"
+      },
+      "height": 720,
+      "label": "720p",
+      "measured_frames": 240,
+      "upload_ns": {
+        "law": "packed = write_texture of 3686400 RGBA bytes, fenced; planar = write_texture of 1382400 plane bytes plus one conversion pass, fenced; 60 warm-up and 240 measured iterations each",
+        "packed": {
+          "p50_ns": 505600,
+          "p95_ns": 603400,
+          "p99_ns": 771900
+        },
+        "planar": {
+          "p50_ns": 358900,
+          "p95_ns": 488000,
+          "p99_ns": 757000
+        },
+        "planar_p95_improvement_percent": 19.12495856811402
+      },
+      "width": 1280
+    },
+    {
+      "admission": "PrototypePlanar(Yuv420p8) through prototype_delivery_decision on the production-frozen descriptor",
+      "bytes_per_frame": {
+        "packed_rgba8": 8294400,
+        "planar_yuv420p8": 3110400,
+        "staging_reduction_percent": 62.5
+      },
+      "delivery_ns": {
+        "law": "packed = one swscale run plus stride-aware repack into a fresh allocation; planar = row-copy of the decoder's planes into one immutable planar allocation; decode excluded from both",
+        "packed": {
+          "p50_ns": 1469100,
+          "p95_ns": 1644100,
+          "p99_ns": 1831000
+        },
+        "planar": {
+          "p50_ns": 447700,
+          "p95_ns": 515600,
+          "p99_ns": 781700
+        },
+        "planar_p95_improvement_percent": 68.639377166839
+      },
+      "equality": {
+        "max_channel_delta": 1,
+        "spot_frames": [
+          0,
+          120,
+          239
+        ],
+        "tolerance": "one 8-bit code value per channel; alpha exact"
+      },
+      "height": 1080,
+      "label": "1080p",
+      "measured_frames": 240,
+      "upload_ns": {
+        "law": "packed = write_texture of 8294400 RGBA bytes, fenced; planar = write_texture of 3110400 plane bytes plus one conversion pass, fenced; 60 warm-up and 240 measured iterations each",
+        "packed": {
+          "p50_ns": 969300,
+          "p95_ns": 1058900,
+          "p99_ns": 1148700
+        },
+        "planar": {
+          "p50_ns": 653800,
+          "p95_ns": 763500,
+          "p99_ns": 918300
+        },
+        "planar_p95_improvement_percent": 27.896874114647275
+      },
+      "width": 1920
+    }
+  ]
+}
