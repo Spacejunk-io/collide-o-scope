@@ -148,7 +148,7 @@ must not be stripped.
 
 | Path | Component | Terms |
 |---|---|---|
-| `third_party/wgpu-hal-29.0.3/` | Vendored `wgpu-hal` 29.0.3 with a one-arm patch for [gfx-rs/wgpu#9029](https://github.com/gfx-rs/wgpu/issues/9029), marked `// LOCAL PATCH (collide-o-scope)` at `src/vulkan/swapchain/native.rs:472` | `MIT OR Apache-2.0`; **MIT is the elected option** for this copy, so the sole obligation is notice retention. See `LICENSE.MIT` and `LICENSE.APACHE` in that directory. |
+| `third_party/wgpu-hal-29.0.4/` | Vendored `wgpu-hal` 29.0.4 with a one-arm patch for [gfx-rs/wgpu#9029](https://github.com/gfx-rs/wgpu/issues/9029), marked `// LOCAL PATCH (collide-o-scope)` at `src/vulkan/swapchain/native.rs:472` | `MIT OR Apache-2.0`; **MIT is the elected option** for this copy, so the sole obligation is notice retention. See `LICENSE.MIT` and `LICENSE.APACHE` in that directory. |
 | `assets/`, `static/` | Program icon, bundled panel assets | `GPL-3.0-or-later` with the combined work |
 
 MIT and Apache-2.0 are both one-way compatible with GPLv3: their code may be

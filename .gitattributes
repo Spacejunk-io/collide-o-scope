@@ -22,7 +22,7 @@ LICENSES/** text eol=lf
 third_party/**/LICENSE* text eol=lf
 
 # The vendored wgpu-hal manifest hashes its full upstream tree byte-for-byte.
-third_party/wgpu-hal-29.0.3/** text eol=lf
+third_party/wgpu-hal-29.0.4/** text eol=lf
 
 # Shell scripts and macOS property lists must never be checked out CRLF:
 # a CRLF shebang line makes a script unrunnable on macOS and Linux.

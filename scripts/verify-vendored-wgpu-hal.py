@@ -17,8 +17,8 @@ import urllib.request
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MANIFEST_PATH = ROOT / "third_party" / "wgpu-hal-29.0.3.vendor.json"
-VENDOR_ROOT = ROOT / "third_party" / "wgpu-hal-29.0.3"
+MANIFEST_PATH = ROOT / "third_party" / "wgpu-hal-29.0.4.vendor.json"
+VENDOR_ROOT = ROOT / "third_party" / "wgpu-hal-29.0.4"
 MAX_ARCHIVE_BYTES = 16 * 1024 * 1024
 
 

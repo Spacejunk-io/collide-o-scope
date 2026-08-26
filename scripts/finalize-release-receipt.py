@@ -592,7 +592,7 @@ def validate_attestations(
 
 
 def vendor_hashes() -> dict:
-    path = ROOT / "third_party" / "wgpu-hal-29.0.3.vendor.json"
+    path = ROOT / "third_party" / "wgpu-hal-29.0.4.vendor.json"
     document = read_json(path)
     crate = document.get("crate")
     delta = document.get("intended_delta")
@@ -619,6 +619,7 @@ def source_evidence_receipts() -> list[dict]:
         "v1.7.3-release-recovery-receipt.md",
         "v1.7.4-release-recovery-receipt.md",
         "v1.8.0-ffmpeg-9-software-baseline-receipt.md",
+        "v1.8.1-patch-refresh-receipt.md",
     }
     for prefix in ("p3", "p9", "p10"):
         names.update(path.name for path in evidence_root.glob(f"{prefix}*"))
@@ -1126,6 +1127,7 @@ def validate_final_receipt(receipt: dict) -> None:
         not in source_paths
         or "docs/evidence/v1.8.0-ffmpeg-9-software-baseline-receipt.md"
         not in source_paths
+        or "docs/evidence/v1.8.1-patch-refresh-receipt.md" not in source_paths
         or not any(
             isinstance(path, str) and path.startswith("docs/evidence/p10")
             for path in source_paths
