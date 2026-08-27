@@ -77,6 +77,15 @@ EXPECTED_WORKFLOW_ACTIONS = {
         }
     ),
 }
+REVIEWED_WORKFLOW_SHA256 = {
+    "adversarial.yml": (
+        "4f8143f8316943894c0e545ba70e54fec4d4b8e227a4e429bd3f7b8c30028590"
+    ),
+    "ci.yml": "0848e77ff0bb959611c6a85f7e69ecca5ddf5464a3130942ad43ff7b2855a2b9",
+    "release-trust.yml": (
+        "7da4f2fb04d1107e8306d8d815866234c2022337d0326296ca5003433512212b"
+    ),
+}
 PINNED_WORKFLOW_ACTION = re.compile(
     r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40} # v[0-9]+\.[0-9]+\.[0-9]+"
 )
@@ -182,6 +191,10 @@ def validate_pinned_workflow_actions(workflows: dict[str, str]) -> None:
     if set(workflows) != set(EXPECTED_WORKFLOW_ACTIONS):
         fail("reviewed workflow inventory differs from the exact expected set")
     for name, expected in EXPECTED_WORKFLOW_ACTIONS.items():
+        if hashlib.sha256(workflows[name].encode()).hexdigest() != (
+            REVIEWED_WORKFLOW_SHA256[name]
+        ):
+            fail(f"{name} differs from its reviewed complete document")
         values = workflow_action_values(workflows[name])
         if any(PINNED_WORKFLOW_ACTION.fullmatch(value) is None for value in values):
             fail(
@@ -218,6 +231,12 @@ def self_test_pinned_workflow_actions(workflows: dict[str, str]) -> None:
         run: echo "$env:uses"'''
     quoted_action = f'''      - name: Check out source
         "uses": {CHECKOUT_ACTION}'''
+    escaped_action = f'''      - name: Escaped unknown action
+        "u\\u0073es": actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v6.0.0'''
+    inline_action = (
+        "      - { name: Inline unknown action, uses: "
+        "actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d } # v6.0.0"
+    )
     hostile = [
         changed("adversarial.yml", adversarial.replace(checkout_line + "\n", "", 1)),
         changed(
@@ -235,6 +254,14 @@ def self_test_pinned_workflow_actions(workflows: dict[str, str]) -> None:
         changed(
             "adversarial.yml",
             adversarial.replace(checkout_step, quoted_action, 1),
+        ),
+        changed(
+            "adversarial.yml",
+            adversarial.replace(checkout_step, checkout_step + "\n" + escaped_action, 1),
+        ),
+        changed(
+            "adversarial.yml",
+            adversarial.replace(checkout_step, checkout_step + "\n" + inline_action, 1),
         ),
         changed(
             "adversarial.yml",
