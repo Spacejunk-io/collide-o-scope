@@ -1,9 +1,9 @@
 # §3.4 — performance-recorder v2 addresses: evidence note
 
 Date: 2026-08-27. Status: hosted implementation and exact local gate observed.
-The labeled GPU/export receipts below are also observed; topic commit,
-integration commit, and exact-commit CI remain pending until the branch
-closes.
+The labeled GPU/export receipts and topic implementation commit below are also
+observed; integration commit and exact-commit CI remain pending until the
+branch closes.
 
 ## Claim and compatibility boundary
 
@@ -214,7 +214,7 @@ no performance sidecar. The fixture neither requires nor creates
 
 Closing fields:
 
-- Topic commit: **PENDING**
+- Topic implementation commit: **`7eba14a`**
 - Integration commit on `feat/web-control-panel`: **PENDING**
 - Exact-commit CI: **PENDING**
 - Hosted gate result/toolchain: **OBSERVED PASS** — the exact six-command gate
