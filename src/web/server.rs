@@ -3941,6 +3941,21 @@ mod tests {
         panic!("could not reserve an adjacent control-server port pair");
     }
 
+    /// [`available_port_pair`] can only reserve ports by binding and then
+    /// dropping its probe listeners, so until the control server rebinds them
+    /// any concurrent test (or unrelated process) can steal either port.
+    /// Scenarios whose truth depends on a reserved port staying free retry
+    /// with a fresh pair when — and only when — the observed failure is that
+    /// stolen-port bind error; every other outcome is asserted unchanged.
+    const STOLEN_PORT_RETRIES: usize = 8;
+
+    fn reserved_port_was_stolen(status: &ControlListenerStatus, bind_error_marker: &str) -> bool {
+        matches!(
+            status,
+            ControlListenerStatus::Unavailable { reason } if reason.contains(bind_error_marker)
+        )
+    }
+
     fn test_start_config(
         base_port: u16,
         identity_dir: &FsPath,
@@ -4968,94 +4983,150 @@ mod tests {
 
     #[test]
     fn tls_fault_and_independent_port_occupation_publish_exact_listener_truth() {
-        let base_port = available_port_pair();
-        let identity_dir = control_test_dir("tls-fault");
-        let state = WebState::new().unwrap();
-        let mut handle = start(
-            state.clone(),
-            test_start_config(
-                base_port,
-                &identity_dir,
-                FIRST_TEST_TOKEN,
-                StartFaults {
-                    tls_config: true,
-                    ..StartFaults::default()
-                },
-            ),
-        )
-        .unwrap();
-        let info = state.control_server_info();
-        assert!(matches!(
-            info.loopback_ipv4,
-            ControlListenerStatus::Listening { address }
-                if address == SocketAddr::new(Ipv4Addr::LOCALHOST.into(), base_port)
-        ));
-        assert!(matches!(
-            info.lan_tls,
-            ControlListenerStatus::Unavailable { ref reason }
-                if reason.contains("injected TLS configuration fault")
-        ));
-        assert!(info.lan_url.is_none());
-        handle.retire().unwrap();
-        fs::remove_dir_all(&identity_dir).unwrap();
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let base_port = available_port_pair();
+            let identity_dir = control_test_dir("tls-fault");
+            let state = WebState::new().unwrap();
+            let mut handle = start(
+                state.clone(),
+                test_start_config(
+                    base_port,
+                    &identity_dir,
+                    FIRST_TEST_TOKEN,
+                    StartFaults {
+                        tls_config: true,
+                        ..StartFaults::default()
+                    },
+                ),
+            )
+            .unwrap();
+            let info = state.control_server_info();
+            if reserved_port_was_stolen(&info.loopback_ipv4, "cannot bind loopback IPv4") {
+                handle.retire().unwrap();
+                fs::remove_dir_all(&identity_dir).unwrap();
+                assert!(
+                    attempts < STOLEN_PORT_RETRIES,
+                    "reserved loopback port was stolen {attempts} consecutive times"
+                );
+                continue;
+            }
+            assert!(matches!(
+                info.loopback_ipv4,
+                ControlListenerStatus::Listening { address }
+                    if address == SocketAddr::new(Ipv4Addr::LOCALHOST.into(), base_port)
+            ));
+            assert!(matches!(
+                info.lan_tls,
+                ControlListenerStatus::Unavailable { ref reason }
+                    if reason.contains("injected TLS configuration fault")
+            ));
+            assert!(info.lan_url.is_none());
+            handle.retire().unwrap();
+            fs::remove_dir_all(&identity_dir).unwrap();
+            break;
+        }
 
-        let base_port = available_port_pair();
-        let identity_dir = control_test_dir("occupied-lan");
-        let occupied_lan = TcpListener::bind((Ipv4Addr::UNSPECIFIED, base_port + 1)).unwrap();
-        let state = WebState::new().unwrap();
-        let mut handle = start(
-            state.clone(),
-            test_start_config(
-                base_port,
-                &identity_dir,
-                FIRST_TEST_TOKEN,
-                StartFaults::default(),
-            ),
-        )
-        .unwrap();
-        let info = state.control_server_info();
-        assert!(matches!(
-            info.loopback_ipv4,
-            ControlListenerStatus::Listening { .. }
-        ));
-        assert!(matches!(
-            info.lan_tls,
-            ControlListenerStatus::Unavailable { ref reason }
-                if reason.contains("cannot bind LAN HTTPS")
-        ));
-        assert!(info.lan_url.is_none());
-        handle.retire().unwrap();
-        drop(occupied_lan);
-        fs::remove_dir_all(&identity_dir).unwrap();
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let base_port = available_port_pair();
+            let Ok(occupied_lan) = TcpListener::bind((Ipv4Addr::UNSPECIFIED, base_port + 1)) else {
+                assert!(
+                    attempts < STOLEN_PORT_RETRIES,
+                    "reserved LAN port was stolen {attempts} consecutive times"
+                );
+                continue;
+            };
+            let identity_dir = control_test_dir("occupied-lan");
+            let state = WebState::new().unwrap();
+            let mut handle = start(
+                state.clone(),
+                test_start_config(
+                    base_port,
+                    &identity_dir,
+                    FIRST_TEST_TOKEN,
+                    StartFaults::default(),
+                ),
+            )
+            .unwrap();
+            let info = state.control_server_info();
+            if reserved_port_was_stolen(&info.loopback_ipv4, "cannot bind loopback IPv4") {
+                handle.retire().unwrap();
+                drop(occupied_lan);
+                fs::remove_dir_all(&identity_dir).unwrap();
+                assert!(
+                    attempts < STOLEN_PORT_RETRIES,
+                    "reserved loopback port was stolen {attempts} consecutive times"
+                );
+                continue;
+            }
+            assert!(matches!(
+                info.loopback_ipv4,
+                ControlListenerStatus::Listening { .. }
+            ));
+            assert!(matches!(
+                info.lan_tls,
+                ControlListenerStatus::Unavailable { ref reason }
+                    if reason.contains("cannot bind LAN HTTPS")
+            ));
+            assert!(info.lan_url.is_none());
+            handle.retire().unwrap();
+            drop(occupied_lan);
+            fs::remove_dir_all(&identity_dir).unwrap();
+            break;
+        }
 
-        let base_port = available_port_pair();
-        let identity_dir = control_test_dir("occupied-loopback");
-        let occupied_loopback = TcpListener::bind((Ipv4Addr::LOCALHOST, base_port)).unwrap();
-        let state = WebState::new().unwrap();
-        let mut handle = start(
-            state.clone(),
-            test_start_config(
-                base_port,
-                &identity_dir,
-                FIRST_TEST_TOKEN,
-                StartFaults::default(),
-            ),
-        )
-        .unwrap();
-        let info = state.control_server_info();
-        assert!(matches!(
-            info.loopback_ipv4,
-            ControlListenerStatus::Unavailable { ref reason }
-                if reason.contains("cannot bind loopback IPv4")
-        ));
-        assert!(matches!(
-            info.lan_tls,
-            ControlListenerStatus::Listening { .. }
-        ));
-        assert!(info.lan_url.is_some());
-        handle.retire().unwrap();
-        drop(occupied_loopback);
-        fs::remove_dir_all(&identity_dir).unwrap();
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let base_port = available_port_pair();
+            let Ok(occupied_loopback) = TcpListener::bind((Ipv4Addr::LOCALHOST, base_port)) else {
+                assert!(
+                    attempts < STOLEN_PORT_RETRIES,
+                    "reserved loopback port was stolen {attempts} consecutive times"
+                );
+                continue;
+            };
+            let identity_dir = control_test_dir("occupied-loopback");
+            let state = WebState::new().unwrap();
+            let mut handle = start(
+                state.clone(),
+                test_start_config(
+                    base_port,
+                    &identity_dir,
+                    FIRST_TEST_TOKEN,
+                    StartFaults::default(),
+                ),
+            )
+            .unwrap();
+            let info = state.control_server_info();
+            if reserved_port_was_stolen(&info.lan_tls, "cannot bind LAN HTTPS") {
+                handle.retire().unwrap();
+                drop(occupied_loopback);
+                fs::remove_dir_all(&identity_dir).unwrap();
+                assert!(
+                    attempts < STOLEN_PORT_RETRIES,
+                    "reserved LAN port was stolen {attempts} consecutive times"
+                );
+                continue;
+            }
+            assert!(matches!(
+                info.loopback_ipv4,
+                ControlListenerStatus::Unavailable { ref reason }
+                    if reason.contains("cannot bind loopback IPv4")
+            ));
+            assert!(matches!(
+                info.lan_tls,
+                ControlListenerStatus::Listening { .. }
+            ));
+            assert!(info.lan_url.is_some());
+            handle.retire().unwrap();
+            drop(occupied_loopback);
+            fs::remove_dir_all(&identity_dir).unwrap();
+            break;
+        }
     }
 
     #[test]
