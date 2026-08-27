@@ -65,6 +65,15 @@ pub(crate) struct MotionFieldReadParity {
     pub valid: bool,
 }
 
+/// Exact staged vector/gate parity rendered by Master, borrowed without
+/// exposing motion's ping/pong owners to the host renderer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MotionMonitorSource<'a> {
+    pub vectors: &'a wgpu::TextureView,
+    pub gates: &'a wgpu::TextureView,
+    pub grid: [u32; 2],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MotionGpuScopeSpec {
     pub scope: VisualScopeId,
@@ -1341,6 +1350,73 @@ impl MotionGpuResources {
             index: usize::from(stage.render_field_index),
             valid: stage.render_field_valid,
         })
+    }
+
+    /// Truthful availability for the exact field routed into Master motion.
+    /// During an open frame this reports the staged parity's validity; outside
+    /// that window it reports the committed parity. A Master field generated
+    /// only for some other consumer is intentionally not a substitute: the
+    /// route must exist in `MotionScopeBindings` because that is what
+    /// `encode_scope` actually renders.
+    pub(crate) fn master_motion_monitor_available(&self) -> bool {
+        let Some(bindings) = self.scopes.get(&VisualScopeId::Master) else {
+            return false;
+        };
+        if bindings.derived_collider {
+            let Some(collider) = self.collider.as_ref() else {
+                return false;
+            };
+            collider
+                .frame_stage
+                .map_or(collider.memory.committed.valid, |stage| stage.render_valid)
+        } else {
+            let Some(field) = self.fields.get(usize::from(bindings.render_field_slot)) else {
+                return false;
+            };
+            field
+                .frame_stage
+                .map_or(field.memory.committed.field_valid, |stage| {
+                    stage.render_field_valid
+                })
+        }
+    }
+
+    /// Borrow only the exact currently staged parity that Master rendered.
+    /// Scheduling is deliberately stricter than the availability snapshot:
+    /// without an open frame there is no source, so a caller can never sample
+    /// the first admitted field, a layer field, or retained bytes by fallback.
+    pub(crate) fn staged_master_motion_monitor_source(&self) -> Option<MotionMonitorSource<'_>> {
+        if !self.program_advances {
+            return None;
+        }
+        let bindings = self.scopes.get(&VisualScopeId::Master)?;
+        if bindings.derived_collider {
+            let collider = self.collider.as_ref()?;
+            let stage = collider.frame_stage?;
+            if !stage.render_valid {
+                return None;
+            }
+            let index = usize::from(stage.render_index);
+            Some(MotionMonitorSource {
+                vectors: &collider.vectors.get(index)?.view,
+                gates: &collider.gates.get(index)?.view,
+                grid: [
+                    collider.plan.output_grid.width,
+                    collider.plan.output_grid.height,
+                ],
+            })
+        } else {
+            let parity = self.field_read_parity(bindings.render_field_slot)?;
+            if !parity.valid {
+                return None;
+            }
+            let views = self.field_primitive_views(bindings.render_field_slot)?;
+            Some(MotionMonitorSource {
+                vectors: *views.vectors.get(parity.index)?,
+                gates: *views.gates.get(parity.index)?,
+                grid: views.grid,
+            })
+        }
     }
 
     /// Materialize the routed scalar from the same staged field parity used by

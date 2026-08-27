@@ -8656,7 +8656,7 @@ monitorBayNative.addEventListener('change', () => {
 });
 
 monitorBayProbe.addEventListener('change', () => {
-  const probe = ['program', 'program_tap', 'gesture_canvas'].includes(monitorBayProbe.value)
+  const probe = ['program', 'program_tap', 'gesture_canvas', 'ntsc_line_state', 'melt_band_mask', 'motion_field'].includes(monitorBayProbe.value)
     ? monitorBayProbe.value : 'program';
   sendAction({ action: 'set_monitor_probe', probe });
 });
@@ -8702,7 +8702,7 @@ function drawMonitorBitmap(canvas, b64, width, height, decorate) {
 function syncMonitorBay(bay = {}) {
   if (!monitorBayGroup) return;
   if (canSync(monitorBayNative)) monitorBayNative.checked = !!bay.native_overlay;
-  const probe = ['program', 'program_tap', 'gesture_canvas'].includes(bay.probe) ? bay.probe : 'program';
+  const probe = ['program', 'program_tap', 'gesture_canvas', 'ntsc_line_state', 'melt_band_mask', 'motion_field'].includes(bay.probe) ? bay.probe : 'program';
   if (canSync(monitorBayProbe)) monitorBayProbe.value = probe;
   if (!bay.active) {
     if (monitorBayLastSample !== -1) {

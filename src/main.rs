@@ -23451,8 +23451,13 @@ impl App {
                         if self.monitor_probe != probe {
                             self.monitor_probe = probe;
                             // A probe change is a new signal; the old
-                            // instruments must not present as the new probe.
+                            // instruments and cadence debt must not present as
+                            // the new probe or cause an immediate stale sample.
                             self.monitor_bay_state.clear();
+                            self.monitor_bay_accumulator = 0.0;
+                            if let Some(renderer) = self.renderer.as_mut() {
+                                renderer.disarm_monitor_bay_sources();
+                            }
                             *accepted_coalesced = true;
                         }
                     }
@@ -24716,6 +24721,13 @@ impl App {
                 .as_ref()
                 .and_then(renderer::gesture_canvas::GestureCanvasResources::presented_view)
                 .is_some(),
+            monitor_bay::MonitorProbe::NtscLineState | monitor_bay::MonitorProbe::MeltBandMask => {
+                self.renderer.is_some()
+            }
+            monitor_bay::MonitorProbe::MotionField => self
+                .composition_gpu
+                .as_ref()
+                .is_some_and(|executor| executor.master_motion_monitor_available()),
         };
         if available {
             ""
@@ -27773,6 +27785,9 @@ impl ApplicationHandler for App {
                     } else if self.monitor_bay_was_armed {
                         self.monitor_bay_state.clear();
                         self.monitor_bay_accumulator = 0.0;
+                        if let Some(renderer) = self.renderer.as_mut() {
+                            renderer.disarm_monitor_bay_sources();
+                        }
                     }
                     self.monitor_bay_was_armed = monitor_armed;
 
@@ -29363,7 +29378,38 @@ impl ApplicationHandler for App {
                         None => None,
                     };
 
+                    // Browser, native, and controller actions above may have
+                    // changed the observer gate after the start-of-frame
+                    // harvest. Refresh that fact before any monitor-only work:
+                    // a disable accepted in this drain must clear and disarm
+                    // now, not after one final diagnostic allocation/readback.
+                    let monitor_armed_after_actions = self.monitor_bay_armed();
+                    if monitor_armed_after_actions != self.monitor_bay_was_armed {
+                        self.monitor_bay_accumulator = 0.0;
+                        if !monitor_armed_after_actions {
+                            self.monitor_bay_state.clear();
+                            if let Some(renderer) = self.renderer.as_mut() {
+                                renderer.disarm_monitor_bay_sources();
+                            }
+                        }
+                        self.monitor_bay_was_armed = monitor_armed_after_actions;
+                    }
+
+                    // The melt mask must be captured at B8, before the
+                    // accepted-frame decision where the monitor reduction is
+                    // scheduled. Predict only this cadence crossing. A
+                    // rejected frame does not advance the accumulator, so the
+                    // next accepted frame requests the exact mask again.
+                    let monitor_melt_mask_due = self.monitor_bay_was_armed
+                        && self.monitor_probe == monitor_bay::MonitorProbe::MeltBandMask
+                        && temporal_input.freeze.program_advances()
+                        && self.monitor_bay_accumulator + f64::from(program_delta)
+                            >= monitor_bay::MONITOR_BAY_INTERVAL_SECONDS;
+
                     let renderer = self.renderer.as_mut().unwrap();
+                    if monitor_melt_mask_due {
+                        renderer.request_monitor_melt_mask();
+                    }
                     let mut encoder =
                         renderer
                             .device
@@ -30606,14 +30652,23 @@ impl ApplicationHandler for App {
                                     renderer.program_tap_valid()
                                 }
                                 monitor_bay::MonitorProbe::GestureCanvas => canvas_view.is_some(),
+                                monitor_bay::MonitorProbe::NtscLineState
+                                | monitor_bay::MonitorProbe::MeltBandMask => true,
+                                monitor_bay::MonitorProbe::MotionField => {
+                                    self.composition_gpu.as_ref().is_some_and(|executor| {
+                                        executor.master_motion_monitor_available()
+                                    })
+                                }
                             };
                             if available {
                                 self.monitor_bay_accumulator += f64::from(program_delta);
-                                let interval = f64::from(monitor_bay::MONITOR_BAY_INTERVAL_TICKS)
-                                    / f64::from(crate::effects::params::TEMPORAL_REFERENCE_FPS);
-                                if self.monitor_bay_accumulator >= interval
-                                    && renderer
-                                        .schedule_monitor_bay(self.monitor_probe, canvas_view)
+                                if self.monitor_bay_accumulator
+                                    >= monitor_bay::MONITOR_BAY_INTERVAL_SECONDS
+                                    && renderer.schedule_monitor_bay(
+                                        self.monitor_probe,
+                                        canvas_view,
+                                        self.composition_gpu.as_ref(),
+                                    )
                                 {
                                     self.monitor_bay_accumulator = 0.0;
                                 }

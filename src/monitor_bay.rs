@@ -37,6 +37,8 @@ pub const MONITOR_BAY_CELLS: usize = MONITOR_BAY_WIDTH * MONITOR_BAY_HEIGHT;
 /// The 10 Hz cadence expressed on the 30 Hz reference grid, exactly the B10
 /// video-analysis law: three reference ticks per sample.
 pub const MONITOR_BAY_INTERVAL_TICKS: u32 = 3;
+pub const MONITOR_BAY_INTERVAL_SECONDS: f64 =
+    MONITOR_BAY_INTERVAL_TICKS as f64 / crate::effects::params::TEMPORAL_REFERENCE_FPS as f64;
 
 /// Waveform bitmap width — one column per grid column, so the plot needs no
 /// horizontal resampling law.
@@ -157,30 +159,157 @@ pub fn reduce_instruments(grid: &[u8]) -> MonitorInstruments {
     out
 }
 
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn unit_byte(value: f32) -> u8 {
+    (finite_or_zero(value).clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// Encode one NTSC sync-latch line for the diagnostic probe. The signed
+/// displacement is normalized by the engine's permanent bound: positive is
+/// red, negative is blue, and an exact zero is opaque black. Hostile
+/// non-finite input is the neutral zero state, never a diagnostic colour.
+pub fn sync_line_state_color(offset: f32) -> [u8; 4] {
+    let bound = crate::sync_latch::SYNC_LATCH_MAX_OFFSET;
+    let normalized = finite_or_zero(offset).clamp(-bound, bound) / bound;
+    [
+        unit_byte(normalized.max(0.0)),
+        0,
+        unit_byte((-normalized).max(0.0)),
+        255,
+    ]
+}
+
+/// Reduce the live per-line sync-latch table to the monitor bay's fixed
+/// 128×72 RGBA oracle. Output row `y` samples input row
+/// `floor(y * offsets.len() / 72)` and repeats that colour across the row.
+/// A table shorter than the diagnostic height is not materialized enough to
+/// represent the probe, so it yields one all-black opaque grid.
+pub fn reduce_sync_line_state(offsets: &[f32]) -> Vec<u8> {
+    let mut grid = vec![0; MONITOR_BAY_CELLS * 4];
+    for alpha in grid.iter_mut().skip(3).step_by(4) {
+        *alpha = 255;
+    }
+    if offsets.len() < MONITOR_BAY_HEIGHT {
+        return grid;
+    }
+
+    for y in 0..MONITOR_BAY_HEIGHT {
+        let source_y = y * offsets.len() / MONITOR_BAY_HEIGHT;
+        let color = sync_line_state_color(offsets[source_y]);
+        for x in 0..MONITOR_BAY_WIDTH {
+            let base = (y * MONITOR_BAY_WIDTH + x) * 4;
+            grid[base..base + 4].copy_from_slice(&color);
+        }
+    }
+    grid
+}
+
+/// Encode one bus-melt band-mask sample. The retained mask is a unit scalar;
+/// its diagnostic is opaque grayscale after finite-or-zero sanitization and
+/// clamping to the mask's [0,1] domain.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the CPU diagnostic oracle is exercised by renderer parity fixtures"
+    )
+)]
+pub fn melt_band_color(mask: f32) -> [u8; 4] {
+    let gray = unit_byte(mask);
+    [gray, gray, gray, 255]
+}
+
+/// Encode one admitted master motion-field sample for the diagnostic probe.
+/// Red is signed horizontal velocity, green is inverted signed vertical
+/// velocity, and blue is confidence gated by visibility. Velocity uses the
+/// motion engine's own permanent bound; every lane is finite-or-zero and
+/// clamped before byte encoding.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the CPU diagnostic oracle is exercised by renderer parity fixtures"
+    )
+)]
+pub fn motion_field_color(
+    velocity_uv_per_second: [f32; 2],
+    confidence: f32,
+    visibility: f32,
+) -> [u8; 4] {
+    let vx = finite_or_zero(velocity_uv_per_second[0]);
+    let vy = finite_or_zero(velocity_uv_per_second[1]);
+    let confidence = finite_or_zero(confidence).clamp(0.0, 1.0);
+    let visibility = finite_or_zero(visibility).clamp(0.0, 1.0);
+    [
+        unit_byte((vx / crate::motion::MOTION_MAX_UV_PER_SECOND + 1.0) * 0.5),
+        unit_byte((1.0 - vy / crate::motion::MOTION_MAX_UV_PER_SECOND) * 0.5),
+        unit_byte(confidence * visibility),
+        255,
+    ]
+}
+
 /// The PROBE vocabulary: which internal signal feeds the instruments. Closed
 /// and append-only (codes are permanent); every member is a retained,
 /// renderer-owned image that costs nothing to observe. The named deferred
 /// probes — the NTSC per-line state, the melt band mask, a motion-field
 /// visualizer — join by appending codes, never by renumbering.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MonitorProbe {
     /// The finished programme picture (pre-blackout slot 2), code 0.
     #[default]
-    Program,
+    Program = 0,
     /// The B16 programme re-entry tap (the honest N-1 image), code 1.
-    ProgramTap,
+    ProgramTap = 1,
     /// The gesture-canvas presented donor (the etch field), code 2.
-    GestureCanvas,
+    GestureCanvas = 2,
+    /// The live sync-latch offset table rendered as signed line state, code 3.
+    NtscLineState = 3,
+    /// The retained bus-melt band mask rendered as grayscale, code 4.
+    MeltBandMask = 4,
+    /// The master scope's exact admitted motion field, code 5. If that field
+    /// is absent or has not materialized, the probe is unavailable; it never
+    /// rebinds to a layer field, raw field, or any other nearby producer.
+    MotionField = 5,
 }
 
 impl MonitorProbe {
-    pub const ALL: [Self; 3] = [Self::Program, Self::ProgramTap, Self::GestureCanvas];
+    /// Frozen append-only code order. New probes may only be appended.
+    pub const ALL: [Self; 6] = [
+        Self::Program,
+        Self::ProgramTap,
+        Self::GestureCanvas,
+        Self::NtscLineState,
+        Self::MeltBandMask,
+        Self::MotionField,
+    ];
 
-    pub fn key(&self) -> &'static str {
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "permanent probe codes are asserted by the append-only vocabulary fixture"
+        )
+    )]
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn key(&self) -> &'static str {
         match self {
             Self::Program => "program",
             Self::ProgramTap => "program_tap",
             Self::GestureCanvas => "gesture_canvas",
+            Self::NtscLineState => "ntsc_line_state",
+            Self::MeltBandMask => "melt_band_mask",
+            Self::MotionField => "motion_field",
         }
     }
 
@@ -579,12 +708,128 @@ mod tests {
 
     #[test]
     fn probe_vocabulary_is_closed_and_round_trips() {
-        for probe in MonitorProbe::ALL {
-            assert_eq!(MonitorProbe::try_from_str(probe.key()), Some(probe));
+        let frozen = [
+            (MonitorProbe::Program, 0, "program"),
+            (MonitorProbe::ProgramTap, 1, "program_tap"),
+            (MonitorProbe::GestureCanvas, 2, "gesture_canvas"),
+            (MonitorProbe::NtscLineState, 3, "ntsc_line_state"),
+            (MonitorProbe::MeltBandMask, 4, "melt_band_mask"),
+            (MonitorProbe::MotionField, 5, "motion_field"),
+        ];
+        assert_eq!(
+            MonitorProbe::ALL.map(|probe| probe.key()),
+            frozen.map(|v| v.2)
+        );
+        for (probe, code, token) in frozen {
+            assert_eq!(probe.code(), code);
+            assert_eq!(probe.key(), token);
+            assert_eq!(MonitorProbe::try_from_str(token), Some(probe));
         }
-        assert_eq!(MonitorProbe::try_from_str("programme"), None);
-        assert_eq!(MonitorProbe::try_from_str(""), None);
+        for near_miss in [
+            "programme",
+            "ntsc-line-state",
+            "NTSC_line_state",
+            "ntsc_line_states",
+            "melt_band",
+            "melt-band-mask",
+            "motion",
+            "motion_fields",
+            "motion_field ",
+            "",
+        ] {
+            assert_eq!(
+                MonitorProbe::try_from_str(near_miss),
+                None,
+                "near miss must be refused: {near_miss:?}"
+            );
+        }
         assert_eq!(MonitorProbe::default(), MonitorProbe::Program);
+    }
+
+    #[test]
+    fn sync_line_state_oracle_is_signed_bounded_opaque_and_row_mapped() {
+        use crate::sync_latch::SYNC_LATCH_MAX_OFFSET;
+
+        assert_eq!(sync_line_state_color(0.0), [0, 0, 0, 255]);
+        assert_eq!(
+            sync_line_state_color(SYNC_LATCH_MAX_OFFSET * 0.5),
+            [128, 0, 0, 255]
+        );
+        assert_eq!(
+            sync_line_state_color(-SYNC_LATCH_MAX_OFFSET),
+            [0, 0, 255, 255]
+        );
+        assert_eq!(
+            sync_line_state_color(SYNC_LATCH_MAX_OFFSET * 4.0),
+            [255, 0, 0, 255]
+        );
+        assert_eq!(sync_line_state_color(-f32::MAX), [0, 0, 255, 255]);
+        for hostile in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(sync_line_state_color(hostile), [0, 0, 0, 255]);
+        }
+
+        let short_offsets = vec![SYNC_LATCH_MAX_OFFSET; MONITOR_BAY_HEIGHT - 1];
+        for short in [&[][..], short_offsets.as_slice()] {
+            let grid = reduce_sync_line_state(short);
+            assert_eq!(grid.len(), MONITOR_BAY_CELLS * 4);
+            assert!(grid.chunks_exact(4).all(|pixel| pixel == [0, 0, 0, 255]));
+        }
+
+        let mut offsets = vec![0.0; MONITOR_BAY_HEIGHT * 2];
+        offsets[0] = -SYNC_LATCH_MAX_OFFSET;
+        offsets[2] = SYNC_LATCH_MAX_OFFSET * 0.5;
+        offsets[(MONITOR_BAY_HEIGHT - 1) * 2] = SYNC_LATCH_MAX_OFFSET;
+        let grid = reduce_sync_line_state(&offsets);
+        let pixel = |x: usize, y: usize| {
+            let base = (y * MONITOR_BAY_WIDTH + x) * 4;
+            &grid[base..base + 4]
+        };
+        assert_eq!(pixel(0, 0), [0, 0, 255, 255]);
+        assert_eq!(pixel(MONITOR_BAY_WIDTH - 1, 1), [128, 0, 0, 255]);
+        assert_eq!(pixel(0, MONITOR_BAY_HEIGHT - 1), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn melt_and_motion_color_oracles_pin_clamping_axes_and_visibility() {
+        use crate::motion::MOTION_MAX_UV_PER_SECOND;
+
+        assert_eq!(melt_band_color(-1.0), [0, 0, 0, 255]);
+        assert_eq!(melt_band_color(0.5), [128, 128, 128, 255]);
+        assert_eq!(melt_band_color(2.0), [255, 255, 255, 255]);
+        assert_eq!(melt_band_color(f32::NAN), [0, 0, 0, 255]);
+
+        assert_eq!(motion_field_color([0.0, 0.0], 0.0, 1.0), [128, 128, 0, 255]);
+        assert_eq!(
+            motion_field_color(
+                [MOTION_MAX_UV_PER_SECOND, MOTION_MAX_UV_PER_SECOND],
+                0.5,
+                0.5,
+            ),
+            [255, 0, 64, 255]
+        );
+        assert_eq!(
+            motion_field_color(
+                [-MOTION_MAX_UV_PER_SECOND, -MOTION_MAX_UV_PER_SECOND],
+                1.0,
+                1.0,
+            ),
+            [0, 255, 255, 255]
+        );
+        assert_eq!(
+            motion_field_color(
+                [
+                    MOTION_MAX_UV_PER_SECOND * 4.0,
+                    -MOTION_MAX_UV_PER_SECOND * 4.0
+                ],
+                2.0,
+                2.0,
+            ),
+            [255, 255, 255, 255]
+        );
+        assert_eq!(
+            motion_field_color([f32::NAN, f32::INFINITY], f32::NAN, 1.0),
+            [128, 128, 0, 255]
+        );
     }
 
     #[test]
