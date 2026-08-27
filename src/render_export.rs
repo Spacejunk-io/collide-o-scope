@@ -199,6 +199,11 @@ pub struct ExportConfig {
     /// `None` is the pre-recorder path: nothing is replayed and no
     /// performance sidecar is published.
     pub(crate) performance_take: Option<crate::performance_track::PerformanceTakeDocument>,
+    /// D5 opt-in straight-alpha companion artifacts, published beside the MP4
+    /// as one atomic `<output>.alpha` generation from the frozen
+    /// `pre_opaque_straight_alpha_v1` seam. `None` is the exact ordinary MP4
+    /// path: no readback, pass, copy, or branch is added.
+    pub alpha: Option<collide_o_scope::alpha_export::AlphaArtifactKind>,
 }
 
 /// Closed offline Curved Shutter sample policy. The explicit variants name
@@ -5423,6 +5428,74 @@ fn pre_opaque_straight_alpha_v1_view(views: &[wgpu::TextureView; 3]) -> &wgpu::T
     &views[0]
 }
 
+/// The D5 application action's offline publisher: one transactional alpha
+/// generation staged beside the MP4 and fed frame-by-frame from the named
+/// seam. Drop cancels and removes the unpublished staging directory, so every
+/// early export exit cleans the alpha half for free.
+enum AlphaActionPublisher {
+    Png(collide_o_scope::alpha_export::AlphaPngSequencePublisher),
+    Ffv1(collide_o_scope::alpha_export::AlphaFfv1Publisher),
+}
+
+impl AlphaActionPublisher {
+    fn begin(
+        destination: &std::path::Path,
+        plan: collide_o_scope::alpha_export::AlphaExportPlan,
+    ) -> Result<Self, String> {
+        match plan.artifact {
+            collide_o_scope::alpha_export::AlphaArtifactKind::Ffv1Rgba => {
+                collide_o_scope::alpha_export::AlphaFfv1Publisher::begin(
+                    crate::host_paths::ffmpeg(),
+                    destination,
+                    plan,
+                )
+                .map(Self::Ffv1)
+            }
+            _ => collide_o_scope::alpha_export::AlphaPngSequencePublisher::begin(destination, plan)
+                .map(Self::Png),
+        }
+        .map_err(|error| format!("straight-alpha export could not begin: {error}"))
+    }
+
+    fn write_frame(&mut self, ordinal: u64, rgba: &[u8]) -> Result<(), String> {
+        match self {
+            Self::Png(publisher) => publisher.write_frame(ordinal, rgba),
+            Self::Ffv1(publisher) => publisher.write_frame(ordinal, rgba),
+        }
+        .map_err(|error| format!("straight-alpha export frame {ordinal}: {error}"))
+    }
+
+    fn finish(self) -> Result<collide_o_scope::alpha_export::AlphaExportReceipt, String> {
+        match self {
+            Self::Png(publisher) => publisher.finish(),
+            Self::Ffv1(publisher) => publisher.finish(),
+        }
+        .map_err(|error| format!("straight-alpha export publication: {error}"))
+    }
+}
+
+/// The atomic alpha generation publishes beside the MP4 under one derived
+/// name, so the pair travels together and the MP4 path stays authoritative.
+fn alpha_destination(output_path: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{output_path}.alpha"))
+}
+
+/// Authored effect truth for the up-front alpha refusal. Morph endpoints and
+/// modulation can wake either effect after this reads the saved state, so the
+/// frame loop re-checks both and aborts rather than publishing a plate that
+/// mislabels a moshed or VHS-replaced programme.
+fn authored_alpha_effect_state(
+    patch: &PatchState,
+) -> collide_o_scope::alpha_export::AlphaEffectState {
+    collide_o_scope::alpha_export::AlphaEffectState {
+        codec_mosh: patch
+            .temporal
+            .as_ref()
+            .is_some_and(|temporal| temporal.mosh.sanitized().is_active()),
+        final_program_vhs: patch.ntsc.as_ref().is_some_and(|ntsc| ntsc.enabled),
+    }
+}
+
 fn run_export(
     patch: &PatchState,
     config: &ExportConfig,
@@ -5453,6 +5526,25 @@ fn run_export(
     if total_frames == 0 {
         return Err("export duration is shorter than one frame".to_string());
     }
+    // D5: validate the complete opt-in alpha plan — bounds and the authored
+    // effect refusal — before any device, texture, or directory exists.
+    let alpha_plan = match config.alpha {
+        Some(artifact) => {
+            let plan = collide_o_scope::alpha_export::AlphaExportPlan {
+                width: config.width,
+                height: config.height,
+                frame_count: total_frames,
+                fps_numerator: config.fps,
+                fps_denominator: 1,
+                artifact,
+                effects: authored_alpha_effect_state(patch),
+            };
+            plan.validate()
+                .map_err(|error| format!("straight-alpha export refused: {error}"))?;
+            Some(plan)
+        }
+        None => None,
+    };
 
     // Reuse the live renderer device when available. Standalone audit/tests
     // still create an isolated headless device.
@@ -6462,6 +6554,17 @@ fn run_export(
         }
     };
     check_cancelled(progress)?;
+    // D5: stage the opt-in alpha generation now that the output directory
+    // exists. Every failure or cancellation from here on drops the publisher,
+    // which removes the private staging directory; nothing becomes visible
+    // before `finish` succeeds after the MP4 itself has been published.
+    let mut alpha_job = match alpha_plan {
+        Some(plan) => Some(AlphaActionPublisher::begin(
+            &alpha_destination(&config.output_path),
+            plan,
+        )?),
+        None => None,
+    };
     let encoder = start_encoder_supervisor(
         "ffmpeg".to_string(),
         build_ffmpeg_args(config, audio_path.as_deref()),
@@ -7648,6 +7751,49 @@ fn run_export(
                 break;
             }
         };
+        // D5: the straight-alpha plate reads the named seam through the same
+        // bounded staging buffer, sequentially after the audience readback —
+        // one in-flight readback, no new allocation. Morph or modulation can
+        // wake an effect the authored refusal could not see, so both laws are
+        // re-checked here: an alpha generation must never mislabel a moshed
+        // or VHS-replaced programme, and an abort publishes nothing.
+        if let Some(alpha) = alpha_job.as_mut() {
+            let woken_effect = if mosh_active {
+                Some("Codec-Mosh")
+            } else if !selective_frame && mod_ntsc.enabled {
+                Some("final-program VHS")
+            } else {
+                None
+            };
+            let alpha_result = match woken_effect {
+                Some(effect) => Err(format!(
+                    "{effect} became active at frame {frame_num}; it has no proven \
+                     straight-alpha propagation law and the alpha export was refused"
+                )),
+                None => readback_pre_opaque_straight_alpha_v1(
+                    &device,
+                    &queue,
+                    &composite_textures,
+                    &staging,
+                    w,
+                    h,
+                    bytes_per_row,
+                    &progress.cancel,
+                )
+                .and_then(|straight| alpha.write_frame(frame_num, &straight)),
+            };
+            if let Err(error) = alpha_result {
+                temporal_state.discard_staged();
+                gesture_canvas.discard_staged();
+                if advanced_history_staged {
+                    if let Some(executor) = composition_gpu.as_mut() {
+                        executor.discard_frame_history();
+                    }
+                }
+                write_error = Some(error);
+                break;
+            }
+        }
         // An isolated dry prefix must be visible to analysis and the N-1
         // programme tap, but Codec Mosh must receive only the wet audience.
         // Render the pre-mosh full programme into a transaction candidate now;
@@ -8242,6 +8388,17 @@ fn run_export(
     // still owns terminal cleanup; `finalize_export_worker` removes both the
     // video and its paired report.
     check_cancelled(progress)?;
+    // D5: the alpha generation publishes last, after the MP4 and every
+    // sidecar, so a failure anywhere above leaves only its private staging
+    // directory — removed on drop — and never a visible half-artifact.
+    if let Some(alpha) = alpha_job.take() {
+        let receipt = alpha.finish()?;
+        log::info!(
+            "Straight-alpha generation published beside the export: {} frames as {:?}",
+            receipt.frame_count,
+            receipt.artifact
+        );
+    }
 
     Ok(())
 }
@@ -8342,13 +8499,13 @@ fn readback_pixels(
     Ok(pixels)
 }
 
-/// Proof-safe D5 acquisition primitive. A future opt-in job format can reuse
-/// the established bounded staging buffer and cancellation law; ordinary MP4
-/// never calls it and therefore gains no readback or synchronization point.
+/// Proof-safe D5 acquisition primitive: the opt-in alpha action reads the
+/// named seam through the established bounded staging buffer and cancellation
+/// law. Ordinary MP4 never calls it and therefore gains no readback or
+/// synchronization point.
 #[allow(
-    dead_code,
     clippy::too_many_arguments,
-    reason = "retained acquisition seam awaits the opt-in export action/config integration"
+    reason = "acquisition seam mirrors the established readback signature"
 )]
 fn readback_pre_opaque_straight_alpha_v1(
     device: &wgpu::Device,
@@ -10707,6 +10864,7 @@ mod tests {
             temporal_event_track: crate::temporal::TemporalEventTrack::default(),
             gesture_track: None,
             performance_take: None,
+            alpha: None,
         }
     }
 
@@ -19747,6 +19905,7 @@ layers:
             temporal_event_track: crate::temporal::TemporalEventTrack::default(),
             gesture_track: None,
             performance_take: None,
+            alpha: None,
         };
         let mut job = ExportJob::start(patch, config, "videos");
 
@@ -19853,6 +20012,46 @@ mod effects_audit {
         }
     }
 
+    #[test]
+    fn straight_alpha_effect_state_reads_authored_ntsc_and_mosh_truth() {
+        let plan = |effects| collide_o_scope::alpha_export::AlphaExportPlan {
+            width: 16,
+            height: 16,
+            frame_count: 24,
+            fps_numerator: 24,
+            fps_denominator: 1,
+            artifact: collide_o_scope::alpha_export::AlphaArtifactKind::StraightPngAndFillKey,
+            effects,
+        };
+        let mut patch = base_patch();
+        let neutral = authored_alpha_effect_state(&patch);
+        assert!(!neutral.codec_mosh);
+        assert!(!neutral.final_program_vhs);
+        assert!(plan(neutral).validate().is_ok());
+        patch.ntsc.as_mut().unwrap().enabled = true;
+        let vhs = authored_alpha_effect_state(&patch);
+        assert!(vhs.final_program_vhs);
+        assert!(plan(vhs).validate().is_err(), "authored VHS must refuse");
+        patch.ntsc.as_mut().unwrap().enabled = false;
+        patch.temporal.as_mut().unwrap().mosh.amount = 0.5;
+        let mosh = authored_alpha_effect_state(&patch);
+        assert!(mosh.codec_mosh);
+        assert!(plan(mosh).validate().is_err(), "authored mosh must refuse");
+        // Absent sections are the exact pre-effect path and admit the plan.
+        patch.ntsc = None;
+        patch.temporal = None;
+        let absent = authored_alpha_effect_state(&patch);
+        assert!(!absent.codec_mosh && !absent.final_program_vhs);
+    }
+
+    #[test]
+    fn straight_alpha_destination_is_the_derived_sibling_generation() {
+        assert_eq!(
+            alpha_destination("renders/patch_1_1280x720.mp4"),
+            std::path::PathBuf::from("renders/patch_1_1280x720.mp4.alpha")
+        );
+    }
+
     fn render(label: &str, patch: PatchState) {
         render_with_gesture(label, patch, None);
     }
@@ -19881,6 +20080,7 @@ mod effects_audit {
             temporal_event_track: crate::temporal::TemporalEventTrack::default(),
             gesture_track,
             performance_take: None,
+            alpha: None,
         };
         let output_path = config.output_path.clone();
         let job = ExportJob::start(patch, config, "videos");
@@ -19912,6 +20112,7 @@ mod effects_audit {
             temporal_event_track: crate::temporal::TemporalEventTrack::default(),
             gesture_track: None,
             performance_take: None,
+            alpha: None,
         };
         let job = ExportJob::start(patch, config, library);
         while !job.is_done() {
@@ -19919,6 +20120,200 @@ mod effects_audit {
         }
         let err = job.progress.error.lock().unwrap().clone();
         assert!(err.is_empty(), "{label}: export failed: {err}");
+    }
+
+    /// D5's labeled export case. One real job publishes the MP4 and one
+    /// atomic straight+fill/key generation; the fill and key laws are then
+    /// re-derived from the published straight bytes and compared byte-exactly,
+    /// and the receipt's source hash is recomputed from the decoded PNGs. An
+    /// identical request under authored VHS refuses before anything exists,
+    /// and a plain run of the same patch measures the alpha overhead honestly.
+    /// Self-provisioning on the P4c precedent: the fixture generates its own
+    /// declared source clip instead of consuming an operator-provided one.
+    #[test]
+    #[ignore = "requires a GPU and FFmpeg on PATH; generates its own source clip"]
+    fn render_straight_alpha_action_pipeline() {
+        use sha2::Digest as _;
+        std::fs::create_dir_all("renders").unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "collideoscope-straight-alpha-audit-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("fixture library root");
+        let clip = root.join("straight_alpha.mp4");
+        crate::video::planar_gpu::write_declared_test_clip(&clip, 320, 180, 2.0)
+            .expect("declared source clip");
+        let library = root.to_string_lossy().into_owned();
+        // The alpha generation and the gesture sidecar are no-replace by law,
+        // so a previous fixture run's artifacts must be cleared up front —
+        // never mid-run.
+        for stale in [
+            "renders/audit_straight_alpha_refused.mp4",
+            "renders/audit_straight_alpha_action.mp4",
+            "renders/audit_straight_alpha_plain.mp4",
+        ] {
+            let _ = std::fs::remove_file(stale);
+            let _ = std::fs::remove_file(format!("{stale}.motion.json"));
+            let _ = std::fs::remove_dir_all(format!("{stale}.alpha"));
+        }
+        let alpha_config =
+            |label: &str, alpha: Option<collide_o_scope::alpha_export::AlphaArtifactKind>| {
+                ExportConfig {
+                    width: 320,
+                    height: 180,
+                    fps: 24,
+                    duration_secs: 1.0,
+                    output_path: format!("renders/audit_{label}.mp4"),
+                    audio_path: None,
+                    audio_path_hint: None,
+                    layer_source_hints: Vec::new(),
+                    analysis_audio_path_hint: None,
+                    ntsc_quality: NtscExportQuality::LiveParity,
+                    shutter_samples: ExportShutterSamples::Authored,
+                    media_safety_policy: MediaSafetyPolicy::default(),
+                    temporal_event_track: crate::temporal::TemporalEventTrack::default(),
+                    gesture_track: None,
+                    performance_take: None,
+                    alpha,
+                }
+            };
+        let alpha_patch = || {
+            let mut patch = base_patch();
+            patch.layers[0].filename = "straight_alpha.mp4".to_string();
+            patch.layers[0].clip_slots = crate::performance::ClipSlots::singleton(
+                crate::performance::ClipSlotConfig::from_legacy(
+                    "straight_alpha.mp4".to_string(),
+                    String::new(),
+                    1.0,
+                    30.0,
+                ),
+            );
+            patch
+        };
+        let run = |config: ExportConfig, patch: PatchState| {
+            let output = config.output_path.clone();
+            let started = std::time::Instant::now();
+            let job = ExportJob::start(patch, config, &library);
+            while !job.is_done() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let error = job.progress.error.lock().unwrap().clone();
+            (output, error, started.elapsed())
+        };
+
+        // Refusal: authored final-program VHS has no straight-alpha law, and
+        // the refusal happens before any output name or directory exists.
+        let mut vhs_patch = alpha_patch();
+        vhs_patch.ntsc.as_mut().unwrap().enabled = true;
+        let (refused_output, refused_error, _) = run(
+            alpha_config(
+                "straight_alpha_refused",
+                Some(collide_o_scope::alpha_export::AlphaArtifactKind::StraightPngSequence),
+            ),
+            vhs_patch,
+        );
+        assert!(
+            refused_error.contains("straight-alpha export refused"),
+            "expected the authored-VHS refusal, got: {refused_error}"
+        );
+        assert!(!std::path::Path::new(&refused_output).exists());
+        assert!(!std::path::Path::new(&format!("{refused_output}.alpha")).exists());
+
+        // The real generation.
+        let (output, error, alpha_elapsed) = run(
+            alpha_config(
+                "straight_alpha_action",
+                Some(collide_o_scope::alpha_export::AlphaArtifactKind::StraightPngAndFillKey),
+            ),
+            alpha_patch(),
+        );
+        assert!(error.is_empty(), "alpha export failed: {error}");
+        assert!(std::path::Path::new(&output).is_file());
+        let generation = std::path::PathBuf::from(format!("{output}.alpha"));
+        let receipt: collide_o_scope::alpha_export::AlphaExportReceipt = serde_json::from_slice(
+            &std::fs::read(generation.join("alpha-export-receipt.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            receipt.seam,
+            collide_o_scope::alpha_export::PRE_OPAQUE_STRAIGHT_ALPHA_V1
+        );
+        assert_eq!(receipt.frame_count, 24);
+        assert_eq!(receipt.width, 320);
+        assert_eq!(receipt.height, 180);
+
+        // Re-derive the fill/key laws from the published straight bytes and
+        // recompute the receipt's raw source hash from the decoded PNGs.
+        let mut raw_hash = sha2::Sha256::new();
+        for frame in 0..receipt.frame_count {
+            let name = format!("frame_{frame:08}.png");
+            let straight = image::open(generation.join("rgba").join(&name))
+                .unwrap()
+                .into_rgba8()
+                .into_raw();
+            raw_hash.update(&straight);
+            let mut expected = vec![0_u8; straight.len()];
+            collide_o_scope::alpha_export::derive_black_fill_rgba(&straight, &mut expected)
+                .unwrap();
+            let fill = image::open(generation.join("fill").join(&name))
+                .unwrap()
+                .into_rgba8()
+                .into_raw();
+            assert_eq!(fill, expected, "fill law diverged at frame {frame}");
+            collide_o_scope::alpha_export::derive_key_rgba(&straight, &mut expected).unwrap();
+            let key = image::open(generation.join("key").join(&name))
+                .unwrap()
+                .into_rgba8()
+                .into_raw();
+            assert_eq!(key, expected, "key law diverged at frame {frame}");
+        }
+        let recomputed = raw_hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>();
+        assert_eq!(
+            recomputed, receipt.raw_straight_rgba_sha256,
+            "the receipt hash must match the published straight bytes"
+        );
+
+        // FFV1 through the same action: the resolved host ffmpeg, the plate,
+        // and the receipt all arrive through one no-replace generation.
+        let _ = std::fs::remove_file("renders/audit_straight_alpha_ffv1.mp4");
+        let _ = std::fs::remove_file("renders/audit_straight_alpha_ffv1.mp4.motion.json");
+        let _ = std::fs::remove_dir_all("renders/audit_straight_alpha_ffv1.mp4.alpha");
+        let (ffv1_output, ffv1_error, _) = run(
+            alpha_config(
+                "straight_alpha_ffv1",
+                Some(collide_o_scope::alpha_export::AlphaArtifactKind::Ffv1Rgba),
+            ),
+            alpha_patch(),
+        );
+        assert!(
+            ffv1_error.is_empty(),
+            "FFV1 alpha export failed: {ffv1_error}"
+        );
+        let ffv1_generation = std::path::PathBuf::from(format!("{ffv1_output}.alpha"));
+        assert!(ffv1_generation.join("plate.mkv").is_file());
+        let ffv1_receipt: collide_o_scope::alpha_export::AlphaExportReceipt =
+            serde_json::from_slice(
+                &std::fs::read(ffv1_generation.join("alpha-export-receipt.json")).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            ffv1_receipt.artifact,
+            collide_o_scope::alpha_export::AlphaArtifactKind::Ffv1Rgba
+        );
+        assert_eq!(ffv1_receipt.storage_pixel_format, "FFV1_v3_GBRAP");
+
+        // The honest overhead measurement for the evidence note.
+        let (plain_output, plain_error, plain_elapsed) =
+            run(alpha_config("straight_alpha_plain", None), alpha_patch());
+        assert!(plain_error.is_empty(), "plain export failed: {plain_error}");
+        assert!(!std::path::Path::new(&format!("{plain_output}.alpha")).exists());
+        println!(
+            "straight-alpha action: alpha+mp4 {alpha_elapsed:?}, plain mp4 {plain_elapsed:?} over 24 frames at 320x180"
+        );
     }
 
     /// The P4c Phase B labeled export case: one video layer whose authored
@@ -21844,6 +22239,7 @@ mod effects_audit {
             temporal_event_track: crate::temporal::TemporalEventTrack::default(),
             gesture_track: None,
             performance_take,
+            alpha: None,
         };
         let output_path = config.output_path.clone();
         let job = ExportJob::start(patch, config, "videos");

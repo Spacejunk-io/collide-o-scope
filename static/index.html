@@ -1942,6 +1942,16 @@
                 <label title="Audio starts at source time zero at 1x; visual pause, speed, modulation, and looping do not alter it.">Audio (1x independent)</label>
                 <select id="export-audio"><option value="">None</option></select>
               </div>
+              <div class="param-row select-row">
+                <label title="Publishes a companion generation beside the MP4 from the straight-alpha seam before the opaque audience pass. Codec Mosh and final-program VHS have no proven alpha law and refuse the export.">Alpha plates</label>
+                <select id="export-alpha">
+                  <option value="" selected>None (MP4 only)</option>
+                  <option value="straight_png_sequence">Straight RGBA PNGs</option>
+                  <option value="fill_key_png_sequence">Fill + key PNGs</option>
+                  <option value="straight_png_and_fill_key">Straight + fill/key PNGs</option>
+                  <option value="ffv1_rgba">FFV1 lossless RGBA (MKV)</option>
+                </select>
+              </div>
               <div class="patch-capture-controls">
                 <button id="patch-capture" class="btn-export" type="button" title="Save the complete performance state">Capture snapshot</button>
                 <button id="patch-load-snapshot" class="btn-export" type="button" title="Replace sources, stack, transport, modulation, morph, and visual state from a patch">Load snapshot…</button>

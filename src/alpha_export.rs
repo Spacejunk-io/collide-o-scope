@@ -966,6 +966,49 @@ mod tests {
     }
 
     #[test]
+    fn d5_action_invokes_the_named_readback_guards_effects_and_publishes_last() {
+        let export_source = include_str!("render_export.rs");
+        // The acquisition wrapper is invoked by the frame loop, not merely
+        // retained: the name appears at its definition and at least one call.
+        assert!(
+            export_source
+                .matches("readback_pre_opaque_straight_alpha_v1(")
+                .count()
+                >= 2,
+            "the frame loop must invoke the named acquisition wrapper"
+        );
+        assert!(export_source.contains("alpha.write_frame(frame_num"));
+        // Both effect laws are re-checked per frame: a Morph or modulation
+        // wake aborts instead of publishing a mislabeled plate.
+        assert!(export_source.contains("became active at frame {frame_num}"));
+        assert!(export_source.contains("fn authored_alpha_effect_state"));
+        assert!(export_source.contains("mosh.sanitized().is_active()"));
+        assert!(export_source.contains("ntsc.enabled"));
+        // The alpha generation stages before the encoder starts and publishes
+        // strictly after the MP4 and every sidecar, so no failure path can
+        // leave a visible half-artifact.
+        let run = export_source
+            .find("fn run_export(")
+            .expect("offline export entry");
+        let begin = export_source[run..]
+            .find("AlphaActionPublisher::begin(")
+            .map(|offset| run + offset)
+            .expect("the action stages its generation");
+        let encoder = export_source[run..]
+            .find("let encoder = start_encoder_supervisor(")
+            .map(|offset| run + offset)
+            .expect("the MP4 encoder start");
+        assert!(begin < encoder);
+        let sidecar = export_source
+            .find("write_motion_sidecar_atomic(&config.output_path, &sidecar)?")
+            .expect("the sidecar publication");
+        let finish = export_source
+            .find("alpha.finish()?")
+            .expect("the alpha publication");
+        assert!(sidecar < finish);
+    }
+
+    #[test]
     #[ignore = "requires the pinned external FFmpeg executable"]
     fn d5_ffv1_gbrap_round_trips_exact_rgba() {
         let ffmpeg_dir = std::env::var_os("FFMPEG_DIR").expect("FFMPEG_DIR");

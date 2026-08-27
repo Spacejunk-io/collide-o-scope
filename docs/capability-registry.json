@@ -760,6 +760,53 @@
           ]
         },
         {
+          "key": "straight_alpha_key_fill",
+          "title": "Straight-alpha plate and fill/key export",
+          "platform": "windows",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_recording",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "d5-straight-alpha-export",
+            "d5-alpha-export-action-note"
+          ],
+          "known_limitations": [
+            {
+              "code": "alpha_effect_propagation_refused",
+              "text": "Codec-Mosh and final-program VHS have no proven straight-alpha propagation law: an export authoring either is refused up front, and a Morph or modulation wake mid-job aborts before anything publishes."
+            },
+            {
+              "code": "video_only_recorder",
+              "text": "The live recorder owns no alpha-capable encoder; alpha generations are an offline-export companion artifact only."
+            }
+          ]
+        },
+        {
           "key": "study_motion_abi_1_1",
           "title": "Study motion ABI 1.1",
           "platform": "windows",
@@ -1796,6 +1843,53 @@
           ]
         },
         {
+          "key": "straight_alpha_key_fill",
+          "title": "Straight-alpha plate and fill/key export",
+          "platform": "macos",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_recording",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "d5-straight-alpha-export",
+            "d5-alpha-export-action-note"
+          ],
+          "known_limitations": [
+            {
+              "code": "alpha_effect_propagation_refused",
+              "text": "Codec-Mosh and final-program VHS have no proven straight-alpha propagation law: an export authoring either is refused up front, and a Morph or modulation wake mid-job aborts before anything publishes."
+            },
+            {
+              "code": "video_only_recorder",
+              "text": "The live recorder owns no alpha-capable encoder; alpha generations are an offline-export companion artifact only."
+            }
+          ]
+        },
+        {
           "key": "study_motion_abi_1_1",
           "title": "Study motion ABI 1.1",
           "platform": "macos",
@@ -2828,6 +2922,53 @@
             {
               "code": "external_proof_required",
               "text": "An external receiver and target adapter are required for physical interoperability proof."
+            }
+          ]
+        },
+        {
+          "key": "straight_alpha_key_fill",
+          "title": "Straight-alpha plate and fill/key export",
+          "platform": "linux",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_recording",
+              "status": "deferred",
+              "reason": {
+                "kind": "deferred",
+                "detail": "backend_not_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "d5-straight-alpha-export",
+            "d5-alpha-export-action-note"
+          ],
+          "known_limitations": [
+            {
+              "code": "alpha_effect_propagation_refused",
+              "text": "Codec-Mosh and final-program VHS have no proven straight-alpha propagation law: an export authoring either is refused up front, and a Morph or modulation wake mid-job aborts before anything publishes."
+            },
+            {
+              "code": "video_only_recorder",
+              "text": "The live recorder owns no alpha-capable encoder; alpha generations are an offline-export companion artifact only."
             }
           ]
         },

@@ -23460,6 +23460,7 @@ impl App {
                 shutter_samples,
                 audio_layer,
                 audio_layer_id,
+                alpha,
             } => {
                 if matches!(
                     self.autopilot_scheduler.state(),
@@ -23574,6 +23575,7 @@ impl App {
                                 performance_track::PerformanceTakeDocument::capture(&take)
                             })
                         },
+                        alpha,
                     };
                     for layer in self
                         .layers

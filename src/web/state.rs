@@ -5468,6 +5468,11 @@ pub enum WebAction {
         audio_layer: Option<usize>,
         #[serde(default)]
         audio_layer_id: Option<String>,
+        /// D5 opt-in straight-alpha companion artifacts from the frozen
+        /// `pre_opaque_straight_alpha_v1` seam. Omitted legacy clients keep
+        /// the exact ordinary MP4 path; an unknown token rejects the action.
+        #[serde(default)]
+        alpha: Option<collide_o_scope::alpha_export::AlphaArtifactKind>,
     },
     /// Cancel a running export
     #[serde(rename = "cancel_export")]
@@ -8147,6 +8152,52 @@ mod protocol_tests {
         ));
         assert!(serde_json::from_str::<WebAction>(
             r#"{"action":"start_export","width":1280,"height":720,"fps":30,"duration_secs":1,"shutter_samples":"samples_2"}"#
+        )
+        .is_err());
+        // D5: the omitted field is the exact prior path, every closed alpha
+        // token parses, null is None, and an unknown token rejects the action.
+        assert!(matches!(
+            serde_json::from_str::<WebAction>(
+                r#"{"action":"start_export","width":1280,"height":720,"fps":30,"duration_secs":1}"#,
+            )
+            .unwrap(),
+            WebAction::StartExport { alpha: None, .. }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<WebAction>(
+                r#"{"action":"start_export","width":1280,"height":720,"fps":30,"duration_secs":1,"alpha":null}"#,
+            )
+            .unwrap(),
+            WebAction::StartExport { alpha: None, .. }
+        ));
+        for (token, expected) in [
+            (
+                "straight_png_sequence",
+                collide_o_scope::alpha_export::AlphaArtifactKind::StraightPngSequence,
+            ),
+            (
+                "fill_key_png_sequence",
+                collide_o_scope::alpha_export::AlphaArtifactKind::FillKeyPngSequence,
+            ),
+            (
+                "straight_png_and_fill_key",
+                collide_o_scope::alpha_export::AlphaArtifactKind::StraightPngAndFillKey,
+            ),
+            (
+                "ffv1_rgba",
+                collide_o_scope::alpha_export::AlphaArtifactKind::Ffv1Rgba,
+            ),
+        ] {
+            let action: WebAction = serde_json::from_str(&format!(
+                r#"{{"action":"start_export","width":1280,"height":720,"fps":30,"duration_secs":1,"alpha":"{token}"}}"#,
+            ))
+            .unwrap();
+            assert!(
+                matches!(action, WebAction::StartExport { alpha: Some(kind), .. } if kind == expected)
+            );
+        }
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"start_export","width":1280,"height":720,"fps":30,"duration_secs":1,"alpha":"premultiplied_png"}"#
         )
         .is_err());
     }
