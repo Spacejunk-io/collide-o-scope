@@ -2,8 +2,9 @@
 //!
 //! This module introduces **no** geometry of its own. Every drag resolves to
 //! absolute values in the exact `param` vocabulary the browser's
-//! `set_layer_transform` / `set_master_transform` actions already carry, and
-//! the host feeds them through the one authoring function those actions use.
+//! `set_layer_transform` / `set_master_transform` / `set_group_transform`
+//! actions already carry, and the host feeds them through the one authoring
+//! function those actions use.
 //! A gizmo that could author something the numeric editor cannot author would
 //! be a second authored geometry wearing a handle, which the spatial contract
 //! forbids; keeping the vocabulary closed and shared makes that impossible by
@@ -39,6 +40,7 @@ use crate::spatial::{
     SCALE_MIN,
 };
 use crate::stage_map::{native_controls_visible, StageSurface};
+use crate::visual_rack::GroupId;
 
 /// Divisor applied to every handle's delta while Alt is held.
 ///
@@ -151,16 +153,18 @@ pub use permit::{preview_gizmo_permit, PreviewGizmoPermit};
 
 /// The scopes a preview gizmo may address.
 ///
-/// Master and layer are exactly the scopes the browser numeric editor can
-/// author, through `set_master_transform` and `set_layer_transform`. A group
-/// carries a `SpatialTransform` in the composition model but has no interactive
-/// authoring action at all, so a group handle would author something no other
-/// controller can — the defect this module exists to avoid. Adding one is a
-/// wire and protocol change, not a gizmo change.
+/// These are exactly the scopes the browser numeric editor can author, through
+/// `set_master_transform`, `set_layer_transform`, and `set_group_transform`.
+/// A group is identified only by its stable [`GroupId`]: it never carries a
+/// member-layer identity, so a host cannot silently turn a missing group into
+/// a drag on one of its former members. Scope selection and stale-ID refusal
+/// remain host responsibilities; the portable geometry layer only retains the
+/// exact identity it was given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GizmoScope {
     Master,
     Layer(StableLayerId),
+    Group(GroupId),
 }
 
 /// Which corner of the footprint a scale drag is driven from.
@@ -552,8 +556,11 @@ impl GizmoFrame {
     ///
     /// `source_dimensions` and `output_dimensions` must be exactly what
     /// `EffectPassUniforms::for_target` passes for the same scope — a layer's
-    /// actual source size, or the output size twice for master. Anything else
-    /// would place handles on a transform nobody renders.
+    /// actual source size, or the output size twice for master and group.
+    /// Group materialization transforms the already-composited, output-sized
+    /// group surface; using any member's source dimensions would therefore
+    /// place handles on geometry nobody renders. Anything else would place
+    /// handles on a transform nobody renders.
     ///
     /// Returns `None` for the same conditions the shader treats as
     /// unrenderable: a collapsed or singular transform, a zero dimension, or a
@@ -1809,6 +1816,7 @@ mod tests {
     #[test]
     fn a_drag_captures_its_scope_and_cannot_retarget() {
         let layer = StableLayerId::new(77).unwrap();
+        let group = GroupId::new(91).unwrap();
         let frame = frame_for(SpatialTransform::default(), SQUARE, SQUARE);
         let (drag, _) =
             GizmoDrag::begin(GizmoScope::Layer(layer), frame, move_handle(&frame)).unwrap();
@@ -1816,6 +1824,39 @@ mod tests {
         // The captured transform is immutable for the life of the drag, so a
         // later authored change cannot be read back into the drag's own math.
         assert_eq!(drag.captured(), SpatialTransform::default());
+
+        let (group_drag, _) =
+            GizmoDrag::begin(GizmoScope::Group(group), frame, move_handle(&frame)).unwrap();
+        assert_eq!(group_drag.scope(), GizmoScope::Group(group));
+        assert_eq!(group_drag.captured(), SpatialTransform::default());
+    }
+
+    #[test]
+    fn a_group_frame_uses_the_output_sized_composite_not_member_geometry() {
+        let group = GroupId::new(91).unwrap();
+        let transform = SpatialTransform {
+            position: [0.2, -0.15],
+            scale: [0.75, 1.25],
+            rotation_deg: 23.0,
+            fit: FitMode::Fit,
+            ..SpatialTransform::default()
+        };
+        let output_frame = frame_for(transform, WIDE, WIDE);
+        let member_sized_frame = frame_for(transform, SOURCE_43, WIDE);
+        let (drag, _) = GizmoDrag::begin(
+            GizmoScope::Group(group),
+            output_frame,
+            move_handle(&output_frame),
+        )
+        .unwrap();
+
+        assert_eq!(drag.scope(), GizmoScope::Group(group));
+        assert_eq!(drag.captured(), transform.sanitized());
+        assert_ne!(
+            bytemuck::bytes_of(&output_frame.uniforms()),
+            bytemuck::bytes_of(&member_sized_frame.uniforms()),
+            "a member's source aspect must not masquerade as group geometry"
+        );
     }
 
     // ---- nudges ---------------------------------------------------------

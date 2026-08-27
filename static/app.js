@@ -230,7 +230,7 @@ let outputRequestSequence = 0;
 
 const QUANTIZABLE_ACTIONS = new Set([
   'set_param', 'set_master_transform', 'set_layer_param', 'set_layer_effect',
-  'set_layer_transform', 'set_ntsc_param', 'set_temporal',
+  'set_layer_transform', 'set_group_transform', 'set_ntsc_param', 'set_temporal',
   'set_clip_transport', 'set_clip_cue', 'set_layer_matte_param',
   'set_visual_node_param', 'set_composition_group_param',
   'set_composition_group_matte_param', 'set_composition_bus_crossfade',
@@ -583,6 +583,8 @@ const creativeBusCrossfadeValue = document.getElementById('creative-bus-crossfad
 const creativeGroupCreate = document.getElementById('creative-group-create');
 const creativeGroupName = document.getElementById('creative-group-name');
 const creativeGroupMembers = document.getElementById('creative-group-members');
+const creativeGroupGizmoRelease = document.getElementById('creative-group-gizmo-release');
+const creativeGroupGizmoReleaseStatus = document.getElementById('creative-group-gizmo-release-status');
 let creativeStructureKey = '';
 
 const CREATIVE_NODE_INFO = Object.freeze({
@@ -772,25 +774,6 @@ const CREATIVE_NODE_PARAMS = Object.freeze({
     enumDef('avalanche_axis', 'Axis', [['sub', 'Sub (row)'], ['up', 'Up (column)'], ['average', 'Average (diagonal)']]),
   ],
 });
-
-const GROUP_TRANSFORM_FIELDS = Object.freeze([
-  floatDef('position_x', 'Position X', -4, 4, 0.01),
-  floatDef('position_y', 'Position Y', -4, 4, 0.01),
-  floatDef('scale_x', 'Scale X', -16, 16, 0.01),
-  floatDef('scale_y', 'Scale Y', -16, 16, 0.01),
-  floatDef('anchor_x', 'Anchor X', -2, 3, 0.01),
-  floatDef('anchor_y', 'Anchor Y', -2, 3, 0.01),
-  floatDef('rotation_deg', 'Rotation', -180, 180, 0.1),
-  floatDef('skew_deg', 'Skew', -89, 89, 0.1),
-  floatDef('skew_axis_deg', 'Skew axis', -180, 180, 0.1),
-  floatDef('crop_left', 'Crop left', 0, 1, 0.001),
-  floatDef('crop_top', 'Crop top', 0, 1, 0.001),
-  floatDef('crop_right', 'Crop right', 0, 1, 0.001),
-  floatDef('crop_bottom', 'Crop bottom', 0, 1, 0.001),
-  enumDef('fit', 'Fit', [['stretch', 'Stretch'], ['fit', 'Fit'], ['fill', 'Fill'], ['native', 'Native']]),
-  enumDef('edge', 'Edge', [['transparent', 'Transparent'], ['clamp', 'Clamp'], ['repeat', 'Repeat'], ['mirror', 'Mirror']]),
-  enumDef('sampling', 'Sampling', [['linear', 'Linear'], ['nearest', 'Nearest']]),
-]);
 
 function creativeScopeWire(value = creativeRackScope?.value || 'master') {
   if (value.startsWith('layer:')) return { scope: 'layer', layer_id: value.slice(6) };
@@ -1279,23 +1262,37 @@ function renderCreativeRack() {
   });
 }
 
-function groupTransformValue(transform, param) {
-  const value = transform || {};
-  const components = {
-    position_x: value.position?.[0], position_y: value.position?.[1],
-    scale_x: value.scale?.[0], scale_y: value.scale?.[1],
-    anchor_x: value.anchor?.[0], anchor_y: value.anchor?.[1],
-    crop_left: value.crop?.[0], crop_top: value.crop?.[1],
-    crop_right: value.crop?.[2], crop_bottom: value.crop?.[3],
-  };
-  return Object.hasOwn(components, param) ? components[param] : value[param];
+function currentCreativeGroup(card) {
+  const groupId = String(card?.dataset.groupId || '');
+  if (!groupId) return null;
+  return (latestCreative?.groups || []).find(
+    (candidate) => String(candidate.group_id) === groupId
+  ) || null;
 }
 
-function wireGroupControl(card, group, param, eventName = 'input') {
+function sendCurrentGroupTransform(card, action, pending) {
+  const group = currentCreativeGroup(card);
+  if (!group) {
+    creativeSetStatus('Group transform target is no longer present.', true);
+    return false;
+  }
+  return creativeSend({
+    ...action,
+    group_id: String(group.group_id),
+    composition_revision: compositionRevision,
+  }, pending);
+}
+
+function wireGroupControl(card, param, eventName = 'input') {
   const row = card.querySelector(`[data-group-param="${param}"]`);
   const input = row?.querySelector('input,select');
   if (!input) return;
   input.addEventListener(eventName, () => {
+    const group = currentCreativeGroup(card);
+    if (!group) {
+      creativeSetStatus('Group target is no longer present.', true);
+      return;
+    }
     let value = input.type === 'checkbox' ? input.checked : (input.type === 'range' ? Number(input.value) : input.value);
     if (param === 'name') {
       value = String(value).replace(/[\u0000-\u001f\u007f]/g, '').trim();
@@ -1325,7 +1322,7 @@ function renderCreativeGroups() {
       const id = String(layer.layer_id);
       return `<option value="${escapeHtml(id)}" ${(group.member_layer_ids || []).map(String).includes(id) ? 'selected' : ''}>${escapeHtml(creativeLayerLabel(id))}</option>`;
     }).join('');
-    const transformControls = GROUP_TRANSFORM_FIELDS.map((def) => `<div data-group-param="${def.key}">${creativeControlHtml(def, groupTransformValue(group.transform, def.key))}</div>`).join('');
+    const transformControls = groupTransformControlsHtml(group);
     const matte = group.matte;
     const matteBody = matte ? `${creativeRouteEditorHtml(matte.route, matte.channel, matte.invert)}
       ${creativeControlHtml(floatDef('amount', 'Matte amount', 0, 1, 0.001), matte.amount)}
@@ -1346,7 +1343,7 @@ function renderCreativeGroups() {
       <label class="creative-control" data-group-param="bypass"><span>Processing bypass</span><input type="checkbox" ${group.bypass ? 'checked' : ''}><output>${group.bypass ? 'on' : 'off'}</output></label>
       <label class="creative-control creative-control-wide creative-group-members"><span>Members</span><select multiple size="3">${memberOptions}</select><output></output></label>
     </div>
-    <details><summary class="creative-subtitle">GROUP TRANSFORM</summary><div class="creative-group-controls">${transformControls}</div></details>
+    <details><summary class="creative-subtitle">GROUP TRANSFORM</summary><div class="creative-group-transform spatial-transform-body" role="region" aria-label="${escapeHtml(group.name || `Group ${group.group_id}`)} (#${escapeHtml(group.group_id)}) transform">${transformControls}</div></details>
     <details><summary class="creative-subtitle">GROUP MATTE</summary><label class="creative-control"><span>Enabled</span><input class="creative-group-matte-enabled" type="checkbox" ${matte ? 'checked' : ''}><output>${matte ? 'on' : 'off'}</output></label><div class="creative-matte-controls">${matteBody}</div></details>`;
     creativeGroups.appendChild(card);
     card.querySelector('.creative-group-rack').addEventListener('click', () => {
@@ -1356,12 +1353,35 @@ function renderCreativeGroups() {
       document.getElementById('creative-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
     card.querySelector('.creative-group-remove').addEventListener('click', () => creativeSend({ action: 'remove_composition_group', group_id: String(group.group_id), composition_revision: compositionRevision }, 'Ungrouping without deleting member layers…'));
-    wireGroupControl(card, group, 'name', 'change');
-    wireGroupControl(card, group, 'opacity');
-    wireGroupControl(card, group, 'bus', 'change');
-    wireGroupControl(card, group, 'solo', 'change');
-    wireGroupControl(card, group, 'bypass', 'change');
-    for (const def of GROUP_TRANSFORM_FIELDS) wireGroupControl(card, group, def.key, def.type === 'enum' ? 'change' : 'input');
+    wireGroupControl(card, 'name', 'change');
+    wireGroupControl(card, 'opacity');
+    wireGroupControl(card, 'bus', 'change');
+    wireGroupControl(card, 'solo', 'change');
+    wireGroupControl(card, 'bypass', 'change');
+    wireTransformPanel(card.querySelector('.creative-group-transform'), {
+      stateKey: `group:${group.group_id}`,
+      getTransform: () => currentCreativeGroup(card)?.transform,
+      set: (param, value) => sendCurrentGroupTransform(
+        card,
+        { action: 'set_group_transform', param, value },
+        `Applying group ${param.replaceAll('_', ' ')}…`
+      ),
+      reset: () => sendCurrentGroupTransform(
+        card,
+        { action: 'reset_group_transform' },
+        'Resetting group transform…'
+      ),
+      apply: (transform) => sendCurrentGroupTransform(
+        card,
+        { action: 'apply_group_transform', transform },
+        'Applying complete group transform…'
+      ),
+      targetGizmo: () => sendCurrentGroupTransform(
+        card,
+        { action: 'target_group_transform_gizmo' },
+        'Targeting this group in the preview gizmo for the current control session…'
+      ),
+    });
     const memberSelect = card.querySelector('.creative-group-members select');
     memberSelect.addEventListener('change', () => creativeSend({
       action: 'set_composition_group_members', group_id: String(group.group_id), member_layer_ids: [...memberSelect.selectedOptions].map((option) => option.value), composition_revision: compositionRevision,
@@ -1446,7 +1466,7 @@ function syncCreativeRenderedValues() {
     for (const [param, value] of [['name', group.name], ['opacity', group.opacity], ['bus', group.bus], ['solo', group.solo], ['bypass', group.bypass]]) {
       creativeSyncRow(card.querySelector(`[data-group-param="${param}"]`), value);
     }
-    for (const def of GROUP_TRANSFORM_FIELDS) creativeSyncRow(card.querySelector(`[data-group-param="${def.key}"]`), groupTransformValue(group.transform, def.key));
+    syncTransformPanel(card.querySelector('.creative-group-transform'), group.transform);
     if (group.matte) {
       for (const param of ['amount', 'threshold', 'softness']) creativeSyncRow(card.querySelector(`.creative-matte-controls [data-creative-param="${param}"]`), group.matte[param]);
     }
@@ -1501,6 +1521,14 @@ function creativeSnapshotStructure(creative, selectedScope) {
 
 function syncCreative(creative) {
   latestCreative = creative || { master_rack: { nodes: [] }, layer_racks: [], groups: [], root: [], bus_crossfade: 0.5 };
+  const liveGroupTransformKeys = new Set(
+    (latestCreative.groups || []).map((group) => `group:${group.group_id}`)
+  );
+  for (const key of spatialTransformUiState.keys()) {
+    if (String(key).startsWith('group:') && !liveGroupTransformKeys.has(key)) {
+      spatialTransformUiState.delete(key);
+    }
+  }
   if (creativeRevision) creativeRevision.textContent = `composition ${compositionRevision}`;
   const currentScope = creativeRackScope?.value || 'master';
   const scopeOptions = [['master', 'Master']];
@@ -1629,6 +1657,19 @@ creativeGroupCreate?.addEventListener('submit', (event) => {
   }
 });
 
+creativeGroupGizmoRelease?.addEventListener('click', () => {
+  const sent = creativeSend({
+    action: 'clear_group_transform_gizmo_target',
+    composition_revision: compositionRevision,
+  }, 'Group gizmo target release requested for this control session; the current master or layer scope can recover.');
+  if (creativeGroupGizmoReleaseStatus) {
+    creativeGroupGizmoReleaseStatus.textContent = sent
+      ? 'Release requested. The preview gizmo can recover the current master or layer scope for this control session.'
+      : 'Control connection is offline; the group gizmo target was not released.';
+    creativeGroupGizmoReleaseStatus.classList.toggle('error', !sent);
+  }
+});
+
 function layerBlendOptionsHtml(selected) {
   const selectedKey = layerBlendModeInfo(selected).key;
   return LAYER_BLEND_MODES.map((mode) =>
@@ -1722,6 +1763,12 @@ function decimalPlaces(value) {
   return Math.max(0, fraction - exponent);
 }
 
+function rangeValuePrecision(step, base = 0) {
+  return Number.isFinite(step)
+    ? Math.min(12, Math.max(decimalPlaces(step), decimalPlaces(base)))
+    : 3;
+}
+
 function rangeBounds(slider) {
   const min = Number.parseFloat(slider.min);
   const max = Number.parseFloat(slider.max);
@@ -1751,8 +1798,9 @@ function normalizeRangeValue(slider, rawValue) {
     const base = Number.isFinite(min) ? min : 0;
     value = base + Math.round((value - base) / step) * step;
     value = Math.min(max, Math.max(min, value));
-    const precision = Math.min(12, Math.max(decimalPlaces(step), decimalPlaces(base)));
-    value = Number(value.toFixed(precision));
+    value = Number(value.toFixed(rangeValuePrecision(step, base)));
+    // Decimal formatting must never round the exact crop ceiling up to 1.
+    value = Math.min(max, Math.max(min, value));
   }
   return Number.isFinite(value) ? value : null;
 }
@@ -1760,9 +1808,9 @@ function normalizeRangeValue(slider, rawValue) {
 function formatRangeValue(slider, rawValue) {
   const value = normalizeRangeValue(slider, rawValue);
   if (value === null) return '';
-  const { step } = rangeBounds(slider);
-  const precision = Number.isFinite(step) ? Math.min(6, decimalPlaces(step)) : 3;
-  return value.toFixed(precision);
+  const { min, step } = rangeBounds(slider);
+  const base = Number.isFinite(min) ? min : 0;
+  return value.toFixed(rangeValuePrecision(step, base));
 }
 
 function rangeControlLabel(slider) {
@@ -2140,16 +2188,16 @@ const TRANSFORM_RANGE_SPECS = [
   ['rotation_deg', 'Rotation °', -180, 180, 0.1, 0],
   ['skew_deg', 'Skew °', -89, 89, 0.1, 0],
   ['skew_axis_deg', 'Skew Axis °', -180, 180, 0.1, 0],
-  ['crop_left', 'Crop Left', 0, 0.999, 0.001, 0],
-  ['crop_top', 'Crop Top', 0, 0.999, 0.001, 0],
-  ['crop_right', 'Crop Right', 0, 0.999, 0.001, 0],
-  ['crop_bottom', 'Crop Bottom', 0, 0.999, 0.001, 0],
+  ['crop_left', 'Crop Left', 0, 0.999755859375, 0.000244140625, 0],
+  ['crop_top', 'Crop Top', 0, 0.999755859375, 0.000244140625, 0],
+  ['crop_right', 'Crop Right', 0, 0.999755859375, 0.000244140625, 0],
+  ['crop_bottom', 'Crop Bottom', 0, 0.999755859375, 0.000244140625, 0],
 ];
 
 const TRANSFORM_RANGE_DEFAULTS = Object.fromEntries(
   TRANSFORM_RANGE_SPECS.map(([param, , , , , fallback]) => [param, fallback])
 );
-const layerTransformUiState = new Map();
+const spatialTransformUiState = new Map();
 let latestMasterTransform = cloneSpatialTransform(LEGACY_SPATIAL_TRANSFORM);
 let spatialTransformClipboard = null;
 
@@ -2224,12 +2272,12 @@ function spatialTransformPreset(name) {
 }
 
 function transformRowParam(row) {
-  return row?.dataset.masterTransform || row?.dataset.layerTransform || '';
+  return row?.dataset.masterTransform || row?.dataset.layerTransform || row?.dataset.groupTransform || '';
 }
 
 function transformRow(panel, param) {
   return panel?.querySelector(
-    `[data-master-transform="${param}"], [data-layer-transform="${param}"]`
+    `[data-master-transform="${param}"], [data-layer-transform="${param}"], [data-group-transform="${param}"]`
   );
 }
 
@@ -2254,7 +2302,7 @@ function updateTransformRangeDisplay(slider) {
 function syncTransformPanel(panel, transform) {
   if (!panel) return;
   const normalized = normalizeSpatialTransform(transform);
-  panel.querySelectorAll('[data-master-transform], [data-layer-transform]').forEach((row) => {
+  panel.querySelectorAll('[data-master-transform], [data-layer-transform], [data-group-transform]').forEach((row) => {
     const param = transformRowParam(row);
     const value = transformFieldValue(normalized, param);
     const control = row.querySelector('input[type="range"],select');
@@ -2281,15 +2329,15 @@ function wireTransformPanel(panel, api) {
   panel.dataset.transformWired = 'true';
   const link = panel.querySelector('.transform-scale-link');
   if (api.stateKey) {
-    const remembered = layerTransformUiState.get(api.stateKey);
+    const remembered = spatialTransformUiState.get(api.stateKey);
     link.checked = remembered?.scaleLinked
       ?? Math.abs(transformFieldValue(api.getTransform(), 'scale_x') - transformFieldValue(api.getTransform(), 'scale_y')) < 1e-6;
     link.addEventListener('change', () => {
-      layerTransformUiState.set(api.stateKey, { scaleLinked: link.checked });
+      spatialTransformUiState.set(api.stateKey, { scaleLinked: link.checked });
     });
   }
 
-  panel.querySelectorAll('[data-master-transform], [data-layer-transform]').forEach((row) => {
+  panel.querySelectorAll('[data-master-transform], [data-layer-transform], [data-group-transform]').forEach((row) => {
     const param = transformRowParam(row);
     const control = row.querySelector('input[type="range"],select');
     if (!control) return;
@@ -2345,6 +2393,14 @@ function wireTransformPanel(panel, api) {
       api.apply(transform)
         ? 'Transform preset requested.'
         : 'Control connection is offline; preset was not sent.'
+      );
+  });
+  panel.querySelector('.transform-target-gizmo')?.addEventListener('click', () => {
+    setTransformPanelStatus(
+      panel,
+      api.targetGizmo?.()
+        ? 'Preview gizmo target requested for this control session.'
+        : 'Control connection is offline; the preview gizmo target was not changed.'
     );
   });
   bindRangeEditors(panel);
@@ -2352,29 +2408,50 @@ function wireTransformPanel(panel, api) {
   updateTransformPasteButtons();
 }
 
-function layerTransformControlsHtml(index) {
+function spatialTransformControlsHtml(scope, accessibleLabel) {
+  const rowAttribute = (param) => scope === 'group'
+    ? `data-group-transform="${param}"`
+    : `data-layer-transform="${param}"`;
+  const fitAttribute = scope === 'group' ? 'data-group-transform="fit"' : 'data-layer-transform="fit"';
+  const edgeAttribute = scope === 'group' ? 'data-group-transform="edge"' : 'data-layer-transform="edge"';
+  const samplingAttribute = scope === 'group' ? 'data-group-transform="sampling"' : 'data-layer-transform="sampling"';
+  const ariaScope = escapeHtml(accessibleLabel);
+  const targetGizmo = scope === 'group'
+    ? `<button type="button" class="transform-target-gizmo" aria-label="Target ${ariaScope} in the preview transform gizmo for this control session" title="Session-only preview gizmo target">Target gizmo</button>`
+    : '';
   const ranges = TRANSFORM_RANGE_SPECS.map(([param, label, min, max, step, fallback]) => `
-    <div class="param-row" data-layer-transform="${param}">
-      <label>${label}</label><input type="range" min="${min}" max="${max}" step="${step}" value="${fallback}" aria-label="Layer ${index + 1} ${label}"><span class="value">${formatValue(fallback, min, max, step)}</span>
+    <div class="param-row" ${rowAttribute(param)}>
+      <label>${label}</label><input type="range" min="${min}" max="${max}" step="${step}" value="${fallback}" aria-label="${ariaScope} ${label}"><span class="value">${formatValue(fallback, min, max, step)}</span>
     </div>`).join('');
   return `
-    <div class="transform-toolbar" role="group" aria-label="Layer ${index + 1} transform commands">
+    <div class="transform-toolbar" role="group" aria-label="${ariaScope} transform commands">
       <button type="button" class="transform-reset" title="Reset to the legacy full-frame identity">Reset</button>
       <button type="button" class="transform-copy">Copy</button>
       <button type="button" class="transform-paste">Paste</button>
+      ${targetGizmo}
       <label class="transform-preset-label">Preset
-        <select class="transform-preset" aria-label="Layer ${index + 1} transform preset">
+        <select class="transform-preset" aria-label="${ariaScope} transform preset">
           <option value="">Choose…</option><option value="identity">Identity</option><option value="center_fit">Center Fit</option><option value="center_fill">Center Fill</option><option value="native">Native 1:1</option><option value="mirror_x">Mirror X</option><option value="mirror_y">Mirror Y</option>
         </select>
       </label>
     </div>
     ${ranges}
-    <div class="param-row toggle-row transform-scale-link-row"><label>Link scale</label><label class="toggle"><input type="checkbox" class="transform-scale-link" aria-label="Link layer ${index + 1} scale axes"><span class="toggle-slider"></span></label></div>
-    <div class="param-row select-row" data-layer-transform="fit"><label>Fit</label><select aria-label="Layer ${index + 1} media fit"><option value="stretch">Stretch</option><option value="fit">Fit</option><option value="fill">Fill</option><option value="native">Native</option></select></div>
-    <div class="param-row select-row" data-layer-transform="edge"><label>Edge</label><select aria-label="Layer ${index + 1} edge mode"><option value="transparent">Transparent</option><option value="clamp">Clamp</option><option value="repeat">Repeat</option><option value="mirror">Mirror</option></select></div>
-    <div class="param-row select-row" data-layer-transform="sampling"><label>Sampling</label><select aria-label="Layer ${index + 1} sampling mode"><option value="linear">Linear</option><option value="nearest">Nearest</option></select></div>
+    <div class="param-row toggle-row transform-scale-link-row"><label>Link scale</label><label class="toggle"><input type="checkbox" class="transform-scale-link" aria-label="Link ${ariaScope} scale axes"><span class="toggle-slider"></span></label></div>
+    <div class="param-row select-row" ${fitAttribute}><label>Fit</label><select aria-label="${ariaScope} media fit"><option value="stretch">Stretch</option><option value="fit">Fit</option><option value="fill">Fill</option><option value="native">Native</option></select></div>
+    <div class="param-row select-row" ${edgeAttribute}><label>Edge</label><select aria-label="${ariaScope} edge mode"><option value="transparent">Transparent</option><option value="clamp">Clamp</option><option value="repeat">Repeat</option><option value="mirror">Mirror</option></select></div>
+    <div class="param-row select-row" ${samplingAttribute}><label>Sampling</label><select aria-label="${ariaScope} sampling mode"><option value="linear">Linear</option><option value="nearest">Nearest</option></select></div>
     <div class="audio-status">Position uses composition dimensions; anchor and crop use source fractions. Zero scale fails closed to transparent.</div>
     <div class="transform-status" role="status" aria-live="polite"></div>`;
+}
+
+function layerTransformControlsHtml(index) {
+  return spatialTransformControlsHtml('layer', `Layer ${index + 1}`);
+}
+
+function groupTransformControlsHtml(group) {
+  const groupId = String(group?.group_id || '');
+  const groupName = String(group?.name || `Group ${groupId}`);
+  return spatialTransformControlsHtml('group', `${groupName} (#${groupId})`);
 }
 
 const masterTransformPanel = document.getElementById('master-transform-body');
@@ -3589,8 +3666,10 @@ function syncLayers(layers) {
   for (const key of layerDisclosureState.keys()) {
     if (!liveDisclosureKeys.has(key)) layerDisclosureState.delete(key);
   }
-  for (const key of layerTransformUiState.keys()) {
-    if (!liveDisclosureKeys.has(key)) layerTransformUiState.delete(key);
+  for (const key of spatialTransformUiState.keys()) {
+    if (!String(key).startsWith('group:') && !liveDisclosureKeys.has(key)) {
+      spatialTransformUiState.delete(key);
+    }
   }
   syncExportAudioLayers(layers);
   syncLibrarySlotTargets(layers);
@@ -8781,6 +8860,8 @@ function syncRemote(url, status) {
 
 function formatValue(v, min, max, step) {
   if (step >= 1) return v.toFixed(0);
+  const exactPrecision = rangeValuePrecision(Number(step), Number(min));
+  if (exactPrecision > 3) return v.toFixed(exactPrecision);
   if (max <= 1 && min >= -1) return v.toFixed(2);
   if (step >= 0.01) return v.toFixed(1);
   return v.toFixed(3);

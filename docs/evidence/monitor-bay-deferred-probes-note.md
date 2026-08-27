@@ -167,9 +167,12 @@ final run; focused and opt-in receipts do not replace it.
 ## Closing fields
 
 - Topic implementation commit: **`6aa9d94`**
-- Topic receipt commit: **PENDING**
-- Integration commit on `feat/web-control-panel`: **PENDING**
-- Exact-commit CI: **PENDING**
+- Topic receipt commit: **`c5e9226`**
+- Integration commit on `feat/web-control-panel`: **`0b5584e`**
+- Exact-commit CI: **OBSERVED PASS** — run `33044395445` at `0b5584e`;
+  `scripts/check-ci-status.py` reported
+  `complete-suites green=1 failed=0 pending=0` after Linux 24.04, macOS 15,
+  Windows VS 2022, and dependency policy all completed successfully
 - Hosted full gate: **OBSERVED PASS** — the exact six-command CI-form gate
   passed: formatting and both JavaScript parsers; all-target/all-feature
   compile; 2,132 tests passed with zero failures and 163 explicitly ignored

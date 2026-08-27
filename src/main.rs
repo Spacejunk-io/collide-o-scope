@@ -5484,6 +5484,11 @@ struct App {
     accepted_creative_surface_layers: Option<u32>,
     layers: Vec<Layer>,
     selected_layer: Option<usize>,
+    /// Explicit session-only group target for the preview transform gizmo,
+    /// paired with the exact composition generation that witnessed it.
+    /// Stable group identity always wins over layer selection while current;
+    /// it is never persisted, recorded, or inferred from a member layer.
+    transform_gizmo_group_target: Option<(visual_rack::GroupId, u64)>,
     /// The proxy cache, opened lazily on first use (a Y-key encode request or
     /// a patch-load consultation). Opening performs the crash-recovery scan.
     /// `None` means not yet opened; an open failure is remembered separately
@@ -5733,6 +5738,10 @@ struct App {
     /// nothing about an in-flight drag is re-read from live state. A topology
     /// barrier aborts it rather than letting it land on a different program.
     transform_gizmo_drag: Option<transform_gizmo::GizmoDrag>,
+    /// Composition topology generation captured when a group drag begins.
+    /// Every move and pre-commit restore reuses this exact value so a stale
+    /// drag can never bless itself with a newer generation.
+    transform_gizmo_composition_revision: Option<u64>,
     /// Routes the gizmo's pointer edges onto exactly one manual-history entry,
     /// through the same tested router the etch surface uses rather than a
     /// second open/close law written beside it.
@@ -6193,6 +6202,7 @@ impl App {
             accepted_creative_surface_layers: None,
             layers: Vec::new(),
             selected_layer: None,
+            transform_gizmo_group_target: None,
             proxy_store: None,
             proxy_store_error: None,
             proxy_encode_worker: None,
@@ -6293,6 +6303,7 @@ impl App {
             gesture_history: history::GestureHistoryRouter::default(),
             gesture_history_open: None,
             transform_gizmo_drag: None,
+            transform_gizmo_composition_revision: None,
             transform_gizmo_history: history::GestureHistoryRouter::default(),
             transform_gizmo_history_open: None,
             transform_gizmo_hover: None,
@@ -6446,6 +6457,12 @@ impl App {
     }
 
     fn bump_composition_revision(&mut self) {
+        // Settle before advancing the generation: an untouched drag is
+        // abandoned, while values already authored by a committed drag retain
+        // their one undo entry. The target keeps its old witness as a
+        // tombstone, so even a same-numbered group in the next generation
+        // cannot silently inherit the session selection.
+        self.settle_transform_gizmo_drag_for_barrier("the composition topology changed");
         self.composition_revision = self.composition_revision.wrapping_add(1).max(1);
     }
 
@@ -7697,6 +7714,9 @@ impl App {
                 | WebAction::SetCompositionGroupMatteRoute { .. }
                 | WebAction::SetCompositionGroupMatteParam { .. }
                 | WebAction::SetCompositionGroupParam { .. }
+                | WebAction::SetGroupTransform { .. }
+                | WebAction::ResetGroupTransform { .. }
+                | WebAction::ApplyGroupTransform { .. }
                 | WebAction::CreateCompositionGroup { .. }
                 | WebAction::RemoveCompositionGroup { .. }
                 | WebAction::SetCompositionGroupMembers { .. }
@@ -8202,8 +8222,15 @@ impl App {
                     group_id,
                     param,
                     value,
-                    ..
+                    composition_revision,
                 } => {
+                    // Stored v1 performance takes still decode through the
+                    // generic code-18 carrier. Transform spellings therefore
+                    // remain a compatibility alias, but they obey the same
+                    // exact topology barrier as the dedicated action family.
+                    if spatial::spatial_transform_value_law(param).is_some() {
+                        self.creative_revision_matches(*composition_revision)?;
+                    }
                     let group_id = parse_group_id(group_id)
                         .ok_or_else(|| "group ID is malformed".to_string())?;
                     let mut staged = self.staged_creative_graph();
@@ -8216,6 +8243,68 @@ impl App {
                         staged,
                         false,
                         format!("Updated group {} {param}", group_id.get()),
+                    )?;
+                }
+                WebAction::SetGroupTransform {
+                    group_id,
+                    param,
+                    value,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let group_id = parse_group_id(group_id)
+                        .ok_or_else(|| "group ID is malformed".to_string())?;
+                    let mut staged = self.staged_creative_graph();
+                    let Some(group) = staged.composition.group_mut(group_id) else {
+                        return Ok(());
+                    };
+                    if !Self::apply_spatial_transform_edit(&mut group.transform, param, value) {
+                        return Err(format!("unsupported group transform parameter {param}"));
+                    }
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        false,
+                        format!("Updated group {} transform {param}", group_id.get()),
+                    )?;
+                }
+                WebAction::ResetGroupTransform {
+                    group_id,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let group_id = parse_group_id(group_id)
+                        .ok_or_else(|| "group ID is malformed".to_string())?;
+                    let mut staged = self.staged_creative_graph();
+                    let Some(group) = staged.composition.group_mut(group_id) else {
+                        return Ok(());
+                    };
+                    group.transform = spatial::SpatialTransform::default();
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        false,
+                        format!("Reset group {} transform", group_id.get()),
+                    )?;
+                }
+                WebAction::ApplyGroupTransform {
+                    group_id,
+                    transform,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let group_id = parse_group_id(group_id)
+                        .ok_or_else(|| "group ID is malformed".to_string())?;
+                    let mut staged = self.staged_creative_graph();
+                    let Some(group) = staged.composition.group_mut(group_id) else {
+                        return Ok(());
+                    };
+                    group.transform = transform.sanitized();
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        false,
+                        format!("Applied group {} transform", group_id.get()),
                     )?;
                 }
                 WebAction::CreateCompositionGroup {
@@ -8609,6 +8698,10 @@ impl App {
     }
 
     fn bump_layer_stack_revision(&mut self) {
+        // A layer-stack barrier has the same history law as a composition
+        // barrier: keep a committed drag as one undo entry, but abandon an
+        // untouched boundary before the stack generation moves.
+        self.settle_transform_gizmo_drag_for_barrier("the layer stack changed");
         self.layer_stack_revision = self.layer_stack_revision.wrapping_add(1).max(1);
         // Legacy clients omitted a stack revision. Do not let one of their
         // already-latched captures bind itself to a later topology.
@@ -8620,12 +8713,9 @@ impl App {
                     | web::state::WebAction::SnapshotBankRecall { .. }
             )
         });
-        // This is the one barrier every topology edit crosses — add, remove,
-        // reorder, and patch apply all bump the revision — so it is the single
-        // place an open preview-gizmo drag is abandoned. Aborting here is what
-        // stops a drag that began on one stack from delivering its remaining
-        // delta to whatever now occupies that position.
-        self.abort_transform_gizmo_drag();
+        // The settlement above is what stops a drag that began on one stack
+        // from delivering its remaining delta to whatever now occupies that
+        // position.
     }
 
     /// Turn live selected-layer matte edges into an explicit missing route
@@ -11464,7 +11554,10 @@ impl App {
                         .contains(&patch::LookNodeRef { scope, node_id })
                 }),
             WebAction::SetCompositionGroupParam { group_id, .. }
-            | WebAction::SetCompositionGroupMatteParam { group_id, .. } => parse_group_id(group_id)
+            | WebAction::SetCompositionGroupMatteParam { group_id, .. }
+            | WebAction::SetGroupTransform { group_id, .. }
+            | WebAction::ResetGroupTransform { group_id, .. }
+            | WebAction::ApplyGroupTransform { group_id, .. } => parse_group_id(group_id)
                 .is_some_and(|group_id| applied.applied_group_ids.contains(&group_id)),
             // The bus mixer rides the same composition value application the
             // crossfade does, so a pending mixer edit conflicts exactly when
@@ -12030,6 +12123,16 @@ impl App {
             } => Some(match layer_id.as_deref().filter(|id| !id.is_empty()) {
                 Some(id) => format!("layer:id:{id}:transform:{param}"),
                 None => format!("layer:index:{index}:transform:{param}"),
+            }),
+            WebAction::SetGroupTransform {
+                group_id, param, ..
+            } => Some(format!("group:id:{group_id}:transform:{param}")),
+            WebAction::SetCompositionGroupParam {
+                group_id, param, ..
+            } => Some(if spatial::spatial_transform_value_law(param).is_some() {
+                format!("group:id:{group_id}:transform:{param}")
+            } else {
+                format!("group:id:{group_id}:{param}")
             }),
             WebAction::SetNtscParam { param, .. } => Some(format!("ntsc:{param}")),
             WebAction::SetTemporal { param, .. } => Some(format!("temporal:{param}")),
@@ -14291,6 +14394,18 @@ impl App {
                 },
                 PerformanceActionValue::Json(value.clone()),
             ),
+            WebAction::SetGroupTransform {
+                group_id,
+                param,
+                value,
+                ..
+            } => (
+                Control::GroupParam {
+                    group: parse_nonzero_decimal(group_id)?,
+                    param: param.clone(),
+                },
+                PerformanceActionValue::Json(value.clone()),
+            ),
             WebAction::SetCompositionGroupMatteParam {
                 group_id,
                 param,
@@ -14928,6 +15043,10 @@ impl App {
                 | web::state::WebAction::SetPerformanceRecording { .. }
                 | web::state::WebAction::SetPerformancePlayback { .. }
                 | web::state::WebAction::ClearPerformanceTake
+                | web::state::WebAction::TargetGroupTransformGizmo { .. }
+                | web::state::WebAction::ClearGroupTransformGizmoTarget { .. }
+                | web::state::WebAction::ResetGroupTransform { .. }
+                | web::state::WebAction::ApplyGroupTransform { .. }
                 // Autopilot already owns a precise future-beat scheduler.
                 // Nesting it in the generic four-beat latch would give one
                 // command two independent clocks and ambiguous priority.
@@ -17820,6 +17939,8 @@ impl App {
                 | WebAction::SetMonitorBay { .. }
                 | WebAction::SetMonitorProbe { .. }
                 | WebAction::MonitorWatch { .. }
+                | WebAction::TargetGroupTransformGizmo { .. }
+                | WebAction::ClearGroupTransformGizmoTarget { .. }
                 | WebAction::SetStageTestCard { .. }
                 | WebAction::SetOutputIdentification { .. }
                 | WebAction::RequestLayerProxy { .. }
@@ -19157,6 +19278,14 @@ impl App {
                 if !self.composition.contains_group(group_id) {
                     return Err(format!("automation group {} is absent", group_id.get()));
                 }
+                let is_transform = matches!(
+                    parameter,
+                    Param::PositionX
+                        | Param::PositionY
+                        | Param::ScaleX
+                        | Param::ScaleY
+                        | Param::Rotation
+                );
                 let (param, value) = match parameter {
                     Param::Opacity | Param::Amount | Param::Value => {
                         ("opacity", serde_json::json!(requested))
@@ -19201,11 +19330,20 @@ impl App {
                     ),
                     _ => return Err("parameter is unsupported for group automation".to_string()),
                 };
-                WebAction::SetCompositionGroupParam {
-                    group_id: group_id.get().to_string(),
-                    param: param.into(),
-                    value,
-                    composition_revision: self.composition_revision,
+                if is_transform {
+                    WebAction::SetGroupTransform {
+                        group_id: group_id.get().to_string(),
+                        param: param.into(),
+                        value,
+                        composition_revision: self.composition_revision,
+                    }
+                } else {
+                    WebAction::SetCompositionGroupParam {
+                        group_id: group_id.get().to_string(),
+                        param: param.into(),
+                        value,
+                        composition_revision: self.composition_revision,
+                    }
                 }
             }
             Address::Node {
@@ -19900,12 +20038,16 @@ impl App {
 
     /// The scope a gizmo drag would address right now.
     ///
-    /// It reads the host's existing `selected_layer` — the same selection the
-    /// keyboard's Space already honors — rather than introducing a second
-    /// selection concept. The positional index is converted to a stable
-    /// identity here and nowhere else, so everything downstream carries the
-    /// identity and a reorder cannot slide a drag onto a different layer.
+    /// A group is reachable only through the explicit session-only target set
+    /// by its panel card. It is never inferred from a member layer. Without a
+    /// group target, the host's existing layer selection retains its exact
+    /// master/layer behavior and is converted to stable identity here.
     fn transform_gizmo_scope(&self) -> Option<transform_gizmo::GizmoScope> {
+        if let Some((group_id, witness_revision)) = self.transform_gizmo_group_target {
+            return (witness_revision == self.composition_revision
+                && self.composition.contains_group(group_id))
+            .then_some(transform_gizmo::GizmoScope::Group(group_id));
+        }
         match self.selected_layer {
             None => Some(transform_gizmo::GizmoScope::Master),
             Some(index) => self
@@ -19918,9 +20060,8 @@ impl App {
     /// Resolve one scope to its authored transform and the exact dimension
     /// pair `EffectPassUniforms::for_target` uses for it.
     ///
-    /// Master uses output/output; a layer uses its actual source size. Getting
-    /// this wrong would place handles on a transform nobody renders, so the
-    /// convention is read from the render path rather than restated.
+    /// Master and group scopes use output/output; a layer uses its actual
+    /// source size. Group geometry never borrows a member's dimensions.
     fn transform_gizmo_frame(
         &self,
         scope: transform_gizmo::GizmoScope,
@@ -19942,6 +20083,10 @@ impl App {
                     (layer.width.max(1), layer.height.max(1)),
                     output,
                 )
+            }
+            transform_gizmo::GizmoScope::Group(group_id) => {
+                let group = self.composition.group(group_id)?;
+                transform_gizmo::GizmoFrame::new(group.transform, output, output)
             }
         }
     }
@@ -19968,6 +20113,7 @@ impl App {
         &mut self,
         scope: transform_gizmo::GizmoScope,
         edits: transform_gizmo::GizmoEdits,
+        group_composition_revision: Option<u64>,
     ) -> ActionLifecycleOutcome {
         let mut lifecycle = ActionLifecycleOutcome::Refused;
         for edit in edits.iter() {
@@ -19989,6 +20135,17 @@ impl App {
                         layer_id: Some(layer_id.get().to_string()),
                         param: edit.param.as_str().to_string(),
                         value: serde_json::Value::Number(number),
+                    }
+                }
+                transform_gizmo::GizmoScope::Group(group_id) => {
+                    let Some(composition_revision) = group_composition_revision else {
+                        continue;
+                    };
+                    web::state::WebAction::SetGroupTransform {
+                        group_id: group_id.get().to_string(),
+                        param: edit.param.as_str().to_string(),
+                        value: serde_json::Value::Number(number),
+                        composition_revision,
                     }
                 }
             };
@@ -20015,6 +20172,14 @@ impl App {
         &mut self,
         event: transform_gizmo::GizmoPointerEvent,
     ) -> ActionLifecycleOutcome {
+        if !matches!(event.phase, transform_gizmo::GizmoPhase::Begin)
+            && !self.transform_gizmo_drag_revision_is_current()
+        {
+            self.settle_transform_gizmo_drag_for_barrier(
+                "the captured composition revision is no longer current",
+            );
+            return ActionLifecycleOutcome::Refused;
+        }
         match event.phase {
             transform_gizmo::GizmoPhase::Begin => {
                 if self.begin_transform_gizmo_drag(event) {
@@ -20031,7 +20196,11 @@ impl App {
                 if edits.is_empty() {
                     return ActionLifecycleOutcome::Refused;
                 }
-                let lifecycle = self.apply_transform_gizmo_edits(drag.scope(), edits);
+                let lifecycle = self.apply_transform_gizmo_edits(
+                    drag.scope(),
+                    edits,
+                    self.transform_gizmo_composition_revision,
+                );
                 if lifecycle == ActionLifecycleOutcome::Applied {
                     if let Some(open) = self.transform_gizmo_drag.as_mut() {
                         open.mark_committed();
@@ -20109,6 +20278,9 @@ impl App {
             }
         }
         self.transform_gizmo_drag = Some(drag);
+        self.transform_gizmo_composition_revision =
+            matches!(scope, transform_gizmo::GizmoScope::Group(_))
+                .then_some(self.composition_revision);
         self.transform_gizmo_status.clear();
         true
     }
@@ -20117,6 +20289,7 @@ impl App {
         if self.transform_gizmo_drag.take().is_none() {
             return false;
         }
+        self.transform_gizmo_composition_revision = None;
         if let history::GestureHistoryStep::Close(id) = self.transform_gizmo_history.observe(
             gesture::GestureOrigin::NativePointer,
             gesture::GesturePhase::End,
@@ -20164,14 +20337,12 @@ impl App {
 
     /// Abandon an open drag without committing it.
     ///
-    /// A topology or generation barrier replaced the authored world the open
-    /// checkpoint described, so the transaction is abandoned rather than
-    /// committed against a program that no longer exists. This is the same law
-    /// `clear_gesture_recording_state` applies to an open etch stroke, and it
-    /// is why a reorder mid-drag cannot deliver the remaining delta to whatever
-    /// now occupies the vacated position.
-    fn abort_transform_gizmo_drag(&mut self) {
+    /// This path is used only before a Move has authored a value. Once a drag
+    /// commits, `settle_transform_gizmo_drag_for_barrier` closes it normally so
+    /// the live mutation cannot escape Undo.
+    fn abort_transform_gizmo_drag_with_reason(&mut self, reason: &str) {
         let had_drag = self.transform_gizmo_drag.take().is_some();
+        self.transform_gizmo_composition_revision = None;
         if let Some(id) = self.transform_gizmo_history.abandon() {
             if self.transform_gizmo_history_open.take() == Some(id) {
                 let _ = self.manual_history.cancel_gesture(id);
@@ -20179,9 +20350,41 @@ impl App {
             }
         }
         if had_drag {
-            self.transform_gizmo_status =
-                "Transform gizmo drag aborted: the layer stack changed".to_string();
+            self.transform_gizmo_status = format!("Transform gizmo drag aborted: {reason}");
         }
+    }
+
+    /// Resolve an open drag before a topology, generation, or target barrier.
+    ///
+    /// Once a Move has authored a value, cancelling the history checkpoint
+    /// would strand a live mutation outside Undo. Close that drag normally so
+    /// it remains exactly one entry. A boundary that authored nothing is safe
+    /// to abandon and must add no entry.
+    fn settle_transform_gizmo_drag_for_barrier(&mut self, reason: &str) {
+        let Some(committed) = self.transform_gizmo_drag.map(|drag| drag.has_committed()) else {
+            self.transform_gizmo_composition_revision = None;
+            return;
+        };
+        if committed {
+            let settled = self.end_transform_gizmo_drag();
+            self.transform_gizmo_status = if settled {
+                format!("Transform gizmo drag settled before {reason}")
+            } else {
+                format!("Transform gizmo drag could not settle before {reason}")
+            };
+        } else {
+            self.abort_transform_gizmo_drag_with_reason(reason);
+        }
+    }
+
+    fn transform_gizmo_drag_revision_is_current(&self) -> bool {
+        self.transform_gizmo_drag
+            .is_none_or(|drag| match drag.scope() {
+                transform_gizmo::GizmoScope::Group(_) => {
+                    self.transform_gizmo_composition_revision == Some(self.composition_revision)
+                }
+                transform_gizmo::GizmoScope::Master | transform_gizmo::GizmoScope::Layer(_) => true,
+            })
     }
 
     /// Escape while a gizmo drag is open.
@@ -20190,23 +20393,27 @@ impl App {
     /// consumes nothing at all, so Escape keeps its existing meaning
     /// everywhere else in the application.
     ///
-    /// Before the first committed value the drag is cancelled: the captured
-    /// transform is restored verbatim and the open history gesture is
-    /// abandoned, so nothing reaches the bounded stack. After a value has
+    /// Before the first committed value the drag is cancelled without entering
+    /// an authoring path, and the open history gesture is abandoned, so neither
+    /// Morph ownership nor the bounded stack changes. After a value has
     /// committed, a cancel would be a lie — the program already moved — so the
     /// gesture closes normally and an ordinary undo runs.
     fn transform_gizmo_escape(&mut self) -> Option<ActionLifecycleOutcome> {
+        if self.transform_gizmo_drag.is_some() && !self.transform_gizmo_drag_revision_is_current() {
+            self.settle_transform_gizmo_drag_for_barrier(
+                "the captured composition revision is no longer current",
+            );
+            return Some(ActionLifecycleOutcome::Refused);
+        }
         let drag = self.transform_gizmo_drag?;
         let lifecycle = match drag.cancel() {
-            transform_gizmo::GizmoCancel::Restore(transform) => {
-                self.restore_transform_gizmo_scope(drag.scope(), transform);
-                self.transform_gizmo_drag = None;
-                if let Some(id) = self.transform_gizmo_history.abandon() {
-                    if self.transform_gizmo_history_open.take() == Some(id) {
-                        let _ = self.manual_history.cancel_gesture(id);
-                        self.history_gesture_begin = None;
-                    }
-                }
+            transform_gizmo::GizmoCancel::Restore(_) => {
+                // Begin and refused/empty Moves author nothing. Dispatching an
+                // Apply action here would be an edit of its own: in particular
+                // it would materialize and clear an active Morph before this
+                // history boundary is abandoned. Cancel the untouched
+                // transaction without entering any authoring path.
+                self.abort_transform_gizmo_drag_with_reason("cancelled before any authored change");
                 self.transform_gizmo_status = "Transform gizmo drag cancelled".to_string();
                 ActionLifecycleOutcome::Coalesced
             }
@@ -20223,31 +20430,6 @@ impl App {
             }
         };
         Some(lifecycle)
-    }
-
-    /// Put a captured transform back through the same authoring path an edit
-    /// takes, so a cancel cannot become a second way to write authored state.
-    fn restore_transform_gizmo_scope(
-        &mut self,
-        scope: transform_gizmo::GizmoScope,
-        transform: spatial::SpatialTransform,
-    ) {
-        let action = match scope {
-            transform_gizmo::GizmoScope::Master => {
-                web::state::WebAction::ApplyMasterTransform { transform }
-            }
-            transform_gizmo::GizmoScope::Layer(layer_id) => {
-                web::state::WebAction::ApplyLayerTransform {
-                    index: 0,
-                    layer_id: Some(layer_id.get().to_string()),
-                    transform,
-                }
-            }
-        };
-        self.handle_web_action_inner_with_feedback_from_origin(
-            action,
-            action_correlation::ActionSourceClass::Native,
-        );
     }
 
     /// One keyboard nudge of the selected scope's position.
@@ -20275,7 +20457,9 @@ impl App {
             return false;
         }
         self.apply_native_manual_action("Nudge transform", "transform_gizmo", |app| {
-            let _ = app.apply_transform_gizmo_edits(scope, edits);
+            let group_revision = matches!(scope, transform_gizmo::GizmoScope::Group(_))
+                .then_some(app.composition_revision);
+            let _ = app.apply_transform_gizmo_edits(scope, edits, group_revision);
         })
     }
 
@@ -20707,11 +20891,22 @@ impl App {
                     (Control::GroupParam { group, param }, _) => visual_rack::GroupId::new(*group)
                         .filter(|group_id| self.composition.contains_group(*group_id))
                         .and_then(|_| {
-                            value.map(|value| WebAction::SetCompositionGroupParam {
-                                group_id: group.to_string(),
-                                param: param.clone(),
-                                value,
-                                composition_revision: self.composition_revision,
+                            value.map(|value| {
+                                if spatial::spatial_transform_value_law(param).is_some() {
+                                    WebAction::SetGroupTransform {
+                                        group_id: group.to_string(),
+                                        param: param.clone(),
+                                        value,
+                                        composition_revision: self.composition_revision,
+                                    }
+                                } else {
+                                    WebAction::SetCompositionGroupParam {
+                                        group_id: group.to_string(),
+                                        param: param.clone(),
+                                        value,
+                                        composition_revision: self.composition_revision,
+                                    }
+                                }
                             })
                         }),
                     (Control::GroupMatteParam { group, param }, _) => {
@@ -21320,6 +21515,9 @@ impl App {
             }
             WebAction::SetCompositionGroupParam {
                 group_id, param, ..
+            }
+            | WebAction::SetGroupTransform {
+                group_id, param, ..
             } => Some(Address::Group {
                 group_id: parse_group_id(group_id)?,
                 parameter: match param.as_str() {
@@ -21381,7 +21579,9 @@ impl App {
             | WebAction::Pad { .. }
             | WebAction::BendPad { .. }
             | WebAction::GestureSample { .. }
-            | WebAction::MonitorWatch { .. } => false,
+            | WebAction::MonitorWatch { .. }
+            | WebAction::TargetGroupTransformGizmo { .. }
+            | WebAction::ClearGroupTransformGizmoTarget { .. } => false,
             WebAction::Quantized { inner } => Self::web_action_requires_full_publication(inner),
             _ => true,
         }
@@ -21917,6 +22117,44 @@ impl App {
                     log::warn!("{}", self.composition_status);
                 }
             },
+            WebAction::TargetGroupTransformGizmo {
+                group_id,
+                composition_revision,
+            } => {
+                if self.creative_revision_matches(composition_revision).is_ok()
+                    && parse_group_id(&group_id)
+                        .filter(|group_id| self.composition.contains_group(*group_id))
+                        .is_some_and(|group_id| {
+                            let target = (group_id, composition_revision);
+                            if self.transform_gizmo_group_target != Some(target) {
+                                self.settle_transform_gizmo_drag_for_barrier(
+                                    "the explicit gizmo target changed",
+                                );
+                                self.transform_gizmo_group_target = Some(target);
+                            }
+                            self.transform_gizmo_status =
+                                format!("Transform gizmo targets group {}", group_id.get());
+                            true
+                        })
+                {
+                    *accepted_coalesced = true;
+                }
+            }
+            WebAction::ClearGroupTransformGizmoTarget {
+                composition_revision,
+            } => {
+                if self.creative_revision_matches(composition_revision).is_ok() {
+                    if self.transform_gizmo_group_target.is_some() {
+                        self.settle_transform_gizmo_drag_for_barrier(
+                            "the explicit group gizmo target was cleared",
+                        );
+                        self.transform_gizmo_group_target = None;
+                    }
+                    self.transform_gizmo_status =
+                        "Transform gizmo follows the native master/layer selection".to_string();
+                    *accepted_coalesced = true;
+                }
+            }
             WebAction::SetParam { param, value } => {
                 let valid = Self::valid_effect_edit(&param, &value);
                 let before = self.master_effects;
@@ -24157,6 +24395,9 @@ impl App {
             | WebAction::SetCompositionGroupMatteRoute { .. }
             | WebAction::SetCompositionGroupMatteParam { .. }
             | WebAction::SetCompositionGroupParam { .. }
+            | WebAction::SetGroupTransform { .. }
+            | WebAction::ResetGroupTransform { .. }
+            | WebAction::ApplyGroupTransform { .. }
             | WebAction::CreateCompositionGroup { .. }
             | WebAction::RemoveCompositionGroup { .. }
             | WebAction::SetCompositionGroupMembers { .. }
@@ -36270,6 +36511,323 @@ mod app_state_tests {
     }
 
     #[test]
+    fn dedicated_group_transform_actions_are_exact_revision_atomic_and_stable_id_safe() {
+        use web::state::WebAction;
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.handle_web_action(WebAction::CreateCompositionGroup {
+            name: "Transform owner".into(),
+            member_layer_ids: Vec::new(),
+            root_index: 0,
+            composition_revision: app.composition_revision,
+        });
+        let group_id = app.composition.groups().next().unwrap().id;
+        let group_id_text = group_id.get().to_string();
+        let revision = app.composition_revision;
+        let history_before = app.manual_history.metrics().undo_depth;
+
+        let fields = [
+            ("position_x", serde_json::json!(0.25)),
+            ("position_y", serde_json::json!(-0.5)),
+            ("scale_x", serde_json::json!(-2.0)),
+            ("scale_y", serde_json::json!(1.5)),
+            ("anchor_x", serde_json::json!(0.1)),
+            ("anchor_y", serde_json::json!(0.9)),
+            ("rotation_deg", serde_json::json!(37.0)),
+            ("skew_deg", serde_json::json!(-12.0)),
+            ("skew_axis_deg", serde_json::json!(24.0)),
+            ("crop_left", serde_json::json!(0.1)),
+            ("crop_top", serde_json::json!(0.2)),
+            ("crop_right", serde_json::json!(0.3)),
+            ("crop_bottom", serde_json::json!(0.4)),
+            ("fit", serde_json::json!("fill")),
+            ("edge", serde_json::json!("mirror")),
+            ("sampling", serde_json::json!("nearest")),
+        ];
+        let field_count = fields.len();
+        for (param, value) in fields {
+            app.handle_web_action(WebAction::SetGroupTransform {
+                group_id: group_id_text.clone(),
+                param: param.into(),
+                value,
+                composition_revision: revision,
+            });
+        }
+        let sentinel = spatial::SpatialTransform {
+            position: [0.25, -0.5],
+            scale: [-2.0, 1.5],
+            anchor: [0.1, 0.9],
+            rotation_deg: 37.0,
+            skew_deg: -12.0,
+            skew_axis_deg: 24.0,
+            crop: [0.1, 0.2, 0.3, 0.4],
+            fit: spatial::FitMode::Fill,
+            edge: spatial::EdgeMode::Mirror,
+            sampling: spatial::SamplingMode::Nearest,
+        };
+        assert_eq!(app.composition.group(group_id).unwrap().transform, sentinel);
+        assert_eq!(
+            app.composition_revision, revision,
+            "group transform values never advance topology"
+        );
+        assert_eq!(
+            app.manual_history.metrics().undo_depth,
+            history_before + field_count,
+            "each one-shot numeric edit is one authored history entry"
+        );
+
+        let stale_revision = revision.saturating_sub(1);
+        app.handle_web_action(WebAction::SetGroupTransform {
+            group_id: group_id_text.clone(),
+            param: "position_x".into(),
+            value: serde_json::json!(0.75),
+            composition_revision: stale_revision,
+        });
+        assert_eq!(app.composition.group(group_id).unwrap().transform, sentinel);
+        assert!(app
+            .composition_status
+            .contains("stale composition revision"));
+
+        // The stored-v1 code-18 carrier remains replayable, but its transform
+        // spelling cannot bypass the dedicated family's revision guard.
+        app.handle_web_action(WebAction::SetCompositionGroupParam {
+            group_id: group_id_text.clone(),
+            param: "position_x".into(),
+            value: serde_json::json!(-0.75),
+            composition_revision: stale_revision,
+        });
+        assert_eq!(app.composition.group(group_id).unwrap().transform, sentinel);
+
+        let replacement = spatial::SpatialTransform {
+            position: [-0.75, 0.5],
+            scale: [0.75, 0.5],
+            ..spatial::SpatialTransform::default()
+        };
+        app.handle_web_action(WebAction::ApplyGroupTransform {
+            group_id: group_id_text.clone(),
+            transform: replacement,
+            composition_revision: revision,
+        });
+        assert_eq!(
+            app.composition.group(group_id).unwrap().transform,
+            replacement
+        );
+        app.handle_web_action(WebAction::ResetGroupTransform {
+            group_id: group_id_text.clone(),
+            composition_revision: revision,
+        });
+        assert_eq!(
+            app.composition.group(group_id).unwrap().transform,
+            spatial::SpatialTransform::default()
+        );
+
+        app.handle_web_action(WebAction::RemoveCompositionGroup {
+            group_id: group_id_text.clone(),
+            composition_revision: revision,
+        });
+        let post_delete_revision = app.composition_revision;
+        app.handle_web_action(WebAction::SetGroupTransform {
+            group_id: group_id_text,
+            param: "position_x".into(),
+            value: serde_json::json!(0.5),
+            composition_revision: post_delete_revision,
+        });
+        assert!(app.composition.group(group_id).is_none());
+        assert_eq!(app.composition_revision, post_delete_revision);
+    }
+
+    #[test]
+    fn dedicated_group_transform_edit_materializes_and_releases_morph_before_authoring() {
+        use web::state::WebAction;
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let group_id = app
+            .composition
+            .insert_empty_group(
+                composition::GroupName::new("Morph group".to_string()).unwrap(),
+                0,
+            )
+            .unwrap();
+        app.composition
+            .group_mut(group_id)
+            .unwrap()
+            .transform
+            .position[0] = -0.6;
+        let empty_racks = app.layer_racks();
+        let a = morph::MorphSlot::capture_with_composition(
+            &app.master_effects,
+            &app.master_transform,
+            &app.ntsc_params,
+            &app.temporal_params,
+            &app.layers,
+            &app.master_rack,
+            &empty_racks,
+            &app.composition,
+        )
+        .unwrap();
+        app.composition
+            .group_mut(group_id)
+            .unwrap()
+            .transform
+            .position[0] = 0.8;
+        let b = morph::MorphSlot::capture_with_composition(
+            &app.master_effects,
+            &app.master_transform,
+            &app.ntsc_params,
+            &app.temporal_params,
+            &app.layers,
+            &app.master_rack,
+            &empty_racks,
+            &app.composition,
+        )
+        .unwrap();
+        app.composition
+            .group_mut(group_id)
+            .unwrap()
+            .transform
+            .position[0] = -0.6;
+        app.morph.a = Some(a);
+        app.morph.b = Some(b);
+        app.morph.t = 0.5;
+        assert!(app.morph.active());
+
+        let revision = app.composition_revision;
+        app.handle_web_action(WebAction::SetGroupTransform {
+            group_id: group_id.get().to_string(),
+            param: "position_x".into(),
+            value: serde_json::json!(0.375),
+            composition_revision: revision,
+        });
+        assert!(!app.morph.active());
+        assert_eq!(
+            app.composition.group(group_id).unwrap().transform.position[0],
+            0.375
+        );
+        assert_eq!(app.composition_revision, revision);
+    }
+
+    #[test]
+    fn group_transform_controller_emission_and_feedback_share_the_stable_address() {
+        use controller_profile::{
+            AutomationOrigin, AutomationValue, ControlParameter, RuntimeControlAddress,
+        };
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let group_id = app
+            .composition
+            .insert_empty_group(
+                composition::GroupName::new("Controller group".to_string()).unwrap(),
+                0,
+            )
+            .unwrap();
+        let address = RuntimeControlAddress::Group {
+            group_id,
+            parameter: ControlParameter::PositionX,
+        };
+        let outcome = app
+            .apply_automation_control(
+                AutomationOrigin::Midi,
+                address,
+                AutomationValue::Absolute(0.625),
+            )
+            .unwrap();
+        assert_eq!(outcome.lifecycle, ActionLifecycleOutcome::Applied);
+        assert_eq!(
+            app.composition.group(group_id).unwrap().transform.position[0],
+            1.0
+        );
+        assert_eq!(app.automation_current_normalized(address), Some(0.625));
+        assert_eq!(
+            app.feedback_address_for_web_action(&web::state::WebAction::SetGroupTransform {
+                group_id: group_id.get().to_string(),
+                param: "position_x".into(),
+                value: serde_json::json!(1.0),
+                composition_revision: app.composition_revision,
+            }),
+            Some(address)
+        );
+    }
+
+    #[test]
+    fn group_transform_look_conflicts_and_quantized_aliases_use_one_identity() {
+        use web::state::WebAction;
+
+        let group_id = visual_rack::GroupId::new(7).unwrap();
+        let applied = AppliedLookScope {
+            mapped_layer_ids: Vec::new(),
+            applied_ntsc: false,
+            applied_temporal: false,
+            applied_nodes: Vec::new(),
+            applied_group_ids: vec![group_id],
+            applied_bus_crossfade: false,
+        };
+        let dedicated = WebAction::SetGroupTransform {
+            group_id: group_id.get().to_string(),
+            param: "position_x".into(),
+            value: serde_json::json!(0.25),
+            composition_revision: 9,
+        };
+        let legacy = WebAction::SetCompositionGroupParam {
+            group_id: group_id.get().to_string(),
+            param: "position_x".into(),
+            value: serde_json::json!(0.5),
+            composition_revision: 9,
+        };
+        assert_eq!(
+            App::quantized_action_key(&dedicated),
+            App::quantized_action_key(&legacy)
+        );
+        for action in [
+            dedicated,
+            WebAction::ResetGroupTransform {
+                group_id: group_id.get().to_string(),
+                composition_revision: 9,
+            },
+            WebAction::ApplyGroupTransform {
+                group_id: group_id.get().to_string(),
+                transform: spatial::SpatialTransform::default(),
+                composition_revision: 9,
+            },
+        ] {
+            assert!(App::action_conflicts_with_applied_look(&action, &applied));
+        }
+        assert!(!App::action_conflicts_with_applied_look(
+            &WebAction::TargetGroupTransformGizmo {
+                group_id: group_id.get().to_string(),
+                composition_revision: 9,
+            },
+            &applied,
+        ));
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        for ordered in [
+            WebAction::TargetGroupTransformGizmo {
+                group_id: group_id.get().to_string(),
+                composition_revision: app.composition_revision,
+            },
+            WebAction::ResetGroupTransform {
+                group_id: group_id.get().to_string(),
+                composition_revision: app.composition_revision,
+            },
+            WebAction::ApplyGroupTransform {
+                group_id: group_id.get().to_string(),
+                transform: spatial::SpatialTransform::default(),
+                composition_revision: app.composition_revision,
+            },
+        ] {
+            assert_eq!(
+                app.queue_quantized_action_from_source(
+                    ordered,
+                    action_correlation::ActionSourceClass::Browser,
+                )
+                .lifecycle,
+                ActionLifecycleOutcome::Refused
+            );
+        }
+        assert!(app.quantized_actions.is_empty());
+    }
+
+    #[test]
     fn successful_group_delete_tombstones_stable_modulation_only_after_commit() {
         use modulation::{
             GroupModParameter, SavedMissingTarget, SavedStableModTarget, StableModTarget,
@@ -39196,6 +39754,447 @@ mod app_state_tests {
         // fixture can reach without a real decoded media source.
         app.selected_layer = None;
         app
+    }
+
+    fn group_gizmo_test_app() -> (App, visual_rack::GroupId) {
+        let mut app = gizmo_test_app();
+        let group_id = app
+            .composition
+            .insert_empty_group(
+                composition::GroupName::new("Gizmo group".to_string()).unwrap(),
+                0,
+            )
+            .expect("group fixture");
+        let outcome = app.handle_web_action_inner_with_feedback_from_origin(
+            web::state::WebAction::TargetGroupTransformGizmo {
+                group_id: group_id.get().to_string(),
+                composition_revision: app.composition_revision,
+            },
+            action_correlation::ActionSourceClass::Browser,
+        );
+        assert_eq!(outcome.lifecycle, ActionLifecycleOutcome::Coalesced);
+        assert_eq!(
+            app.transform_gizmo_scope(),
+            Some(transform_gizmo::GizmoScope::Group(group_id))
+        );
+        (app, group_id)
+    }
+
+    #[test]
+    fn group_gizmo_authors_the_dedicated_path_and_topology_aborts_fail_closed() {
+        use web::state::WebAction;
+
+        let (mut app, group_id) = group_gizmo_test_app();
+        let scope = transform_gizmo::GizmoScope::Group(group_id);
+        let grab = app
+            .transform_gizmo_frame(scope)
+            .expect("group output/output frame")
+            .handle_position(transform_gizmo::GizmoHandle::Translate)
+            .expect("group move handle");
+        let untouched_master = app.master_transform;
+        let history_before = app.manual_history.metrics().undo_depth;
+        drive_gizmo_drag(
+            &mut app,
+            grab,
+            &[[grab[0] + 0.12, grab[1] - 0.07]],
+            transform_gizmo::GizmoModifiers::NONE,
+        );
+        let dragged = app.composition.group(group_id).unwrap().transform;
+        assert_ne!(dragged, spatial::SpatialTransform::default());
+        assert_eq!(app.master_transform, untouched_master);
+        assert_eq!(app.manual_history.metrics().undo_depth, history_before + 1);
+        assert!(app.transform_gizmo_composition_revision.is_none());
+
+        // The same absolute values through the browser action are byte-exact.
+        let (mut numeric, numeric_group_id) = group_gizmo_test_app();
+        for (param, value) in [
+            ("position_x", dragged.position[0]),
+            ("position_y", dragged.position[1]),
+        ] {
+            numeric.handle_web_action(WebAction::SetGroupTransform {
+                group_id: numeric_group_id.get().to_string(),
+                param: param.into(),
+                value: serde_json::json!(value),
+                composition_revision: numeric.composition_revision,
+            });
+        }
+        assert_eq!(
+            numeric
+                .composition
+                .group(numeric_group_id)
+                .unwrap()
+                .transform,
+            dragged
+        );
+
+        // A composition-only barrier abandons the captured revision and open
+        // history transaction before advancing the generation.
+        let grab = app
+            .transform_gizmo_frame(scope)
+            .unwrap()
+            .handle_position(transform_gizmo::GizmoHandle::Translate)
+            .unwrap();
+        app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+            phase: transform_gizmo::GizmoPhase::Begin,
+            output_uv: grab,
+            modifiers: transform_gizmo::GizmoModifiers::NONE,
+        });
+        assert_eq!(
+            app.transform_gizmo_composition_revision,
+            Some(app.composition_revision)
+        );
+        app.bump_composition_revision();
+        assert!(app.transform_gizmo_drag.is_none());
+        assert!(app.transform_gizmo_composition_revision.is_none());
+        assert!(!app.manual_history.metrics().gesture_open);
+
+        // Defense in depth: even if a future topology owner advances the field
+        // without calling the shared bump helper, the next edge refuses the
+        // stale captured stamp rather than blessing it with the new value.
+        let refreshed_revision = app.composition_revision;
+        assert_eq!(
+            app.handle_web_action_inner_with_feedback_from_origin(
+                WebAction::TargetGroupTransformGizmo {
+                    group_id: group_id.get().to_string(),
+                    composition_revision: refreshed_revision,
+                },
+                action_correlation::ActionSourceClass::Browser,
+            )
+            .lifecycle,
+            ActionLifecycleOutcome::Coalesced
+        );
+        let grab = app
+            .transform_gizmo_frame(scope)
+            .unwrap()
+            .handle_position(transform_gizmo::GizmoHandle::Translate)
+            .unwrap();
+        assert_eq!(
+            app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+                phase: transform_gizmo::GizmoPhase::Begin,
+                output_uv: grab,
+                modifiers: transform_gizmo::GizmoModifiers::NONE,
+            }),
+            ActionLifecycleOutcome::Coalesced
+        );
+        app.composition_revision = app.composition_revision.wrapping_add(1).max(1);
+        assert_eq!(
+            app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+                phase: transform_gizmo::GizmoPhase::Move,
+                output_uv: [grab[0] + 0.1, grab[1]],
+                modifiers: transform_gizmo::GizmoModifiers::NONE,
+            }),
+            ActionLifecycleOutcome::Refused
+        );
+        assert!(app.transform_gizmo_drag.is_none());
+
+        // If the targeted stable group is gone, scope resolution refuses.
+        // It never borrows a member-layer transform or silently becomes master.
+        app.composition.remove_group_ungroup(group_id).unwrap();
+        app.bump_composition_revision();
+        assert_eq!(
+            app.transform_gizmo_group_target,
+            Some((group_id, refreshed_revision))
+        );
+        assert_eq!(app.transform_gizmo_scope(), None);
+    }
+
+    #[test]
+    fn committed_group_gizmo_drags_settle_before_target_and_generation_barriers() {
+        use web::state::WebAction;
+
+        let (mut app, first_group) = group_gizmo_test_app();
+        let second_group = app
+            .composition
+            .insert_empty_group(
+                composition::GroupName::new("Second gizmo group".to_string()).unwrap(),
+                1,
+            )
+            .expect("second group fixture");
+        let history_before = app.manual_history.metrics().undo_depth;
+
+        let first_scope = transform_gizmo::GizmoScope::Group(first_group);
+        let first_grab = app
+            .transform_gizmo_frame(first_scope)
+            .unwrap()
+            .handle_position(transform_gizmo::GizmoHandle::Translate)
+            .unwrap();
+        assert_eq!(
+            app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+                phase: transform_gizmo::GizmoPhase::Begin,
+                output_uv: first_grab,
+                modifiers: transform_gizmo::GizmoModifiers::NONE,
+            }),
+            ActionLifecycleOutcome::Coalesced
+        );
+        assert_eq!(
+            app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+                phase: transform_gizmo::GizmoPhase::Move,
+                output_uv: [first_grab[0] + 0.12, first_grab[1] - 0.07],
+                modifiers: transform_gizmo::GizmoModifiers::NONE,
+            }),
+            ActionLifecycleOutcome::Applied
+        );
+        let first_transform = app.composition.group(first_group).unwrap().transform;
+        assert!(app
+            .transform_gizmo_drag
+            .is_some_and(|drag| drag.has_committed()));
+        assert!(app.manual_history.metrics().gesture_open);
+        assert_eq!(app.manual_history.metrics().undo_depth, history_before);
+
+        let revision = app.composition_revision;
+        assert_eq!(
+            app.handle_web_action_inner_with_feedback_from_origin(
+                WebAction::TargetGroupTransformGizmo {
+                    group_id: second_group.get().to_string(),
+                    composition_revision: revision,
+                },
+                action_correlation::ActionSourceClass::Browser,
+            )
+            .lifecycle,
+            ActionLifecycleOutcome::Coalesced
+        );
+        assert_eq!(
+            app.transform_gizmo_group_target,
+            Some((second_group, revision))
+        );
+        assert!(app.transform_gizmo_drag.is_none());
+        assert!(!app.manual_history.metrics().gesture_open);
+        assert_eq!(app.manual_history.metrics().undo_depth, history_before + 1);
+        assert_eq!(
+            app.composition.group(first_group).unwrap().transform,
+            first_transform,
+            "retargeting must keep the committed mutation inside its one undo entry"
+        );
+
+        let second_scope = transform_gizmo::GizmoScope::Group(second_group);
+        let second_grab = app
+            .transform_gizmo_frame(second_scope)
+            .unwrap()
+            .handle_position(transform_gizmo::GizmoHandle::Translate)
+            .unwrap();
+        assert_eq!(
+            app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+                phase: transform_gizmo::GizmoPhase::Begin,
+                output_uv: second_grab,
+                modifiers: transform_gizmo::GizmoModifiers::NONE,
+            }),
+            ActionLifecycleOutcome::Coalesced
+        );
+        assert_eq!(
+            app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+                phase: transform_gizmo::GizmoPhase::Move,
+                output_uv: [second_grab[0] - 0.08, second_grab[1] + 0.05],
+                modifiers: transform_gizmo::GizmoModifiers::NONE,
+            }),
+            ActionLifecycleOutcome::Applied
+        );
+        let second_transform = app.composition.group(second_group).unwrap().transform;
+        app.bump_composition_revision();
+        assert!(app.transform_gizmo_drag.is_none());
+        assert!(!app.manual_history.metrics().gesture_open);
+        assert_eq!(app.manual_history.metrics().undo_depth, history_before + 2);
+        assert_eq!(
+            app.composition.group(second_group).unwrap().transform,
+            second_transform,
+            "a revision barrier must settle, not strand, a committed drag"
+        );
+        assert_eq!(
+            app.transform_gizmo_group_target,
+            Some((second_group, revision)),
+            "the old witness remains as a fail-closed tombstone"
+        );
+        assert_eq!(app.transform_gizmo_scope(), None);
+    }
+
+    #[test]
+    fn uncommitted_group_escape_preserves_active_morph_and_authored_world() {
+        let (mut app, group_id) = group_gizmo_test_app();
+        app.composition
+            .group_mut(group_id)
+            .unwrap()
+            .transform
+            .position[0] = -0.6;
+        let empty_racks = app.layer_racks();
+        let a = morph::MorphSlot::capture_with_composition(
+            &app.master_effects,
+            &app.master_transform,
+            &app.ntsc_params,
+            &app.temporal_params,
+            &app.layers,
+            &app.master_rack,
+            &empty_racks,
+            &app.composition,
+        )
+        .unwrap();
+        app.composition
+            .group_mut(group_id)
+            .unwrap()
+            .transform
+            .position[0] = 0.8;
+        let b = morph::MorphSlot::capture_with_composition(
+            &app.master_effects,
+            &app.master_transform,
+            &app.ntsc_params,
+            &app.temporal_params,
+            &app.layers,
+            &app.master_rack,
+            &empty_racks,
+            &app.composition,
+        )
+        .unwrap();
+        app.composition
+            .group_mut(group_id)
+            .unwrap()
+            .transform
+            .position[0] = -0.6;
+        app.morph.a = Some(a);
+        app.morph.b = Some(b);
+        app.morph.t = 0.5;
+        assert!(app.morph.active());
+
+        let canonical_before = app.capture_manual_history_world().unwrap().1;
+        let history_before = app.manual_history.metrics().undo_depth;
+        let scope = transform_gizmo::GizmoScope::Group(group_id);
+        let grab = app
+            .transform_gizmo_frame(scope)
+            .unwrap()
+            .handle_position(transform_gizmo::GizmoHandle::Translate)
+            .unwrap();
+        assert_eq!(
+            app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+                phase: transform_gizmo::GizmoPhase::Begin,
+                output_uv: grab,
+                modifiers: transform_gizmo::GizmoModifiers::NONE,
+            }),
+            ActionLifecycleOutcome::Coalesced
+        );
+        assert_eq!(
+            app.transform_gizmo_escape(),
+            Some(ActionLifecycleOutcome::Coalesced)
+        );
+
+        assert!(
+            app.morph.active(),
+            "an untouched drag must not release Morph"
+        );
+        assert_eq!(
+            app.capture_manual_history_world().unwrap().1,
+            canonical_before,
+            "precommit Escape must not dispatch an Apply action"
+        );
+        assert_eq!(app.manual_history.metrics().undo_depth, history_before);
+        assert!(!app.manual_history.metrics().gesture_open);
+        assert!(app.transform_gizmo_drag.is_none());
+    }
+
+    #[test]
+    fn group_target_witness_and_explicit_clear_recover_without_fallback() {
+        use web::state::WebAction;
+
+        let (mut app, group_id) = group_gizmo_test_app();
+        let witnessed_revision = app.composition_revision;
+        app.bump_composition_revision();
+        let current_revision = app.composition_revision;
+        assert_eq!(
+            app.transform_gizmo_group_target,
+            Some((group_id, witnessed_revision))
+        );
+        assert_eq!(
+            app.transform_gizmo_scope(),
+            None,
+            "the same numeric group ID in a new generation must not inherit the target"
+        );
+
+        for refused_revision in [0, witnessed_revision] {
+            assert_eq!(
+                app.handle_web_action_inner_with_feedback_from_origin(
+                    WebAction::ClearGroupTransformGizmoTarget {
+                        composition_revision: refused_revision,
+                    },
+                    action_correlation::ActionSourceClass::Browser,
+                )
+                .lifecycle,
+                ActionLifecycleOutcome::Refused
+            );
+            assert_eq!(
+                app.transform_gizmo_group_target,
+                Some((group_id, witnessed_revision)),
+                "zero and stale clear requests must leave the target untouched"
+            );
+        }
+
+        let clear_current = WebAction::ClearGroupTransformGizmoTarget {
+            composition_revision: current_revision,
+        };
+        assert!(App::history_action_is_performance_only(&clear_current));
+        assert!(!App::web_action_requires_full_publication(&clear_current));
+        assert!(app.performance_record_view(&clear_current).is_none());
+        assert!(app
+            .feedback_address_for_web_action(&clear_current)
+            .is_none());
+        assert!(App::quantized_action_key(&clear_current).is_none());
+        assert_eq!(
+            app.queue_quantized_action_from_source(
+                clear_current.clone(),
+                action_correlation::ActionSourceClass::Browser,
+            )
+            .lifecycle,
+            ActionLifecycleOutcome::Refused
+        );
+        assert_eq!(
+            app.transform_gizmo_group_target,
+            Some((group_id, witnessed_revision))
+        );
+        assert_eq!(
+            app.handle_web_action_inner_with_feedback_from_origin(
+                clear_current,
+                action_correlation::ActionSourceClass::Browser,
+            )
+            .lifecycle,
+            ActionLifecycleOutcome::Coalesced
+        );
+        assert_eq!(app.transform_gizmo_group_target, None);
+        assert_eq!(
+            app.transform_gizmo_scope(),
+            Some(transform_gizmo::GizmoScope::Master),
+            "an explicit clear restores the ordinary master/layer selection law"
+        );
+
+        assert_eq!(
+            app.handle_web_action_inner_with_feedback_from_origin(
+                WebAction::TargetGroupTransformGizmo {
+                    group_id: group_id.get().to_string(),
+                    composition_revision: current_revision,
+                },
+                action_correlation::ActionSourceClass::Browser,
+            )
+            .lifecycle,
+            ActionLifecycleOutcome::Coalesced
+        );
+        app.composition.remove_group_ungroup(group_id).unwrap();
+        app.bump_composition_revision();
+        assert_eq!(
+            app.transform_gizmo_group_target,
+            Some((group_id, current_revision))
+        );
+        assert_eq!(app.transform_gizmo_scope(), None);
+        let post_delete_revision = app.composition_revision;
+        assert_eq!(
+            app.handle_web_action_inner_with_feedback_from_origin(
+                WebAction::ClearGroupTransformGizmoTarget {
+                    composition_revision: post_delete_revision,
+                },
+                action_correlation::ActionSourceClass::Browser,
+            )
+            .lifecycle,
+            ActionLifecycleOutcome::Coalesced
+        );
+        assert_eq!(app.transform_gizmo_group_target, None);
+        assert_eq!(
+            app.transform_gizmo_scope(),
+            Some(transform_gizmo::GizmoScope::Master),
+            "a current clear must recover even after the target was deleted"
+        );
     }
 
     /// The delivery claim, in one fixture: a drag really moves the authored
@@ -43663,6 +44662,12 @@ mod app_state_tests {
             value: serde_json::json!(0.4),
             composition_revision: app.composition_revision,
         });
+        app.handle_web_action(WebAction::SetGroupTransform {
+            group_id: group_id.get().to_string(),
+            param: "position_x".to_string(),
+            value: serde_json::json!(0.625),
+            composition_revision: app.composition_revision,
+        });
         app.handle_web_action(WebAction::SetVisualNodeParam {
             scope: CreativeScopeSnapshot::Group {
                 group_id: group_id.get().to_string(),
@@ -43701,12 +44706,12 @@ mod app_state_tests {
         });
         assert_eq!(
             app.pending_performance_edits.len(),
-            8,
+            9,
             "every accepted v2 family must reach the recorder tap"
         );
         performance_commit_frame(&mut app, 1.0 / performance_track::PERFORMANCE_REFERENCE_FPS);
         app.set_performance_recording(false);
-        assert_eq!(app.performance_take.events().len(), 8);
+        assert_eq!(app.performance_take.events().len(), 9);
         assert_eq!(app.performance_rejected_edits, 0);
         let controls = app
             .performance_take
@@ -43724,6 +44729,14 @@ mod app_state_tests {
             Control::GroupParam { group, param }
                 if *group == group_id.get() && param == "opacity"
         )));
+        assert!(
+            controls.iter().any(|control| matches!(
+                control,
+                Control::GroupParam { group, param }
+                    if *group == group_id.get() && param == "position_x"
+            )),
+            "the dedicated action reuses permanent group_param code 18"
+        );
         assert!(controls.iter().any(|control| matches!(
             control,
             Control::RackNodeGroup { group, node, param, .. }
@@ -43757,6 +44770,7 @@ mod app_state_tests {
         {
             let group = app.composition.group_mut(group_id).unwrap();
             group.opacity = 1.0;
+            group.transform.position[0] = -0.75;
             group.matte.as_mut().unwrap().softness = 0.1;
             match &mut group.rack.get_mut(group_node).unwrap().kind {
                 RuntimeVisualNodeKind::DigitalColor(params) => params.contrast = 0.0,
@@ -43787,6 +44801,7 @@ mod app_state_tests {
         }
         let group = app.composition.group(group_id).unwrap();
         assert!((group.opacity - 0.4).abs() < 1.0e-4);
+        assert!((group.transform.position[0] - 0.625).abs() < 1.0e-4);
         assert!((group.matte.unwrap().softness - 0.35).abs() < 1.0e-4);
         match group.rack.get(group_node).unwrap().kind {
             RuntimeVisualNodeKind::DigitalColor(params) => {
@@ -43813,7 +44828,7 @@ mod app_state_tests {
             .find(|route| route.route_id().to_string() == other_route_id)
             .expect("unaddressed routing remains present");
         assert_eq!(other_route.source, modulation::ModSource::Lfo(1));
-        assert_eq!(app.performance_take.events().len(), 8);
+        assert_eq!(app.performance_take.events().len(), 9);
         assert!(app.pending_performance_edits.is_empty());
     }
 

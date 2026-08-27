@@ -2815,6 +2815,15 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                     | WebAction::SetPerformanceRecording { .. }
                     | WebAction::SetPerformancePlayback { .. }
                     | WebAction::ClearPerformanceTake
+                    // Preview-gizmo targeting is session UI state, not an
+                    // authored value that may be moved to a later downbeat.
+                    | WebAction::TargetGroupTransformGizmo { .. }
+                    | WebAction::ClearGroupTransformGizmoTarget { .. }
+                    // Whole-transform reset/apply are ordered barriers. They
+                    // must not fall through an unknown latch key and execute
+                    // immediately under a Quantized wrapper.
+                    | WebAction::ResetGroupTransform { .. }
+                    | WebAction::ApplyGroupTransform { .. }
                     | WebAction::SetMotionDonor { .. }
                     | WebAction::SetMotionColliderInput { .. }
                     | WebAction::ClearMotionMemory
@@ -3023,6 +3032,41 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                 && valid_group_param(param, value)
                 && valid_composition_revision(*composition_revision)
         }
+        WebAction::SetGroupTransform {
+            group_id,
+            param,
+            value,
+            composition_revision,
+        } => {
+            valid_required_stable_id(group_id)
+                && valid_identifier(param, 64)
+                && valid_transform_edit(param, value)
+                && valid_composition_revision(*composition_revision)
+        }
+        WebAction::ResetGroupTransform {
+            group_id,
+            composition_revision,
+        } => {
+            valid_required_stable_id(group_id) && valid_composition_revision(*composition_revision)
+        }
+        WebAction::ApplyGroupTransform {
+            group_id,
+            transform,
+            composition_revision,
+        } => {
+            valid_required_stable_id(group_id)
+                && valid_complete_transform(transform)
+                && valid_composition_revision(*composition_revision)
+        }
+        WebAction::TargetGroupTransformGizmo {
+            group_id,
+            composition_revision,
+        } => {
+            valid_required_stable_id(group_id) && valid_composition_revision(*composition_revision)
+        }
+        WebAction::ClearGroupTransformGizmoTarget {
+            composition_revision,
+        } => valid_composition_revision(*composition_revision),
         WebAction::CreateCompositionGroup {
             name,
             member_layer_ids,
@@ -6925,6 +6969,15 @@ mod tests {
                 value,
             }
         };
+        let group =
+            |group_id: &str, param: &str, value: serde_json::Value, composition_revision: u64| {
+                WebAction::SetGroupTransform {
+                    group_id: group_id.to_owned(),
+                    param: param.into(),
+                    value,
+                    composition_revision,
+                }
+            };
         assert!(valid_action(
             &layer(Some("22"), "position_x", serde_json::json!(0.25)),
             0
@@ -6948,6 +7001,29 @@ mod tests {
             );
         }
 
+        assert!(valid_action(
+            &group("23", "position_x", serde_json::json!(0.25), 9),
+            0
+        ));
+        assert!(valid_action(
+            &group("23", "edge", serde_json::json!("mirror"), 9),
+            0
+        ));
+        for invalid in [
+            group("0", "position_x", serde_json::json!(0.25), 9),
+            group("group-23", "position_x", serde_json::json!(0.25), 9),
+            group("23", "position_x", serde_json::json!(0.25), 0),
+            group("23", "position_x", serde_json::json!(4.01), 9),
+            group("23", "skew_deg", serde_json::json!(89.1), 9),
+            group("23", "edge", serde_json::json!("smear"), 9),
+            group("23", "unknown", serde_json::json!(0.0), 9),
+        ] {
+            assert!(
+                !valid_action(&invalid, 0),
+                "unexpectedly valid group transform: {invalid:?}"
+            );
+        }
+
         assert!(!valid_action(
             &WebAction::ResetLayerTransform {
                 index: 0,
@@ -6962,10 +7038,37 @@ mod tests {
             },
             0,
         ));
+        assert!(valid_action(
+            &WebAction::ResetGroupTransform {
+                group_id: "23".into(),
+                composition_revision: 9,
+            },
+            0,
+        ));
+        for invalid in [
+            WebAction::ResetGroupTransform {
+                group_id: "0".into(),
+                composition_revision: 9,
+            },
+            WebAction::ResetGroupTransform {
+                group_id: "23".into(),
+                composition_revision: 0,
+            },
+        ] {
+            assert!(!valid_action(&invalid, 0));
+        }
 
         let exact = crate::spatial::SpatialTransform::default();
         assert!(valid_action(
             &WebAction::ApplyMasterTransform { transform: exact },
+            0,
+        ));
+        assert!(valid_action(
+            &WebAction::ApplyGroupTransform {
+                group_id: "23".into(),
+                transform: exact,
+                composition_revision: 9,
+            },
             0,
         ));
         assert!(valid_action(
@@ -6984,6 +7087,89 @@ mod tests {
             &WebAction::ApplyMasterTransform { transform: hostile },
             0,
         ));
+        for invalid in [
+            WebAction::ApplyGroupTransform {
+                group_id: "0".into(),
+                transform: exact,
+                composition_revision: 9,
+            },
+            WebAction::ApplyGroupTransform {
+                group_id: "23".into(),
+                transform: hostile,
+                composition_revision: 9,
+            },
+            WebAction::ApplyGroupTransform {
+                group_id: "23".into(),
+                transform: exact,
+                composition_revision: 0,
+            },
+        ] {
+            assert!(!valid_action(&invalid, 0));
+        }
+
+        let target = WebAction::TargetGroupTransformGizmo {
+            group_id: "23".into(),
+            composition_revision: 9,
+        };
+        assert!(valid_action(&target, 0));
+        assert!(!valid_action(
+            &WebAction::TargetGroupTransformGizmo {
+                group_id: "group-23".into(),
+                composition_revision: 9,
+            },
+            0,
+        ));
+        assert!(!valid_action(
+            &WebAction::TargetGroupTransformGizmo {
+                group_id: "23".into(),
+                composition_revision: 0,
+            },
+            0,
+        ));
+        let clear_target = WebAction::ClearGroupTransformGizmoTarget {
+            composition_revision: 9,
+        };
+        assert!(valid_action(&clear_target, 0));
+        assert!(!valid_action(
+            &WebAction::ClearGroupTransformGizmoTarget {
+                composition_revision: 0,
+            },
+            0,
+        ));
+        for malformed in [
+            r#"{"action":"clear_group_transform_gizmo_target"}"#,
+            r#"{"action":"clear_group_transform_gizmo_target","composition_revision":"9"}"#,
+            r#"{"action":"clear_group_transform_gizmo_target","composition_revision":9.5}"#,
+            r#"{"action":"clear_group_transform_gizmo_target","composition_revision":null}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<WebAction>(malformed).is_err(),
+                "accepted malformed clear-target revision: {malformed}"
+            );
+        }
+        for ordered in [
+            target,
+            clear_target,
+            WebAction::ResetGroupTransform {
+                group_id: "23".into(),
+                composition_revision: 9,
+            },
+            WebAction::ApplyGroupTransform {
+                group_id: "23".into(),
+                transform: exact,
+                composition_revision: 9,
+            },
+        ] {
+            assert!(
+                !valid_action(
+                    &WebAction::Quantized {
+                        inner: Box::new(ordered),
+                    },
+                    0,
+                ),
+                "ordered/session group action must never be quantized"
+            );
+        }
 
         assert!(valid_action(
             &WebAction::SetMasterTransform {
