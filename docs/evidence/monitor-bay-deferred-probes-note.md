@@ -166,7 +166,7 @@ final run; focused and opt-in receipts do not replace it.
 
 ## Closing fields
 
-- Topic implementation commit: **PENDING**
+- Topic implementation commit: **`6aa9d94`**
 - Topic receipt commit: **PENDING**
 - Integration commit on `feat/web-control-panel`: **PENDING**
 - Exact-commit CI: **PENDING**
