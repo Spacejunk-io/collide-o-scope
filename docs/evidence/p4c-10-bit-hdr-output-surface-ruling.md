@@ -257,9 +257,11 @@ before running.
 - P010/HDR production admission: **BLOCKED BY ITEM 13**
 - Topic evidence commit: **PASS** —
   `bcdb99cf93d76cad1536273994f4714e3f84e316`
-- Integration commit on `feat/web-control-panel`: **PENDING**
-- Exact-commit CI: **PENDING**
-- Deterministic implementation/tests: **NOT YET RUN**
+- Integration commit on `feat/web-control-panel`: **PASS** —
+  `2c4dd7b0767d16e31f5b36237985abfd85c3b906`
+- Exact-commit CI: **PASS**, run `33068097719` — dependency 34 s,
+  Linux 8m51s, macOS 10m42s, Windows 15m29s
+- HDR reopening implementation/tests: **NOT YET RUN**
 - Physical HDR/backend/display matrix: **NOT RUN**
 - Production renderer/export change: **NOT ATTEMPTED**
 

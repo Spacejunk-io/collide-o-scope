@@ -12,16 +12,24 @@ version number as physical audio/MIDI proof. The current direct dependencies
 remain `cpal = "0.16"` and `midir = "0.10"`; the locked nodes remain CPAL
 0.16.0 and midir 0.10.4. No manifest or lockfile was repinned.
 
-The same tranche closes two deterministic truth gaps discovered while auditing
-the maintenance boundary:
+The same tranche closes three deterministic truth gaps discovered while
+auditing the maintenance boundary:
 
 - callback failures and non-loopback sample stalls now enter one terminal
   teardown path, which drops the stream, clears active-device facts, zeroes
-  analysis state, and marks/removes an armed `ProgramAudioTap`; and
+  analysis state, and marks/removes an armed `ProgramAudioTap`. The callback
+  marks its tap lost immediately, and health polling continues while Program
+  Pause freezes FFT/modulation work, because frozen video recording still owns
+  a live PCM clock;
 - the macOS microphone disclosure now truthfully says that live audio can be
   included in Program recordings only after the operator starts recording. A
   source-contract test pins the key and exact disclosure once and forbids the
-  former false sentence, `Nothing is recorded`.
+  former false sentence, `Nothing is recorded`; and
+- README and both operator guides now state the implemented conditional mux
+  law exactly once: a live capture stream at recording start arms the bounded
+  Program PCM tap; otherwise the artifact is video-only and reports
+  `audio_not_muxed=true`. A source contract forbids the former video-only
+  contradictions.
 
 Those changes harden the pinned stack. They are not candidate-upgrade proof.
 
@@ -158,7 +166,11 @@ evidence.
 
 - Disposition: **EVIDENCE-BACKED STOP**
 - Pinned versions retained: **CPAL 0.16.0 / midir 0.10.4**
-- Deterministic terminalization/disclosure implementation commit: **PENDING**
+- Deterministic terminalization/disclosure implementation commits: **PASS** —
+  `db88a19abd2430ed981428ed3767e88650f99be8`,
+  `53b74d56a85b0381f824ec886e487a9d8eb8e565`
+- Targeted hardware-free contracts: **PASS** — 16 audio tests plus the
+  three-document conditional-mux contract
 - CI-form six-command gate: **PENDING**
 - Topic integration commit on `feat/web-control-panel`: **PENDING**
 - Exact-commit CI: **PENDING**
