@@ -23,8 +23,8 @@
     },
     {
       "id": "d5_straight_alpha_key_fill",
-      "status": "retained",
-      "gate": "application_action_live_acquisition_and_p1_readback"
+      "status": "implemented",
+      "gate": "offline_action_complete_live_acquisition_deferred"
     },
     {
       "id": "exact_pts_vfr_live",

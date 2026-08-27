@@ -894,6 +894,7 @@ The authoritative, executable capability matrix is [generated here](docs/capabil
 | `correlated_engine_gpu_timing` | Implemented | Implemented | Implemented |
 | `source_descriptor_color_truth` | Implemented | Implemented | Implemented |
 | `supervised_gpu_recovery_phase_a` | Implemented | Implemented | Implemented |
+| `straight_alpha_key_fill` | Implemented | Implemented | Implemented |
 | `d3d11va_hardware_decode` | Evaluation required | Unavailable on platform | Unavailable on platform |
 | `final_program_vhs` | Implemented | Implemented | Implemented |
 | `live_recorder_audio_mux` | Implemented | Implemented | Implemented |

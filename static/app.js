@@ -6257,13 +6257,16 @@ document.getElementById('export-start').addEventListener('click', () => {
   const audioLayerId = audioSelect.value === '' || audioSelect.value.startsWith('legacy-index:')
     ? null : audioSelect.value;
   const audioLayer = audioOption?.dataset.index === undefined ? null : parseInt(audioOption.dataset.index, 10);
+  const requestedAlpha = document.getElementById('export-alpha').value;
+  const alpha = ['straight_png_sequence', 'fill_key_png_sequence', 'straight_png_and_fill_key', 'ffv1_rgba']
+    .includes(requestedAlpha) ? requestedAlpha : null;
   exportActive = true;
   document.getElementById('export-start').style.display = 'none';
   document.getElementById('export-cancel').style.display = '';
   document.getElementById('export-progress').style.display = '';
   document.getElementById('export-status').textContent = 'Starting render…';
   syncExportWarnings([]);
-  if (!sendAction({ action: 'start_export', width: w, height: h, fps, duration_secs: duration, ntsc_quality: ntscQuality, shutter_samples: shutterSamples, audio_layer: audioLayer, audio_layer_id: audioLayerId })) {
+  if (!sendAction({ action: 'start_export', width: w, height: h, fps, duration_secs: duration, ntsc_quality: ntscQuality, shutter_samples: shutterSamples, audio_layer: audioLayer, audio_layer_id: audioLayerId, alpha })) {
     exportActive = false;
     document.getElementById('export-start').style.display = '';
     document.getElementById('export-cancel').style.display = 'none';

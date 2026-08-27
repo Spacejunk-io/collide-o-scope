@@ -38,8 +38,8 @@ const FINAL_AUDIT_CAMPAIGNS: [(&str, &str, &str); 5] = [
     ("d4_accepted_creative_mutation", "implemented", "complete"),
     (
         "d5_straight_alpha_key_fill",
-        "retained",
-        "application_action_live_acquisition_and_p1_readback",
+        "implemented",
+        "offline_action_complete_live_acquisition_deferred",
     ),
 ];
 
@@ -223,7 +223,6 @@ fn validate_registry_audit_boundary() -> Result<(), String> {
     for unavailable in [
         "photosensitivity_advisor",
         "portable_show_bundle",
-        "straight_alpha_key_fill",
         "source_display_geometry_application",
         "transparent_gpu_recovery",
     ] {
@@ -268,7 +267,7 @@ fn validate_rfc_truth(root: &Path) -> Result<(), String> {
     )?;
     require_document_claim(
         &root.join("docs/rfcs/d5-straight-alpha-export.md"),
-        "cannot be reached by the current MP4 action",
+        "reached by the ordinary MP4 action's explicit opt-in `alpha` field",
     )?;
     require_document_claim(
         &root.join("docs/rfcs/d5-straight-alpha-and-key-fill-export.md"),

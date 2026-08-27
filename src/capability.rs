@@ -58,6 +58,7 @@ pub enum CapabilityKey {
     SourceDescriptorColorTruth,
     SpoutInput,
     SpoutOutput,
+    StraightAlphaKeyFill,
     #[serde(rename = "study_motion_abi_1_1")]
     StudyMotionAbi11,
     SupervisedGpuRecoveryPhaseA,
@@ -69,7 +70,7 @@ pub enum CapabilityKey {
 
 impl CapabilityKey {
     /// Stable key order is also the generated-document order.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::AcceptedCreativeMutationV1,
         Self::AdvancedPrecision,
         Self::BoundedMeshWarp,
@@ -86,6 +87,7 @@ impl CapabilityKey {
         Self::SourceDescriptorColorTruth,
         Self::SpoutInput,
         Self::SpoutOutput,
+        Self::StraightAlphaKeyFill,
         Self::StudyMotionAbi11,
         Self::SupervisedGpuRecoveryPhaseA,
         Self::SyphonInput,
@@ -112,6 +114,7 @@ impl CapabilityKey {
             Self::SourceDescriptorColorTruth => "source_descriptor_color_truth",
             Self::SpoutInput => "spout_input",
             Self::SpoutOutput => "spout_output",
+            Self::StraightAlphaKeyFill => "straight_alpha_key_fill",
             Self::StudyMotionAbi11 => "study_motion_abi_1_1",
             Self::SupervisedGpuRecoveryPhaseA => "supervised_gpu_recovery_phase_a",
             Self::SyphonInput => "syphon_input",
@@ -139,6 +142,7 @@ impl CapabilityKey {
             Self::SourceDescriptorColorTruth => "Source descriptor and color-truth diagnostics",
             Self::SpoutInput => "Spout input",
             Self::SpoutOutput => "Spout output",
+            Self::StraightAlphaKeyFill => "Straight-alpha plate and fill/key export",
             Self::StudyMotionAbi11 => "Study motion ABI 1.1",
             Self::SupervisedGpuRecoveryPhaseA => "Supervised GPU recovery (Phase A)",
             Self::SyphonInput => "Syphon input",
@@ -381,6 +385,7 @@ pub enum CapabilityLimitation {
     AsynchronousFinalProgramLatency,
     VideoOnlyRecorder,
     LiveAudioCaptureRequired,
+    AlphaEffectPropagationRefused,
     AverageFrameRateCadence,
     WindowsOnly,
     LiveSourceIsBlackOffline,
@@ -586,6 +591,7 @@ fn primary_decision(key: CapabilityKey, facts: CapabilityRuntimeFacts) -> Capabi
             CapabilityRejectionReason::MeasuredResourceTradeoff,
         ),
         CapabilityKey::LiveRecorderAudioMux => CapabilityDecision::Implemented,
+        CapabilityKey::StraightAlphaKeyFill => CapabilityDecision::Implemented,
         CapabilityKey::SpoutInput | CapabilityKey::SpoutOutput => {
             if matches!(facts.platform, Platform::Windows) {
                 CapabilityDecision::Implemented
@@ -690,6 +696,16 @@ fn surfaces(key: CapabilityKey, primary: CapabilityDecision) -> Vec<CapabilitySu
             Surface::LiveRecording,
             primary,
         )],
+        CapabilityKey::StraightAlphaKeyFill => vec![
+            CapabilitySurfaceRecord::new(Surface::BrowserControl, primary),
+            CapabilitySurfaceRecord::new(Surface::OfflineExport, primary),
+            // The live recorder owns no alpha-capable encoder; the live half
+            // of D5 remains deferred exactly as its keep/stop receipt says.
+            CapabilitySurfaceRecord::new(
+                Surface::LiveRecording,
+                CapabilityDecision::Deferred(CapabilityDeferredReason::BackendNotIntegrated),
+            ),
+        ],
         CapabilityKey::ExactVfrLiveTransport => {
             vec![CapabilitySurfaceRecord::new(Surface::LiveProgram, primary)]
         }
@@ -766,6 +782,9 @@ fn evidence(key: CapabilityKey) -> Vec<EvidenceReceiptId> {
         ],
         CapabilityKey::SourceDescriptorColorTruth => &["p4b-source-descriptor-stop-receipt"],
         CapabilityKey::SupervisedGpuRecoveryPhaseA => &["p7-gpu-loss-phase-a"],
+        CapabilityKey::StraightAlphaKeyFill => {
+            &["d5-straight-alpha-export", "d5-alpha-export-action-note"]
+        }
         CapabilityKey::StudyMotionAbi11 => &["d1-study-motion-abi-1.1"],
         CapabilityKey::BoundedMeshWarp
         | CapabilityKey::CaptureInput
@@ -855,6 +874,16 @@ fn limitations(key: CapabilityKey) -> Vec<CapabilityLimitationRecord> {
             CapabilityLimitationRecord::new(
                 Limitation::ExternalProofRequired,
                 "Ring, drift, and device-loss laws are proven in software with an opt-in ffprobe fixture; a physical audio interface driving a live recording is hardware-matrix proof.",
+            ),
+        ],
+        CapabilityKey::StraightAlphaKeyFill => vec![
+            CapabilityLimitationRecord::new(
+                Limitation::AlphaEffectPropagationRefused,
+                "Codec-Mosh and final-program VHS have no proven straight-alpha propagation law: an export authoring either is refused up front, and a Morph or modulation wake mid-job aborts before anything publishes.",
+            ),
+            CapabilityLimitationRecord::new(
+                Limitation::VideoOnlyRecorder,
+                "The live recorder owns no alpha-capable encoder; alpha generations are an offline-export companion artifact only.",
             ),
         ],
         CapabilityKey::ExactVfrLiveTransport => vec![CapabilityLimitationRecord::new(
@@ -1038,6 +1067,7 @@ pub fn generated_readme_summary() -> String {
         CapabilityKey::CorrelatedEngineGpuTiming,
         CapabilityKey::SourceDescriptorColorTruth,
         CapabilityKey::SupervisedGpuRecoveryPhaseA,
+        CapabilityKey::StraightAlphaKeyFill,
         CapabilityKey::D3d11vaHardwareDecode,
         CapabilityKey::FinalProgramVhs,
         CapabilityKey::LiveRecorderAudioMux,
@@ -1282,23 +1312,36 @@ mod tests {
         }
 
         let registry = canonical_registry_json();
-        for unavailable_operator_capability in [
-            "photosensitivity_advisor",
-            "portable_show_bundle",
-            "straight_alpha_key_fill",
-        ] {
+        for unavailable_operator_capability in ["photosensitivity_advisor", "portable_show_bundle"]
+        {
             assert!(
                 !registry.contains(unavailable_operator_capability),
                 "registry upgraded unavailable campaign {unavailable_operator_capability}"
             );
         }
+        // D5's application action landed: the registry now carries the
+        // straight-alpha record with its offline scope and a live-recording
+        // surface that stays truthfully deferred.
+        let d5 = record(CapabilityKey::StraightAlphaKeyFill, Platform::Windows);
+        assert_eq!(d5.status, CapabilityStatus::Implemented);
+        assert!(d5.surfaces.iter().any(|surface| {
+            surface.surface == CapabilitySurface::OfflineExport
+                && surface.status == CapabilityStatus::Implemented
+        }));
+        assert!(d5.surfaces.iter().any(|surface| {
+            surface.surface == CapabilitySurface::LiveRecording
+                && surface.status == CapabilityStatus::Deferred
+        }));
+        assert!(d5.known_limitations.iter().any(|limitation| {
+            limitation.code == CapabilityLimitation::AlphaEffectPropagationRefused
+        }));
         assert!(
             include_str!("../docs/rfcs/d2-photosensitivity-risk-advisor.md")
                 .contains("does not declare an available live")
         );
         assert!(include_str!("../docs/rfcs/d3-portable-show-bundle.md").contains("operator UI"));
         assert!(include_str!("../docs/rfcs/d5-straight-alpha-export.md")
-            .contains("cannot be reached by the current MP4 action"));
+            .contains("reached by the ordinary MP4 action's explicit opt-in `alpha` field"));
     }
 
     #[test]
@@ -1462,8 +1505,8 @@ mod tests {
             ("d4_accepted_creative_mutation", "implemented", "complete"),
             (
                 "d5_straight_alpha_key_fill",
-                "retained",
-                "application_action_live_acquisition_and_p1_readback",
+                "implemented",
+                "offline_action_complete_live_acquisition_deferred",
             ),
         ] {
             let campaign = document

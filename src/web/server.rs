@@ -5263,6 +5263,7 @@ mod tests {
             shutter_samples: crate::render_export::ExportShutterSamples::Authored,
             audio_layer: None,
             audio_layer_id: None,
+            alpha: None,
         };
         assert!(!valid_action(&huge, 0));
         let zero_duration = WebAction::StartExport {
@@ -5274,6 +5275,7 @@ mod tests {
             shutter_samples: crate::render_export::ExportShutterSamples::Authored,
             audio_layer: None,
             audio_layer_id: None,
+            alpha: None,
         };
         assert!(!valid_action(&zero_duration, 0));
         let uhd_area = WebAction::StartExport {
@@ -5285,6 +5287,7 @@ mod tests {
             shutter_samples: crate::render_export::ExportShutterSamples::Samples16,
             audio_layer: None,
             audio_layer_id: None,
+            alpha: None,
         };
         assert!(valid_action(&uhd_area, 0));
         let above_uhd_area = WebAction::StartExport {
@@ -5296,6 +5299,7 @@ mod tests {
             shutter_samples: crate::render_export::ExportShutterSamples::Authored,
             audio_layer: None,
             audio_layer_id: None,
+            alpha: None,
         };
         assert!(!valid_action(&above_uhd_area, 0));
         let nested = WebAction::Quantized {

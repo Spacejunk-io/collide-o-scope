@@ -1,7 +1,11 @@
 # RFC D5 — explicitly ordered straight-alpha plate and fill/key export
 
-Status: **exact artifact contract and transactional publishers implemented;
-application action/live acquisition deferred at the integration stop gate**.
+Status: **implemented as an offline-export application action; live-recorder
+acquisition remains deferred**. The exact artifact contract and transactional
+publishers landed first at the integration stop gate; the application action,
+the invoked offline readback at the named seam, and the action receipt landed
+in the follow-on tranche
+(`docs/evidence/d5-alpha-export-action-note.md`).
 
 ## Frozen seam
 
@@ -56,20 +60,22 @@ implementation never synthesizes alpha one and calls it a key, and it never
 silently labels a pre-effect matte as a post-effect plate.
 
 The ordinary MP4 action/configuration, FFmpeg arguments, `libx264`, `yuv420p`,
-frame order, and opaque shader pass are unchanged. The sole offline production
-edit names the same existing slot-0 view when constructing the existing opaque
-bind group; the live edit does the same. Alpha publishers are opt-in library
-objects and cannot be reached by the current MP4 action.
+frame order, and opaque shader pass are unchanged. Alpha publishers are
+reached by the ordinary MP4 action's explicit opt-in `alpha` field
+(`start_export`, closed token vocabulary; omitted legacy clients keep the
+exact prior path). When the field is set, the offline frame loop reads the
+named seam through the existing bounded staging buffer — one sequential
+in-flight readback, after the audience readback, with the established
+cancellation law — and stages one atomic `<output>.mp4.alpha` generation that
+publishes only after the MP4 and every sidecar. The authored effect refusal
+runs before any directory exists, and the frame loop re-checks both effect
+laws so a Morph or modulation wake aborts the job instead of publishing a
+mislabeled plate.
 
-## Promotion stop
+## Remaining boundary
 
-The existing bounded offline staging-buffer readback is retained behind a
-named, unused acquisition wrapper. Wiring it into a new action would require a
-new output-format schema, progress/cancellation ownership, a dedicated bounded
-in-flight readback plan, and performance evidence. `main.rs` and the action
-schema were concurrently owned, and no exact live-recorder encoder/action seam
-or P1 readback performance campaign was available. Those steps are therefore
-deferred rather than widening or changing ordinary MP4.
-
-The exact implementation and test receipt is
-`docs/evidence/d5-straight-alpha-export.md`.
+Live-recorder alpha acquisition remains deferred: the recorder owns no
+alpha-capable encoder, and the capability registry carries that surface as
+deferred. The keep/stop receipt for the retained core is
+`docs/evidence/d5-straight-alpha-export.md`; the application-action receipt is
+`docs/evidence/d5-alpha-export-action-note.md`.
