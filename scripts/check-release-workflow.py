@@ -43,7 +43,7 @@ REVIEWED_PACKAGE_ASSEMBLY_STEP_SHA256 = (
     "f327da1c8f9029e9b224bffe95b1d5713b9cee875428c56733ff04f15e468cbb"
 )
 REVIEWED_SBOM_POLICY_SHA256 = (
-    "18ca32ac7c13002dc9d498e8c0bfa855c8716c0c00b59cb91d4fe11fd5ef614d"
+    "24627d3c98aa1cb78805a03ec03f6049539e39b54fc6e238022ddef284ea8d38"
 )
 REVIEWED_RELEASE_VERIFIER_SHA256 = (
     "904cfa1fac528996daca88ac17799cf0a1f06652cb621a26f6f477f4207801a4"
@@ -83,7 +83,7 @@ REVIEWED_WORKFLOW_SHA256 = {
     ),
     "ci.yml": "0848e77ff0bb959611c6a85f7e69ecca5ddf5464a3130942ad43ff7b2855a2b9",
     "release-trust.yml": (
-        "7da4f2fb04d1107e8306d8d815866234c2022337d0326296ca5003433512212b"
+        "86ddc170589a43b3a4e7cc71cce36c7883682fd1274b170c21185b886c522881"
     ),
 }
 PINNED_WORKFLOW_ACTION = re.compile(
@@ -2665,7 +2665,7 @@ def validate_reviewed_sbom_policy_digest(policy: str) -> None:
         or 'EXPECTED_ROOT_EDGES = 35' not in policy
         or 'EXPECTED_REWRITTEN_REFERENCES = 13' not in policy
         or 'EXPECTED_SEMANTIC_PROFILE_SHA256 = (' not in policy
-        or '"d8333dbde0a319d518a7461ee68d8e3617221ddbb0b47b99480c1b43ecd1942b"' not in policy
+        or '"28a7e617720766836d822c04f1de3c81387effc170ee2cd10edb8c96116cc0ab"' not in policy
         or 'object_pairs_hook=_reject_duplicate_keys' not in policy
         or 'parse_constant=_reject_nonfinite_constant' not in policy
         or 'if observed_changes != changed_paths:' not in policy
@@ -3051,6 +3051,7 @@ def validate_versioned_release_receipts(finalizer: str) -> None:
         "v1.7.4-release-recovery-receipt.md",
         "v1.8.0-ffmpeg-9-software-baseline-receipt.md",
         "v1.8.1-patch-refresh-receipt.md",
+        "v1.9.0-perfection-release-receipt.md",
     )
     for name in names:
         if (
@@ -3070,6 +3071,7 @@ def self_test_versioned_release_receipts(finalizer: str) -> None:
         "v1.7.4-release-recovery-receipt.md",
         "v1.8.0-ffmpeg-9-software-baseline-receipt.md",
         "v1.8.1-patch-refresh-receipt.md",
+        "v1.9.0-perfection-release-receipt.md",
     )
     for name in names:
         for literal in (f'"{name}",', f'"docs/evidence/{name}"'):

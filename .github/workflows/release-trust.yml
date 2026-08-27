@@ -9,7 +9,7 @@ on:
       release_tag:
         description: Candidate tag whose version must match Cargo.toml
         required: true
-        default: v1.8.1
+        default: v1.9.0
 
 permissions:
   contents: read

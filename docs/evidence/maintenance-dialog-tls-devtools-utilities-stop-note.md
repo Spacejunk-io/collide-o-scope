@@ -53,7 +53,8 @@ The current source census found:
 - four qualified rcgen references plus two `CertifiedKey::key_pair` field
   uses around certificate generation and persisted-certificate validation;
 - one Criterion benchmark source, two macro invocations, and six named groups;
-- ten `getrandom::fill` calls across seven production files;
+- ten `getrandom::fill` calls across seven tracked `src/` files: six runtime
+  calls and four test-only temporary-path helpers;
 - 158 `pollster::block_on` calls across 27 files; and
 - 91 `Sha256`-bearing lines across 26 Rust files, including the two P4c
   Windows-test helper lines added after the audit base. The sha2 0.11 migration
@@ -127,16 +128,18 @@ methodology/baseline ruling before candidate values are compared to history.
 
 ### getrandom 0.4.3 — bounded but unproved
 
-The ten direct `fill` calls are source-compatible, and the candidate contains
+All ten direct `fill` calls are source-compatible, and the candidate contains
 corrected Windows `ProcessPrng` error handling. It is nevertheless already in
-the graph transitively, while 0.3.4 and 0.2.17 remain owned elsewhere. The
-direct calls guard authentication material and transactional staging names.
+the graph transitively, while 0.3.4 and 0.2.17 remain owned elsewhere. The six
+runtime calls guard authentication material and transactional staging names;
+the other four calls are test-only temporary-path helpers.
 
 Reopening requires a direct-edge-only topic with frozen inverse trees and
-SBOM facts; deterministic entropy-failure injection at all ten calls; forced
-collision proof preserving each existing retry ceiling and never overwriting;
-and successful affected operations on Windows, macOS, and Linux with fixed
-token encoding, no secret logging, atomic cleanup, and unchanged resources.
+SBOM facts; deterministic entropy-failure injection at all six runtime calls
+plus retained coverage of the four test helpers; forced collision proof
+preserving each existing retry ceiling and never overwriting; and successful
+affected operations on Windows, macOS, and Linux with fixed token encoding,
+no secret logging, atomic cleanup, and unchanged resources.
 
 ### pollster 1.0.1 — executor/GPU boundary
 
@@ -168,7 +171,9 @@ own changed hash and derived build identity must be re-ledgered honestly.
 - Rfd and pollster stay separately attributable; neither may hide the other's
   split graph or physical/liveness proof.
 - Rcgen persistence is proved against retained sha2 bytes before any sha2
-  migration, and rcgen and direct getrandom land serially around TLS identity.
+  migration. Rcgen and direct getrandom still land serially for attribution;
+  their only source-file co-occurrence is a test-only helper in
+  `tls_identity.rs`, not a production TLS coupling.
 - Criterion 0.8 cannot be the measuring instrument for another dependency's
   campaign until its own methodology has been ruled.
 - Sha2 moves across root normal, root build, root lock, fuzz manifest, and fuzz
@@ -181,9 +186,10 @@ own changed hash and derived build identity must be re-ledgered honestly.
 
 ## Repository and protected-artifact boundary
 
-The authorized tracked write is this evidence note only. It does not alter
-either manifest or lock, `build.rs`, source, benches, fuzz targets, workflows,
-vendor bytes, capability records, or release artifacts.
+The only utility-candidate tracked write is this evidence note; the topic also
+closed the already-implemented audio/MIDI note fields. It does not alter either
+manifest or lock, `build.rs`, source, benches, fuzz targets, workflows, vendor
+bytes, capability records, or release artifacts.
 
 | Artifact | Bytes | SHA-256 |
 | --- | ---: | --- |
@@ -202,10 +208,17 @@ or hash evidence.
   direct getrandom 0.3.4 / pollster 0.4.0 / sha2 0.10.9**
 - Getrandom 0.4.3 promotion: **NOT YET PROVEN**
 - Candidate manifest/lock mutation: **NOT ATTEMPTED**
-- Topic evidence commit: **PENDING**
-- Integration commit on `feat/web-control-panel`: **PENDING**
-- CI-form six-command gate: **PENDING**
-- Exact-commit CI: **PENDING**
+- Topic evidence commits: **`ab826465466a4a75936fa45fb4c68ca62464c773`**
+  (utility note plus audio/MIDI closure) and
+  **`2d4bfe9df60fecf619c89352fedb5b256dc4619d`** (metadata normalization and
+  exact gated topic head)
+- Integration commit on `feat/web-control-panel`:
+  **`bfc1d769e5ae94dc13df4e1ebd3e2d4392518936`**
+- CI-form six-command gate: **OBSERVED PASS** at `2d4bfe9` — 2,154 tests
+  passed, 164 ignored external/physical seats, six benches green, and clippy
+  clean
+- Exact-commit CI: **PASS**, run `33071440667` — dependency 35 s,
+  Linux 8m53s, macOS 10m09s, Windows 17m24s
 - rfd physical dialog matrix: **NOT RUN**
 - rcgen persistence/live-handshake campaign: **NOT RUN**
 - Criterion side-by-side methodology campaign: **NOT RUN**

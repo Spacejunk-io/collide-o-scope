@@ -620,6 +620,7 @@ def source_evidence_receipts() -> list[dict]:
         "v1.7.4-release-recovery-receipt.md",
         "v1.8.0-ffmpeg-9-software-baseline-receipt.md",
         "v1.8.1-patch-refresh-receipt.md",
+        "v1.9.0-perfection-release-receipt.md",
     }
     for prefix in ("p3", "p9", "p10"):
         names.update(path.name for path in evidence_root.glob(f"{prefix}*"))
@@ -1128,6 +1129,7 @@ def validate_final_receipt(receipt: dict) -> None:
         or "docs/evidence/v1.8.0-ffmpeg-9-software-baseline-receipt.md"
         not in source_paths
         or "docs/evidence/v1.8.1-patch-refresh-receipt.md" not in source_paths
+        or "docs/evidence/v1.9.0-perfection-release-receipt.md" not in source_paths
         or not any(
             isinstance(path, str) and path.startswith("docs/evidence/p10")
             for path in source_paths
