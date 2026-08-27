@@ -1,7 +1,9 @@
 # Ableton Link and LTC closeout — defer and doctrine-stop note
 
-Date: 2026-08-27  
-Topic: `docs/link-ltc-closeout`  
+Date: 2026-08-27
+
+Topic: `docs/link-ltc-closeout`
+
 Pinned integration base: `d43cffaa596952741f669e018d3ea63c93aa6c01`
 
 Status: **Ableton Link remains deferred; LTC/MTC remains a doctrine change.**
@@ -110,12 +112,19 @@ remained absent and was not minted.
 
 ## Closing fields
 
-- Topic evidence commit: **PENDING**
+- Topic evidence commit: **`a25a55c`**
 - Topic receipt commit: **PENDING**
 - Integration commit on `feat/web-control-panel`: **PENDING**
 - Exact-commit CI: **PENDING**
-- Hosted full gate: **PENDING**
-- Protected-root and `videos/audit.mp4` recheck: **PENDING**
+- Hosted full gate: **OBSERVED PASS** — the exact six-command CI-form gate
+  passed: formatting and both JavaScript parsers; all-target/all-feature
+  compile; 2,143 tests passed with zero failures and 163 explicitly ignored
+  external/GPU seats; all six bench harnesses reported success; clippy passed
+  with `-D warnings`
+- Protected-root and `videos/audit.mp4` recheck: **OBSERVED PASS** — the three
+  protected root files remain the only untracked root artifacts at 66,225 /
+  `494b63ad...ab1eea4`, 56,984,527 / `ee1cfc47...13d034a0`, and 60,528,641 /
+  `2b51dda2...722630a4`; `videos/audit.mp4` remains absent
 
 ## Deliberate non-claims
 
