@@ -97,13 +97,18 @@ negative decision, not a favorable-average promotion claim.
 
 - Deterministic implementation commit: **PASS** —
   `bcdb99cf93d76cad1536273994f4714e3f84e316`
-- CI-form six-command gate: **PENDING**
+- CI-form six-command gate: **PASS** at exact topic
+  `f1f3eea5dd05377940dc7dbc16284a255c235d57` — 2,149 tests passed,
+  164 explicit external/physical fixtures ignored, six benches green, and
+  warnings-as-errors clippy clean
 - Integrated total-frame release fixture: **PASS (EXECUTION); NEGATIVE
   DEFAULT-FLIP DECISION** — 600 aggregate seconds; ignored receipt 33,587,500
   bytes; SHA-256
   `4fffec11688836c59b5e9d7b05b34bdd85854af1b5041c7f74be73e16aab8c59`
-- Topic integration commit on `feat/web-control-panel`: **PENDING**
-- Exact-commit CI: **PENDING**
+- Topic integration commit on `feat/web-control-panel`: **PASS** —
+  `2c4dd7b0767d16e31f5b36237985abfd85c3b906`
+- Exact-commit CI: **PASS**, run `33068097719` — dependency 34 s,
+  Linux 8m51s, macOS 10m42s, Windows 15m29s
 - Capability registry regeneration/check: **PASS**
 - Phase-A JSON identity recheck: **PASS** — 4,505 bytes, SHA-256
   `fc682e51a549f33b1b70ed684b575eb8da65d989e69cc648be569c9e9e3e082e`;

@@ -49,14 +49,15 @@
 	     LAN address is discovered by opening a UDP socket outward. macOS 15
 	     gates all of that behind the Local Network permission.
 
-	     Microphone: cpal captures a live input for the audio analysis that
-	     drives the modulation matrix. Denial here is soft by design - the
-	     sources fall to zero and the toggle returns to off - but the operator
-	     should still be asked rather than silently refused. -->
+	     Microphone: cpal captures a live input for audio analysis and, only
+	     after the operator starts Program recording, supplies that recording's
+	     audio track. Denial here is soft by design - the sources fall to zero
+	     and the toggle returns to off - but the operator should still be asked
+	     rather than silently refused. -->
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>collide-o-scope serves its control panel on your local network so you can perform from a phone, tablet, or another computer.</string>
 
 	<key>NSMicrophoneUsageDescription</key>
-	<string>collide-o-scope analyses live audio to drive visual modulation. Nothing is recorded or transmitted.</string>
+	<string>collide-o-scope uses live audio to drive visual modulation and can include it in Program recordings when you start recording.</string>
 </dict>
 </plist>

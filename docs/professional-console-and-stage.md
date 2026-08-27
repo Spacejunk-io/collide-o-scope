@@ -133,8 +133,11 @@ thread never waits for FFmpeg and never allocates recorder frame buffers on the
 warm path. Four fixed RGBA buffers feed a queue of two; pool/queue/source misses
 increment explicit drop counters. Capture metadata is frozen at the GPU copy,
 including capture/program clocks, visual epoch, freeze/blackout facts, and an
-optional audio-clock correlation stamp. The current recorder is video-only and
-does not claim to mux audio without a bounded program-PCM source.
+optional audio-clock correlation stamp. If a live capture stream is running
+when recording starts, the recorder muxes its bounded Program PCM tap;
+otherwise the artifact is video-only and the sidecar reports
+`audio_not_muxed=true`. A lost capture device is reported and padded on the
+owned audio clock rather than silently relabeled as uninterrupted audio.
 
 Program capture taps the final audience image after NTSC and absolute blackout.
 Layer/group capture taps the requested stable post-effects scope. A missing or

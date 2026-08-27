@@ -28686,11 +28686,17 @@ impl ApplicationHandler for App {
                         } else if !self.mod_matrix.audio_enabled && self.audio.is_running() {
                             self.audio.stop();
                         }
-                        if !program_transport_paused {
+                        if program_transport_paused {
+                            // Recording continues to admit frozen Program
+                            // frames during Pause. Keep device/stall truth and
+                            // its independent PCM clock live even though FFT
+                            // and modulation state deliberately stay frozen.
+                            self.audio.poll_stream_health();
+                        } else {
                             self.mod_matrix.audio = self.audio.analyze(self.mod_matrix.audio_gain);
-                            if !self.audio.is_running() && !self.audio.error.is_empty() {
-                                self.mod_matrix.audio_enabled = false;
-                            }
+                        }
+                        if !self.audio.is_running() && !self.audio.error.is_empty() {
+                            self.mod_matrix.audio_enabled = false;
                         }
                     }
 
