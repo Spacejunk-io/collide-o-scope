@@ -4,8 +4,8 @@ Date prepared: 2026-08-27
 Topic: `feat/maintenance-actions-cosign3`
 Pinned integration base:
 `7e79ed773e1278f65da2ce15e32927b1d5847fa0`
-Status: **topic implementation and local gate observed; receipt, integration,
-exact-commit CI, and live v0.3 signing remain pending**
+Status: **integrated with exact-commit CI observed; live v0.3 signing remains
+operator-gated**
 
 This is the §3.8(a) maintenance tranche. It updates the immutable GitHub Action
 pins, advances the release signer and verifier to the patched Cosign 3 line,
@@ -178,9 +178,12 @@ only non-ignored untracked root artifacts at 66,225, 56,984,527, and
 ## Closing fields
 
 - Topic implementation commits: **`a8764df`**, **`22588b1`**
-- Topic receipt commit: **PENDING**
-- Integration commit on `feat/web-control-panel`: **PENDING**
-- Exact-commit CI: **PENDING**
+- Topic receipt commit: **`bfda487`**
+- Integration commit on `feat/web-control-panel`: **`96bcb73`**
+- Exact-commit CI: **OBSERVED PASS** —
+  [run 33054896096](https://github.com/Spacejunk-io/collide-o-scope/actions/runs/33054896096)
+  passed at exact head `96bcb73` across Linux 24.04, macOS 15, Windows
+  VS 2022, and dependency policy
 - Hosted full gate: **OBSERVED PASS** — the exact six-command CI-form gate
   passed on the topic tree: formatting and both JavaScript parsers;
   all-target/all-feature compile; 2,143 tests passed with zero failures and
@@ -197,8 +200,8 @@ only non-ignored untracked root artifacts at 66,225, 56,984,527, and
 
 ## Deliberate non-claims
 
-This note is not an exact-commit CI receipt, hosted-runner execution receipt,
-new release receipt, v0.3 persistence receipt, or offline-verification receipt.
+This note is not a new release receipt, v0.3 persistence receipt, or
+offline-verification receipt.
 It does not claim that Node 24 actions run on an older or unreviewed self-hosted
 runner, that containerized authenticated checkout was exercised, or that a
 local parser substitutes for GitHub Actions. Historical release tags, assets,
