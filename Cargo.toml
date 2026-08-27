@@ -1,6 +1,6 @@
 [package]
 name = "collide-o-scope"
-version = "1.8.1"
+version = "1.9.0"
 edition = "2021"
 default-run = "collide-o-scope"
 license = "GPL-3.0-or-later"
