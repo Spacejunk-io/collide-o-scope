@@ -1959,6 +1959,23 @@
               </div>
               <div class="export-status" id="patch-save-status" role="status" aria-live="polite"></div>
               <div class="export-status" id="patch-load-status" role="status" aria-live="polite"></div>
+              <section class="bundle-panel" aria-labelledby="bundle-heading">
+                <h3 id="bundle-heading">Show bundle</h3>
+                <div class="patch-capture-controls" role="group" aria-label="Portable show bundle">
+                  <button id="bundle-export" class="btn-export" type="button" title="Build one portable .cosbundle carrying the complete performance state and every resolved original medium the captured patch references">Export bundle…</button>
+                  <button id="bundle-preview" class="btn-export" type="button" title="Verify a .cosbundle and show its contents without importing or writing anything">Preview bundle…</button>
+                </div>
+                <div id="bundle-pending" hidden>
+                  <div class="export-status" id="bundle-pending-summary"></div>
+                  <ul id="bundle-pending-entries"></ul>
+                  <div class="patch-capture-controls" role="group" aria-label="Confirm bundle import">
+                    <button id="bundle-import" class="btn-export" type="button" title="Import the previewed bundle into the active library as one atomic generation">Import</button>
+                    <button id="bundle-import-load" class="btn-export" type="button" title="Import, then load the bundled show as a complete snapshot">Import + load show</button>
+                    <button id="bundle-cancel" class="btn-export btn-cancel" type="button" title="Discard the standing preview without importing">Discard preview</button>
+                  </div>
+                </div>
+                <div class="export-status" id="bundle-status" role="status" aria-live="polite"></div>
+              </section>
               <section class="history-panel" aria-labelledby="history-heading">
                 <h3 id="history-heading">Manual history</h3>
                 <div class="history-controls" role="group" aria-label="Manual undo and redo">

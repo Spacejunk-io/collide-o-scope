@@ -1016,6 +1016,14 @@ struct DeferredPerformanceHistory {
     label: String,
 }
 
+/// A verified, side-effect-free bundle preview held for explicit import
+/// confirmation. Confirmation re-inspects the file and refuses a digest that
+/// moved, so this is a display of what was seen, never import authority.
+struct PendingBundleImport {
+    path: PathBuf,
+    preview: show_bundle::BundlePreview,
+}
+
 #[derive(Clone)]
 struct ScheduledPerformanceActivation {
     key: performance_runtime::PreparedTransactionKey,
@@ -5938,6 +5946,10 @@ struct App {
     control_server: Option<web::server::ControlServerHandle>,
     patch_collector: procedural::PatchCollector,
     patch_load_status: String,
+    /// D3 operator surface: last bundle outcome plus the standing
+    /// side-effect-free preview awaiting explicit import confirmation.
+    show_bundle_status: String,
+    pending_bundle_import: Option<PendingBundleImport>,
     // Offline render export
     export_job: Option<render_export::ExportJob>,
     // Actions latched for the next four-beat downbeat.
@@ -6397,6 +6409,8 @@ impl App {
             control_server: None,
             patch_collector: procedural::PatchCollector::new(),
             patch_load_status: String::new(),
+            show_bundle_status: String::new(),
+            pending_bundle_import: None,
             export_job: None,
             quantized_actions: Vec::new(),
             quantized_action_sources: Vec::new(),
@@ -11376,6 +11390,7 @@ impl App {
             | WebAction::SetMorphLaw { .. }
             | WebAction::MorphGlide { .. }
             | WebAction::OpenPatchSnapshot
+            | WebAction::ConfirmShowBundleImport { .. }
             | WebAction::OpenPatchLook { .. } => true,
             WebAction::SetNtscParam { .. } => applied.applied_ntsc,
             WebAction::SetTemporal { .. } => applied.applied_temporal,
@@ -11696,6 +11711,240 @@ impl App {
                 log::error!("{}", self.patch_load_status);
                 false
             }
+        }
+    }
+
+    /// Export the complete current performance state and its resolved
+    /// original media as one portable `.cosbundle`. The whole flow — picker,
+    /// capture, media resolution/fingerprinting, and the transactional
+    /// build — runs under the native-modal clock pause, exactly as patch
+    /// save/load do, so a long hash never becomes program catch-up debt.
+    fn export_show_bundle_dialog(&mut self) {
+        let patch = match self.try_capture_current_patch() {
+            Ok(patch) => patch,
+            Err(error) => {
+                self.show_bundle_status = format!("Bundle export rejected: {error}");
+                log::warn!("{}", self.show_bundle_status);
+                return;
+            }
+        };
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Export collide-o-scope show bundle")
+            .set_file_name("show.cosbundle")
+            .add_filter("Collide-o-Scope show bundle", &["cosbundle"]);
+        if let Some(folder) = &self.library_folder {
+            dialog = dialog.set_directory(folder);
+        }
+        let modal_started = Instant::now();
+        let was_program_paused = self.program_transport_paused();
+        self.mod_matrix.clock.set_paused(true, modal_started);
+        let destination = dialog.save_file();
+        let result = destination.map(|destination| {
+            let context = media_source::ResolveContext::new(None, self.library_folder.clone());
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            media_source::FingerprintSession::new(media_source::FingerprintLimits::default())
+                .map_err(|error| error.to_string())
+                .and_then(|mut fingerprints| {
+                    show_bundle::collect_bundle_media_inputs(&patch, &context, &mut fingerprints)
+                        .map_err(|error| error.to_string())
+                })
+                .and_then(|media| {
+                    show_bundle::build_show_bundle(
+                        &destination,
+                        show_bundle::BundleBuildRequest {
+                            patch,
+                            media,
+                            documents: Vec::new(),
+                            // The native save dialog already confirmed the name,
+                            // including its overwrite prompt.
+                            output_collision: show_bundle::BundleOutputCollision::Replace,
+                        },
+                        show_bundle::BundleLimits::default(),
+                        &cancel,
+                    )
+                    .map_err(|error| error.to_string())
+                    .map(|receipt| (destination, receipt))
+                })
+        });
+        self.finish_native_modal(was_program_paused, Instant::now());
+        match result {
+            None => {
+                self.show_bundle_status = "Bundle export cancelled".to_string();
+            }
+            Some(Err(error)) => {
+                self.show_bundle_status = format!("Bundle export rejected: {error}");
+                log::warn!("{}", self.show_bundle_status);
+            }
+            Some(Ok((destination, receipt))) => {
+                self.show_bundle_status = format!(
+                    "Exported {} ({} entries, {} bytes, bundle {})",
+                    destination.display(),
+                    receipt.entry_count,
+                    receipt.byte_len,
+                    &receipt.bundle_sha256[..16.min(receipt.bundle_sha256.len())],
+                );
+                log::info!("{}", self.show_bundle_status);
+            }
+        }
+    }
+
+    /// Run the side-effect-free bundle inspection and hold the verified
+    /// preview for explicit confirmation. Nothing is written or imported.
+    fn preview_show_bundle_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Preview collide-o-scope show bundle")
+            .add_filter("Collide-o-Scope show bundle", &["cosbundle"]);
+        if let Some(folder) = &self.library_folder {
+            dialog = dialog.set_directory(folder);
+        }
+        let modal_started = Instant::now();
+        let was_program_paused = self.program_transport_paused();
+        self.mod_matrix.clock.set_paused(true, modal_started);
+        let path = dialog.pick_file();
+        let result = path.map(|path| {
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            show_bundle::inspect_show_bundle(&path, show_bundle::BundleLimits::default(), &cancel)
+                .map(|preview| (path, preview))
+                .map_err(|error| error.to_string())
+        });
+        self.finish_native_modal(was_program_paused, Instant::now());
+        match result {
+            None => {
+                self.show_bundle_status = "Bundle preview cancelled".to_string();
+            }
+            Some(Err(error)) => {
+                self.pending_bundle_import = None;
+                self.show_bundle_status = format!("Bundle preview rejected: {error}");
+                log::warn!("{}", self.show_bundle_status);
+            }
+            Some(Ok((path, preview))) => {
+                self.show_bundle_status = format!(
+                    "Previewed {} — confirm to import into the active library",
+                    path.display()
+                );
+                self.pending_bundle_import = Some(PendingBundleImport { path, preview });
+            }
+        }
+    }
+
+    /// Import the standing previewed bundle into the active library as one
+    /// atomic generation. The bundle is re-inspected first and must still
+    /// carry the exact previewed digest — a file that changed since the
+    /// preview is a refusal, never a silent import of unseen content.
+    /// Returns true when `load` applied the imported patch as a snapshot.
+    fn confirm_show_bundle_import(&mut self, load: bool) -> bool {
+        let Some(pending) = self.pending_bundle_import.take() else {
+            self.show_bundle_status =
+                "No bundle preview is pending; run Preview bundle first".to_string();
+            return false;
+        };
+        let Some(library) = self.library_folder.clone() else {
+            self.show_bundle_status =
+                "Bundle import needs an active library folder; choose one first".to_string();
+            return false;
+        };
+        let modal_started = Instant::now();
+        let was_program_paused = self.program_transport_paused();
+        self.mod_matrix.clock.set_paused(true, modal_started);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let receipt = show_bundle::inspect_show_bundle(
+            &pending.path,
+            show_bundle::BundleLimits::default(),
+            &cancel,
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|inspection| {
+            if inspection.bundle_sha256 != pending.preview.bundle_sha256 {
+                return Err("bundle changed since it was previewed; preview it again".to_string());
+            }
+            show_bundle::import_show_bundle(
+                &pending.path,
+                &library,
+                show_bundle::BundleImportCollision::ReuseVerified,
+                show_bundle::BundleLimits::default(),
+                &cancel,
+            )
+            .map_err(|error| error.to_string())
+        });
+        self.finish_native_modal(was_program_paused, Instant::now());
+        let receipt = match receipt {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.show_bundle_status = format!("Bundle import rejected: {error}");
+                log::warn!("{}", self.show_bundle_status);
+                return false;
+            }
+        };
+        self.show_bundle_status = format!(
+            "Imported {} generation {}{}",
+            pending.path.display(),
+            receipt.generation_root.display(),
+            if receipt.reused {
+                " (existing verified generation reused)"
+            } else {
+                ""
+            },
+        );
+        log::info!("{}", self.show_bundle_status);
+        if !load {
+            return false;
+        }
+        match patch::editor::load_patch_path(&receipt.patch_path)
+            .and_then(|loaded| self.apply_loaded_patch(loaded, &receipt.patch_path))
+        {
+            Ok(()) => {
+                self.patch_load_status =
+                    format!("Loaded snapshot {}", receipt.patch_path.display());
+                self.show_bundle_status.push_str("; show loaded");
+                log::info!("{}", self.patch_load_status);
+                true
+            }
+            Err(error) => {
+                self.patch_load_status = format!("Error: {error}");
+                self.show_bundle_status = format!(
+                    "Imported, but the show did not load: {error}; use Load snapshot on {}",
+                    receipt.patch_path.display()
+                );
+                log::error!("{}", self.show_bundle_status);
+                false
+            }
+        }
+    }
+
+    fn cancel_show_bundle_import(&mut self) {
+        if self.pending_bundle_import.take().is_some() {
+            self.show_bundle_status = "Bundle preview discarded".to_string();
+        }
+    }
+
+    fn show_bundle_snapshot(&self) -> web::state::ShowBundleSnapshot {
+        web::state::ShowBundleSnapshot {
+            status: self.show_bundle_status.clone(),
+            pending: self.pending_bundle_import.as_ref().map(|pending| {
+                let bound = web::state::SHOW_BUNDLE_SNAPSHOT_MAX_ENTRIES;
+                web::state::ShowBundlePendingSnapshot {
+                    path: pending.path.display().to_string(),
+                    bundle_sha256: pending.preview.bundle_sha256.clone(),
+                    patch_sha256: pending.preview.patch_sha256.clone(),
+                    bundle_bytes: pending.preview.bundle_bytes,
+                    expanded_bytes: pending.preview.expanded_bytes,
+                    entry_count: pending.preview.entries.len(),
+                    entries: pending
+                        .preview
+                        .entries
+                        .iter()
+                        .take(bound)
+                        .map(|entry| web::state::ShowBundleEntrySnapshot {
+                            logical_name: entry.logical_name.clone(),
+                            kind: entry.kind.clone(),
+                            byte_len: entry.byte_len,
+                            authoritative: entry.authoritative,
+                            license: entry.license.clone(),
+                        })
+                        .collect(),
+                    entries_truncated: pending.preview.entries.len() > bound,
+                }
+            }),
         }
     }
 
@@ -17428,6 +17677,10 @@ impl App {
                 | WebAction::QuickSavePatch
                 | WebAction::StartExport { .. }
                 | WebAction::CancelExport
+                | WebAction::ExportShowBundle
+                | WebAction::PreviewShowBundle
+                | WebAction::ConfirmShowBundleImport { .. }
+                | WebAction::CancelShowBundleImport
                 | WebAction::ControllerProfile {
                     request: controller_profile::ControllerProfileAction::Export {},
                 }
@@ -21333,6 +21586,20 @@ impl App {
                     disposition = WebActionBatchDisposition::SnapshotCommitted;
                 }
             }
+            WebAction::ExportShowBundle => {
+                self.export_show_bundle_dialog();
+            }
+            WebAction::PreviewShowBundle => {
+                self.preview_show_bundle_dialog();
+            }
+            WebAction::ConfirmShowBundleImport { load } => {
+                if self.confirm_show_bundle_import(load) {
+                    disposition = WebActionBatchDisposition::SnapshotCommitted;
+                }
+            }
+            WebAction::CancelShowBundleImport => {
+                self.cancel_show_bundle_import();
+            }
             WebAction::OpenPatchLook { stack_revision } => {
                 if let Some(scope) = self.choose_and_apply_patch_look(Some(stack_revision)) {
                     disposition = WebActionBatchDisposition::LookApplied(scope);
@@ -25222,6 +25489,7 @@ impl App {
                 recovery_status: self.recovery_status.clone(),
                 patch_save_status: self.patch_collector.status(),
                 patch_load_status: self.patch_load_status.clone(),
+                show_bundle: self.show_bundle_snapshot(),
                 quantized_pending: self.quantized_actions.len(),
                 constraint_diagnostics: self.constraint_diagnostics.borrow().clone(),
             },
@@ -25939,6 +26207,7 @@ impl App {
             recovery_status: self.recovery_status.clone(),
             patch_save_status: self.patch_collector.status(),
             patch_load_status: self.patch_load_status.clone(),
+            show_bundle: self.show_bundle_snapshot(),
             quantized_pending: self.quantized_actions.len(),
         };
 

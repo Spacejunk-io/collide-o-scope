@@ -653,6 +653,166 @@ fn is_self_contained_source(source: &str) -> bool {
         || crate::layers::spout_sender_from_source_path(source).is_some()
 }
 
+/// Operator-surface media collector. It walks **exactly** the references
+/// `rewrite_patch_to_content_identities` visits — layer source, every clip
+/// slot, and the file analysis-audio clip — resolves each through the one
+/// shared `media_source` resolver, and groups the results into build inputs.
+/// A reference the resolver cannot satisfy is a named refusal, never a bundle
+/// with a silently absent original; self-contained sources (Spout, pattern,
+/// text page) are skipped exactly as the rewriter skips them.
+pub(crate) fn collect_bundle_media_inputs(
+    patch: &PatchState,
+    context: &crate::media_source::ResolveContext,
+    fingerprints: &mut crate::media_source::FingerprintSession,
+) -> Result<Vec<BundleMediaInput>, BundleError> {
+    struct WalkedReference {
+        source_path: String,
+        logical_name: String,
+        audio: bool,
+    }
+    let mut walked = Vec::new();
+    for layer in &patch.layers {
+        walked.push(WalkedReference {
+            source_path: layer.source_path.clone(),
+            logical_name: layer.filename.clone(),
+            audio: false,
+        });
+        for slot in layer.clip_slots.iter() {
+            walked.push(WalkedReference {
+                source_path: slot.source_path.clone(),
+                logical_name: slot.filename.clone(),
+                audio: false,
+            });
+        }
+    }
+    if let Some(modulation) = &patch.modulation {
+        if crate::modulation::normalize_audio_source_kind(&modulation.audio_source_kind)
+            == crate::modulation::AUDIO_SOURCE_FILE
+            && !modulation.audio_clip_path.is_empty()
+        {
+            let logical_name = Path::new(&modulation.audio_clip_path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "analysis-audio".to_owned());
+            walked.push(WalkedReference {
+                source_path: modulation.audio_clip_path.clone(),
+                logical_name,
+                audio: true,
+            });
+        }
+    }
+
+    struct CollectedOriginal {
+        source: PathBuf,
+        logical_name: String,
+        references: BTreeSet<String>,
+        expected_identity: Option<ContentIdentity>,
+    }
+    let mut collected: Vec<CollectedOriginal> = Vec::new();
+    let mut by_group_key: BTreeMap<String, usize> = BTreeMap::new();
+    let mut seen_spellings: BTreeSet<(String, String)> = BTreeSet::new();
+    for reference in walked {
+        if is_self_contained_source(&reference.source_path) {
+            continue;
+        }
+        if reference.source_path.is_empty() && reference.logical_name.is_empty() {
+            return Err(BundleError::Invalid(
+                "a captured source has neither a path nor a filename to resolve".to_owned(),
+            ));
+        }
+        if !seen_spellings.insert((
+            reference.source_path.clone(),
+            reference.logical_name.clone(),
+        )) {
+            continue;
+        }
+        let resolved = if reference.audio {
+            crate::media_source::resolve_file_source(
+                &reference.source_path,
+                &reference.logical_name,
+                context,
+                None,
+                |path| crate::audio::is_supported_audio_file(path),
+                fingerprints,
+            )
+        } else {
+            crate::media_source::resolve_file_source(
+                &reference.source_path,
+                &reference.logical_name,
+                context,
+                None,
+                crate::layers::is_supported_visual_file,
+                fingerprints,
+            )
+        }
+        .map_err(|error| {
+            BundleError::Invalid(format!(
+                "cannot bundle '{}': {error}",
+                reference.logical_name
+            ))
+        })?;
+        // Group by the canonicalized resolved path: a file referenced by a
+        // plain path in one slot and by its content identity in another must
+        // become exactly one original entry, and plain-path resolution
+        // deliberately carries no identity to group on.
+        let group_key = fs::canonicalize(&resolved.path)
+            .unwrap_or_else(|_| resolved.path.clone())
+            .to_string_lossy()
+            .into_owned();
+        // The rewriter looks a non-content-reference spelling up verbatim:
+        // the authored path string, or the filename when the path is empty.
+        let rewrite_spelling = if parse_content_reference(&reference.source_path)
+            .map_err(|error| BundleError::Invalid(error.to_string()))?
+            .is_some()
+        {
+            None
+        } else if reference.source_path.is_empty() {
+            Some(reference.logical_name.clone())
+        } else {
+            Some(reference.source_path.clone())
+        };
+        let index = match by_group_key.get(&group_key) {
+            Some(index) => *index,
+            None => {
+                collected.push(CollectedOriginal {
+                    source: resolved.path.clone(),
+                    logical_name: reference.logical_name.clone(),
+                    references: BTreeSet::new(),
+                    expected_identity: None,
+                });
+                by_group_key.insert(group_key, collected.len() - 1);
+                collected.len() - 1
+            }
+        };
+        let entry = &mut collected[index];
+        if let Some(identity) = resolved.identity {
+            match &entry.expected_identity {
+                Some(existing) if *existing != identity => {
+                    return Err(BundleError::Invalid(format!(
+                        "'{}' resolved to two different content identities",
+                        entry.logical_name
+                    )));
+                }
+                _ => entry.expected_identity = Some(identity),
+            }
+        }
+        if let Some(spelling) = rewrite_spelling {
+            entry.references.insert(spelling);
+        }
+    }
+    Ok(collected
+        .into_iter()
+        .map(|entry| BundleMediaInput {
+            source: entry.source,
+            logical_name: entry.logical_name,
+            patch_references: entry.references.into_iter().collect(),
+            expected_identity: entry.expected_identity,
+            license: None,
+            role: BundleMediaRole::Original,
+        })
+        .collect())
+}
+
 fn validate_patch_original_coverage(
     patch: &PatchState,
     originals: &BTreeMap<String, u64>,
@@ -2704,6 +2864,147 @@ layers:
         assert_eq!(cleanup_show_bundle_orphans(&library, 16).unwrap(), 1);
         assert!(!orphan.exists());
         assert!(keep.exists());
+    }
+
+    fn collector_session() -> crate::media_source::FingerprintSession {
+        crate::media_source::FingerprintSession::new(
+            crate::media_source::FingerprintLimits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn collector_walks_the_rewriter_references_and_groups_one_file_per_original() {
+        let root = TempDir::new("collector");
+        let alpha_bytes = b"alpha media bytes".to_vec();
+        let alpha = root.0.join("alpha.mp4");
+        fs::write(&alpha, &alpha_bytes).unwrap();
+        let tune = root.0.join("tune.wav");
+        fs::write(&tune, b"analysis audio bytes").unwrap();
+        let identity = ContentIdentity::new(
+            {
+                use sha2::Digest as _;
+                let digest = Sha256::digest(&alpha_bytes);
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            },
+            alpha_bytes.len() as u64,
+        )
+        .unwrap();
+        let alpha_path = alpha.to_string_lossy().into_owned();
+        let tune_path = tune.to_string_lossy().into_owned();
+        // One file, three spellings across three layers — a content
+        // reference, a plain path, and the empty-path/library-filename
+        // form — plus a self-contained Spout layer and a file
+        // analysis-audio clip.
+        let yaml = format!(
+            r#"master: {{}}
+layers:
+  - filename: alpha.mp4
+    source_path: '{content_ref}'
+  - filename: alpha.mp4
+    source_path: '{alpha_path}'
+  - filename: alpha.mp4
+    source_path: ''
+  - filename: 'spout: deck'
+    source_path: 'spout://deck'
+modulation:
+  audio_source_kind: file
+  audio_clip_path: '{tune_path}'
+"#,
+            content_ref = identity.source_reference(),
+        );
+        let patch = crate::patch::editor::parse_patch_bytes(yaml.as_bytes()).unwrap();
+        let context = crate::media_source::ResolveContext::new(None, Some(root.0.clone()));
+        let mut fingerprints = collector_session();
+        let inputs = collect_bundle_media_inputs(&patch, &context, &mut fingerprints).unwrap();
+        assert_eq!(
+            inputs.len(),
+            2,
+            "one grouped visual original plus the analysis audio clip"
+        );
+        let visual = inputs
+            .iter()
+            .find(|input| input.logical_name == "alpha.mp4")
+            .expect("grouped visual original");
+        // The rewriter looks up the plain path spelling and the
+        // empty-path/filename spelling; the content reference needs none.
+        assert_eq!(
+            visual
+                .patch_references
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["alpha.mp4".to_owned(), alpha_path.clone()])
+        );
+        assert_eq!(visual.expected_identity.as_ref(), Some(&identity));
+        assert!(matches!(visual.role, BundleMediaRole::Original));
+        let audio = inputs
+            .iter()
+            .find(|input| input.logical_name == "tune.wav")
+            .expect("analysis audio original");
+        assert_eq!(audio.patch_references, vec![tune_path.clone()]);
+
+        // The collected inputs are exactly what the build's rewriter needs:
+        // the bundle builds, and its preview carries both originals.
+        let destination = root.0.join("collected.cosbundle");
+        let cancel = no_cancel();
+        build_show_bundle(
+            &destination,
+            BundleBuildRequest {
+                patch,
+                media: inputs,
+                documents: Vec::new(),
+                output_collision: BundleOutputCollision::Fail,
+            },
+            BundleLimits::default(),
+            &cancel,
+        )
+        .unwrap();
+        let preview = inspect_show_bundle(&destination, BundleLimits::default(), &cancel).unwrap();
+        assert_eq!(
+            preview
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == "original_media")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn collector_skips_self_contained_sources_and_refuses_a_missing_file_by_name() {
+        let root = TempDir::new("collector-refusal");
+        let yaml = r#"master: {}
+layers:
+  - filename: 'synth'
+    source_path: 'synth://pattern'
+  - filename: vanished.mp4
+    source_path: ''
+"#;
+        let patch = crate::patch::editor::parse_patch_bytes(yaml.as_bytes()).unwrap();
+        let context = crate::media_source::ResolveContext::new(None, Some(root.0.clone()));
+        let mut fingerprints = collector_session();
+        let error = collect_bundle_media_inputs(&patch, &context, &mut fingerprints)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("vanished.mp4"),
+            "the refusal names the unresolvable source: {error}"
+        );
+
+        // With only self-contained sources, nothing is collected and the
+        // patch is bundleable with no media at all.
+        let self_contained = crate::patch::editor::parse_patch_bytes(
+            b"master: {}\nlayers:\n  - filename: 'synth'\n    source_path: 'synth://pattern'\n",
+        )
+        .unwrap();
+        let mut fingerprints = collector_session();
+        let inputs =
+            collect_bundle_media_inputs(&self_contained, &context, &mut fingerprints).unwrap();
+        assert!(inputs.is_empty());
     }
 
     proptest! {

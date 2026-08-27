@@ -1554,9 +1554,51 @@ pub struct AppSnapshot {
     /// Result of the most recent exact-load or Apply Look request.
     #[serde(default)]
     pub patch_load_status: String,
+    /// D3 portable show-bundle operator state: the last outcome plus any
+    /// standing side-effect-free preview awaiting confirmation.
+    #[serde(default)]
+    pub show_bundle: ShowBundleSnapshot,
     /// Number of coalesced actions waiting for the next downbeat.
     #[serde(default)]
     pub quantized_pending: usize,
+}
+
+/// The D3 operator surface's published truth. `pending` exists exactly while
+/// a verified preview awaits an explicit import confirmation; the entry list
+/// is bounded so a 4,096-entry bundle cannot inflate the snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShowBundleSnapshot {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<ShowBundlePendingSnapshot>,
+}
+
+pub const SHOW_BUNDLE_SNAPSHOT_MAX_ENTRIES: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShowBundlePendingSnapshot {
+    /// The previewed bundle file, shown so the operator confirms the exact
+    /// artifact they inspected (the `patch_load_status` path precedent).
+    pub path: String,
+    pub bundle_sha256: String,
+    pub patch_sha256: String,
+    pub bundle_bytes: u64,
+    pub expanded_bytes: u64,
+    pub entry_count: usize,
+    pub entries: Vec<ShowBundleEntrySnapshot>,
+    /// True when `entries` was cut at the bound; `entry_count` stays whole.
+    pub entries_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShowBundleEntrySnapshot {
+    pub logical_name: String,
+    pub kind: String,
+    pub byte_len: u64,
+    pub authoritative: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
 }
 
 impl Default for AppSnapshot {
@@ -1620,6 +1662,7 @@ impl Default for AppSnapshot {
             recovery_status: String::new(),
             patch_save_status: String::new(),
             patch_load_status: String::new(),
+            show_bundle: ShowBundleSnapshot::default(),
             quantized_pending: 0,
         }
     }
@@ -1653,6 +1696,8 @@ pub struct WebOperationalSnapshot {
     pub recovery_status: String,
     pub patch_save_status: String,
     pub patch_load_status: String,
+    #[serde(default)]
+    pub show_bundle: ShowBundleSnapshot,
     pub quantized_pending: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constraint_diagnostics: Vec<crate::diagnostics::ConstraintDiagnostic>,
@@ -5477,6 +5522,28 @@ pub enum WebAction {
     /// Cancel a running export
     #[serde(rename = "cancel_export")]
     CancelExport,
+    /// Open a host-native save picker and build one portable `.cosbundle`
+    /// from the complete current performance state and every resolved
+    /// original medium the captured patch references.
+    #[serde(rename = "export_show_bundle")]
+    ExportShowBundle,
+    /// Open a host-native picker and run the side-effect-free bundle
+    /// inspection. The verified preview is published for confirmation; this
+    /// action imports nothing and writes nothing.
+    #[serde(rename = "preview_show_bundle")]
+    PreviewShowBundle,
+    /// Import the previously previewed bundle into the active library as one
+    /// atomic no-replace generation; `load` additionally applies the imported
+    /// patch as a complete snapshot. Refused without a standing preview, and
+    /// refused if the file changed since the preview was taken.
+    #[serde(rename = "confirm_show_bundle_import")]
+    ConfirmShowBundleImport {
+        #[serde(default)]
+        load: bool,
+    },
+    /// Discard the standing bundle preview without importing anything.
+    #[serde(rename = "cancel_show_bundle_import")]
+    CancelShowBundleImport,
 }
 
 fn bool_true() -> bool {
@@ -5740,6 +5807,10 @@ impl WebAction {
                 | Self::QuickSavePatch
                 | Self::StartExport { .. }
                 | Self::CancelExport
+                | Self::ExportShowBundle
+                | Self::PreviewShowBundle
+                | Self::ConfirmShowBundleImport { .. }
+                | Self::CancelShowBundleImport
                 | Self::ControllerProfile {
                     request: crate::controller_profile::ControllerProfileAction::Export {},
                 }
@@ -5829,6 +5900,10 @@ impl WebAction {
             | Self::OpenPatchSnapshot
             | Self::OpenPatchLook { .. }
             | Self::QuickSavePatch
+            | Self::ExportShowBundle
+            | Self::PreviewShowBundle
+            | Self::ConfirmShowBundleImport { .. }
+            | Self::CancelShowBundleImport
             | Self::RescanLibrary => true,
             Self::SetLayerMatteParam { param, .. }
                 if !matches!(param.as_str(), "amount" | "threshold" | "softness") =>
@@ -9475,6 +9550,103 @@ mod protocol_tests {
         assert!(js.contains("{ action: 'open_patch_snapshot' }"));
         assert!(js.contains("{ action: 'open_patch_look', stack_revision: layerStackRevision }"));
         assert!(js.contains("syncPatchLoad(msg.patch_load_status || '')"));
+    }
+
+    #[test]
+    fn show_bundle_actions_are_priority_history_free_and_wired_to_the_panel() {
+        // The wire vocabulary: every action parses, the confirm's `load`
+        // defaults to false, and the whole family is uncoalesced priority
+        // outside manual history — a bundle operation is an operational
+        // event, never an authored scalar edit.
+        let export: WebAction = serde_json::from_str(r#"{"action":"export_show_bundle"}"#).unwrap();
+        assert!(matches!(export, WebAction::ExportShowBundle));
+        let preview: WebAction =
+            serde_json::from_str(r#"{"action":"preview_show_bundle"}"#).unwrap();
+        assert!(matches!(preview, WebAction::PreviewShowBundle));
+        let confirm: WebAction =
+            serde_json::from_str(r#"{"action":"confirm_show_bundle_import"}"#).unwrap();
+        assert!(matches!(
+            confirm,
+            WebAction::ConfirmShowBundleImport { load: false }
+        ));
+        let confirm_load: WebAction =
+            serde_json::from_str(r#"{"action":"confirm_show_bundle_import","load":true}"#).unwrap();
+        assert!(matches!(
+            confirm_load,
+            WebAction::ConfirmShowBundleImport { load: true }
+        ));
+        let cancel: WebAction =
+            serde_json::from_str(r#"{"action":"cancel_show_bundle_import"}"#).unwrap();
+        assert!(matches!(cancel, WebAction::CancelShowBundleImport));
+        for action in [&export, &preview, &confirm, &confirm_load, &cancel] {
+            assert!(action.is_priority(), "{action:?} must be priority");
+            assert!(
+                action.is_performance_only_for_history(),
+                "{action:?} must stay outside manual history"
+            );
+            assert!(
+                action.coalesce_key().is_none(),
+                "{action:?} must never coalesce"
+            );
+        }
+
+        // Snapshot closure: the block defaults empty, a pending preview
+        // round-trips, and a pre-D3 operational payload still decodes.
+        let default_snapshot = ShowBundleSnapshot::default();
+        assert!(default_snapshot.status.is_empty());
+        assert!(default_snapshot.pending.is_none());
+        let pending = ShowBundleSnapshot {
+            status: "Previewed show.cosbundle".to_owned(),
+            pending: Some(ShowBundlePendingSnapshot {
+                path: "show.cosbundle".to_owned(),
+                bundle_sha256: "AB".repeat(32),
+                patch_sha256: "CD".repeat(32),
+                bundle_bytes: 1_024,
+                expanded_bytes: 900,
+                entry_count: 70,
+                entries: vec![ShowBundleEntrySnapshot {
+                    logical_name: "clip.mp4".to_owned(),
+                    kind: "original_media".to_owned(),
+                    byte_len: 512,
+                    authoritative: true,
+                    license: None,
+                }],
+                entries_truncated: true,
+            }),
+        };
+        let round_trip: ShowBundleSnapshot =
+            serde_json::from_value(serde_json::to_value(&pending).unwrap()).unwrap();
+        assert_eq!(round_trip, pending);
+        let legacy: AppSnapshot = serde_json::from_value(serde_json::json!({
+            "msg_type": "state"
+        }))
+        .unwrap_or_default();
+        assert!(legacy.show_bundle.pending.is_none());
+
+        // The panel surface: buttons, the preview region shown before any
+        // commit (the RFC's stated requirement), and both sync sites.
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        for id in [
+            "bundle-export",
+            "bundle-preview",
+            "bundle-pending",
+            "bundle-pending-summary",
+            "bundle-pending-entries",
+            "bundle-import",
+            "bundle-import-load",
+            "bundle-cancel",
+        ] {
+            assert!(html.contains(&format!("id=\"{id}\"")), "missing #{id}");
+        }
+        assert!(html.contains("id=\"bundle-status\" role=\"status\" aria-live=\"polite\""));
+        assert!(js.contains("{ action: 'export_show_bundle' }"));
+        assert!(js.contains("{ action: 'preview_show_bundle' }"));
+        assert!(js.contains("{ action: 'confirm_show_bundle_import', load: false }"));
+        assert!(js.contains("{ action: 'confirm_show_bundle_import', load: true }"));
+        assert!(js.contains("{ action: 'cancel_show_bundle_import' }"));
+        assert!(js.contains("syncShowBundle(msg.show_bundle || {})"));
+        assert!(js.contains("syncShowBundle(op.show_bundle || {})"));
     }
 
     #[test]
