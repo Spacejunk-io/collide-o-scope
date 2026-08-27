@@ -4,7 +4,7 @@ Date prepared: 2026-08-27
 Topic: `feat/maintenance-actions-cosign3`
 Pinned integration base:
 `7e79ed773e1278f65da2ce15e32927b1d5847fa0`
-Status: **focused source and backward-compatibility evidence; integration,
+Status: **topic implementation and local gate observed; receipt, integration,
 exact-commit CI, and live v0.3 signing remain pending**
 
 This is the §3.8(a) maintenance tranche. It updates the immutable GitHub Action
@@ -30,7 +30,9 @@ The policy checker binds the exact three-workflow inventory, full lowercase
 commit SHAs, version comments, and per-file counts. Its hostile fixtures cover
 a removed use, a duplicate, a one-nibble SHA substitution, a changed tag
 comment, an unreviewed action, and movement of an otherwise allowed pin between
-workflows.
+workflows. The two security-critical signing steps are additionally bound by
+reviewed whole-block SHA-256 values, so an inert wrapper, reordered statement,
+swallowed failure, or hidden assignment changes the admitted body.
 
 Checkout v7 and cache v6 use the Node 24 action runtime. Upstream documents
 Actions Runner **2.327.1 or later** as the minimum Node 24 runner. These
@@ -169,11 +171,18 @@ only non-ignored untracked root artifacts at 66,225, 56,984,527, and
 
 ## Closing fields
 
-- Topic implementation commit: **PENDING**
+- Topic implementation commit: **`a8764df`**
 - Topic receipt commit: **PENDING**
 - Integration commit on `feat/web-control-panel`: **PENDING**
 - Exact-commit CI: **PENDING**
-- Hosted full gate: **PENDING**
+- Hosted full gate: **OBSERVED PASS** — the exact six-command CI-form gate
+  passed on the topic tree: formatting and both JavaScript parsers;
+  all-target/all-feature compile; 2,143 tests passed with zero failures and
+  163 explicitly ignored tests; all six benchmark probes succeeded; and
+  Clippy passed with warnings denied
+- Focused workflow gates: **OBSERVED PASS** — policy checker and hostile
+  self-tests, Python AST, PyYAML parse, actionlint 1.7.12, 41 PowerShell run
+  blocks parsed after GitHub-expression substitution, and `git diff --check`
 - Live v0.3 sign/verify/persist/redownload proof: **PENDING — OPERATOR-GATED**
 - Focused immutable-pin and trust-policy source inspection: **OBSERVED PASS**
 - Local Cosign v3.1.3 binary identity and v1.8.1 legacy-bundle replay:
