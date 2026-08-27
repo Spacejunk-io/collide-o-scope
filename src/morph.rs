@@ -25,6 +25,7 @@ use crate::patch::{
     RefreshGardenMotionRouteConfig, TemporalLoomConfig, TemporalOriginalsConfig,
     TemporalResetPolicyConfig, TemporalRigConfig, TimeDisplaceMapConfig,
 };
+use crate::performance::AuthoringValueLaw;
 use crate::scan_processor::ScanProcessorParams;
 use crate::spatial::SpatialTransform;
 use crate::symmetry::{
@@ -57,6 +58,19 @@ pub enum MorphBlendLaw {
 }
 
 impl MorphBlendLaw {
+    pub const ALL: [Self; 2] = [Self::Linear, Self::EqualPower];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::EqualPower => "equal_power",
+        }
+    }
+
+    pub fn try_from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|law| law.key() == key)
+    }
+
     /// Return the contribution of snapshots A and B for a crossfader value.
     /// Non-finite values are treated as A and finite values are clamped.
     pub fn weights(self, t: f32) -> [f32; 2] {
@@ -96,6 +110,61 @@ impl MorphBlendLaw {
     }
 }
 
+/// The two operator-addressable capture slots. The wire remains a string, but
+/// this owner table keeps recorder vocabulary and capture dispatch aligned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MorphCaptureSlot {
+    A,
+    B,
+}
+
+impl MorphCaptureSlot {
+    pub const ALL: [Self; 2] = [Self::A, Self::B];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::A => "a",
+            Self::B => "b",
+        }
+    }
+
+    pub fn try_from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|slot| slot.key() == key)
+    }
+}
+
+pub(crate) fn morph_blend_value_law() -> AuthoringValueLaw {
+    AuthoringValueLaw::Discrete(
+        MorphBlendLaw::ALL
+            .into_iter()
+            .map(MorphBlendLaw::key)
+            .collect(),
+    )
+}
+
+pub(crate) fn morph_capture_slot_value_law() -> AuthoringValueLaw {
+    AuthoringValueLaw::Discrete(
+        MorphCaptureSlot::ALL
+            .into_iter()
+            .map(MorphCaptureSlot::key)
+            .collect(),
+    )
+}
+
+pub(crate) fn morph_glide_target_value_law() -> AuthoringValueLaw {
+    AuthoringValueLaw::Unit([0.0, 1.0])
+}
+
+pub const MORPH_GLIDE_MIN_POSITIVE_DURATION_BEATS: f64 = 0.25;
+pub const MORPH_GLIDE_MAX_DURATION_BEATS: f64 = 64.0;
+
+/// Recorder law for the glide's stored duration lane. Zero is the explicit
+/// snap; positive operator requests below a quarter beat are normalized by
+/// [`MorphGlide::new`] to the owner minimum.
+pub(crate) fn morph_glide_duration_value_law() -> AuthoringValueLaw {
+    AuthoringValueLaw::Unit([0.0, MORPH_GLIDE_MAX_DURATION_BEATS as f32])
+}
+
 /// A deterministic crossfader movement described entirely in beat space.
 ///
 /// Callers own the clock. Passing the same beat always produces the same
@@ -116,7 +185,10 @@ impl MorphGlide {
         let duration_beats = if duration_beats <= 0.0 {
             0.0
         } else {
-            duration_beats.clamp(0.25, 64.0)
+            duration_beats.clamp(
+                MORPH_GLIDE_MIN_POSITIVE_DURATION_BEATS,
+                MORPH_GLIDE_MAX_DURATION_BEATS,
+            )
         };
         Self::with_remaining(start, target, start_beat, duration_beats)
     }
@@ -130,7 +202,7 @@ impl MorphGlide {
             start: normalized_position(start),
             target: normalized_position(target),
             start_beat: finite_f64_or(start_beat, 0.0),
-            duration_beats: duration_beats.clamp(0.0, 64.0),
+            duration_beats: duration_beats.clamp(0.0, MORPH_GLIDE_MAX_DURATION_BEATS),
         }
     }
 
@@ -1410,10 +1482,59 @@ impl Default for LayerMorphSnapshot {
     }
 }
 
+/// Detached authored values needed to capture one layer into a Morph slot.
+///
+/// Live layers and offline export layers both project into this CPU-only view,
+/// so capture never depends on decoder or GPU ownership.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MorphLayerCapture<'a> {
+    pub opacity: f32,
+    pub mosh_send: f32,
+    pub speed: f32,
+    pub fps: f32,
+    pub effects: &'a EffectUniforms,
+    pub blend_mode: BlendMode,
+    pub visible: bool,
+    pub paused: bool,
+    pub bypass_master_fx: bool,
+    pub bypass_temporal_fx: bool,
+    pub transform: SpatialTransform,
+    pub motion: MotionParams,
+    pub pattern: Option<&'a crate::pattern_synth::PatternSynthParams>,
+}
+
+impl<'a> From<&'a Layer> for MorphLayerCapture<'a> {
+    fn from(layer: &'a Layer) -> Self {
+        Self {
+            opacity: layer.opacity,
+            mosh_send: layer.mosh_send,
+            speed: layer.speed,
+            fps: layer.fps,
+            effects: &layer.effects,
+            blend_mode: layer.blend_mode,
+            visible: layer.visible,
+            paused: layer.paused,
+            bypass_master_fx: layer.bypass_master_fx,
+            bypass_temporal_fx: layer.bypass_temporal_fx,
+            transform: layer.transform,
+            motion: layer.motion,
+            pattern: layer.pattern_params(),
+        }
+    }
+}
+
 impl LayerMorphSnapshot {
     fn capture(
         position: usize,
         layer: &Layer,
+        layer_ids: &[crate::image_routing::StableLayerId],
+    ) -> Self {
+        Self::capture_portable(position, &MorphLayerCapture::from(layer), layer_ids)
+    }
+
+    fn capture_portable(
+        position: usize,
+        layer: &MorphLayerCapture<'_>,
         layer_ids: &[crate::image_routing::StableLayerId],
     ) -> Self {
         Self {
@@ -1422,7 +1543,7 @@ impl LayerMorphSnapshot {
             mosh_send: Some(layer.mosh_send),
             speed: layer.speed,
             fps: Some(layer.fps),
-            effects: Some(MorphMasterSnapshot::capture(&layer.effects)),
+            effects: Some(MorphMasterSnapshot::capture(layer.effects)),
             blend_mode: Some(MorphLayerBlendMode::capture(layer.blend_mode)),
             visible: Some(layer.visible),
             paused: Some(layer.paused),
@@ -1435,7 +1556,7 @@ impl LayerMorphSnapshot {
             )),
             key_threshold: None,
             pattern: layer
-                .pattern_params()
+                .pattern
                 .map(crate::patch::PatternSynthConfig::from_params),
         }
         .sanitized()
@@ -2290,6 +2411,7 @@ impl MorphSlot {
     /// signature: sampling and application never insert, remove, or reorder a
     /// node, layer, group, or image edge.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub fn capture_with_composition(
         master: &EffectUniforms,
         master_transform: &SpatialTransform,
@@ -2367,18 +2489,123 @@ impl MorphSlot {
         layer_racks: &[RuntimeVisualRack],
         composition: &RuntimeComposition,
     ) -> Result<Self, String> {
-        let mut slot = Self::capture_with_composition(
+        let layer_ids = layers
+            .iter()
+            .map(Layer::stable_layer_id)
+            .collect::<Vec<_>>();
+        let layer_values = layers
+            .iter()
+            .map(MorphLayerCapture::from)
+            .collect::<Vec<_>>();
+        Self::capture_portable_with_composition_and_motion(
             master,
             master_transform,
+            master_motion,
             ntsc,
             temporal,
-            layers,
+            &layer_ids,
+            &layer_values,
             master_rack,
             layer_racks,
             composition,
-        )?;
-        slot.master_motion = Some(MotionConfig::from_params(*master_motion).sanitized());
-        Ok(slot)
+        )
+    }
+
+    /// Capture the full authored world from detached CPU values. This is the
+    /// one slot-construction seam used by live layers and offline export.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_portable_with_composition_and_motion(
+        master: &EffectUniforms,
+        master_transform: &SpatialTransform,
+        master_motion: &MotionParams,
+        ntsc: &NtscParams,
+        temporal: &TemporalParams,
+        layer_ids: &[crate::image_routing::StableLayerId],
+        layers: &[MorphLayerCapture<'_>],
+        master_rack: &RuntimeVisualRack,
+        layer_racks: &[RuntimeVisualRack],
+        composition: &RuntimeComposition,
+    ) -> Result<Self, String> {
+        if layers.len() != layer_ids.len() || layer_racks.len() != layer_ids.len() {
+            return Err(format!(
+                "morph capture has {} layer values, {} IDs, and {} layer racks",
+                layers.len(),
+                layer_ids.len(),
+                layer_racks.len()
+            ));
+        }
+        if layer_racks.len() > MAX_MORPH_LAYER_RACKS {
+            return Err(format!(
+                "morph capture has {} layer racks; limit is {MAX_MORPH_LAYER_RACKS}",
+                layer_racks.len()
+            ));
+        }
+        master_rack
+            .validate_for_scope(crate::visual_rack::LegacyRackScope::Master)
+            .map_err(|error| format!("invalid master rack: {error}"))?;
+        for (position, rack) in layer_racks.iter().enumerate() {
+            rack.validate_for_scope(crate::visual_rack::LegacyRackScope::Layer)
+                .map_err(|error| format!("invalid layer rack {position}: {error}"))?;
+        }
+
+        let position_of_layer = |wanted| {
+            layer_ids
+                .iter()
+                .position(|candidate| *candidate == wanted)
+                .and_then(|position| u32::try_from(position).ok())
+                .and_then(crate::performance::SavedLayerPosition::new)
+        };
+        let saved_master_rack = master_rack
+            .capture_routes(position_of_layer)
+            .map_err(|error| format!("capture morph master rack: {error}"))?;
+        let saved_layer_racks = layer_racks
+            .iter()
+            .enumerate()
+            .map(|(position, rack)| {
+                rack.capture_routes(position_of_layer)
+                    .map_err(|error| format!("capture morph layer rack {position}: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let saved_composition = composition
+            .capture(position_of_layer)
+            .map_err(|error| format!("capture morph composition: {error}"))?;
+
+        let mut temporal_snapshot = MorphTemporalSnapshot::capture(temporal);
+        temporal_snapshot.originals.garden.matte_route =
+            RefreshGardenMatteRouteConfig::from_runtime_for_capture(
+                temporal.originals.garden.matte_route,
+                layer_ids,
+            );
+        temporal_snapshot.originals.garden.motion_route =
+            RefreshGardenMotionRouteConfig::from_runtime_for_capture(
+                temporal.originals.garden.motion_route,
+                layer_ids,
+            );
+        temporal_snapshot.originals.score.loop_driver =
+            CollisionScoreLoopDriverConfig::from_runtime_for_capture(
+                temporal.originals.score.loop_driver,
+                layer_ids,
+            );
+
+        Ok(Self {
+            master: MorphMasterSnapshot::capture(master),
+            master_transform: Some(master_transform.sanitized()),
+            master_motion: Some(MotionConfig::from_params(*master_motion).sanitized()),
+            ntsc: MorphNtscSnapshot::capture(ntsc),
+            temporal: temporal_snapshot,
+            layers: layers
+                .iter()
+                .enumerate()
+                .map(|(position, layer)| {
+                    LayerMorphSnapshot::capture_portable(position, layer, layer_ids)
+                })
+                .collect(),
+            master_rack: Some(saved_master_rack),
+            layer_racks: Some(saved_layer_racks),
+            composition: Some(saved_composition),
+            gesture: None,
+        }
+        .sanitized())
     }
 
     pub fn sanitized(&self) -> Self {
@@ -4549,6 +4776,55 @@ fn pick_finite(a: f32, b: f32, choose_b: bool) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recorder_morph_laws_share_the_owner_vocabulary_and_glide_bounds() {
+        use super::*;
+
+        assert_eq!(
+            morph_blend_value_law(),
+            AuthoringValueLaw::Discrete(
+                MorphBlendLaw::ALL
+                    .into_iter()
+                    .map(MorphBlendLaw::key)
+                    .collect()
+            )
+        );
+        for law in MorphBlendLaw::ALL {
+            assert_eq!(MorphBlendLaw::try_from_key(law.key()), Some(law));
+        }
+        assert_eq!(MorphBlendLaw::try_from_key("quadratic"), None);
+
+        assert_eq!(
+            morph_capture_slot_value_law(),
+            AuthoringValueLaw::Discrete(
+                MorphCaptureSlot::ALL
+                    .into_iter()
+                    .map(MorphCaptureSlot::key)
+                    .collect()
+            )
+        );
+        for slot in MorphCaptureSlot::ALL {
+            assert_eq!(MorphCaptureSlot::try_from_key(slot.key()), Some(slot));
+        }
+        assert_eq!(MorphCaptureSlot::try_from_key("c"), None);
+        assert_eq!(
+            morph_glide_target_value_law(),
+            AuthoringValueLaw::Unit([0.0, 1.0])
+        );
+        assert_eq!(
+            morph_glide_duration_value_law(),
+            AuthoringValueLaw::Unit([0.0, MORPH_GLIDE_MAX_DURATION_BEATS as f32])
+        );
+        assert_eq!(
+            MorphGlide::new(0.0, 1.0, 0.0, 0.1).duration_beats,
+            MORPH_GLIDE_MIN_POSITIVE_DURATION_BEATS
+        );
+        assert_eq!(
+            MorphGlide::new(0.0, 1.0, 0.0, 100.0).duration_beats,
+            MORPH_GLIDE_MAX_DURATION_BEATS
+        );
+    }
+
     #[test]
     fn a_snapshot_bank_is_fixed_width_bounded_and_empty_by_default() {
         let bank = SnapshotBank::default();

@@ -2128,6 +2128,13 @@ struct ExportLayer {
     /// `Some` iff this layer is a pattern layer. The per-frame GPU pass is
     /// its only pixel producer offline exactly as live.
     pattern: Option<crate::pattern_synth::PatternSynthParams>,
+    /// B7 text-page authored values retained so a replayed B9 edit can run
+    /// through `TextPageEdit` and regenerate the immutable source texture.
+    /// `Some` iff this layer is a text page.
+    text_page: Option<crate::text_page::TextPageParams>,
+    /// Set only when an accepted replay event changed `text_page`. The frame
+    /// loop uploads the shared CPU raster before the layer is sampled.
+    text_page_dirty: bool,
     /// Lazy P4c conversion state, mirroring the live layer's exactly; built
     /// on the first admitted planar frame under a `metadata_managed` config.
     planar_gpu: Option<crate::layers::LayerPlanarDelivery>,
@@ -3393,6 +3400,8 @@ fn black_placeholder_layer(
         width,
         height,
         pattern: None,
+        text_page: None,
+        text_page_dirty: false,
         planar_gpu: None,
     })
 }
@@ -3488,6 +3497,8 @@ fn pattern_export_layer(
         width,
         height,
         pattern: Some(params),
+        text_page: None,
+        text_page_dirty: false,
         planar_gpu: None,
     })
 }
@@ -3576,6 +3587,8 @@ fn text_page_export_layer(
         width,
         height,
         pattern: None,
+        text_page: Some(params),
+        text_page_dirty: false,
         planar_gpu: None,
     })
 }
@@ -3651,6 +3664,8 @@ fn still_export_layer(
         width,
         height,
         pattern: None,
+        text_page: None,
+        text_page_dirty: false,
         planar_gpu: None,
     })
 }
@@ -4025,6 +4040,32 @@ struct ExportFrameMorphWorld {
     morph_overrides: Vec<ExportMorphOverrides>,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn capture_export_morph_world(
+    master: EffectUniforms,
+    master_transform: SpatialTransform,
+    master_motion: crate::motion::MotionParams,
+    ntsc: &crate::ntsc::NtscParams,
+    temporal: crate::effects::params::TemporalParams,
+    gesture_canvas: crate::gesture_canvas::GestureCanvasParams,
+    creative_graph: &ExportCreativeGraph,
+    layers: &[ExportLayer],
+    layer_motion: &[crate::motion::MotionParams],
+) -> ExportFrameMorphWorld {
+    ExportFrameMorphWorld {
+        creative_graph: creative_graph.clone(),
+        master,
+        master_transform,
+        master_motion,
+        ntsc: ntsc.clone(),
+        temporal,
+        gesture_canvas,
+        layer_bases: layers.iter().map(ExportFrameLayerBase::from).collect(),
+        layer_motion: layer_motion.to_vec(),
+        morph_overrides: vec![ExportMorphOverrides::default(); layers.len()],
+    }
+}
+
 fn resolved_export_motion(
     config: Option<crate::patch::MotionConfig>,
     layer_ids: &[StableLayerId],
@@ -4140,8 +4181,211 @@ fn apply_export_morph_world(
             if let Some(bypass_temporal_fx) = sampled.bypass_temporal_fx {
                 world.layer_bases[position].bypass_temporal_fx = bypass_temporal_fx;
             }
+            // Kind-gated exactly like `LayerMorphSnapshot::apply_to`: a
+            // sampled pattern can change authored values only when this export
+            // layer already owns a pattern source. Morph never changes source
+            // topology.
+            if let (Some(config), Some(params)) = (
+                sampled.pattern,
+                world.layer_bases[position].pattern.as_mut(),
+            ) {
+                *params = config.to_params();
+            }
         }
     }
+}
+
+/// Commit a sampled Morph world back into the export's authored bases. This
+/// mirrors live materialization before a slot capture; decoder/GPU ownership
+/// remains on `ExportLayer` and is never part of the sampled value world.
+#[allow(clippy::too_many_arguments)]
+fn install_export_morph_world(
+    world: ExportFrameMorphWorld,
+    master_effects: &mut EffectUniforms,
+    master_transform: &mut SpatialTransform,
+    master_motion: &mut crate::motion::MotionParams,
+    layer_motion: &mut [crate::motion::MotionParams],
+    ntsc: &mut crate::ntsc::NtscParams,
+    temporal: &mut crate::effects::params::TemporalParams,
+    gesture_canvas: &mut crate::gesture_canvas::GestureCanvasParams,
+    creative_graph: &mut ExportCreativeGraph,
+    layers: &mut [ExportLayer],
+) {
+    *creative_graph = world.creative_graph;
+    *master_effects = world.master;
+    *master_transform = world.master_transform;
+    *master_motion = world.master_motion;
+    *ntsc = world.ntsc;
+    *temporal = world.temporal;
+    *gesture_canvas = world.gesture_canvas;
+    layer_motion.clone_from_slice(&world.layer_motion);
+    for (layer, base) in layers.iter_mut().zip(world.layer_bases) {
+        layer.effects = base.effects;
+        layer.transform = base.transform;
+        layer.opacity = base.opacity;
+        layer.mosh_send = base.mosh_send;
+        layer.speed = base.speed;
+        layer.fps = base.fps;
+        layer.blend_mode = base.blend_mode;
+        layer.visible = base.visible;
+        layer.paused = base.paused;
+        layer.bypass_master_fx = base.bypass_master_fx;
+        layer.bypass_temporal_fx = base.bypass_temporal_fx;
+        layer.pattern = base.pattern;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_export_morph_slot(
+    master_effects: &EffectUniforms,
+    master_transform: &SpatialTransform,
+    master_motion: &crate::motion::MotionParams,
+    layer_motion: &[crate::motion::MotionParams],
+    ntsc: &crate::ntsc::NtscParams,
+    temporal: &crate::effects::params::TemporalParams,
+    gesture_canvas: crate::gesture_canvas::GestureCanvasParams,
+    gesture_track_checksum: &str,
+    creative_graph: &ExportCreativeGraph,
+    layers: &[ExportLayer],
+) -> Result<crate::morph::MorphSlot, String> {
+    let mut values = Vec::with_capacity(creative_graph.layer_ids.len());
+    let mut racks = Vec::with_capacity(creative_graph.layer_ids.len());
+    for (position, layer_id) in creative_graph.layer_ids.iter().copied().enumerate() {
+        let (runtime_index, layer) = layers
+            .iter()
+            .enumerate()
+            .find(|(_, layer)| layer.source_index == position)
+            .ok_or_else(|| format!("export Morph capture is missing layer position {position}"))?;
+        let motion = *layer_motion
+            .get(runtime_index)
+            .ok_or_else(|| format!("export Morph capture is missing motion position {position}"))?;
+        let rack = creative_graph
+            .layer_racks
+            .iter()
+            .find_map(|(candidate, rack)| (*candidate == layer_id).then_some(rack.clone()))
+            .ok_or_else(|| format!("export Morph capture is missing rack position {position}"))?;
+        values.push(crate::morph::MorphLayerCapture {
+            opacity: layer.opacity,
+            mosh_send: layer.mosh_send,
+            speed: layer.speed,
+            fps: layer.fps,
+            effects: &layer.effects,
+            blend_mode: layer.blend_mode,
+            visible: layer.visible,
+            paused: layer.paused,
+            bypass_master_fx: layer.bypass_master_fx,
+            bypass_temporal_fx: layer.bypass_temporal_fx,
+            transform: layer.transform,
+            motion,
+            pattern: layer.pattern.as_ref(),
+        });
+        racks.push(rack);
+    }
+    crate::morph::MorphSlot::capture_portable_with_composition_and_motion(
+        master_effects,
+        master_transform,
+        master_motion,
+        ntsc,
+        temporal,
+        &creative_graph.layer_ids,
+        &values,
+        &creative_graph.master_rack,
+        &racks,
+        &creative_graph.composition,
+    )
+    .map(|slot| slot.with_gesture(gesture_canvas, gesture_track_checksum.to_string()))
+}
+
+/// Replay one recorded Morph capture against the export's current authored
+/// world. If an active blend cannot pass the same candidate preflight used by
+/// rendering, retain the baseline and still capture it: that is the live
+/// handler's failure law. A malformed portable world remains a hard export
+/// error rather than silently dropping the recorded event.
+#[allow(clippy::too_many_arguments)]
+fn apply_export_morph_capture(
+    slot: crate::morph::MorphCaptureSlot,
+    program_beat: f64,
+    gesture_track_checksum: &str,
+    preflight: ExportMorphPreflightContext<'_>,
+    master_effects: &mut EffectUniforms,
+    master_transform: &mut SpatialTransform,
+    master_motion: &mut crate::motion::MotionParams,
+    layer_motion: &mut [crate::motion::MotionParams],
+    ntsc: &mut crate::ntsc::NtscParams,
+    temporal: &mut crate::effects::params::TemporalParams,
+    gesture_canvas: &mut crate::gesture_canvas::GestureCanvasParams,
+    creative_graph: &mut ExportCreativeGraph,
+    layers: &mut [ExportLayer],
+    morph: &mut Option<crate::morph::Morph>,
+) -> Result<Option<String>, String> {
+    let mut warning = None;
+    if let Some(active) = morph.as_ref().filter(|morph| morph.active()) {
+        let baseline = capture_export_morph_world(
+            *master_effects,
+            *master_transform,
+            *master_motion,
+            ntsc,
+            *temporal,
+            *gesture_canvas,
+            creative_graph,
+            layers,
+            layer_motion,
+        );
+        let requested_position = (active.position_at_beat(program_beat)
+            + preflight.modulation.morph_offset())
+        .clamp(0.0, 1.0);
+        match select_export_morph_world(active, requested_position, &baseline, layers, preflight) {
+            Ok(selected) => {
+                if (selected.selected_position - selected.requested_position).abs() > f32::EPSILON {
+                    warning = Some(format!(
+                        "Morph sample {:.4} was invalid ({}); used captured endpoint {:.1} before recorded slot capture",
+                        selected.requested_position,
+                        selected
+                            .requested_error
+                            .as_deref()
+                            .unwrap_or("creative graph rejected"),
+                        selected.selected_position
+                    ));
+                }
+                install_export_morph_world(
+                    selected.value,
+                    master_effects,
+                    master_transform,
+                    master_motion,
+                    layer_motion,
+                    ntsc,
+                    temporal,
+                    gesture_canvas,
+                    creative_graph,
+                    layers,
+                );
+            }
+            Err(error) => {
+                warning = Some(format!(
+                    "{error}; retained the authored baseline before recorded slot capture"
+                ));
+            }
+        }
+    }
+
+    let snapshot = capture_export_morph_slot(
+        master_effects,
+        master_transform,
+        master_motion,
+        layer_motion,
+        ntsc,
+        temporal,
+        *gesture_canvas,
+        gesture_track_checksum,
+        creative_graph,
+        layers,
+    )?;
+    let morph = morph.get_or_insert_with(Default::default);
+    match slot {
+        crate::morph::MorphCaptureSlot::A => morph.a = Some(snapshot),
+        crate::morph::MorphCaptureSlot::B => morph.b = Some(snapshot),
+    }
+    Ok(warning)
 }
 
 #[derive(Debug)]
@@ -4183,6 +4427,66 @@ fn select_valid_morph_candidate<T>(
             .as_deref()
             .unwrap_or("creative graph rejected")
     ))
+}
+
+#[derive(Clone, Copy)]
+struct ExportMorphPreflightContext<'a> {
+    modulation: &'a crate::modulation::ModulationFrame,
+    frame: FramePlanContext,
+    layer_mattes: &'a [LayerMatte],
+    program_history_initialized: bool,
+    resource_limits: CreativeResourceLimits,
+    motion_limits: crate::motion::MotionDeviceLimits,
+    authored_motion_modulation: bool,
+    shutter_samples: ExportShutterSamples,
+}
+
+/// Select and preflight one complete export Morph world. Frame rendering and
+/// recorded slot capture both use this seam, so an invalid midpoint chooses
+/// the same deterministic endpoint before either path commits authored values.
+fn select_export_morph_world(
+    morph: &crate::morph::Morph,
+    requested_position: f32,
+    baseline: &ExportFrameMorphWorld,
+    layers: &[ExportLayer],
+    preflight: ExportMorphPreflightContext<'_>,
+) -> Result<ValidatedMorphCandidate<ExportFrameMorphWorld>, String> {
+    select_valid_morph_candidate(requested_position, |sample_position| {
+        let sample = morph
+            .sample(sample_position)
+            .ok_or_else(|| format!("Morph has no complete sample at {sample_position:.4}"))?;
+        let mut candidate = baseline.clone();
+        apply_export_morph_world(&sample, layers, &mut candidate);
+        preflight_export_morph_world(&candidate, layers, preflight)?;
+        Ok(candidate)
+    })
+}
+
+fn preflight_export_morph_world(
+    candidate: &ExportFrameMorphWorld,
+    layers: &[ExportLayer],
+    preflight: ExportMorphPreflightContext<'_>,
+) -> Result<(), String> {
+    let evaluated =
+        evaluate_export_morph_world(candidate, layers, preflight.modulation, preflight.frame);
+    plan_export_composition_with_motion(
+        &evaluated,
+        &candidate.creative_graph,
+        preflight.layer_mattes,
+        preflight.program_history_initialized,
+        preflight.resource_limits,
+        ExportMotionPlanAdapter {
+            master: candidate.master_motion,
+            layers: &candidate.layer_motion,
+            sources: layers,
+            limits: preflight.motion_limits,
+            modulation: preflight.modulation,
+            authored_motion_modulation: preflight.authored_motion_modulation,
+            shutter_samples: preflight.shutter_samples,
+            codec_availability: None,
+        },
+    )
+    .map(|_| ())
 }
 
 fn evaluate_export_morph_world(
@@ -5137,6 +5441,27 @@ fn export_recorded_gesture_track(
         .map_err(|error| format!("recorded gesture track rejected before rendering: {error}"))
 }
 
+/// Revalidate every appended address against the engine owner's current law.
+/// A take's serialized law makes its quantization deterministic; it cannot
+/// grant recordability to an excluded field or widen the owner's lattice.
+/// Codes 0–14 retain their frozen v1 replay contract unchanged.
+fn validate_v2_performance_owner_laws(
+    take: &crate::performance_track::PerformanceTake,
+) -> Result<(), String> {
+    for address in take.addresses() {
+        if address.control.code() < crate::performance_track::PERFORMANCE_V2_FIRST_CONTROL_CODE {
+            continue;
+        }
+        if crate::App::performance_value_law_for(&address.control).as_ref() != Some(&address.law) {
+            return Err(format!(
+                "{} does not match the engine owner law",
+                address.control.describe()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Whether a validated performance take can ever author the explicit dry
 /// partition during this job. Scan the bounded event/address tables once at
 /// admission; waiting until the event's frame would create a partial export
@@ -5170,18 +5495,446 @@ fn export_replayed_layer_mosh_send(
     }
 }
 
+fn apply_export_text_page_param(
+    params: &mut crate::text_page::TextPageParams,
+    param: &str,
+    raw: &crate::performance_track::PerformanceRawValue,
+) -> bool {
+    // Preserve the engine-owned recordability boundary even for a
+    // hand-authored sidecar (notably, the body has no one-event scalar law).
+    if crate::text_page::text_page_value_law(param).is_none() {
+        return false;
+    }
+    let Some(value) = raw.to_json() else {
+        return false;
+    };
+    let Some(edit) = crate::text_page::TextPageEdit::parse(param, &value) else {
+        return false;
+    };
+    let before = params.clone();
+    edit.apply(params);
+    *params != before
+}
+
+/// Rebuild only text pages changed by due take events. The retained params
+/// and shared CPU raster are the same authored state and renderer used by the
+/// live layer; the texture upload completes before this frame can sample it.
+fn upload_dirty_export_text_pages(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layers: &mut [ExportLayer],
+) -> Result<(), String> {
+    for layer in layers.iter_mut().filter(|layer| layer.text_page_dirty) {
+        let Some(params) = layer.text_page.as_ref() else {
+            layer.text_page_dirty = false;
+            continue;
+        };
+        let page = crate::text_page::render_text_page(params, crate::text_page::bundled_fonts());
+        upload_export_texture_checked(
+            device,
+            queue,
+            &layer.texture,
+            &page,
+            layer.width,
+            layer.height,
+            "Export Text Page Performance Replay",
+        )?;
+        layer.text_page_dirty = false;
+    }
+    Ok(())
+}
+
+fn export_layer_rack_mut(
+    graph: &mut ExportCreativeGraph,
+    position: u32,
+) -> Option<&mut RuntimeVisualRack> {
+    let layer_id = *graph.layer_ids.get(usize::try_from(position).ok()?)?;
+    graph
+        .layer_racks
+        .iter_mut()
+        .find_map(|(candidate, rack)| (*candidate == layer_id).then_some(rack))
+}
+
+fn apply_export_routing_param(
+    matrix: &mut crate::modulation::ModMatrix,
+    position: u32,
+    param: &str,
+    raw: &crate::performance_track::PerformanceRawValue,
+) -> bool {
+    if crate::modulation::routing_value_law(param).is_none() {
+        return false;
+    }
+    let Some(index) = usize::try_from(position).ok() else {
+        return false;
+    };
+    if index >= matrix.routings.len() {
+        return false;
+    }
+    let Some(value) = raw.to_json() else {
+        return false;
+    };
+    crate::modulation::apply_routing_value(&mut matrix.routings[index], param, &value)
+        .unwrap_or(false)
+}
+
+fn export_performance_control_requires_creative_preflight(
+    control: &crate::performance_track::PerformanceControl,
+) -> bool {
+    use crate::performance_track::PerformanceControl as Control;
+    matches!(
+        control,
+        Control::BusCrossfade
+            | Control::BusMix { .. }
+            | Control::RackNodeMaster { .. }
+            | Control::RackNodeLayer { .. }
+            | Control::RackNodeGroup { .. }
+            | Control::GroupParam { .. }
+            | Control::GroupMatteParam { .. }
+    )
+}
+
+/// Stage one recorded creative scalar/discrete edit against a detached graph.
+/// `Ok(false)` is the live stable-ID no-op law: a target that disappeared is
+/// never rebound positionally and, importantly, does not release active Morph.
+fn apply_export_creative_performance_event(
+    control: &crate::performance_track::PerformanceControl,
+    raw: &crate::performance_track::PerformanceRawValue,
+    graph: &mut ExportCreativeGraph,
+) -> Result<bool, String> {
+    use crate::performance_track::{PerformanceControl as Control, PerformanceRawValue as Raw};
+
+    let json = raw.to_json();
+    match control {
+        Control::BusCrossfade => {
+            let Raw::Continuous(value) = raw else {
+                return Err("recorded bus crossfade is not continuous".to_string());
+            };
+            if !value.is_finite() {
+                return Err("recorded bus crossfade is not finite".to_string());
+            }
+            graph.composition.set_bus_crossfade(*value);
+            Ok(true)
+        }
+        Control::BusMix { param } => {
+            let Some(value) = json else {
+                return Err(format!("recorded bus mixer {param} value is malformed"));
+            };
+            let Some(edit) = crate::mixing_boundary::BusMixerEdit::parse(param, &value) else {
+                return Err(format!("recorded bus mixer {param} edit is invalid"));
+            };
+            let mut mixer = graph.composition.mixer();
+            edit.apply(&mut mixer);
+            graph.composition.set_mixer(mixer);
+            Ok(true)
+        }
+        Control::RackNodeMaster {
+            node,
+            node_kind,
+            param,
+        } => {
+            if crate::visual_rack::node_param_value_law(node_kind, param).is_none() {
+                return Err(format!(
+                    "recorded {node_kind} node parameter {param} is not recordable"
+                ));
+            }
+            let Some(node) = crate::visual_rack::NodeId::new(*node) else {
+                return Err("recorded master rack node ID is zero".to_string());
+            };
+            if graph.master_rack.get(node).is_none() {
+                return Ok(false);
+            }
+            let Some(value) = json else {
+                return Err(format!(
+                    "recorded {node_kind} node {param} value is malformed"
+                ));
+            };
+            crate::set_runtime_node_param(&mut graph.master_rack, node, node_kind, param, &value)?;
+            Ok(true)
+        }
+        Control::RackNodeLayer {
+            layer,
+            node,
+            node_kind,
+            param,
+        } => {
+            if crate::visual_rack::node_param_value_law(node_kind, param).is_none() {
+                return Err(format!(
+                    "recorded {node_kind} node parameter {param} is not recordable"
+                ));
+            }
+            let Some(node) = crate::visual_rack::NodeId::new(*node) else {
+                return Err("recorded layer rack node ID is zero".to_string());
+            };
+            let Some(rack) = export_layer_rack_mut(graph, *layer) else {
+                return Ok(false);
+            };
+            if rack.get(node).is_none() {
+                return Ok(false);
+            }
+            let Some(value) = json else {
+                return Err(format!(
+                    "recorded {node_kind} node {param} value is malformed"
+                ));
+            };
+            crate::set_runtime_node_param(rack, node, node_kind, param, &value)?;
+            Ok(true)
+        }
+        Control::RackNodeGroup {
+            group,
+            node,
+            node_kind,
+            param,
+        } => {
+            if crate::visual_rack::node_param_value_law(node_kind, param).is_none() {
+                return Err(format!(
+                    "recorded {node_kind} node parameter {param} is not recordable"
+                ));
+            }
+            let Some(group) = crate::visual_rack::GroupId::new(*group) else {
+                return Err("recorded group rack group ID is zero".to_string());
+            };
+            let Some(node) = crate::visual_rack::NodeId::new(*node) else {
+                return Err("recorded group rack node ID is zero".to_string());
+            };
+            let Some(rack) = graph
+                .composition
+                .group_mut(group)
+                .map(|group| &mut group.rack)
+            else {
+                return Ok(false);
+            };
+            if rack.get(node).is_none() {
+                return Ok(false);
+            }
+            let Some(value) = json else {
+                return Err(format!(
+                    "recorded {node_kind} node {param} value is malformed"
+                ));
+            };
+            crate::set_runtime_node_param(rack, node, node_kind, param, &value)?;
+            Ok(true)
+        }
+        Control::GroupParam { group, param } => {
+            if crate::composition::group_value_law(param).is_none() {
+                return Err(format!(
+                    "recorded group parameter {param} is not recordable"
+                ));
+            }
+            let Some(group) = crate::visual_rack::GroupId::new(*group) else {
+                return Err("recorded group ID is zero".to_string());
+            };
+            let Some(group) = graph.composition.group_mut(group) else {
+                return Ok(false);
+            };
+            let Some(value) = json else {
+                return Err(format!("recorded group {param} value is malformed"));
+            };
+            crate::apply_runtime_group_param(group, param, &value)?;
+            Ok(true)
+        }
+        Control::GroupMatteParam { group, param } => {
+            if crate::composition::group_matte_value_law(param).is_none() {
+                return Err(format!(
+                    "recorded group matte parameter {param} is not recordable"
+                ));
+            }
+            let Some(group) = crate::visual_rack::GroupId::new(*group) else {
+                return Err("recorded group matte group ID is zero".to_string());
+            };
+            let Some(matte) = graph
+                .composition
+                .group_mut(group)
+                .and_then(|group| group.matte.as_mut())
+            else {
+                return Ok(false);
+            };
+            let Some(value) = json else {
+                return Err(format!("recorded group matte {param} value is malformed"));
+            };
+            crate::apply_runtime_group_matte_param(matte, param, &value)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn export_layer_index(layers: &[ExportLayer], position: u32) -> Option<usize> {
+    let position = usize::try_from(position).ok()?;
+    layers
+        .iter()
+        .position(|layer| layer.source_index == position)
+}
+
+fn export_performance_control_requires_transactional_preflight(
+    control: &crate::performance_track::PerformanceControl,
+) -> bool {
+    use crate::performance_track::PerformanceControl as Control;
+    match control {
+        Control::LayerParam { param, .. } => {
+            matches!(param.as_str(), "bypass_master_fx" | "bypass_temporal_fx")
+        }
+        Control::Ntsc { .. } | Control::MotionMaster { .. } | Control::MotionLayer { .. } => true,
+        Control::Temporal { param } => matches!(param.as_str(), "garden_amount" | "garden_gate"),
+        _ => false,
+    }
+}
+
+/// Apply only the live families whose edit, Morph materialization, and full
+/// visual preflight form one rollback-capable transaction.
+fn apply_export_transactional_performance_event(
+    control: &crate::performance_track::PerformanceControl,
+    raw: &crate::performance_track::PerformanceRawValue,
+    world: &mut ExportFrameMorphWorld,
+    layers: &[ExportLayer],
+) -> Result<bool, String> {
+    use crate::performance_track::{PerformanceControl as Control, PerformanceRawValue as Raw};
+    let json = raw.to_json();
+    match control {
+        Control::LayerParam { layer, param }
+            if matches!(param.as_str(), "bypass_master_fx" | "bypass_temporal_fx") =>
+        {
+            let Some(index) = export_layer_index(layers, *layer) else {
+                return Ok(false);
+            };
+            let Raw::Toggle(value) = raw else {
+                return Err(format!("recorded layer {param} value is not a toggle"));
+            };
+            if param == "bypass_master_fx" {
+                world.layer_bases[index].bypass_master_fx = *value;
+            } else {
+                world.layer_bases[index].bypass_temporal_fx = *value;
+            }
+            Ok(true)
+        }
+        Control::Ntsc { param } => {
+            let Some(value) = json else {
+                return Err(format!("recorded NTSC {param} value is malformed"));
+            };
+            world.ntsc.set_param(param, &value);
+            Ok(true)
+        }
+        Control::Temporal { param }
+            if matches!(param.as_str(), "garden_amount" | "garden_gate") =>
+        {
+            let Some(value) = json else {
+                return Err(format!("recorded Temporal {param} value is malformed"));
+            };
+            crate::apply_temporal_wire_edit(&mut world.temporal, param, &value, None);
+            Ok(true)
+        }
+        Control::MotionMaster { param } => {
+            let Some(value) = json else {
+                return Err(format!("recorded master Motion {param} value is malformed"));
+            };
+            crate::apply_motion_param(&mut world.master_motion, true, param, &value)?;
+            Ok(true)
+        }
+        Control::MotionLayer { layer, param } => {
+            let Some(index) = export_layer_index(layers, *layer) else {
+                return Ok(false);
+            };
+            let Some(value) = json else {
+                return Err(format!("recorded layer Motion {param} value is malformed"));
+            };
+            let Some(motion) = world.layer_motion.get_mut(index) else {
+                return Err(format!(
+                    "recorded layer Motion address {layer} has no motion base"
+                ));
+            };
+            crate::apply_motion_param(motion, false, param, &value)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Whether the live handler hands an ordinary edit direct ownership by first
+/// materializing and clearing an engaged Morph. Missing saved positions never
+/// release; optional fields are owned only when both slots captured them.
+fn export_performance_event_releases_active_morph(
+    control: &crate::performance_track::PerformanceControl,
+    raw: &crate::performance_track::PerformanceRawValue,
+    layers: &[ExportLayer],
+    morph: Option<&crate::morph::Morph>,
+) -> bool {
+    use crate::morph::LayerMorphControl as MorphControl;
+    use crate::performance_track::PerformanceControl as Control;
+    let Some(morph) = morph.filter(|morph| morph.active()) else {
+        return false;
+    };
+    let layer_exists = |position: u32| export_layer_index(layers, position).is_some();
+    let owns_layer = |position: u32, field| {
+        layer_exists(position)
+            && usize::try_from(position)
+                .ok()
+                .is_some_and(|position| morph.controls_layer_field(position, field))
+    };
+
+    match control {
+        Control::Master { param } => param != "random_seed",
+        Control::MasterTransform { .. } => morph.controls_master_transform(),
+        Control::LayerParam { layer, param } => raw.to_json().is_some_and(|value| {
+            crate::App::layer_param_morph_control(param, &value)
+                .is_some_and(|field| owns_layer(*layer, field))
+        }),
+        Control::LayerEffect { layer, param } => {
+            param != "random_seed"
+                && owns_layer(
+                    *layer,
+                    if param == "key_threshold" {
+                        MorphControl::KeyThreshold
+                    } else {
+                        MorphControl::Effects
+                    },
+                )
+        }
+        Control::LayerTransform { layer, .. } => owns_layer(*layer, MorphControl::Transform),
+        Control::LayerVisible { layer } => owns_layer(*layer, MorphControl::Visible),
+        Control::LayerPattern { layer, param } => {
+            let Some(index) = export_layer_index(layers, *layer) else {
+                return false;
+            };
+            layers[index].pattern.is_some()
+                && raw.to_json().is_some_and(|value| {
+                    crate::pattern_synth::PatternSynthEdit::parse(param, &value).is_some()
+                })
+                && owns_layer(*layer, MorphControl::Pattern)
+        }
+        Control::Ntsc { .. } | Control::Temporal { .. } | Control::MotionMaster { .. } => true,
+        Control::MotionLayer { layer, .. } => layer_exists(*layer),
+        Control::GestureCanvas { param } => {
+            matches!(param.as_str(), "radius" | "strength" | "retention")
+                && morph.controls_master_gesture()
+        }
+        Control::BusCrossfade
+        | Control::BusMix { .. }
+        | Control::RackNodeMaster { .. }
+        | Control::RackNodeLayer { .. }
+        | Control::RackNodeGroup { .. }
+        | Control::GroupParam { .. }
+        | Control::GroupMatteParam { .. }
+        | Control::MorphPosition
+        | Control::LayerText { .. }
+        | Control::MorphLaw
+        | Control::MorphGlide { .. }
+        | Control::MorphCapture
+        | Control::Routing { .. } => false,
+    }
+}
+
 /// Apply one replayed B9 performance event to the export job's authored
 /// bases.
 ///
-/// Every family routes through the same applier the live action arm uses —
+/// The replay mutates export-owned copies through the live shared appliers:
 /// `EffectsSnapshot`, `apply_spatial_transform_edit`, `apply_motion_param`,
-/// `apply_temporal_wire_edit`, `BusMixerEdit`, `PatternSynthEdit` — on the
-/// export's own copies of the same engine types, so an offline take mutates
-/// state through identical code and identical clamps. Layer addresses resolve
-/// by saved stack position, which *is* the export layer identity; a position
-/// the job does not hold is a safe no-op exactly as a vanished stable ID is
-/// live. The Collision Score loop driver never has an address here, so the
-/// temporal applier's live-only context is always `None`.
+/// `apply_temporal_wire_edit`, `BusMixerEdit`, `PatternSynthEdit`,
+/// `set_runtime_node_param`, the group appliers, and `TextPageEdit`. Routing
+/// config is admitted by `routing_value_law` and applies the same closed
+/// field clamps as the live arm; target edits remain refused. Layer addresses
+/// resolve by saved stack position, which *is* the export layer identity; a
+/// position the job does not hold is a safe no-op exactly as a vanished stable
+/// ID is live. The Collision Score loop driver never has an address here, so
+/// the temporal applier's live-only context is always `None`.
 #[allow(clippy::too_many_arguments)]
 fn apply_export_performance_event(
     control: &crate::performance_track::PerformanceControl,
@@ -5195,8 +5948,10 @@ fn apply_export_performance_event(
     gesture_canvas: &mut crate::gesture_canvas::GestureCanvasParams,
     creative_graph: &mut ExportCreativeGraph,
     layers: &mut [ExportLayer],
+    mod_matrix: &mut crate::modulation::ModMatrix,
     morph: &mut Option<crate::morph::Morph>,
-) {
+    program_beat: f64,
+) -> Option<crate::morph::MorphCaptureSlot> {
     use crate::performance_track::{PerformanceControl as Control, PerformanceRawValue as Raw};
     let json = raw.to_json();
     let layer_index = |layers: &[ExportLayer], position: u32| -> Option<usize> {
@@ -5222,9 +5977,7 @@ fn apply_export_performance_event(
             }
         }
         Control::LayerParam { layer, param } => {
-            let Some(index) = layer_index(layers, *layer) else {
-                return;
-            };
+            let index = layer_index(layers, *layer)?;
             let target = &mut layers[index];
             match (param.as_str(), raw) {
                 ("opacity", Raw::Continuous(value)) => {
@@ -5261,18 +6014,14 @@ fn apply_export_performance_event(
             }
         }
         Control::LayerEffect { layer, param } => {
-            let Some(index) = layer_index(layers, *layer) else {
-                return;
-            };
+            let index = layer_index(layers, *layer)?;
             if let Some(value) = json {
                 apply_effects(&mut layers[index].effects, param, &value);
                 layers[index].effects.clear_master_only_effects();
             }
         }
         Control::LayerTransform { layer, param } => {
-            let Some(index) = layer_index(layers, *layer) else {
-                return;
-            };
+            let index = layer_index(layers, *layer)?;
             if let Some(value) = json {
                 crate::App::apply_spatial_transform_edit(
                     &mut layers[index].transform,
@@ -5287,9 +6036,7 @@ fn apply_export_performance_event(
             }
         }
         Control::LayerPattern { layer, param } => {
-            let Some(index) = layer_index(layers, *layer) else {
-                return;
-            };
+            let index = layer_index(layers, *layer)?;
             if let Some(value) = json {
                 if let Some(edit) = crate::pattern_synth::PatternSynthEdit::parse(param, &value) {
                     if let Some(params) = layers[index].pattern.as_mut() {
@@ -5314,9 +6061,7 @@ fn apply_export_performance_event(
             }
         }
         Control::MotionLayer { layer, param } => {
-            let Some(index) = layer_index(layers, *layer) else {
-                return;
-            };
+            let index = layer_index(layers, *layer)?;
             if let Some(value) = json {
                 let _ = crate::apply_motion_param(&mut layer_motion[index], false, param, &value);
             }
@@ -5350,7 +6095,118 @@ fn apply_export_performance_event(
                 }
             }
         }
+        Control::RackNodeMaster {
+            node,
+            node_kind,
+            param,
+        } => {
+            crate::visual_rack::node_param_value_law(node_kind, param)?;
+            let node = crate::visual_rack::NodeId::new(*node)?;
+            let _ = crate::set_runtime_node_param(
+                &mut creative_graph.master_rack,
+                node,
+                node_kind,
+                param,
+                &json.unwrap_or(serde_json::Value::Null),
+            );
+        }
+        Control::RackNodeLayer {
+            layer,
+            node,
+            node_kind,
+            param,
+        } => {
+            crate::visual_rack::node_param_value_law(node_kind, param)?;
+            let (Some(rack), Some(node), Some(value)) = (
+                export_layer_rack_mut(creative_graph, *layer),
+                crate::visual_rack::NodeId::new(*node),
+                json,
+            ) else {
+                return None;
+            };
+            let _ = crate::set_runtime_node_param(rack, node, node_kind, param, &value);
+        }
+        Control::RackNodeGroup {
+            group,
+            node,
+            node_kind,
+            param,
+        } => {
+            crate::visual_rack::node_param_value_law(node_kind, param)?;
+            let (Some(group), Some(node), Some(value)) = (
+                crate::visual_rack::GroupId::new(*group),
+                crate::visual_rack::NodeId::new(*node),
+                json,
+            ) else {
+                return None;
+            };
+            let rack = creative_graph
+                .composition
+                .group_mut(group)
+                .map(|group| &mut group.rack)?;
+            let _ = crate::set_runtime_node_param(rack, node, node_kind, param, &value);
+        }
+        Control::GroupParam { group, param } => {
+            crate::composition::group_value_law(param)?;
+            let (Some(group), Some(value)) = (crate::visual_rack::GroupId::new(*group), json)
+            else {
+                return None;
+            };
+            if let Some(group) = creative_graph.composition.group_mut(group) {
+                let _ = crate::apply_runtime_group_param(group, param, &value);
+            }
+        }
+        Control::GroupMatteParam { group, param } => {
+            crate::composition::group_matte_value_law(param)?;
+            let (Some(group), Some(value)) = (crate::visual_rack::GroupId::new(*group), json)
+            else {
+                return None;
+            };
+            if let Some(matte) = creative_graph
+                .composition
+                .group_mut(group)
+                .and_then(|group| group.matte.as_mut())
+            {
+                let _ = crate::apply_runtime_group_matte_param(matte, param, &value);
+            }
+        }
+        Control::LayerText { layer, param } => {
+            let index = layer_index(layers, *layer)?;
+            let target = &mut layers[index];
+            if let Some(params) = target.text_page.as_mut() {
+                target.text_page_dirty |= apply_export_text_page_param(params, param, raw);
+            }
+        }
+        Control::MorphLaw => {
+            let Raw::Token(law) = raw else {
+                return None;
+            };
+            let law = crate::morph::MorphBlendLaw::try_from_key(law)?;
+            morph.get_or_insert_with(Default::default).blend_law = law;
+        }
+        Control::MorphGlide { target_q16 } => {
+            let Raw::Continuous(duration_beats) = raw else {
+                return None;
+            };
+            let target = f32::from(*target_q16) / f32::from(u16::MAX);
+            morph.get_or_insert_with(Default::default).start_glide(
+                target,
+                f64::from(*duration_beats),
+                program_beat,
+            );
+        }
+        Control::MorphCapture => {
+            let Raw::Token(slot) = raw else {
+                return None;
+            };
+            let slot = crate::morph::MorphCaptureSlot::try_from_key(slot)?;
+            return Some(slot);
+        }
+        Control::Routing { routing, param } => {
+            let _ = apply_export_routing_param(mod_matrix, *routing, param, raw);
+        }
     }
+    None
 }
 
 /// Admit and build the one gesture canvas an offline job owns.
@@ -6241,6 +7097,8 @@ fn run_export(
             width: lw,
             height: lh,
             pattern: None,
+            text_page: None,
+            text_page_dirty: false,
             planar_gpu,
         });
     }
@@ -6395,6 +7253,11 @@ fn run_export(
     // tampered or corrupted recording aborts the job with a named error rather
     // than silently re-rendering a performance nobody authored.
     let recorded_gesture_track = export_recorded_gesture_track(config.gesture_track.as_ref())?;
+    let recorded_gesture_checksum = if recorded_gesture_track.events().is_empty() {
+        String::new()
+    } else {
+        recorded_gesture_track.checksum_hex()
+    };
     let mut recorded_gesture_replay = recorded_gesture_track.replay();
     if recorded_gesture_track.truncated() {
         progress.record_warning(
@@ -6422,6 +7285,9 @@ fn run_export(
             let take = document
                 .decode()
                 .map_err(|error| format!("recorded performance take rejected: {error}"))?;
+            validate_v2_performance_owner_laws(&take).map_err(|error| {
+                format!("recorded performance take rejected before rendering: {error}")
+            })?;
             if take.truncated() {
                 progress.record_warning(
                     "The recorded performance take reached its bounded cap; export replays the retained prefix only.",
@@ -6439,10 +7305,10 @@ fn run_export(
     let performance_authors_temporal_bypass = performance_replay
         .as_ref()
         .is_some_and(|(take, _)| performance_take_authors_temporal_bypass(take));
+    let explicit_temporal_bypass_authored =
+        patch_or_morph_authors_temporal_bypass || performance_authors_temporal_bypass;
     mod_matrix
-        .validate_temporal_bypass_motion_routing(
-            patch_or_morph_authors_temporal_bypass || performance_authors_temporal_bypass,
-        )
+        .validate_temporal_bypass_motion_routing(explicit_temporal_bypass_authored)
         .map_err(|error| format!("export Temporal-bypass admission failed: {error}"))?;
     let mut base_gesture_canvas = patch.gesture_canvas.unwrap_or_default().to_params();
     let gesture_canvas_limits = crate::gesture_canvas::GestureCanvasLimits::device(
@@ -6589,77 +7455,605 @@ fn run_export(
             break;
         }
 
-        // Apply every due B9 take event to the authored bases before this
-        // frame's world is built — the offline mirror of the live
-        // drain-before-render order, addressed by the same rounded rational
-        // tick map every other 30 Hz consumer uses.
-        if let Some((take, cursor)) = performance_replay.as_mut() {
-            let tick = u32::try_from(export_temporal_reference_tick(frame_num, config.fps))
-                .unwrap_or(u32::MAX);
-            let (start, end) = cursor.range_due(take.events(), tick);
-            for event in &take.events()[start..end] {
-                let address = &take.addresses()[usize::from(event.address)];
-                if let Some(raw) = address.law.decode(event.value) {
-                    apply_export_performance_event(
-                        &address.control,
-                        &raw,
-                        &mut master_effects,
-                        &mut master_transform,
-                        &mut base_master_motion,
-                        &mut base_layer_motion,
-                        &mut base_ntsc,
-                        &mut base_temporal,
-                        &mut base_gesture_canvas,
-                        &mut base_creative_graph,
-                        &mut layers,
-                        &mut export_morph,
-                    );
-                }
-            }
-        }
-
-        // Update time uniform for effects (breathe, grain seed, etc.)
+        // Program time is frame-indexed and therefore available before the
+        // take drain. Morph glides use this exact beat as their start anchor.
         let (time, program_dt) =
             export_program_transport(frame_num, frame_interval, patch.master_paused);
-        master_effects.time = time;
-
-        // Sample the modulation matrix at this frame's beat position and
-        // derive the modulated params for this frame (bases untouched).
         let beat = time as f64 * (mod_matrix.clock.bpm as f64 / 60.0);
-        if let Some(clip) = &analysis_clip {
-            mod_matrix.audio = clip
-                .analyze_at_time(
-                    time as f64,
-                    mod_matrix.audio_gain,
-                    mod_matrix.audio_band_config,
-                )
-                .levels;
-        } else {
-            // Live capture and hardware sources are deliberately unavailable
-            // offline; their zero value makes exports repeatable.
-            mod_matrix.audio = crate::audio::AudioLevels::default();
+
+        // Match the live frame boundary exactly: source analysis and matrix
+        // time advance first, then the take drains, then `frame()` samples the
+        // possibly edited routing configuration. Pause freezes both automatic
+        // clocks and therefore consumes no take events.
+        if !patch.master_paused {
+            if let Some(clip) = &analysis_clip {
+                mod_matrix.audio = clip
+                    .analyze_at_time(
+                        time as f64,
+                        mod_matrix.audio_gain,
+                        mod_matrix.audio_band_config,
+                    )
+                    .levels;
+            } else {
+                // Live capture and hardware sources are deliberately
+                // unavailable offline; their zero value makes exports
+                // repeatable.
+                mod_matrix.audio = crate::audio::AudioLevels::default();
+            }
         }
         update_export_modulation(&mut mod_matrix, beat, program_dt, patch.master_paused);
-        let modulation_frame = mod_matrix.frame(layers.len());
-        // Keep render parameters detached from decoder/runtime handles. A
-        // full morph sample can then drive exactly the same layer world as
-        // live rendering without mutating the saved patch bases.
-        let baseline_morph_world = ExportFrameMorphWorld {
-            creative_graph: base_creative_graph.clone(),
-            master: master_effects,
-            master_transform,
-            master_motion: base_master_motion,
-            ntsc: base_ntsc.clone(),
-            temporal: base_temporal,
-            gesture_canvas: base_gesture_canvas,
-            layer_bases: layers.iter().map(ExportFrameLayerBase::from).collect(),
-            layer_motion: base_layer_motion.clone(),
-            morph_overrides: vec![ExportMorphOverrides::default(); layers.len()],
-        };
         let frame_mattes = layers.iter().map(|layer| layer.matte).collect::<Vec<_>>();
         let mut composition_history_ready = composition_gpu
             .as_ref()
             .is_some_and(CompositionGpuExecutor::program_history_initialized);
+        // Performance replay runs before this frame's Morph sample, exactly as
+        // live. Its "before" partition is therefore the last displayed frame
+        // (or the authored startup partition before frame zero), not the
+        // export's intentionally un-morphed authored bases.
+        let mut event_temporal_bypass_partition = if temporal_bypass_partition_initialized {
+            previous_temporal_bypass_partition.clone()
+        } else {
+            layers
+                .iter()
+                .map(|layer| layer.bypass_temporal_fx)
+                .collect::<Vec<_>>()
+        };
+
+        if !patch.master_paused {
+            if let Some((take, cursor)) = performance_replay.as_mut() {
+                let tick = u32::try_from(export_temporal_reference_tick(frame_num, config.fps))
+                    .unwrap_or(u32::MAX);
+                let (start, end) = cursor.range_due(take.events(), tick);
+                for event in &take.events()[start..end] {
+                    let address = &take.addresses()[usize::from(event.address)];
+                    if let Some(raw) = address.law.decode(event.value) {
+                        if export_performance_control_requires_creative_preflight(&address.control)
+                        {
+                            // Live creative editing is deliberately two-stage.
+                            // First, stage the edit on the exact requested
+                            // Morph graph and refuse an invalid midpoint without
+                            // fallback. Only then materialize the complete world
+                            // (whose release law may choose an endpoint), replace
+                            // its creative graph with the already-approved exact
+                            // edit, and post-preflight before atomic commit.
+                            let baseline = capture_export_morph_world(
+                                master_effects,
+                                master_transform,
+                                base_master_motion,
+                                &base_ntsc,
+                                base_temporal,
+                                base_gesture_canvas,
+                                &base_creative_graph,
+                                &layers,
+                                &base_layer_motion,
+                            );
+                            let event_modulation = mod_matrix.frame(layers.len());
+                            let preflight = ExportMorphPreflightContext {
+                                modulation: &event_modulation,
+                                frame: FramePlanContext::new(w, h, time).with_study_inputs(
+                                    mod_matrix.audio.bands,
+                                    (beat.fract().abs()) as f32,
+                                ),
+                                layer_mattes: &frame_mattes,
+                                program_history_initialized: composition_history_ready,
+                                resource_limits: creative_resource_limits,
+                                motion_limits: motion_device_limits,
+                                authored_motion_modulation,
+                                shutter_samples: config.shutter_samples,
+                            };
+                            let active = export_morph.as_ref().filter(|morph| morph.active());
+                            let requested_position = active.map(|morph| {
+                                (morph.position_at_beat(beat) + event_modulation.morph_offset())
+                                    .clamp(0.0, 1.0)
+                            });
+                            let mut staged_graph = baseline.creative_graph.clone();
+                            if let (Some(active), Some(requested_position)) =
+                                (active, requested_position)
+                            {
+                                let Some(sample) = active.sample(requested_position) else {
+                                    progress.record_warning(format!(
+                                        "Recorded {} edit was refused because active Morph has no complete requested sample",
+                                        address.control.describe()
+                                    ));
+                                    continue;
+                                };
+                                apply_export_creative_morph(&sample, &mut staged_graph);
+                            }
+                            match apply_export_creative_performance_event(
+                                &address.control,
+                                &raw,
+                                &mut staged_graph,
+                            ) {
+                                Ok(false) => {
+                                    progress.record_warning(format!(
+                                        "Recorded {} edit resolved to no current export target and was a named no-op",
+                                        address.control.describe()
+                                    ));
+                                    continue;
+                                }
+                                Err(error) => {
+                                    progress.record_warning(format!(
+                                        "Recorded {} edit was refused during export staging: {error}",
+                                        address.control.describe()
+                                    ));
+                                    continue;
+                                }
+                                Ok(true) => {}
+                            }
+                            let mut initial_candidate = baseline.clone();
+                            initial_candidate.creative_graph = staged_graph.clone();
+                            if let Err(error) =
+                                preflight_export_morph_world(&initial_candidate, &layers, preflight)
+                            {
+                                progress.record_warning(format!(
+                                    "Recorded {} edit was refused by exact-sample creative preflight: {error}",
+                                    address.control.describe()
+                                ));
+                                continue;
+                            }
+
+                            let mut committed = initial_candidate;
+                            let mut materialization_warning = None;
+                            if let (Some(active), Some(requested_position)) =
+                                (active, requested_position)
+                            {
+                                match select_export_morph_world(
+                                    active,
+                                    requested_position,
+                                    &baseline,
+                                    &layers,
+                                    preflight,
+                                ) {
+                                    Ok(selected) => {
+                                        if (selected.selected_position
+                                            - selected.requested_position)
+                                            .abs()
+                                            > f32::EPSILON
+                                        {
+                                            materialization_warning = Some(format!(
+                                                "Morph sample {:.4} was invalid ({}); used captured endpoint {:.1} before recorded {} edit",
+                                                selected.requested_position,
+                                                selected
+                                                    .requested_error
+                                                    .as_deref()
+                                                    .unwrap_or("creative graph rejected"),
+                                                selected.selected_position,
+                                                address.control.describe()
+                                            ));
+                                        }
+                                        committed = selected.value;
+                                        committed.creative_graph = staged_graph;
+                                    }
+                                    Err(error) => {
+                                        progress.record_warning(format!(
+                                            "Recorded {} edit was refused because active Morph could not be materialized: {error}",
+                                            address.control.describe()
+                                        ));
+                                        continue;
+                                    }
+                                }
+                                if let Err(error) =
+                                    preflight_export_morph_world(&committed, &layers, preflight)
+                                {
+                                    progress.record_warning(format!(
+                                        "Recorded {} edit was refused by post-Morph creative preflight: {error}",
+                                        address.control.describe()
+                                    ));
+                                    continue;
+                                }
+                            }
+                            let next_temporal_partition = committed
+                                .layer_bases
+                                .iter()
+                                .map(|layer| layer.bypass_temporal_fx)
+                                .collect::<Vec<_>>();
+                            let temporal_partition_changed =
+                                event_temporal_bypass_partition != next_temporal_partition;
+                            install_export_morph_world(
+                                committed,
+                                &mut master_effects,
+                                &mut master_transform,
+                                &mut base_master_motion,
+                                &mut base_layer_motion,
+                                &mut base_ntsc,
+                                &mut base_temporal,
+                                &mut base_gesture_canvas,
+                                &mut base_creative_graph,
+                                &mut layers,
+                            );
+                            if active.is_some() {
+                                let morph = export_morph
+                                    .as_mut()
+                                    .expect("active export Morph remains present through commit");
+                                morph.clear();
+                            }
+                            event_temporal_bypass_partition = next_temporal_partition;
+                            if temporal_partition_changed {
+                                // Live invalidates ProgramHistory immediately
+                                // when Morph release crosses the temporal
+                                // bypass partition. The retained export
+                                // observer still owns the GPU reset, but later
+                                // same-tick preflights must see history absent.
+                                composition_history_ready = false;
+                            }
+                            if let Some(warning) = materialization_warning {
+                                progress.record_warning(warning);
+                            }
+                            continue;
+                        }
+
+                        if export_performance_control_requires_transactional_preflight(
+                            &address.control,
+                        ) {
+                            let baseline = capture_export_morph_world(
+                                master_effects,
+                                master_transform,
+                                base_master_motion,
+                                &base_ntsc,
+                                base_temporal,
+                                base_gesture_canvas,
+                                &base_creative_graph,
+                                &layers,
+                                &base_layer_motion,
+                            );
+                            let event_modulation = mod_matrix.frame(layers.len());
+                            let preflight = ExportMorphPreflightContext {
+                                modulation: &event_modulation,
+                                frame: FramePlanContext::new(w, h, time).with_study_inputs(
+                                    mod_matrix.audio.bands,
+                                    (beat.fract().abs()) as f32,
+                                ),
+                                layer_mattes: &frame_mattes,
+                                program_history_initialized: composition_history_ready,
+                                resource_limits: creative_resource_limits,
+                                motion_limits: motion_device_limits,
+                                authored_motion_modulation,
+                                shutter_samples: config.shutter_samples,
+                            };
+                            let release = export_performance_event_releases_active_morph(
+                                &address.control,
+                                &raw,
+                                &layers,
+                                export_morph.as_ref(),
+                            );
+                            let mut staged = baseline.clone();
+                            let mut materialization_warning = None;
+                            if release {
+                                let active = export_morph
+                                    .as_ref()
+                                    .expect("release requires an export Morph");
+                                let requested_position = (active.position_at_beat(beat)
+                                    + event_modulation.morph_offset())
+                                .clamp(0.0, 1.0);
+                                match select_export_morph_world(
+                                    active,
+                                    requested_position,
+                                    &baseline,
+                                    &layers,
+                                    preflight,
+                                ) {
+                                    Ok(selected) => {
+                                        if (selected.selected_position
+                                            - selected.requested_position)
+                                            .abs()
+                                            > f32::EPSILON
+                                        {
+                                            materialization_warning = Some(format!(
+                                                "Morph sample {:.4} was invalid ({}); used captured endpoint {:.1} before recorded {} edit",
+                                                selected.requested_position,
+                                                selected
+                                                    .requested_error
+                                                    .as_deref()
+                                                    .unwrap_or("creative graph rejected"),
+                                                selected.selected_position,
+                                                address.control.describe()
+                                            ));
+                                        }
+                                        staged = selected.value;
+                                    }
+                                    Err(error) => {
+                                        progress.record_warning(format!(
+                                            "Recorded {} edit was refused because active Morph could not be materialized: {error}",
+                                            address.control.describe()
+                                        ));
+                                        continue;
+                                    }
+                                }
+                            }
+                            match apply_export_transactional_performance_event(
+                                &address.control,
+                                &raw,
+                                &mut staged,
+                                &layers,
+                            ) {
+                                Ok(false) => {
+                                    progress.record_warning(format!(
+                                        "Recorded {} edit resolved to no current export target and was a named no-op",
+                                        address.control.describe()
+                                    ));
+                                    continue;
+                                }
+                                Err(error) => {
+                                    progress.record_warning(format!(
+                                        "Recorded {} edit was refused during export staging: {error}",
+                                        address.control.describe()
+                                    ));
+                                    continue;
+                                }
+                                Ok(true) => {}
+                            }
+                            if let Err(error) =
+                                preflight_export_morph_world(&staged, &layers, preflight)
+                            {
+                                progress.record_warning(format!(
+                                    "Recorded {} edit was refused by export visual preflight: {error}",
+                                    address.control.describe()
+                                ));
+                                continue;
+                            }
+                            let next_temporal_partition = staged
+                                .layer_bases
+                                .iter()
+                                .map(|layer| layer.bypass_temporal_fx)
+                                .collect::<Vec<_>>();
+                            let temporal_partition_changed =
+                                event_temporal_bypass_partition != next_temporal_partition;
+                            install_export_morph_world(
+                                staged,
+                                &mut master_effects,
+                                &mut master_transform,
+                                &mut base_master_motion,
+                                &mut base_layer_motion,
+                                &mut base_ntsc,
+                                &mut base_temporal,
+                                &mut base_gesture_canvas,
+                                &mut base_creative_graph,
+                                &mut layers,
+                            );
+                            if release {
+                                export_morph
+                                    .as_mut()
+                                    .expect("released export Morph remains present")
+                                    .clear();
+                            }
+                            event_temporal_bypass_partition = next_temporal_partition;
+                            if temporal_partition_changed {
+                                composition_history_ready = false;
+                            }
+                            if let Some(warning) = materialization_warning {
+                                progress.record_warning(warning);
+                            }
+                            continue;
+                        }
+
+                        if export_performance_event_releases_active_morph(
+                            &address.control,
+                            &raw,
+                            &layers,
+                            export_morph.as_ref(),
+                        ) {
+                            let baseline = capture_export_morph_world(
+                                master_effects,
+                                master_transform,
+                                base_master_motion,
+                                &base_ntsc,
+                                base_temporal,
+                                base_gesture_canvas,
+                                &base_creative_graph,
+                                &layers,
+                                &base_layer_motion,
+                            );
+                            let event_modulation = mod_matrix.frame(layers.len());
+                            let active = export_morph
+                                .as_ref()
+                                .expect("ownership release requires an export Morph");
+                            let requested_position = (active.position_at_beat(beat)
+                                + event_modulation.morph_offset())
+                            .clamp(0.0, 1.0);
+                            let selected = match select_export_morph_world(
+                                active,
+                                requested_position,
+                                &baseline,
+                                &layers,
+                                ExportMorphPreflightContext {
+                                    modulation: &event_modulation,
+                                    frame: FramePlanContext::new(w, h, time).with_study_inputs(
+                                        mod_matrix.audio.bands,
+                                        (beat.fract().abs()) as f32,
+                                    ),
+                                    layer_mattes: &frame_mattes,
+                                    program_history_initialized: composition_history_ready,
+                                    resource_limits: creative_resource_limits,
+                                    motion_limits: motion_device_limits,
+                                    authored_motion_modulation,
+                                    shutter_samples: config.shutter_samples,
+                                },
+                            ) {
+                                Ok(selected) => selected,
+                                Err(error) => {
+                                    progress.record_warning(format!(
+                                        "Recorded {} edit was refused because active Morph could not be materialized: {error}",
+                                        address.control.describe()
+                                    ));
+                                    continue;
+                                }
+                            };
+                            let warning = ((selected.selected_position
+                                - selected.requested_position)
+                                .abs()
+                                > f32::EPSILON)
+                                .then(|| {
+                                    format!(
+                                        "Morph sample {:.4} was invalid ({}); used captured endpoint {:.1} before recorded {} edit",
+                                        selected.requested_position,
+                                        selected
+                                            .requested_error
+                                            .as_deref()
+                                            .unwrap_or("creative graph rejected"),
+                                        selected.selected_position,
+                                        address.control.describe()
+                                    )
+                                });
+                            let next_temporal_partition = selected
+                                .value
+                                .layer_bases
+                                .iter()
+                                .map(|layer| layer.bypass_temporal_fx)
+                                .collect::<Vec<_>>();
+                            let temporal_partition_changed =
+                                event_temporal_bypass_partition != next_temporal_partition;
+                            install_export_morph_world(
+                                selected.value,
+                                &mut master_effects,
+                                &mut master_transform,
+                                &mut base_master_motion,
+                                &mut base_layer_motion,
+                                &mut base_ntsc,
+                                &mut base_temporal,
+                                &mut base_gesture_canvas,
+                                &mut base_creative_graph,
+                                &mut layers,
+                            );
+                            export_morph
+                                .as_mut()
+                                .expect("released export Morph remains present")
+                                .clear();
+                            event_temporal_bypass_partition = next_temporal_partition;
+                            if temporal_partition_changed {
+                                composition_history_ready = false;
+                            }
+                            if let Some(warning) = warning {
+                                progress.record_warning(warning);
+                            }
+                        }
+
+                        match &address.control {
+                            crate::performance_track::PerformanceControl::LayerText {
+                                layer,
+                                ..
+                            } if export_layer_index(&layers, *layer)
+                                .is_none_or(|index| layers[index].text_page.is_none()) =>
+                            {
+                                progress.record_warning(format!(
+                                    "Recorded {} edit resolved to no matching text-page export layer and was a named no-op",
+                                    address.control.describe()
+                                ));
+                                continue;
+                            }
+                            crate::performance_track::PerformanceControl::Routing {
+                                routing,
+                                ..
+                            } if usize::try_from(*routing)
+                                .ok()
+                                .is_none_or(|index| index >= mod_matrix.routings.len()) =>
+                            {
+                                progress.record_warning(format!(
+                                    "Recorded {} edit resolved to no current routing and was a named no-op",
+                                    address.control.describe()
+                                ));
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        let capture = apply_export_performance_event(
+                            &address.control,
+                            &raw,
+                            &mut master_effects,
+                            &mut master_transform,
+                            &mut base_master_motion,
+                            &mut base_layer_motion,
+                            &mut base_ntsc,
+                            &mut base_temporal,
+                            &mut base_gesture_canvas,
+                            &mut base_creative_graph,
+                            &mut layers,
+                            &mut mod_matrix,
+                            &mut export_morph,
+                            beat,
+                        );
+                        if let Some(slot) = capture {
+                            let capture_modulation = mod_matrix.frame(layers.len());
+                            match apply_export_morph_capture(
+                                slot,
+                                beat,
+                                &recorded_gesture_checksum,
+                                ExportMorphPreflightContext {
+                                    modulation: &capture_modulation,
+                                    frame: FramePlanContext::new(w, h, time).with_study_inputs(
+                                        mod_matrix.audio.bands,
+                                        (beat.fract().abs()) as f32,
+                                    ),
+                                    layer_mattes: &frame_mattes,
+                                    program_history_initialized: composition_history_ready,
+                                    resource_limits: creative_resource_limits,
+                                    motion_limits: motion_device_limits,
+                                    authored_motion_modulation,
+                                    shutter_samples: config.shutter_samples,
+                                },
+                                &mut master_effects,
+                                &mut master_transform,
+                                &mut base_master_motion,
+                                &mut base_layer_motion,
+                                &mut base_ntsc,
+                                &mut base_temporal,
+                                &mut base_gesture_canvas,
+                                &mut base_creative_graph,
+                                &mut layers,
+                                &mut export_morph,
+                            ) {
+                                Ok(warning) => {
+                                    let next_temporal_partition = layers
+                                        .iter()
+                                        .map(|layer| layer.bypass_temporal_fx)
+                                        .collect::<Vec<_>>();
+                                    if event_temporal_bypass_partition != next_temporal_partition {
+                                        composition_history_ready = false;
+                                    }
+                                    event_temporal_bypass_partition = next_temporal_partition;
+                                    if let Some(warning) = warning {
+                                        progress.record_warning(warning);
+                                    }
+                                }
+                                Err(error) => {
+                                    write_error = Some(format!(
+                                        "recorded Morph capture rejected during export: {error}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if write_error.is_some() {
+            break;
+        }
+
+        upload_dirty_export_text_pages(&device, &queue, &mut layers)?;
+
+        // Update time uniform for effects (breathe, grain seed, etc.)
+        master_effects.time = time;
+
+        // Sample the modulation matrix after take replay so routing edits on
+        // this tick affect this frame through the same live ordering boundary.
+        let modulation_frame = mod_matrix.frame(layers.len());
+        // Keep render parameters detached from decoder/runtime handles while
+        // leaving the caller's PatchState untouched. The export-owned bases do
+        // mirror live materialization from frame to frame, though: a replayed
+        // edit or capture at the next boundary must see the previously
+        // displayed Morph world rather than the original authored values.
+        let baseline_morph_world = capture_export_morph_world(
+            master_effects,
+            master_transform,
+            base_master_motion,
+            &base_ntsc,
+            base_temporal,
+            base_gesture_canvas,
+            &base_creative_graph,
+            &layers,
+            &base_layer_motion,
+        );
         let mut frame_morph_world = baseline_morph_world.clone();
 
         // Live Pause holds the already-materialized patch bases and does not
@@ -6674,38 +8068,23 @@ fn run_export(
                 write_error = Some("active export Morph disappeared during sampling".to_string());
                 break;
             };
-            let selected = select_valid_morph_candidate(requested_position, |sample_position| {
-                let sample = morph.sample(sample_position).ok_or_else(|| {
-                    format!("Morph has no complete sample at {sample_position:.4}")
-                })?;
-                let mut candidate = baseline_morph_world.clone();
-                apply_export_morph_world(&sample, &layers, &mut candidate);
-                let evaluated = evaluate_export_morph_world(
-                    &candidate,
-                    &layers,
-                    &modulation_frame,
-                    FramePlanContext::new(w, h, time)
+            let selected = select_export_morph_world(
+                morph,
+                requested_position,
+                &baseline_morph_world,
+                &layers,
+                ExportMorphPreflightContext {
+                    modulation: &modulation_frame,
+                    frame: FramePlanContext::new(w, h, time)
                         .with_study_inputs(mod_matrix.audio.bands, (beat.fract().abs()) as f32),
-                );
-                plan_export_composition_with_motion(
-                    &evaluated,
-                    &candidate.creative_graph,
-                    &frame_mattes,
-                    composition_history_ready,
-                    creative_resource_limits,
-                    ExportMotionPlanAdapter {
-                        master: candidate.master_motion,
-                        layers: &candidate.layer_motion,
-                        sources: &layers,
-                        limits: motion_device_limits,
-                        modulation: &modulation_frame,
-                        authored_motion_modulation,
-                        shutter_samples: config.shutter_samples,
-                        codec_availability: None,
-                    },
-                )?;
-                Ok(candidate)
-            });
+                    layer_mattes: &frame_mattes,
+                    program_history_initialized: composition_history_ready,
+                    resource_limits: creative_resource_limits,
+                    motion_limits: motion_device_limits,
+                    authored_motion_modulation,
+                    shutter_samples: config.shutter_samples,
+                },
+            );
             match selected {
                 Ok(selected) => {
                     if (selected.selected_position - selected.requested_position).abs()
@@ -6721,7 +8100,20 @@ fn run_export(
                             selected.selected_position
                         ));
                     }
-                    frame_morph_world = selected.value;
+                    let materialized = selected.value;
+                    install_export_morph_world(
+                        materialized.clone(),
+                        &mut master_effects,
+                        &mut master_transform,
+                        &mut base_master_motion,
+                        &mut base_layer_motion,
+                        &mut base_ntsc,
+                        &mut base_temporal,
+                        &mut base_gesture_canvas,
+                        &mut base_creative_graph,
+                        &mut layers,
+                    );
+                    frame_morph_world = materialized;
                 }
                 Err(error) => {
                     write_error = Some(error);
@@ -15784,6 +17176,8 @@ layers:
                 width: 4,
                 height: 3,
                 pattern: None,
+                text_page: None,
+                text_page_dirty: false,
             })
         }
 
@@ -22310,6 +23704,191 @@ mod effects_audit {
         PerformanceTakeDocument::capture(&take)
     }
 
+    fn self_provisioned_v2_performance_fixture() -> (
+        PatchState,
+        crate::performance_track::PerformanceTakeDocument,
+    ) {
+        use crate::performance_track::{
+            PerformanceControl as Control, PerformanceRawValue as Raw, PerformanceTake,
+            PerformanceTakeDocument, PerformanceValueLaw as Law,
+        };
+        use crate::visual_rack::{DigitalColorParams, LegacyRackScope, VisualNodeKind, VisualRack};
+
+        // A text page is a complete source: bundled fonts + the shared CPU
+        // raster, with no media library and specifically no audit.mp4.
+        let mut patch = base_patch();
+        let page = crate::patch::TextPageConfig {
+            body: "PERFORMANCE\nV2".to_string(),
+            size: 0.12,
+            shape: crate::patch::TextPageShapeConfig::Circle,
+            shape_size: 0.3,
+            ..Default::default()
+        };
+        patch.layers[0].filename = "Text Page".to_string();
+        patch.layers[0].source_path = crate::layers::TEXT_PAGE_SOURCE_PATH.to_string();
+        patch.layers[0].clip_slots = crate::performance::ClipSlots::singleton(
+            crate::performance::ClipSlotConfig::from_legacy(
+                "Text Page".to_string(),
+                crate::layers::TEXT_PAGE_SOURCE_PATH.to_string(),
+                1.0,
+                30.0,
+            ),
+        );
+        patch.layers[0].text_page = Some(page);
+
+        let mut master_rack = VisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let master_node = master_rack
+            .push(VisualNodeKind::DigitalColor(DigitalColorParams::default()))
+            .expect("v2 fixture master node");
+        patch.master_rack = Some(master_rack);
+
+        let mut layer_rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        let layer_node = layer_rack
+            .push(VisualNodeKind::DigitalColor(DigitalColorParams::default()))
+            .expect("v2 fixture layer node");
+        patch.layers[0].rack = Some(layer_rack);
+
+        let saved_layer = crate::performance::SavedLayerPosition::new(0).unwrap();
+        let mut composition =
+            crate::composition::CompositionTree::legacy_for_layers(&[saved_layer])
+                .expect("v2 fixture composition");
+        let group_id = composition
+            .insert_empty_group(
+                crate::composition::GroupName::new("Recorded group".to_string()).unwrap(),
+                0,
+            )
+            .expect("v2 fixture group");
+        let group_node = {
+            let group = composition.group_mut(group_id).unwrap();
+            group.matte = Some(crate::visual_rack::ImageMatte {
+                tap: crate::visual_rack::SavedImageTap {
+                    source: crate::visual_rack::SavedImageSource::GestureCanvas,
+                    timing: crate::visual_rack::EdgeTiming::CurrentFrame,
+                },
+                channel: crate::visual_rack::MatteChannel::Alpha,
+                invert: false,
+                amount: 1.0,
+                threshold: 0.5,
+                softness: 0.1,
+            });
+            group
+                .rack
+                .push(VisualNodeKind::DigitalColor(DigitalColorParams::default()))
+                .expect("v2 fixture group node")
+        };
+        patch.composition = Some(composition);
+
+        let mut matrix = crate::modulation::ModMatrix::new();
+        matrix.routings.push(crate::modulation::Routing::new(
+            crate::modulation::ModSource::Lfo(0),
+            "brightness",
+            0.0,
+        ));
+        patch.modulation = Some(crate::patch::ModConfig::from_matrix(&matrix));
+
+        let mut take = PerformanceTake::default();
+        take.record_accepted(
+            0,
+            Control::RackNodeMaster {
+                node: master_node.get(),
+                node_kind: "digital_color".to_string(),
+                param: "brightness".to_string(),
+            },
+            Law::Unit {
+                min: -1.0,
+                max: 1.0,
+            },
+            &Raw::Continuous(0.55),
+        )
+        .unwrap();
+        let layer_control = Control::RackNodeLayer {
+            layer: 0,
+            node: layer_node.get(),
+            node_kind: "digital_color".to_string(),
+            param: "saturation".to_string(),
+        };
+        let layer_law = crate::App::performance_value_law_for(&layer_control).unwrap();
+        take.record_accepted(0, layer_control, layer_law, &Raw::Continuous(0.55))
+            .unwrap();
+        let group_rack_control = Control::RackNodeGroup {
+            group: group_id.get(),
+            node: group_node.get(),
+            node_kind: "digital_color".to_string(),
+            param: "contrast".to_string(),
+        };
+        let group_rack_law = crate::App::performance_value_law_for(&group_rack_control).unwrap();
+        take.record_accepted(
+            0,
+            group_rack_control,
+            group_rack_law,
+            &Raw::Continuous(-0.3),
+        )
+        .unwrap();
+        let group_control = Control::GroupParam {
+            group: group_id.get(),
+            param: "opacity".to_string(),
+        };
+        let group_law = crate::App::performance_value_law_for(&group_control).unwrap();
+        take.record_accepted(0, group_control, group_law, &Raw::Continuous(0.65))
+            .unwrap();
+        let matte_control = Control::GroupMatteParam {
+            group: group_id.get(),
+            param: "softness".to_string(),
+        };
+        let matte_law = crate::App::performance_value_law_for(&matte_control).unwrap();
+        take.record_accepted(0, matte_control, matte_law, &Raw::Continuous(0.35))
+            .unwrap();
+        take.record_accepted(
+            0,
+            Control::LayerText {
+                layer: 0,
+                param: "size".to_string(),
+            },
+            Law::Unit {
+                min: 0.03,
+                max: 0.6,
+            },
+            &Raw::Continuous(0.5),
+        )
+        .unwrap();
+        take.record_accepted(
+            6,
+            Control::MorphLaw,
+            Law::Discrete {
+                vocab: crate::morph::MorphBlendLaw::ALL
+                    .into_iter()
+                    .map(|law| law.key().to_string())
+                    .collect(),
+            },
+            &Raw::Token("equal_power".to_string()),
+        )
+        .unwrap();
+        take.record_accepted(
+            6,
+            Control::MorphCapture,
+            Law::Discrete {
+                vocab: vec!["a".to_string(), "b".to_string()],
+            },
+            &Raw::Token("a".to_string()),
+        )
+        .unwrap();
+        take.record_accepted(
+            12,
+            Control::Routing {
+                routing: 0,
+                param: "depth".to_string(),
+            },
+            Law::Unit {
+                min: crate::modulation::ROUTING_DEPTH_RANGE[0],
+                max: crate::modulation::ROUTING_DEPTH_RANGE[1],
+            },
+            &Raw::Continuous(0.8),
+        )
+        .unwrap();
+        take.finalize(24);
+        (patch, PerformanceTakeDocument::capture(&take))
+    }
+
     #[test]
     fn export_admission_finds_temporal_bypass_authored_only_by_a_later_take_event() {
         use crate::performance_track::{
@@ -22354,6 +23933,78 @@ mod effects_audit {
             )
             .unwrap();
         assert!(!performance_take_authors_temporal_bypass(&unrelated));
+    }
+
+    #[test]
+    fn export_admission_requires_exact_v2_owner_laws_and_preserves_v1() {
+        use crate::performance_track::{
+            PerformanceControl as Control, PerformanceRawValue as Raw, PerformanceTake,
+            PerformanceValueLaw as Law,
+        };
+
+        let mut legal = PerformanceTake::default();
+        legal
+            .record_accepted(
+                0,
+                Control::GroupParam {
+                    group: 1,
+                    param: "opacity".to_string(),
+                },
+                Law::Unit { min: 0.0, max: 1.0 },
+                &Raw::Continuous(0.5),
+            )
+            .unwrap();
+        assert_eq!(validate_v2_performance_owner_laws(&legal), Ok(()));
+
+        let mut widened = PerformanceTake::default();
+        widened
+            .record_accepted(
+                0,
+                Control::GroupParam {
+                    group: 1,
+                    param: "opacity".to_string(),
+                },
+                Law::Unit {
+                    min: -1.0,
+                    max: 1.0,
+                },
+                &Raw::Continuous(0.5),
+            )
+            .unwrap();
+        assert!(validate_v2_performance_owner_laws(&widened)
+            .unwrap_err()
+            .contains("group_param:1:opacity"));
+
+        let mut excluded = PerformanceTake::default();
+        excluded
+            .record_accepted(
+                0,
+                Control::LayerText {
+                    layer: 0,
+                    param: "body".to_string(),
+                },
+                Law::Discrete {
+                    vocab: vec!["smuggled".to_string()],
+                },
+                &Raw::Token("smuggled".to_string()),
+            )
+            .unwrap();
+        assert!(validate_v2_performance_owner_laws(&excluded)
+            .unwrap_err()
+            .contains("layer_text:0:body"));
+
+        let mut frozen_v1 = PerformanceTake::default();
+        frozen_v1
+            .record_accepted(
+                0,
+                Control::Master {
+                    param: "brightness".to_string(),
+                },
+                Law::Toggle,
+                &Raw::Toggle(true),
+            )
+            .unwrap();
+        assert_eq!(validate_v2_performance_owner_laws(&frozen_v1), Ok(()));
     }
 
     /// The performance sidecar publishes on the gesture sidecar's exact
@@ -22443,6 +24094,7 @@ mod effects_audit {
         let mut gesture_canvas = crate::gesture_canvas::GestureCanvasParams::default();
         let mut graph = resolve_export_creative_graph(&base_patch()).expect("graph");
         let mut layers: Vec<ExportLayer> = Vec::new();
+        let mut mod_matrix = crate::modulation::ModMatrix::new();
         let mut morph: Option<crate::morph::Morph> = None;
 
         let mut apply = |control: Control, raw: Raw| {
@@ -22458,7 +24110,9 @@ mod effects_audit {
                 &mut gesture_canvas,
                 &mut graph,
                 &mut layers,
+                &mut mod_matrix,
                 &mut morph,
+                0.0,
             );
         };
 
@@ -22543,6 +24197,498 @@ mod effects_audit {
             export_replayed_layer_mosh_send(&Raw::Token("0.5".to_string())),
             None
         );
+    }
+
+    #[test]
+    fn export_v2_replay_applies_rack_group_morph_and_routing_values() {
+        use crate::performance_track::{PerformanceControl as Control, PerformanceRawValue as Raw};
+        use crate::visual_rack::{DigitalColorParams, RuntimeVisualNodeKind};
+
+        let mut master_effects = EffectUniforms::default();
+        let mut master_transform = SpatialTransform::default();
+        let mut master_motion = crate::motion::MotionParams::default();
+        let mut layer_motion: Vec<crate::motion::MotionParams> = Vec::new();
+        let mut ntsc = crate::ntsc::NtscParams::default();
+        let mut temporal = crate::effects::params::TemporalParams::default();
+        let mut gesture_canvas = crate::gesture_canvas::GestureCanvasParams::default();
+        let mut graph = resolve_export_creative_graph(&base_patch()).expect("graph");
+        let master_node = graph
+            .master_rack
+            .push(RuntimeVisualNodeKind::DigitalColor(
+                DigitalColorParams::default(),
+            ))
+            .unwrap();
+        let layer_node = graph.layer_racks[0]
+            .1
+            .push(RuntimeVisualNodeKind::DigitalColor(
+                DigitalColorParams::default(),
+            ))
+            .unwrap();
+        let group_id = graph
+            .composition
+            .insert_empty_group(
+                crate::composition::GroupName::new("Recorded group".to_string()).unwrap(),
+                0,
+            )
+            .unwrap();
+        let group_node = {
+            let group = graph.composition.group_mut(group_id).unwrap();
+            group.matte = Some(crate::visual_rack::RuntimeImageMatte {
+                tap: crate::visual_rack::ResolvedImageTap {
+                    source: crate::visual_rack::ResolvedImageSource::OneBelow,
+                    timing: crate::visual_rack::EdgeTiming::CurrentFrame,
+                },
+                channel: crate::visual_rack::MatteChannel::Alpha,
+                invert: false,
+                amount: 1.0,
+                threshold: 0.5,
+                softness: 0.1,
+            });
+            group
+                .rack
+                .push(RuntimeVisualNodeKind::DigitalColor(
+                    DigitalColorParams::default(),
+                ))
+                .unwrap()
+        };
+        let mut layers: Vec<ExportLayer> = Vec::new();
+        let mut mod_matrix = crate::modulation::ModMatrix::new();
+        mod_matrix.routings.push(crate::modulation::Routing::new(
+            crate::modulation::ModSource::Lfo(0),
+            "brightness",
+            0.25,
+        ));
+        let mut morph = Some(crate::morph::Morph::default());
+
+        {
+            let mut apply_creative = |control: Control, raw: Raw| {
+                assert!(export_performance_control_requires_creative_preflight(
+                    &control
+                ));
+                apply_export_creative_performance_event(&control, &raw, &mut graph)
+            };
+
+            assert!(apply_creative(
+                Control::RackNodeMaster {
+                    node: master_node.get(),
+                    node_kind: "digital_color".to_string(),
+                    param: "brightness".to_string(),
+                },
+                Raw::Continuous(0.4),
+            )
+            .unwrap());
+            assert!(apply_creative(
+                Control::RackNodeLayer {
+                    layer: 0,
+                    node: layer_node.get(),
+                    node_kind: "digital_color".to_string(),
+                    param: "saturation".to_string(),
+                },
+                Raw::Continuous(0.55),
+            )
+            .unwrap());
+            // A vanished stable node ID and a stale node-kind assertion must
+            // not retarget or mutate the still-present layer node.
+            assert!(!apply_creative(
+                Control::RackNodeLayer {
+                    layer: 0,
+                    node: u64::MAX,
+                    node_kind: "digital_color".to_string(),
+                    param: "saturation".to_string(),
+                },
+                Raw::Continuous(-0.8),
+            )
+            .unwrap());
+            assert!(apply_creative(
+                Control::RackNodeLayer {
+                    layer: 0,
+                    node: layer_node.get(),
+                    node_kind: "cellular".to_string(),
+                    param: "amount".to_string(),
+                },
+                Raw::Continuous(0.9),
+            )
+            .is_err());
+            assert!(apply_creative(
+                Control::RackNodeGroup {
+                    group: group_id.get(),
+                    node: group_node.get(),
+                    node_kind: "digital_color".to_string(),
+                    param: "contrast".to_string(),
+                },
+                Raw::Continuous(-0.3),
+            )
+            .unwrap());
+            assert!(apply_creative(
+                Control::GroupParam {
+                    group: group_id.get(),
+                    param: "opacity".to_string(),
+                },
+                Raw::Continuous(0.65),
+            )
+            .unwrap());
+            assert!(apply_creative(
+                Control::GroupMatteParam {
+                    group: group_id.get(),
+                    param: "softness".to_string(),
+                },
+                Raw::Continuous(0.35),
+            )
+            .unwrap());
+        }
+
+        let mut apply = |control: Control, raw: Raw| {
+            assert!(!export_performance_control_requires_creative_preflight(
+                &control
+            ));
+            apply_export_performance_event(
+                &control,
+                &raw,
+                &mut master_effects,
+                &mut master_transform,
+                &mut master_motion,
+                &mut layer_motion,
+                &mut ntsc,
+                &mut temporal,
+                &mut gesture_canvas,
+                &mut graph,
+                &mut layers,
+                &mut mod_matrix,
+                &mut morph,
+                2.0,
+            );
+        };
+
+        apply(Control::MorphLaw, Raw::Token("equal_power".to_string()));
+        apply(
+            Control::MorphGlide { target_q16: 49_151 },
+            Raw::Continuous(4.0),
+        );
+        apply(
+            Control::Routing {
+                routing: 0,
+                param: "source".to_string(),
+            },
+            Raw::Token("macro2".to_string()),
+        );
+        apply(
+            Control::Routing {
+                routing: 0,
+                param: "curve".to_string(),
+            },
+            Raw::Token("s_curve".to_string()),
+        );
+        apply(
+            Control::Routing {
+                routing: 0,
+                param: "depth".to_string(),
+            },
+            Raw::Continuous(-0.75),
+        );
+        match graph.master_rack.get(master_node).unwrap().kind {
+            RuntimeVisualNodeKind::DigitalColor(params) => {
+                assert!((params.brightness - 0.4).abs() < 1.0e-6);
+            }
+            other => panic!("unexpected master node {other:?}"),
+        }
+        match graph.layer_racks[0].1.get(layer_node).unwrap().kind {
+            RuntimeVisualNodeKind::DigitalColor(params) => {
+                assert!((params.saturation - 0.55).abs() < 1.0e-6);
+            }
+            other => panic!("unexpected layer node {other:?}"),
+        }
+        let group = graph.composition.group(group_id).unwrap();
+        assert!((group.opacity - 0.65).abs() < 1.0e-6);
+        assert!((group.matte.unwrap().softness - 0.35).abs() < 1.0e-6);
+        match group.rack.get(group_node).unwrap().kind {
+            RuntimeVisualNodeKind::DigitalColor(params) => {
+                assert!((params.contrast + 0.3).abs() < 1.0e-6);
+            }
+            other => panic!("unexpected group node {other:?}"),
+        }
+        let morph = morph.unwrap();
+        assert_eq!(morph.blend_law, crate::morph::MorphBlendLaw::EqualPower);
+        let glide = morph.glide.unwrap();
+        assert!((glide.target - f32::from(49_151_u16) / f32::from(u16::MAX)).abs() < 1.0e-6);
+        assert_eq!(glide.start_beat, 2.0);
+        assert_eq!(glide.duration_beats, 4.0);
+        let routing = &mod_matrix.routings[0];
+        assert_eq!(routing.source, crate::modulation::ModSource::Macro(1));
+        assert_eq!(routing.curve, crate::modulation::Curve::SCurve);
+        assert!((routing.depth + 0.75).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn export_v2_text_page_replay_uses_the_shared_edit_and_refuses_body() {
+        use crate::performance_track::PerformanceRawValue as Raw;
+        let mut params = crate::text_page::TextPageParams::default();
+        let original_body = params.body.clone();
+
+        assert!(apply_export_text_page_param(
+            &mut params,
+            "size",
+            &Raw::Continuous(0.4)
+        ));
+        assert!(apply_export_text_page_param(
+            &mut params,
+            "font",
+            &Raw::Token("sans".to_string())
+        ));
+        assert!(!apply_export_text_page_param(
+            &mut params,
+            "body",
+            &Raw::Token("not representable in one event".to_string())
+        ));
+
+        assert!((params.size - 0.4).abs() < 1.0e-6);
+        assert_eq!(params.font, crate::text_page::TextPageFont::Sans);
+        assert_eq!(params.body, original_body);
+    }
+
+    #[test]
+    fn export_v2_refuses_routing_targets_and_captures_portable_morph_slots() {
+        use crate::performance_track::{PerformanceControl as Control, PerformanceRawValue as Raw};
+        let mut matrix = crate::modulation::ModMatrix::new();
+        matrix.routings.push(crate::modulation::Routing::new(
+            crate::modulation::ModSource::Lfo(0),
+            "brightness",
+            0.5,
+        ));
+        assert!(!apply_export_routing_param(
+            &mut matrix,
+            0,
+            "target",
+            &Raw::Token("motion_shutter_angle".to_string())
+        ));
+        assert_eq!(matrix.routings[0].target(), "brightness");
+
+        let mut master_effects = EffectUniforms {
+            brightness: 0.375,
+            ..Default::default()
+        };
+        let mut master_transform = SpatialTransform::default();
+        let mut master_motion = crate::motion::MotionParams::default();
+        let mut layer_motion: Vec<crate::motion::MotionParams> = Vec::new();
+        let mut ntsc = crate::ntsc::NtscParams::default();
+        let mut temporal = crate::effects::params::TemporalParams::default();
+        let mut gesture_canvas = crate::gesture_canvas::GestureCanvasParams {
+            radius: 0.625,
+            ..Default::default()
+        };
+        let mut patch = base_patch();
+        patch.layers.clear();
+        let mut graph = resolve_export_creative_graph(&patch).expect("graph");
+        let mut layers: Vec<ExportLayer> = Vec::new();
+        let mut morph = None;
+        let request = apply_export_performance_event(
+            &Control::MorphCapture,
+            &Raw::Token("a".to_string()),
+            &mut master_effects,
+            &mut master_transform,
+            &mut master_motion,
+            &mut layer_motion,
+            &mut ntsc,
+            &mut temporal,
+            &mut gesture_canvas,
+            &mut graph,
+            &mut layers,
+            &mut matrix,
+            &mut morph,
+            2.0,
+        )
+        .expect("capture event yields a typed slot request");
+        let modulation = matrix.frame(0);
+        let warning = apply_export_morph_capture(
+            request,
+            2.0,
+            "gesture-sha",
+            ExportMorphPreflightContext {
+                modulation: &modulation,
+                frame: FramePlanContext::new(1, 1, 0.0),
+                layer_mattes: &[],
+                program_history_initialized: false,
+                resource_limits: CreativeResourceLimits::default(),
+                motion_limits: crate::motion::MotionDeviceLimits::new(8_192, u64::MAX),
+                authored_motion_modulation: false,
+                shutter_samples: ExportShutterSamples::Authored,
+            },
+            &mut master_effects,
+            &mut master_transform,
+            &mut master_motion,
+            &mut layer_motion,
+            &mut ntsc,
+            &mut temporal,
+            &mut gesture_canvas,
+            &mut graph,
+            &mut layers,
+            &mut morph,
+        )
+        .expect("portable capture");
+        assert!(
+            warning.is_none(),
+            "inactive Morph needs no fallback warning"
+        );
+        let captured = morph
+            .as_ref()
+            .and_then(|morph| morph.a.as_ref())
+            .expect("portable export capture fills slot A");
+        assert!((captured.master.brightness - 0.375).abs() < 1.0e-6);
+        let gesture = captured
+            .gesture
+            .as_ref()
+            .expect("gesture identity captured");
+        assert!((gesture.canvas.to_params().radius - 0.625).abs() < 1.0e-6);
+        assert_eq!(gesture.track_checksum, "gesture-sha");
+    }
+
+    #[test]
+    #[ignore = "requires a physical wgpu adapter"]
+    fn export_v2_morph_capture_preserves_the_complete_portable_world() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("GPU adapter for portable export Morph capture");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Performance Recorder V2 Portable Morph Capture Test"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .expect("GPU device for portable export Morph capture");
+
+        let (patch, _) = self_provisioned_v2_performance_fixture();
+        let mut graph = resolve_export_creative_graph(&patch).expect("resolved fixture graph");
+        let master_node = graph
+            .master_rack
+            .iter()
+            .find(|node| {
+                matches!(
+                    node.kind,
+                    crate::visual_rack::RuntimeVisualNodeKind::DigitalColor(_)
+                )
+            })
+            .map(|node| node.stable_id)
+            .expect("fixture master node");
+        let layer_node = graph.layer_racks[0]
+            .1
+            .iter()
+            .find(|node| {
+                matches!(
+                    node.kind,
+                    crate::visual_rack::RuntimeVisualNodeKind::DigitalColor(_)
+                )
+            })
+            .map(|node| node.stable_id)
+            .expect("fixture layer node");
+        let group = graph.composition.groups().next().expect("fixture group");
+        let group_id = group.id;
+        let group_node = group
+            .rack
+            .iter()
+            .find(|node| {
+                matches!(
+                    node.kind,
+                    crate::visual_rack::RuntimeVisualNodeKind::DigitalColor(_)
+                )
+            })
+            .map(|node| node.stable_id)
+            .expect("fixture group node");
+
+        let limits = device.limits();
+        let media_limits = crate::media_safety::MediaDeviceLimits::new(
+            limits.max_texture_dimension_2d,
+            limits.max_buffer_size,
+        );
+        let mut layer = text_page_export_layer(
+            &device,
+            &queue,
+            0,
+            &patch.layers[0],
+            &crate::media_safety::MediaSafetyPolicy::safe(),
+            media_limits,
+        )
+        .expect("self-contained export text layer");
+        layer.opacity = 0.42;
+        let mut layers = vec![layer];
+        let mut layer_motion = vec![crate::motion::MotionParams::default()];
+        let mut master_effects = EffectUniforms {
+            brightness: 0.375,
+            ..Default::default()
+        };
+        let mut master_transform = SpatialTransform::default();
+        let mut master_motion = crate::motion::MotionParams::default();
+        let mut ntsc = crate::ntsc::NtscParams::default();
+        let mut temporal = crate::effects::params::TemporalParams::default();
+        let mut gesture_canvas = crate::gesture_canvas::GestureCanvasParams {
+            radius: 0.625,
+            ..Default::default()
+        };
+        let matrix = crate::modulation::ModMatrix::new();
+        let modulation = matrix.frame(1);
+        let mattes = [LayerMatte::default()];
+        let mut morph = None;
+
+        let warning = apply_export_morph_capture(
+            crate::morph::MorphCaptureSlot::A,
+            2.0,
+            "gesture-sha",
+            ExportMorphPreflightContext {
+                modulation: &modulation,
+                frame: FramePlanContext::new(1, 1, 0.0),
+                layer_mattes: &mattes,
+                program_history_initialized: false,
+                resource_limits: CreativeResourceLimits::default(),
+                motion_limits: crate::motion::MotionDeviceLimits::new(
+                    limits.max_texture_dimension_2d,
+                    limits.max_buffer_size,
+                ),
+                authored_motion_modulation: false,
+                shutter_samples: ExportShutterSamples::Authored,
+            },
+            &mut master_effects,
+            &mut master_transform,
+            &mut master_motion,
+            &mut layer_motion,
+            &mut ntsc,
+            &mut temporal,
+            &mut gesture_canvas,
+            &mut graph,
+            &mut layers,
+            &mut morph,
+        )
+        .expect("full portable capture");
+        assert!(warning.is_none());
+
+        let captured = morph
+            .as_ref()
+            .and_then(|morph| morph.a.as_ref())
+            .expect("captured slot A");
+        assert!((captured.master.brightness - 0.375).abs() < 1.0e-6);
+        assert_eq!(captured.layers.len(), 1);
+        assert_eq!(captured.layers[0].position, 0);
+        assert!((captured.layers[0].opacity - 0.42).abs() < 1.0e-6);
+        assert!(captured
+            .master_rack
+            .as_ref()
+            .is_some_and(|rack| rack.get(master_node).is_some()));
+        assert!(captured
+            .layer_racks
+            .as_ref()
+            .and_then(|racks| racks.first())
+            .is_some_and(|rack| rack.get(layer_node).is_some()));
+        let composition = captured.composition.as_ref().expect("captured composition");
+        let group = composition.group(group_id).expect("captured group");
+        assert!(group.rack.get(group_node).is_some());
+        assert!((group.matte.expect("captured group matte").softness - 0.1).abs() < 1.0e-6);
+        let gesture = captured
+            .gesture
+            .as_ref()
+            .expect("captured gesture identity");
+        assert!((gesture.canvas.to_params().radius - 0.625).abs() < 1.0e-6);
+        assert_eq!(gesture.track_checksum, "gesture-sha");
     }
 
     /// B10's labeled export case: the new sources drive the picture through
@@ -22659,6 +24805,55 @@ mod effects_audit {
             decoded_framemd5("renders/audit_performance_recorder.mp4"),
             decoded_framemd5("renders/audit_performance_recorder_repeat.mp4"),
             "the same take against the same patch must replay identically"
+        );
+    }
+
+    /// Performance-recorder v2's labeled export receipt is self-provisioning:
+    /// the text-page source, master rack, Morph capture, and routing all come
+    /// from the patch/take themselves. The test must never mint or require the
+    /// absent videos/audit.mp4 sentinel.
+    #[test]
+    #[ignore = "requires a GPU and ffmpeg on PATH"]
+    fn render_performance_recorder_v2_pipeline() {
+        std::fs::create_dir_all("renders").ok();
+        let (patch, document) = self_provisioned_v2_performance_fixture();
+        assert_eq!(
+            patch.layers[0].source_path,
+            crate::layers::TEXT_PAGE_SOURCE_PATH
+        );
+
+        let output = render_with_take(
+            "performance_recorder_v2",
+            patch.clone(),
+            Some(document.clone()),
+        );
+        let published = crate::performance_track::PerformanceTakeDocument::from_json_bytes(
+            &std::fs::read(performance_sidecar_path(&output)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(published, document, "the v2 sidecar is byte-verifiable");
+        let decoded = published.decode().unwrap();
+        assert!(decoded
+            .addresses()
+            .iter()
+            .any(|address| address.control.code() >= 15));
+
+        render_with_take("performance_recorder_v2_untaken", patch.clone(), None);
+        assert_ne!(
+            decoded_framemd5("renders/audit_performance_recorder_v2.mp4"),
+            decoded_framemd5("renders/audit_performance_recorder_v2_untaken.mp4"),
+            "v2 rack/text/routing replay must change decoded pixels"
+        );
+        assert!(
+            !performance_sidecar_path("renders/audit_performance_recorder_v2_untaken.mp4").exists(),
+            "no take, no v2 sidecar"
+        );
+
+        render_with_take("performance_recorder_v2_repeat", patch, Some(document));
+        assert_eq!(
+            decoded_framemd5("renders/audit_performance_recorder_v2.mp4"),
+            decoded_framemd5("renders/audit_performance_recorder_v2_repeat.mp4"),
+            "the same v2 take against the same self-contained patch must replay identically"
         );
     }
 }

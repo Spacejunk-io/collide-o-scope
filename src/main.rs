@@ -13894,6 +13894,16 @@ impl App {
         let unit_target = |name: &str| -> Option<Law> {
             modulation::target_range(name).map(|(min, max)| Law::Unit { min, max })
         };
+        let owner_law = |law: performance::AuthoringValueLaw| -> Law {
+            match law {
+                performance::AuthoringValueLaw::Unit([min, max]) => Law::Unit { min, max },
+                performance::AuthoringValueLaw::Discrete(vocab) => Law::Discrete {
+                    vocab: vocab.into_iter().map(String::from).collect(),
+                },
+                performance::AuthoringValueLaw::Toggle => Law::Toggle,
+                performance::AuthoringValueLaw::Stepped([min, max]) => Law::Stepped { min, max },
+            }
+        };
         let effect_law = |param: &str, layer_scope: bool| -> Option<Law> {
             match param {
                 "invert" | "color_grain" => Some(Law::Toggle),
@@ -14167,6 +14177,26 @@ impl App {
                 "melt_hold" => Some(Law::Unit { min: 0.0, max: 1.5 }),
                 _ => None,
             },
+            Control::RackNodeMaster {
+                node_kind, param, ..
+            }
+            | Control::RackNodeLayer {
+                node_kind, param, ..
+            }
+            | Control::RackNodeGroup {
+                node_kind, param, ..
+            } => visual_rack::node_param_value_law(node_kind, param).map(owner_law),
+            Control::GroupParam { param, .. } => composition::group_value_law(param).map(owner_law),
+            Control::GroupMatteParam { param, .. } => {
+                composition::group_matte_value_law(param).map(owner_law)
+            }
+            Control::LayerText { param, .. } => {
+                text_page::text_page_value_law(param).map(owner_law)
+            }
+            Control::MorphLaw => Some(owner_law(morph::morph_blend_value_law())),
+            Control::MorphGlide { .. } => Some(owner_law(morph::morph_glide_duration_value_law())),
+            Control::MorphCapture => Some(owner_law(morph::morph_capture_slot_value_law())),
+            Control::Routing { param, .. } => modulation::routing_value_law(param).map(owner_law),
             Control::MorphPosition => Some(Law::Unit { min: 0.0, max: 1.0 }),
             Control::GestureCanvas { param } => match param.as_str() {
                 "radius" => unit_target("gesture_radius"),
@@ -14189,8 +14219,10 @@ impl App {
         performance_track::PerformanceControl,
         PerformanceActionValue,
     )> {
-        use performance_track::PerformanceControl as Control;
-        use web::state::{MotionScopeSnapshot, WebAction};
+        use performance_track::{
+            PerformanceControl as Control, PerformanceRawValue as Raw, PerformanceValueLaw as Law,
+        };
+        use web::state::{CreativeScopeSnapshot, MotionScopeSnapshot, WebAction};
         let layer_position = |index: usize, layer_id: &Option<String>| -> Option<u32> {
             self.resolve_layer_index(index, layer_id)
                 .and_then(|index| u32::try_from(index).ok())
@@ -14204,6 +14236,69 @@ impl App {
             ),
             WebAction::SetMasterTransform { param, value } => (
                 Control::MasterTransform {
+                    param: param.clone(),
+                },
+                PerformanceActionValue::Json(value.clone()),
+            ),
+            WebAction::SetVisualNodeParam {
+                scope,
+                node_id,
+                node_kind,
+                param,
+                value,
+                ..
+            } => {
+                let node = parse_nonzero_decimal(node_id)?;
+                let control = match scope {
+                    CreativeScopeSnapshot::Master => Control::RackNodeMaster {
+                        node,
+                        node_kind: node_kind.clone(),
+                        param: param.clone(),
+                    },
+                    CreativeScopeSnapshot::Layer { layer_id } => {
+                        let stable = parse_nonzero_decimal(layer_id)
+                            .and_then(image_routing::StableLayerId::new)?;
+                        let layer = self
+                            .layers
+                            .iter()
+                            .position(|candidate| candidate.stable_layer_id() == stable)
+                            .and_then(|index| u32::try_from(index).ok())?;
+                        Control::RackNodeLayer {
+                            layer,
+                            node,
+                            node_kind: node_kind.clone(),
+                            param: param.clone(),
+                        }
+                    }
+                    CreativeScopeSnapshot::Group { group_id } => Control::RackNodeGroup {
+                        group: parse_nonzero_decimal(group_id)?,
+                        node,
+                        node_kind: node_kind.clone(),
+                        param: param.clone(),
+                    },
+                };
+                (control, PerformanceActionValue::Json(value.clone()))
+            }
+            WebAction::SetCompositionGroupParam {
+                group_id,
+                param,
+                value,
+                ..
+            } => (
+                Control::GroupParam {
+                    group: parse_nonzero_decimal(group_id)?,
+                    param: param.clone(),
+                },
+                PerformanceActionValue::Json(value.clone()),
+            ),
+            WebAction::SetCompositionGroupMatteParam {
+                group_id,
+                param,
+                value,
+                ..
+            } => (
+                Control::GroupMatteParam {
+                    group: parse_nonzero_decimal(group_id)?,
                     param: param.clone(),
                 },
                 PerformanceActionValue::Json(value.clone()),
@@ -14266,6 +14361,18 @@ impl App {
                 },
                 PerformanceActionValue::Json(value.clone()),
             ),
+            WebAction::SetLayerText {
+                index,
+                layer_id,
+                param,
+                value,
+            } => (
+                Control::LayerText {
+                    layer: layer_position(*index, layer_id)?,
+                    param: param.clone(),
+                },
+                PerformanceActionValue::Json(value.clone()),
+            ),
             WebAction::SetNtscParam { param, value } => (
                 Control::Ntsc {
                     param: param.clone(),
@@ -14318,6 +14425,49 @@ impl App {
             WebAction::SetMorph { value } => (
                 Control::MorphPosition,
                 PerformanceActionValue::Float(*value),
+            ),
+            WebAction::SetMorphLaw { law } => (
+                Control::MorphLaw,
+                PerformanceActionValue::Json(serde_json::Value::String(law.clone())),
+            ),
+            WebAction::MorphGlide {
+                target,
+                duration_beats,
+            } => {
+                let performance::AuthoringValueLaw::Unit([min, max]) =
+                    morph::morph_glide_target_value_law()
+                else {
+                    unreachable!("Morph glide target law is continuous")
+                };
+                // Record the exact sanitized glide the live handler starts.
+                // In particular, Morph maps a non-finite target to zero and a
+                // tiny positive duration to its deterministic 1/4-beat floor.
+                let glide = morph::MorphGlide::new(0.0, *target, 0.0, *duration_beats);
+                let target_q16 = Law::Unit { min, max }.encode(&Raw::Continuous(glide.target))?;
+                let duration_beats = glide.duration_beats as f32;
+                (
+                    Control::MorphGlide { target_q16 },
+                    PerformanceActionValue::Float(duration_beats),
+                )
+            }
+            WebAction::MorphCapture { slot, .. } => (
+                Control::MorphCapture,
+                PerformanceActionValue::Json(serde_json::Value::String(slot.clone())),
+            ),
+            WebAction::SetRouting {
+                index,
+                route_id,
+                param,
+                value,
+                ..
+            } => (
+                Control::Routing {
+                    routing: self
+                        .resolve_routing_index(*index, route_id)
+                        .and_then(|index| u32::try_from(index).ok())?,
+                    param: param.clone(),
+                },
+                PerformanceActionValue::Json(value.clone()),
             ),
             WebAction::SetGestureCanvas { param, value } => (
                 Control::GestureCanvas {
@@ -20432,7 +20582,7 @@ impl App {
         take: &performance_track::PerformanceTake,
     ) -> (Vec<CompiledPerformanceEvent>, Vec<String>) {
         use performance_track::{PerformanceControl as Control, PerformanceRawValue as Raw};
-        use web::state::{MotionScopeSnapshot, WebAction};
+        use web::state::{CreativeScopeSnapshot, MotionScopeSnapshot, WebAction};
         let mut degraded: Vec<String> = Vec::new();
         let mut note_degraded = |control: &Control| {
             let name = control.describe();
@@ -20447,11 +20597,32 @@ impl App {
                 .get(index)
                 .map(|layer| (index, layer.layer_id().to_string()))
         };
+        let rack_node_matches =
+            |rack: &RuntimeVisualRack, node: u64, expected_kind: &str| -> bool {
+                visual_rack::NodeId::new(node)
+                    .and_then(|node_id| rack.get(node_id))
+                    .is_some_and(|entry| {
+                        visual_rack::node_kind_descriptor(entry.kind.tag()).key == expected_kind
+                    })
+            };
         let compiled = take
             .events()
             .iter()
             .map(|event| {
                 let address = &take.addresses()[usize::from(event.address)];
+                // V2 addresses are admitted only under the engine owner's
+                // current value law. The serialized law is part of the take's
+                // checksum, but it is not authority to widen a vocabulary or
+                // make an excluded topology/seed/text field dispatchable.
+                // Keep v1 admission unchanged so stored v1 takes retain their
+                // byte-stable replay contract.
+                if address.control.code() >= performance_track::PERFORMANCE_V2_FIRST_CONTROL_CODE
+                    && Self::performance_value_law_for(&address.control)
+                        .is_none_or(|owner_law| owner_law != address.law)
+                {
+                    note_degraded(&address.control);
+                    return CompiledPerformanceEvent::Degraded;
+                }
                 let Some(raw) = address.law.decode(event.value) else {
                     // Unreachable past document validation; hold it as a
                     // degraded entry rather than trusting it anyway.
@@ -20469,6 +20640,92 @@ impl App {
                             param: param.clone(),
                             value,
                         })
+                    }
+                    (
+                        Control::RackNodeMaster {
+                            node,
+                            node_kind,
+                            param,
+                        },
+                        _,
+                    ) if rack_node_matches(&self.master_rack, *node, node_kind) => {
+                        value.map(|value| WebAction::SetVisualNodeParam {
+                            scope: CreativeScopeSnapshot::Master,
+                            node_id: node.to_string(),
+                            node_kind: node_kind.clone(),
+                            param: param.clone(),
+                            value,
+                            composition_revision: self.composition_revision,
+                        })
+                    }
+                    (
+                        Control::RackNodeLayer {
+                            layer,
+                            node,
+                            node_kind,
+                            param,
+                        },
+                        _,
+                    ) => layer_identity(*layer)
+                        .and_then(|(index, layer_id)| {
+                            rack_node_matches(&self.layers[index].rack, *node, node_kind)
+                                .then_some((index, layer_id))
+                        })
+                        .and_then(|(_, layer_id)| {
+                            value.map(|value| WebAction::SetVisualNodeParam {
+                                scope: CreativeScopeSnapshot::Layer { layer_id },
+                                node_id: node.to_string(),
+                                node_kind: node_kind.clone(),
+                                param: param.clone(),
+                                value,
+                                composition_revision: self.composition_revision,
+                            })
+                        }),
+                    (
+                        Control::RackNodeGroup {
+                            group,
+                            node,
+                            node_kind,
+                            param,
+                        },
+                        _,
+                    ) => visual_rack::GroupId::new(*group)
+                        .and_then(|group_id| self.composition.group(group_id))
+                        .filter(|group| rack_node_matches(&group.rack, *node, node_kind))
+                        .and_then(|_| {
+                            value.map(|value| WebAction::SetVisualNodeParam {
+                                scope: CreativeScopeSnapshot::Group {
+                                    group_id: group.to_string(),
+                                },
+                                node_id: node.to_string(),
+                                node_kind: node_kind.clone(),
+                                param: param.clone(),
+                                value,
+                                composition_revision: self.composition_revision,
+                            })
+                        }),
+                    (Control::GroupParam { group, param }, _) => visual_rack::GroupId::new(*group)
+                        .filter(|group_id| self.composition.contains_group(*group_id))
+                        .and_then(|_| {
+                            value.map(|value| WebAction::SetCompositionGroupParam {
+                                group_id: group.to_string(),
+                                param: param.clone(),
+                                value,
+                                composition_revision: self.composition_revision,
+                            })
+                        }),
+                    (Control::GroupMatteParam { group, param }, _) => {
+                        visual_rack::GroupId::new(*group)
+                            .and_then(|group_id| self.composition.group(group_id))
+                            .filter(|group| group.matte.is_some())
+                            .and_then(|_| {
+                                value.map(|value| WebAction::SetCompositionGroupMatteParam {
+                                    group_id: group.to_string(),
+                                    param: param.clone(),
+                                    value,
+                                    composition_revision: self.composition_revision,
+                                })
+                            })
                     }
                     (Control::LayerParam { layer, param }, _) => layer_identity(*layer)
                         .zip(value)
@@ -20509,6 +20766,15 @@ impl App {
                             param: param.clone(),
                             value,
                         }),
+                    (Control::LayerText { layer, param }, _) => layer_identity(*layer)
+                        .filter(|(index, _)| self.layers[*index].text_page_params().is_some())
+                        .zip(value)
+                        .map(|((index, id), value)| WebAction::SetLayerText {
+                            index,
+                            layer_id: Some(id),
+                            param: param.clone(),
+                            value,
+                        }),
                     (Control::Ntsc { param }, _) => value.map(|value| WebAction::SetNtscParam {
                         param: param.clone(),
                         value,
@@ -20543,6 +20809,35 @@ impl App {
                     (Control::MorphPosition, Raw::Continuous(value)) => {
                         Some(WebAction::SetMorph { value })
                     }
+                    (Control::MorphLaw, Raw::Token(law)) => Some(WebAction::SetMorphLaw { law }),
+                    (Control::MorphGlide { target_q16 }, Raw::Continuous(duration_beats)) => {
+                        Some(WebAction::MorphGlide {
+                            target: f32::from(*target_q16) / f32::from(u16::MAX),
+                            duration_beats: f64::from(duration_beats),
+                        })
+                    }
+                    (Control::MorphCapture, Raw::Token(slot)) => Some(WebAction::MorphCapture {
+                        slot,
+                        stack_revision: Some(self.layer_stack_revision),
+                        composition_revision: Some(self.composition_revision),
+                    }),
+                    (Control::Routing { routing, param }, _) => usize::try_from(*routing)
+                        .ok()
+                        .and_then(|index| {
+                            self.mod_matrix
+                                .routings
+                                .get(index)
+                                .map(|route| (index, route.route_id().to_string()))
+                        })
+                        .zip(value)
+                        .map(|((index, route_id), value)| WebAction::SetRouting {
+                            index,
+                            route_id: Some(route_id),
+                            target_layer_id: None,
+                            layer_stack_revision: Some(self.layer_stack_revision),
+                            param: param.clone(),
+                            value,
+                        }),
                     (Control::GestureCanvas { param }, _) => {
                         value.map(|value| WebAction::SetGestureCanvas {
                             param: param.clone(),
@@ -22826,6 +23121,10 @@ impl App {
                 stack_revision,
                 composition_revision,
             } => {
+                let Some(slot) = morph::MorphCaptureSlot::try_from_key(&slot) else {
+                    log::warn!("Ignored invalid morph slot '{slot}'");
+                    return disposition;
+                };
                 if stack_revision.is_some_and(|revision| revision != self.layer_stack_revision) {
                     self.composition_status = format!(
                         "Morph capture rejected: stale layer-stack revision {:?}; current is {}",
@@ -22869,10 +23168,9 @@ impl App {
                 // recordings are two pieces, not two ends of a blend.
                 let snap =
                     snap.with_gesture(self.gesture_canvas.params(), self.gesture_checksum.clone());
-                match slot.as_str() {
-                    "a" => self.morph.a = Some(snap),
-                    "b" => self.morph.b = Some(snap),
-                    _ => log::warn!("Ignored invalid morph slot '{slot}'"),
+                match slot {
+                    morph::MorphCaptureSlot::A => self.morph.a = Some(snap),
+                    morph::MorphCaptureSlot::B => self.morph.b = Some(snap),
                 }
             }
             WebAction::SnapshotBankSave {
@@ -22962,14 +23260,14 @@ impl App {
                 }
             }
             WebAction::SetMorphLaw { law } => {
-                match law.as_str() {
-                    "linear" => self.morph.blend_law = morph::MorphBlendLaw::Linear,
-                    "equal_power" => {
-                        self.morph.blend_law = morph::MorphBlendLaw::EqualPower;
-                    }
-                    _ => log::warn!("Ignored invalid morph law '{law}'"),
+                let Some(law) = morph::MorphBlendLaw::try_from_key(&law) else {
+                    log::warn!("Ignored invalid morph law '{law}'");
+                    return disposition;
+                };
+                if self.morph.blend_law != law {
+                    self.morph.blend_law = law;
+                    self.materialize_morph_at_current_beat();
                 }
-                self.materialize_morph_at_current_beat();
             }
             WebAction::MorphGlide {
                 target,
@@ -23432,57 +23730,11 @@ impl App {
                         }
                     } else {
                         let routing = &mut self.mod_matrix.routings[index];
-                        match param.as_str() {
-                            "source" => {
-                                if let Some(s) = value.as_str() {
-                                    if let Some(source) = modulation::ModSource::try_from_str(s) {
-                                        if routing.source != source {
-                                            routing.source = source;
-                                            routing.reset_runtime();
-                                        }
-                                    }
-                                }
-                            }
-                            "depth" => {
-                                if let Some(n) = value.as_f64() {
-                                    routing.depth = (n as f32).clamp(-1.0, 1.0);
-                                }
-                            }
-                            "curve" => {
-                                if let Some(s) = value.as_str() {
-                                    let curve = modulation::Curve::from_str(s);
-                                    if routing.curve != curve {
-                                        routing.curve = curve;
-                                        routing.reset_runtime();
-                                    }
-                                }
-                            }
-                            "curve_amount" => {
-                                if let Some(n) = value.as_f64() {
-                                    let amount = (n as f32).clamp(-2.0, 2.0);
-                                    if routing.curve_amount != amount {
-                                        routing.curve_amount = amount;
-                                        routing.reset_runtime();
-                                    }
-                                }
-                            }
-                            "attack" => {
-                                if let Some(n) = value.as_f64() {
-                                    let attack = (n as f32).clamp(0.0, 10.0);
-                                    if routing.attack != attack {
-                                        routing.attack = attack;
-                                    }
-                                }
-                            }
-                            "release" => {
-                                if let Some(n) = value.as_f64() {
-                                    let release = (n as f32).clamp(0.0, 10.0);
-                                    if routing.release != release {
-                                        routing.release = release;
-                                    }
-                                }
-                            }
-                            _ => {}
+                        if let Err(error) = modulation::apply_routing_value(routing, &param, &value)
+                        {
+                            self.composition_status =
+                                format!("Routing value edit rejected: {error}");
+                            log::warn!("{}", self.composition_status);
                         }
                     }
                 }
@@ -43190,6 +43442,587 @@ mod app_state_tests {
         assert!(!app.performance_recording);
         assert!(!app.performance_take.incomplete());
         assert_eq!(app.performance_take.length_ticks(), 2);
+    }
+
+    #[test]
+    fn v2_routing_source_records_through_the_complete_engine_vocabulary() {
+        use performance_track::{PerformanceControl as Control, PerformanceRawValue as Raw};
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.mod_matrix.routings.push(modulation::Routing::new(
+            modulation::ModSource::Lfo(0),
+            "brightness",
+            0.25,
+        ));
+        let route_id = app.mod_matrix.routings[0].route_id().to_string();
+        app.set_performance_recording(true);
+        app.handle_web_action(web::state::WebAction::SetRouting {
+            index: 0,
+            route_id: Some(route_id),
+            target_layer_id: None,
+            layer_stack_revision: None,
+            param: "source".to_string(),
+            value: serde_json::json!("lfo7"),
+        });
+        assert_eq!(app.pending_performance_edits.len(), 1);
+        performance_commit_frame(&mut app, 1.0 / performance_track::PERFORMANCE_REFERENCE_FPS);
+        assert_eq!(app.performance_take.events().len(), 1);
+        assert_eq!(app.performance_rejected_edits, 0);
+
+        let address = &app.performance_take.addresses()[0];
+        assert_eq!(
+            address.control,
+            Control::Routing {
+                routing: 0,
+                param: "source".to_string()
+            }
+        );
+        let performance_track::PerformanceValueLaw::Discrete { vocab } = &address.law else {
+            panic!("routing source must use the engine-owned discrete vocabulary")
+        };
+        assert_eq!(vocab, &modulation::mod_source_authoring_vocab());
+        assert!(vocab.len() <= performance_track::MAX_PERFORMANCE_VOCAB_TOKENS);
+        assert_eq!(
+            address.law.decode(app.performance_take.events()[0].value),
+            Some(Raw::Token("lfo7".to_string()))
+        );
+    }
+
+    #[test]
+    fn v2_morph_glide_records_the_live_minimum_and_preserves_explicit_snap() {
+        use performance_track::{
+            PerformanceControl as Control, PerformanceRawValue as Raw, PerformanceValueLaw as Law,
+        };
+        use web::state::WebAction;
+
+        let app = App::new(None, None, WebState::new().expect("test token"));
+        let recorded_duration = |duration_beats| {
+            let (control, value) = app
+                .performance_record_view(&WebAction::MorphGlide {
+                    target: 0.75,
+                    duration_beats,
+                })
+                .expect("Morph glide is recordable");
+            let law = App::performance_value_law_for(&control).expect("owner duration law");
+            let raw = value.raw_under(&law).expect("duration rides unit lane");
+            let Raw::Continuous(duration) = raw else {
+                panic!("Morph duration must remain continuous")
+            };
+            let Law::Unit { .. } = law else {
+                panic!("Morph duration must use the owner unit law")
+            };
+            (duration, law.encode(&Raw::Continuous(duration)).unwrap())
+        };
+
+        let (tiny, tiny_code) = recorded_duration(1.0e-9);
+        assert!((tiny - morph::MORPH_GLIDE_MIN_POSITIVE_DURATION_BEATS as f32).abs() < 1.0e-6);
+        assert_ne!(
+            tiny_code, 0,
+            "a live positive glide must never replay as a snap"
+        );
+        let (snap, snap_code) = recorded_duration(0.0);
+        assert_eq!(snap, 0.0);
+        assert_eq!(snap_code, 0);
+
+        let (control, _) = app
+            .performance_record_view(&WebAction::MorphGlide {
+                target: f32::NAN,
+                duration_beats: 1.0,
+            })
+            .expect("the live-sanitized non-finite target remains recordable");
+        let Control::MorphGlide { target_q16 } = control else {
+            panic!("Morph glide must retain its dedicated v2 address")
+        };
+        assert_eq!(
+            target_q16, 0,
+            "the recording must encode Morph's live NaN-to-zero target law"
+        );
+    }
+
+    #[test]
+    fn v2_hosted_arm_record_commit_compile_and_replay_roundtrip() {
+        use performance_track::PerformanceControl as Control;
+        use visual_rack::{DigitalColorParams, RuntimeVisualNodeKind};
+        use web::state::{CreativeScopeSnapshot, WebAction};
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let master_node = app
+            .master_rack
+            .insert(
+                1,
+                RuntimeVisualNodeKind::DigitalColor(DigitalColorParams::default()),
+            )
+            .expect("recorded master node");
+        let group_id = app
+            .composition
+            .insert_empty_group(
+                composition::GroupName::new("Recorded group".to_string()).unwrap(),
+                0,
+            )
+            .expect("recorded group");
+        let group_node = {
+            let group = app.composition.group_mut(group_id).unwrap();
+            group.matte = Some(visual_rack::RuntimeImageMatte {
+                tap: visual_rack::ResolvedImageTap {
+                    source: visual_rack::ResolvedImageSource::GestureCanvas,
+                    timing: visual_rack::EdgeTiming::CurrentFrame,
+                },
+                channel: visual_rack::MatteChannel::Alpha,
+                invert: false,
+                amount: 1.0,
+                threshold: 0.5,
+                softness: 0.1,
+            });
+            group
+                .rack
+                .push(RuntimeVisualNodeKind::DigitalColor(
+                    DigitalColorParams::default(),
+                ))
+                .expect("recorded group node")
+        };
+        app.mod_matrix.routings.push(modulation::Routing::new(
+            modulation::ModSource::Lfo(0),
+            "brightness",
+            0.25,
+        ));
+        app.mod_matrix.routings.push(modulation::Routing::new(
+            modulation::ModSource::Lfo(1),
+            "contrast",
+            0.1,
+        ));
+        let route_id = app.mod_matrix.routings[0].route_id().to_string();
+        let other_route_id = app.mod_matrix.routings[1].route_id().to_string();
+
+        app.set_performance_recording(true);
+        app.handle_web_action(WebAction::SetVisualNodeParam {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: master_node.get().to_string(),
+            node_kind: "digital_color".to_string(),
+            param: "brightness".to_string(),
+            value: serde_json::json!(0.35),
+            composition_revision: app.composition_revision,
+        });
+        app.handle_web_action(WebAction::SetCompositionGroupParam {
+            group_id: group_id.get().to_string(),
+            param: "opacity".to_string(),
+            value: serde_json::json!(0.4),
+            composition_revision: app.composition_revision,
+        });
+        app.handle_web_action(WebAction::SetVisualNodeParam {
+            scope: CreativeScopeSnapshot::Group {
+                group_id: group_id.get().to_string(),
+            },
+            node_id: group_node.get().to_string(),
+            node_kind: "digital_color".to_string(),
+            param: "contrast".to_string(),
+            value: serde_json::json!(-0.25),
+            composition_revision: app.composition_revision,
+        });
+        app.handle_web_action(WebAction::SetCompositionGroupMatteParam {
+            group_id: group_id.get().to_string(),
+            param: "softness".to_string(),
+            value: serde_json::json!(0.35),
+            composition_revision: app.composition_revision,
+        });
+        app.handle_web_action(WebAction::SetMorphLaw {
+            law: "equal_power".to_string(),
+        });
+        app.handle_web_action(WebAction::MorphGlide {
+            target: 0.75,
+            duration_beats: 1.0,
+        });
+        app.handle_web_action(WebAction::MorphCapture {
+            slot: "a".to_string(),
+            stack_revision: Some(app.layer_stack_revision),
+            composition_revision: Some(app.composition_revision),
+        });
+        app.handle_web_action(WebAction::SetRouting {
+            index: 0,
+            route_id: Some(route_id.clone()),
+            target_layer_id: None,
+            layer_stack_revision: None,
+            param: "source".to_string(),
+            value: serde_json::json!("lfo7"),
+        });
+        assert_eq!(
+            app.pending_performance_edits.len(),
+            8,
+            "every accepted v2 family must reach the recorder tap"
+        );
+        performance_commit_frame(&mut app, 1.0 / performance_track::PERFORMANCE_REFERENCE_FPS);
+        app.set_performance_recording(false);
+        assert_eq!(app.performance_take.events().len(), 8);
+        assert_eq!(app.performance_rejected_edits, 0);
+        let controls = app
+            .performance_take
+            .addresses()
+            .iter()
+            .map(|address| &address.control)
+            .collect::<Vec<_>>();
+        assert!(controls.iter().any(|control| matches!(
+            control,
+            Control::RackNodeMaster { node, param, .. }
+                if *node == master_node.get() && param == "brightness"
+        )));
+        assert!(controls.iter().any(|control| matches!(
+            control,
+            Control::GroupParam { group, param }
+                if *group == group_id.get() && param == "opacity"
+        )));
+        assert!(controls.iter().any(|control| matches!(
+            control,
+            Control::RackNodeGroup { group, node, param, .. }
+                if *group == group_id.get()
+                    && *node == group_node.get()
+                    && param == "contrast"
+        )));
+        assert!(controls.iter().any(|control| matches!(
+            control,
+            Control::GroupMatteParam { group, param }
+                if *group == group_id.get() && param == "softness"
+        )));
+        assert!(controls
+            .iter()
+            .any(|control| matches!(control, Control::MorphLaw)));
+        assert!(controls
+            .iter()
+            .any(|control| matches!(control, Control::MorphGlide { .. })));
+        assert!(controls
+            .iter()
+            .any(|control| matches!(control, Control::MorphCapture)));
+        assert!(controls.iter().any(|control| matches!(
+            control,
+            Control::Routing { routing: 0, param } if param == "source"
+        )));
+
+        match &mut app.master_rack.get_mut(master_node).unwrap().kind {
+            RuntimeVisualNodeKind::DigitalColor(params) => params.brightness = -0.8,
+            other => panic!("unexpected master node {other:?}"),
+        }
+        {
+            let group = app.composition.group_mut(group_id).unwrap();
+            group.opacity = 1.0;
+            group.matte.as_mut().unwrap().softness = 0.1;
+            match &mut group.rack.get_mut(group_node).unwrap().kind {
+                RuntimeVisualNodeKind::DigitalColor(params) => params.contrast = 0.0,
+                other => panic!("unexpected group node {other:?}"),
+            }
+        }
+        app.morph = morph::Morph::default();
+        app.mod_matrix.routings[0].source = modulation::ModSource::Lfo(0);
+        app.mod_matrix.routings[0].reset_runtime();
+
+        assert!(app.set_performance_playback(true, false));
+        assert!(
+            app.performance_playback
+                .as_ref()
+                .expect("armed playback")
+                .degraded
+                .is_empty(),
+            "every recorded v2 address must compile against the same live program"
+        );
+        app.mod_matrix.routings.swap(0, 1);
+        app.advance_performance_playback();
+
+        match app.master_rack.get(master_node).unwrap().kind {
+            RuntimeVisualNodeKind::DigitalColor(params) => {
+                assert!((params.brightness - 0.35).abs() < 1.0e-4)
+            }
+            other => panic!("unexpected master node {other:?}"),
+        }
+        let group = app.composition.group(group_id).unwrap();
+        assert!((group.opacity - 0.4).abs() < 1.0e-4);
+        assert!((group.matte.unwrap().softness - 0.35).abs() < 1.0e-4);
+        match group.rack.get(group_node).unwrap().kind {
+            RuntimeVisualNodeKind::DigitalColor(params) => {
+                assert!((params.contrast + 0.25).abs() < 1.0e-4)
+            }
+            other => panic!("unexpected group node {other:?}"),
+        }
+        assert_eq!(app.morph.blend_law, morph::MorphBlendLaw::EqualPower);
+        let glide = app.morph.glide.expect("recorded glide replayed");
+        assert!((glide.target - 0.75).abs() < 1.0e-4);
+        assert!((glide.duration_beats - 1.0).abs() < 1.0e-4);
+        assert!(app.morph.a.is_some(), "recorded slot capture replayed");
+        let recorded_route = app
+            .mod_matrix
+            .routings
+            .iter()
+            .find(|route| route.route_id().to_string() == route_id)
+            .expect("bound routing survives index drift");
+        assert_eq!(recorded_route.source, modulation::ModSource::Lfo(7));
+        let other_route = app
+            .mod_matrix
+            .routings
+            .iter()
+            .find(|route| route.route_id().to_string() == other_route_id)
+            .expect("unaddressed routing remains present");
+        assert_eq!(other_route.source, modulation::ModSource::Lfo(1));
+        assert_eq!(app.performance_take.events().len(), 8);
+        assert!(app.pending_performance_edits.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires a physical wgpu adapter"]
+    fn v2_layer_addresses_bind_at_arm_and_follow_the_stable_layer_through_reorder() {
+        use performance_track::PerformanceControl as Control;
+        use visual_rack::{DigitalColorParams, RuntimeVisualNodeKind};
+        use web::state::{CreativeScopeSnapshot, WebAction};
+
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("GPU adapter for v2 layer-address proof");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Performance Recorder V2 Layer Address Test"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .expect("GPU device for v2 layer-address proof");
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let text_index = app
+            .commit_new_bottom_layer(
+                Layer::new_text_page_with_media_policy(
+                    text_page::TextPageParams::default(),
+                    &device,
+                    &media_safety::MediaSafetyPolicy::safe(),
+                    text_page::bundled_fonts(),
+                )
+                .expect("self-contained text layer"),
+            )
+            .expect("commit text layer");
+        let text_id = app.layers[text_index].stable_layer_id();
+        let node = app.layers[text_index]
+            .rack
+            .push(RuntimeVisualNodeKind::DigitalColor(
+                DigitalColorParams::default(),
+            ))
+            .expect("layer rack node");
+        app.commit_new_bottom_layer(
+            Layer::new_spout_with_media_policy(
+                "performance-v2-reorder-fixture",
+                &device,
+                &queue,
+                &media_safety::MediaSafetyPolicy::safe(),
+            )
+            .expect("bounded second layer"),
+        )
+        .expect("commit second layer");
+
+        app.set_performance_recording(true);
+        app.handle_web_action(WebAction::SetVisualNodeParam {
+            scope: CreativeScopeSnapshot::Layer {
+                layer_id: text_id.get().to_string(),
+            },
+            node_id: node.get().to_string(),
+            node_kind: "digital_color".to_string(),
+            param: "saturation".to_string(),
+            value: serde_json::json!(0.45),
+            composition_revision: app.composition_revision,
+        });
+        app.handle_web_action(WebAction::SetLayerText {
+            index: text_index,
+            layer_id: Some(text_id.get().to_string()),
+            param: "size".to_string(),
+            value: serde_json::json!(0.21),
+        });
+        assert_eq!(app.pending_performance_edits.len(), 2);
+        performance_commit_frame(&mut app, 1.0 / performance_track::PERFORMANCE_REFERENCE_FPS);
+        app.set_performance_recording(false);
+        assert!(app
+            .performance_take
+            .addresses()
+            .iter()
+            .any(|address| matches!(
+                address.control,
+                Control::RackNodeLayer { layer: 0, node: saved, .. } if saved == node.get()
+            )));
+        assert!(app
+            .performance_take
+            .addresses()
+            .iter()
+            .any(|address| matches!(
+                address.control,
+                Control::LayerText { layer: 0, ref param } if param == "size"
+            )));
+
+        match &mut app.layers[text_index].rack.get_mut(node).unwrap().kind {
+            RuntimeVisualNodeKind::DigitalColor(params) => params.saturation = -0.8,
+            other => panic!("unexpected layer node {other:?}"),
+        }
+        let mut reset_text = app.layers[text_index].text_page_params().unwrap().clone();
+        reset_text.size = text_page::TextPageParams::default().size;
+        assert!(app.layers[text_index].set_text_page_params(reset_text, text_page::bundled_fonts()));
+
+        assert!(app.set_performance_playback(true, false));
+        assert!(app
+            .performance_playback
+            .as_ref()
+            .expect("armed playback")
+            .degraded
+            .is_empty());
+        app.move_layer_transactional(0, 1)
+            .expect("hosted layer reorder");
+        assert_eq!(app.layers[1].stable_layer_id(), text_id);
+        app.advance_performance_playback();
+
+        let rebound = app
+            .layers
+            .iter()
+            .position(|layer| layer.stable_layer_id() == text_id)
+            .expect("stable layer remains live");
+        assert_eq!(rebound, 1);
+        match app.layers[rebound].rack.get(node).unwrap().kind {
+            RuntimeVisualNodeKind::DigitalColor(params) => {
+                assert!((params.saturation - 0.45).abs() < 1.0e-4)
+            }
+            other => panic!("unexpected layer node {other:?}"),
+        }
+        assert!((app.layers[rebound].text_page_params().unwrap().size - 0.21).abs() < 1.0e-4);
+        assert!(app.pending_performance_edits.is_empty());
+    }
+
+    #[test]
+    fn v2_compile_requires_the_engine_owner_law() {
+        use performance_track::{
+            PerformanceControl as Control, PerformanceRawValue as Raw, PerformanceValueLaw as Law,
+        };
+        use visual_rack::{GrainParams, RuntimeVisualNodeKind};
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let seed_node = app
+            .master_rack
+            .push(RuntimeVisualNodeKind::Grain(GrainParams::default()))
+            .expect("hosted seed-bearing node");
+        let group_id = app
+            .composition
+            .insert_empty_group(
+                composition::GroupName::new("Owner-law group".to_string()).unwrap(),
+                0,
+            )
+            .expect("hosted group");
+        app.mod_matrix.routings.push(modulation::Routing::new(
+            modulation::ModSource::Lfo(0),
+            "brightness",
+            0.25,
+        ));
+
+        let hostile = [
+            (
+                Control::RackNodeMaster {
+                    node: seed_node.get(),
+                    node_kind: "grain".to_string(),
+                    param: "seed".to_string(),
+                },
+                Law::Stepped {
+                    min: 0,
+                    max: i64::from(u16::MAX),
+                },
+                Raw::Integer(7),
+            ),
+            (
+                Control::GroupParam {
+                    group: group_id.get(),
+                    param: "name".to_string(),
+                },
+                Law::Discrete {
+                    vocab: vec!["smuggled".to_string()],
+                },
+                Raw::Token("smuggled".to_string()),
+            ),
+            (
+                Control::GroupParam {
+                    group: group_id.get(),
+                    param: "opacity".to_string(),
+                },
+                Law::Toggle,
+                Raw::Toggle(true),
+            ),
+            (
+                Control::LayerText {
+                    layer: 0,
+                    param: "body".to_string(),
+                },
+                Law::Discrete {
+                    vocab: vec!["smuggled".to_string()],
+                },
+                Raw::Token("smuggled".to_string()),
+            ),
+            (
+                Control::Routing {
+                    routing: 0,
+                    param: "target".to_string(),
+                },
+                Law::Discrete {
+                    vocab: vec!["brightness".to_string()],
+                },
+                Raw::Token("brightness".to_string()),
+            ),
+        ];
+        let mut take = performance_track::PerformanceTake::default();
+        for (control, law, raw) in hostile {
+            take.record_accepted(0, control, law, &raw)
+                .expect("structurally valid hostile address");
+        }
+
+        let expected = take
+            .addresses()
+            .iter()
+            .map(|address| address.control.describe())
+            .collect::<Vec<_>>();
+        let (compiled, degraded) = app.compile_performance_playback(&take);
+        assert_eq!(degraded, expected);
+        assert!(compiled
+            .iter()
+            .all(|event| matches!(event, CompiledPerformanceEvent::Degraded)));
+    }
+
+    #[test]
+    fn v2_rack_compile_degrades_missing_ids_and_mismatched_node_kinds() {
+        use performance_track::{PerformanceControl as Control, PerformanceRawValue as Raw};
+        use visual_rack::{DigitalColorParams, RuntimeVisualNodeKind};
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let node = app
+            .master_rack
+            .push(RuntimeVisualNodeKind::DigitalColor(
+                DigitalColorParams::default(),
+            ))
+            .expect("hosted node");
+        let controls = [
+            Control::RackNodeMaster {
+                node: node.get().saturating_add(100),
+                node_kind: "digital_color".to_string(),
+                param: "brightness".to_string(),
+            },
+            Control::RackNodeMaster {
+                node: node.get(),
+                node_kind: "grain".to_string(),
+                param: "intensity".to_string(),
+            },
+        ];
+        let mut take = performance_track::PerformanceTake::default();
+        for control in controls {
+            let law = App::performance_value_law_for(&control).expect("valid owner law");
+            take.record_accepted(0, control, law, &Raw::Continuous(0.5))
+                .unwrap();
+        }
+
+        let expected = take
+            .addresses()
+            .iter()
+            .map(|address| address.control.describe())
+            .collect::<Vec<_>>();
+        let (compiled, degraded) = app.compile_performance_playback(&take);
+        assert_eq!(degraded, expected);
+        assert!(compiled
+            .iter()
+            .all(|event| matches!(event, CompiledPerformanceEvent::Degraded)));
     }
 
     #[test]

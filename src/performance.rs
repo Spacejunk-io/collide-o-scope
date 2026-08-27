@@ -31,6 +31,20 @@ pub const DEFAULT_AUTOPILOT_HOLD_BEATS: u16 = 4;
 /// Largest saved zero-based layer position accepted from untrusted input.
 pub const MAX_SAVED_LAYER_POSITION: u32 = 4095;
 
+/// Engine-owned description of one scalar authoring value.
+///
+/// Performance recording, browser validation, and offline replay translate
+/// this neutral metadata into their own wire/storage representations. Keeping
+/// the owner vocabulary and range here prevents those adapters from growing a
+/// second hand-maintained parameter table.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum AuthoringValueLaw {
+    Unit([f32; 2]),
+    Discrete(Vec<&'static str>),
+    Toggle,
+    Stepped([i64; 2]),
+}
+
 /// Integer beat/bar boundaries crossed by one forward clock observation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BeatCrossings {

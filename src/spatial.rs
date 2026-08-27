@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::effects::EffectUniforms;
+use crate::performance::AuthoringValueLaw;
 
 pub const POSITION_MIN: f32 = -4.0;
 pub const POSITION_MAX: f32 = 4.0;
@@ -33,6 +34,23 @@ pub enum FitMode {
     Native,
 }
 
+impl FitMode {
+    pub const ALL: [Self; 4] = [Self::Stretch, Self::Fit, Self::Fill, Self::Native];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Stretch => "stretch",
+            Self::Fit => "fit",
+            Self::Fill => "fill",
+            Self::Native => "native",
+        }
+    }
+
+    pub fn try_from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|value| value.key() == key)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeMode {
@@ -45,12 +63,68 @@ pub enum EdgeMode {
     Mirror,
 }
 
+impl EdgeMode {
+    pub const ALL: [Self; 4] = [Self::Transparent, Self::Clamp, Self::Repeat, Self::Mirror];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Transparent => "transparent",
+            Self::Clamp => "clamp",
+            Self::Repeat => "repeat",
+            Self::Mirror => "mirror",
+        }
+    }
+
+    pub fn try_from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|value| value.key() == key)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SamplingMode {
     #[default]
     Linear,
     Nearest,
+}
+
+impl SamplingMode {
+    pub const ALL: [Self; 2] = [Self::Linear, Self::Nearest];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::Nearest => "nearest",
+        }
+    }
+
+    pub fn try_from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|value| value.key() == key)
+    }
+}
+
+/// Metadata for the scalar, one-field spatial authoring seam shared by layer,
+/// master, and composition-group transforms.
+pub(crate) fn spatial_transform_value_law(param: &str) -> Option<AuthoringValueLaw> {
+    let unit = |min, max| Some(AuthoringValueLaw::Unit([min, max]));
+    let discrete = |values: Vec<&'static str>| Some(AuthoringValueLaw::Discrete(values));
+    match param {
+        "position_x" | "position_y" => unit(POSITION_MIN, POSITION_MAX),
+        "scale_x" | "scale_y" => unit(SCALE_MIN, SCALE_MAX),
+        "anchor_x" | "anchor_y" => unit(ANCHOR_MIN, ANCHOR_MAX),
+        "rotation_deg" | "skew_axis_deg" => unit(-180.0, 180.0),
+        "skew_deg" => unit(-SKEW_LIMIT_DEGREES, SKEW_LIMIT_DEGREES),
+        "crop_left" | "crop_top" | "crop_right" | "crop_bottom" => unit(0.0, CROP_MAX),
+        "fit" => discrete(FitMode::ALL.into_iter().map(FitMode::key).collect()),
+        "edge" => discrete(EdgeMode::ALL.into_iter().map(EdgeMode::key).collect()),
+        "sampling" => discrete(
+            SamplingMode::ALL
+                .into_iter()
+                .map(SamplingMode::key)
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 /// Authored transform in normalized composition/source coordinates.
@@ -560,6 +634,49 @@ const fn sampling_mode_code(mode: SamplingMode) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorder_transform_laws_share_owner_ranges_and_vocabularies() {
+        assert_eq!(
+            spatial_transform_value_law("position_x"),
+            Some(AuthoringValueLaw::Unit([POSITION_MIN, POSITION_MAX]))
+        );
+        assert_eq!(
+            spatial_transform_value_law("crop_right"),
+            Some(AuthoringValueLaw::Unit([0.0, CROP_MAX]))
+        );
+        assert_eq!(
+            spatial_transform_value_law("fit"),
+            Some(AuthoringValueLaw::Discrete(
+                FitMode::ALL.into_iter().map(FitMode::key).collect()
+            ))
+        );
+        assert_eq!(
+            spatial_transform_value_law("edge"),
+            Some(AuthoringValueLaw::Discrete(
+                EdgeMode::ALL.into_iter().map(EdgeMode::key).collect()
+            ))
+        );
+        assert_eq!(
+            spatial_transform_value_law("sampling"),
+            Some(AuthoringValueLaw::Discrete(
+                SamplingMode::ALL
+                    .into_iter()
+                    .map(SamplingMode::key)
+                    .collect()
+            ))
+        );
+        for value in FitMode::ALL {
+            assert_eq!(FitMode::try_from_key(value.key()), Some(value));
+        }
+        for value in EdgeMode::ALL {
+            assert_eq!(EdgeMode::try_from_key(value.key()), Some(value));
+        }
+        for value in SamplingMode::ALL {
+            assert_eq!(SamplingMode::try_from_key(value.key()), Some(value));
+        }
+        assert_eq!(spatial_transform_value_law("position"), None);
+    }
 
     fn close(actual: f32, expected: f32) {
         assert!(

@@ -15,13 +15,13 @@ use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::block_dct::BlockDctParams;
-use crate::filter_avalanche::AvalancheParams;
+use crate::filter_avalanche::{AvalancheAxis, AvalancheParams};
 use crate::image_routing::{LayerImageStage, StableLayerId};
-use crate::performance::SavedLayerPosition;
+use crate::performance::{AuthoringValueLaw, SavedLayerPosition};
 use crate::pixel_sort::PixelSortParams;
 use crate::scan_processor::ScanProcessorParams;
-use crate::spatial::SpatialTransform;
-use crate::symmetry::{RuntimeSymmetryParams, SymmetryParams};
+use crate::spatial::{EdgeMode, FitMode, SamplingMode, SpatialTransform};
+use crate::symmetry::{RuntimeSymmetryParams, SymmetryBoundary, SymmetryMode, SymmetryParams};
 
 pub const MAX_NODES_PER_RACK: usize = 8;
 pub const MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK: u32 = 32;
@@ -189,6 +189,44 @@ pub enum NodeBlend {
 }
 
 impl NodeBlend {
+    pub const ALL: [Self; 15] = [
+        Self::Normal,
+        Self::Screen,
+        Self::Multiply,
+        Self::Difference,
+        Self::Add,
+        Self::Subtract,
+        Self::Darken,
+        Self::Lighten,
+        Self::Overlay,
+        Self::SoftLight,
+        Self::HardLight,
+        Self::Exclusion,
+        Self::Dodge,
+        Self::Burn,
+        Self::AlphaCut,
+    ];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Screen => "screen",
+            Self::Multiply => "multiply",
+            Self::Difference => "difference",
+            Self::Add => "add",
+            Self::Subtract => "subtract",
+            Self::Darken => "darken",
+            Self::Lighten => "lighten",
+            Self::Overlay => "overlay",
+            Self::SoftLight => "soft_light",
+            Self::HardLight => "hard_light",
+            Self::Exclusion => "exclusion",
+            Self::Dodge => "dodge",
+            Self::Burn => "burn",
+            Self::AlphaCut => "alpha_cut",
+        }
+    }
+
     pub const fn code(self) -> u32 {
         match self {
             Self::Normal => 0,
@@ -463,6 +501,20 @@ pub enum MatteChannel {
     Blue,
 }
 
+impl MatteChannel {
+    pub const ALL: [Self; 5] = [Self::Alpha, Self::Luma, Self::Red, Self::Green, Self::Blue];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Alpha => "alpha",
+            Self::Luma => "luma",
+            Self::Red => "red",
+            Self::Green => "green",
+            Self::Blue => "blue",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImageMatte {
@@ -579,6 +631,24 @@ pub enum KeyMode {
     KeepDark,
     RemoveColor,
     KeepColor,
+}
+
+impl KeyMode {
+    pub const ALL: [Self; 4] = [
+        Self::KeepBright,
+        Self::KeepDark,
+        Self::RemoveColor,
+        Self::KeepColor,
+    ];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::KeepBright => "keep_bright",
+            Self::KeepDark => "keep_dark",
+            Self::RemoveColor => "remove_color",
+            Self::KeepColor => "keep_color",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -705,6 +775,19 @@ pub enum GrainAlgorithm {
     Blue,
 }
 
+impl GrainAlgorithm {
+    pub const ALL: [Self; 4] = [Self::Gaussian, Self::Perlin, Self::SaltPepper, Self::Blue];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Gaussian => "gaussian",
+            Self::Perlin => "perlin",
+            Self::SaltPepper => "salt_pepper",
+            Self::Blue => "blue",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GrainParams {
@@ -753,6 +836,17 @@ pub enum DisplaceBoundary {
 }
 
 impl DisplaceBoundary {
+    pub const ALL: [Self; 4] = [Self::Transparent, Self::Mirror, Self::Wrap, Self::Hold];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Transparent => "transparent",
+            Self::Mirror => "mirror",
+            Self::Wrap => "wrap",
+            Self::Hold => "hold",
+        }
+    }
+
     /// Permanent append-only shader code. Never renumber an existing entry.
     pub const fn code(self) -> u32 {
         match self {
@@ -852,6 +946,24 @@ pub enum ResidualBlock {
 }
 
 impl ResidualBlock {
+    pub const ALL: [Self; 5] = [
+        Self::Four,
+        Self::Eight,
+        Self::Sixteen,
+        Self::ThirtyTwo,
+        Self::SixtyFour,
+    ];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Four => "four",
+            Self::Eight => "eight",
+            Self::Sixteen => "sixteen",
+            Self::ThirtyTwo => "thirty_two",
+            Self::SixtyFour => "sixty_four",
+        }
+    }
+
     /// Permanent append-only shader code. Never renumber an existing entry.
     pub const fn code(self) -> u32 {
         match self {
@@ -889,6 +1001,17 @@ pub enum ResidualQuantization {
 }
 
 impl ResidualQuantization {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Coarse, Self::Medium, Self::Fine];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Coarse => "coarse",
+            Self::Medium => "medium",
+            Self::Fine => "fine",
+        }
+    }
+
     /// Permanent append-only shader code. Never renumber an existing entry.
     pub const fn code(self) -> u32 {
         match self {
@@ -2937,6 +3060,138 @@ pub const NODE_PARAM_DESCRIPTORS: &[NodeParamDescriptor] = &[
         modulatable: false,
     },
 ];
+
+fn node_enum_value_law(kind: NodeKindTag, param: &str) -> Option<AuthoringValueLaw> {
+    let discrete = |values: Vec<&'static str>| Some(AuthoringValueLaw::Discrete(values));
+    match (kind, param) {
+        (NodeKindTag::Transform, "fit_mode") => {
+            discrete(FitMode::ALL.into_iter().map(FitMode::key).collect())
+        }
+        (NodeKindTag::Transform, "edge_mode") => {
+            discrete(EdgeMode::ALL.into_iter().map(EdgeMode::key).collect())
+        }
+        (NodeKindTag::Transform, "sampling") => discrete(
+            SamplingMode::ALL
+                .into_iter()
+                .map(SamplingMode::key)
+                .collect(),
+        ),
+        (NodeKindTag::Key, "mode") => {
+            discrete(KeyMode::ALL.into_iter().map(KeyMode::key).collect())
+        }
+        (NodeKindTag::Grain, "algorithm") => discrete(
+            GrainAlgorithm::ALL
+                .into_iter()
+                .map(GrainAlgorithm::key)
+                .collect(),
+        ),
+        (NodeKindTag::Displace, "boundary") => discrete(
+            DisplaceBoundary::ALL
+                .into_iter()
+                .map(DisplaceBoundary::key)
+                .collect(),
+        ),
+        (NodeKindTag::Symmetry, "symmetry_mode") => discrete(
+            SymmetryMode::ALL
+                .into_iter()
+                .map(SymmetryMode::key)
+                .collect(),
+        ),
+        (NodeKindTag::Symmetry, "symmetry_boundary") => discrete(
+            SymmetryBoundary::ALL
+                .into_iter()
+                .map(SymmetryBoundary::key)
+                .collect(),
+        ),
+        (NodeKindTag::Residual, "block") => discrete(
+            ResidualBlock::ALL
+                .into_iter()
+                .map(ResidualBlock::key)
+                .collect(),
+        ),
+        (NodeKindTag::Residual, "quantization") => discrete(
+            ResidualQuantization::ALL
+                .into_iter()
+                .map(ResidualQuantization::key)
+                .collect(),
+        ),
+        (NodeKindTag::Avalanche, "avalanche_axis") => discrete(
+            AvalancheAxis::ALL
+                .into_iter()
+                .map(|axis| axis.key())
+                .collect(),
+        ),
+        // Mask variant/channel edits and every route-like enum travel through
+        // ordered topology actions, not SetVisualNodeParam.
+        _ => None,
+    }
+}
+
+/// Performance-recordable scalar law for one ordinary rack-node value edit.
+///
+/// The descriptor registries own membership and numeric bounds. Closed enum
+/// owners supply their own vocabulary; vectors, colors, routes, unbounded
+/// seeds, and Study documents have no one-event scalar representation and are
+/// therefore an explicit refusal.
+pub(crate) fn node_param_value_law(node_kind: &str, param: &str) -> Option<AuthoringValueLaw> {
+    let kind = NODE_KIND_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.key == node_kind)?
+        .tag;
+    if matches!(
+        kind,
+        NodeKindTag::LegacyCanonical | NodeKindTag::LegacyTemporal
+    ) {
+        return None;
+    }
+
+    if let Some(control) = NODE_CONTROL_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.key == param)
+    {
+        return match control.value_type {
+            NodeParamType::Bool => Some(AuthoringValueLaw::Toggle),
+            NodeParamType::Float => control.range.map(AuthoringValueLaw::Unit),
+            NodeParamType::Enum if param == "blend" => Some(AuthoringValueLaw::Discrete(
+                NodeBlend::ALL.into_iter().map(NodeBlend::key).collect(),
+            )),
+            NodeParamType::Unsigned
+            | NodeParamType::Enum
+            | NodeParamType::Vec2
+            | NodeParamType::Color
+            | NodeParamType::ImageTap
+            | NodeParamType::MotionDonor => None,
+        };
+    }
+
+    // Mask image selection is one ordered topology edit. Its invert bit travels
+    // with the tap/channel action and is therefore not an ordinary scalar even
+    // though the registry describes its storage type as Bool.
+    if kind == NodeKindTag::Mask && param == "image_invert" {
+        return None;
+    }
+
+    let descriptor = NODE_PARAM_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.kind == kind && descriptor.key == param)?;
+    match descriptor.value_type {
+        NodeParamType::Bool => Some(AuthoringValueLaw::Toggle),
+        NodeParamType::Float => descriptor.range.map(AuthoringValueLaw::Unit),
+        NodeParamType::Unsigned => descriptor.range.and_then(|[min, max]| {
+            (min.is_finite()
+                && max.is_finite()
+                && min.fract() == 0.0
+                && max.fract() == 0.0
+                && min <= max)
+                .then_some(AuthoringValueLaw::Stepped([min as i64, max as i64]))
+        }),
+        NodeParamType::Enum => node_enum_value_law(kind, param),
+        NodeParamType::Vec2
+        | NodeParamType::Color
+        | NodeParamType::ImageTap
+        | NodeParamType::MotionDonor => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LegacyRackScope {
@@ -5387,6 +5642,72 @@ fn wrap_degrees(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorder_node_laws_follow_descriptor_ranges_and_owner_vocabularies() {
+        assert_eq!(
+            node_param_value_law("digital_color", "brightness"),
+            Some(AuthoringValueLaw::Unit([-1.0, 1.0]))
+        );
+        assert_eq!(
+            node_param_value_law("scan_processor", "scan_lines"),
+            Some(AuthoringValueLaw::Stepped([16, 1_080]))
+        );
+        assert_eq!(
+            node_param_value_law("grain", "color"),
+            Some(AuthoringValueLaw::Toggle)
+        );
+        assert_eq!(
+            node_param_value_law("transform", "fit_mode"),
+            Some(AuthoringValueLaw::Discrete(
+                FitMode::ALL.into_iter().map(FitMode::key).collect()
+            ))
+        );
+        assert_eq!(
+            node_param_value_law("residual", "quantization"),
+            Some(AuthoringValueLaw::Discrete(
+                ResidualQuantization::ALL
+                    .into_iter()
+                    .map(ResidualQuantization::key)
+                    .collect()
+            ))
+        );
+        assert_eq!(node_param_value_law("cellular", "seed"), None);
+        assert_eq!(node_param_value_law("transform", "position"), None);
+        assert_eq!(node_param_value_law("mask", "image_tap"), None);
+        assert_eq!(node_param_value_law("mask", "image_invert"), None);
+        assert_eq!(node_param_value_law("mask", "variant"), None);
+        assert_eq!(node_param_value_law("legacy_canonical", "wet"), None);
+        assert_eq!(node_param_value_law("not_a_kind", "wet"), None);
+
+        for descriptor in NODE_PARAM_DESCRIPTORS {
+            let kind = node_kind_descriptor(descriptor.kind).key;
+            match descriptor.value_type {
+                NodeParamType::Float => assert_eq!(
+                    node_param_value_law(kind, descriptor.key),
+                    descriptor.range.map(AuthoringValueLaw::Unit),
+                    "{kind}:{}",
+                    descriptor.key
+                ),
+                NodeParamType::Unsigned if descriptor.range.is_some() => {
+                    assert!(matches!(
+                        node_param_value_law(kind, descriptor.key),
+                        Some(AuthoringValueLaw::Stepped(_))
+                    ));
+                }
+                NodeParamType::Bool if kind == "mask" && descriptor.key == "image_invert" => {
+                    assert_eq!(node_param_value_law(kind, descriptor.key), None);
+                }
+                NodeParamType::Bool => assert_eq!(
+                    node_param_value_law(kind, descriptor.key),
+                    Some(AuthoringValueLaw::Toggle),
+                    "{kind}:{}",
+                    descriptor.key
+                ),
+                _ => {}
+            }
+        }
+    }
 
     fn live_id(value: u64) -> StableLayerId {
         StableLayerId::new(value).unwrap()

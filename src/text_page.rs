@@ -21,6 +21,8 @@
 
 use ab_glyph::{Font, FontRef, ScaleFont};
 
+use crate::performance::AuthoringValueLaw;
+
 /// The fixed page. An authored page has no native resolution, so the tree
 /// gives it one — fixed rather than output-sized, because an export at a
 /// different output size must raster the identical picture.
@@ -34,6 +36,48 @@ pub const TEXT_PAGE_MAX_BODY_BYTES: usize = 4_096;
 /// The outline stroke never dilates further than this radius in pixels, so
 /// the morphological band stays bounded regardless of authored width.
 const TEXT_PAGE_MAX_STROKE_RADIUS: f32 = 10.0;
+
+const TEXT_PAGE_SIZE_RANGE: [f32; 2] = [0.03, 0.6];
+const TEXT_PAGE_TRACK_RANGE: [f32; 2] = [-0.1, 0.5];
+const TEXT_PAGE_UNIT_RANGE: [f32; 2] = [0.0, 1.0];
+const TEXT_PAGE_ROTATION_RANGE: [f32; 2] = [-180.0, 180.0];
+const TEXT_PAGE_OUTLINE_RANGE: [f32; 2] = [0.0, 20.0];
+const TEXT_PAGE_SHAPE_SIZE_RANGE: [f32; 2] = [0.02, 1.0];
+const TEXT_PAGE_SHAPE_STROKE_RANGE: [f32; 2] = [0.0, 40.0];
+const TEXT_PAGE_REPEAT_RANGE: [i64; 2] = [1, 8];
+const TEXT_PAGE_SHAPE_COUNT_RANGE: [i64; 2] = [1, 24];
+
+/// Canonical scalar wire paths and bounds. Both the parser and performance
+/// recorder oracle consume this table, so a newly appended field cannot be
+/// recordable under a range different from the one ingress validates.
+const TEXT_PAGE_SCALAR_RANGES: &[(&str, [f32; 2])] = &[
+    ("size", TEXT_PAGE_SIZE_RANGE),
+    ("track", TEXT_PAGE_TRACK_RANGE),
+    ("x", TEXT_PAGE_UNIT_RANGE),
+    ("y", TEXT_PAGE_UNIT_RANGE),
+    ("rot_degrees", TEXT_PAGE_ROTATION_RANGE),
+    ("outline", TEXT_PAGE_OUTLINE_RANGE),
+    ("ink_r", TEXT_PAGE_UNIT_RANGE),
+    ("ink_g", TEXT_PAGE_UNIT_RANGE),
+    ("ink_b", TEXT_PAGE_UNIT_RANGE),
+    ("bg_r", TEXT_PAGE_UNIT_RANGE),
+    ("bg_g", TEXT_PAGE_UNIT_RANGE),
+    ("bg_b", TEXT_PAGE_UNIT_RANGE),
+    ("shape_size", TEXT_PAGE_SHAPE_SIZE_RANGE),
+    ("shape_x", TEXT_PAGE_UNIT_RANGE),
+    ("shape_y", TEXT_PAGE_UNIT_RANGE),
+    ("shape_fill_r", TEXT_PAGE_UNIT_RANGE),
+    ("shape_fill_g", TEXT_PAGE_UNIT_RANGE),
+    ("shape_fill_b", TEXT_PAGE_UNIT_RANGE),
+    ("shape_stroke", TEXT_PAGE_SHAPE_STROKE_RANGE),
+];
+
+fn text_page_scalar_range(param: &str) -> Option<(&'static str, [f32; 2])> {
+    TEXT_PAGE_SCALAR_RANGES
+        .iter()
+        .find(|(key, _)| *key == param)
+        .copied()
+}
 
 /// The closed two-face vocabulary. Codes are permanent and append-only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -115,6 +159,30 @@ impl TextPageShape {
     /// BENDR strokes rings and starbursts even when no stroke is authored.
     fn always_stroked(self) -> bool {
         matches!(self, Self::Rings | Self::Starburst)
+    }
+}
+
+/// Performance-recordable value law for one text-page wire field. Body text
+/// remains a counted refusal because one recorder event carries only one
+/// scalar or closed-vocabulary token.
+pub(crate) fn text_page_value_law(param: &str) -> Option<AuthoringValueLaw> {
+    match param {
+        "font" => Some(AuthoringValueLaw::Discrete(
+            TextPageFont::ALL
+                .into_iter()
+                .map(TextPageFont::key)
+                .collect(),
+        )),
+        "shape" => Some(AuthoringValueLaw::Discrete(
+            TextPageShape::ALL
+                .into_iter()
+                .map(TextPageShape::key)
+                .collect(),
+        )),
+        "repeat" => Some(AuthoringValueLaw::Stepped(TEXT_PAGE_REPEAT_RANGE)),
+        "shape_count" => Some(AuthoringValueLaw::Stepped(TEXT_PAGE_SHAPE_COUNT_RANGE)),
+        "body" => None,
+        _ => text_page_scalar_range(param).map(|(_, range)| AuthoringValueLaw::Unit(range)),
     }
 }
 
@@ -201,22 +269,78 @@ impl TextPageParams {
         Self {
             body,
             font: self.font,
-            size: finite_clamp(self.size, defaults.size, 0.03, 0.6),
-            track: finite_clamp(self.track, defaults.track, -0.1, 0.5),
-            x: finite_clamp(self.x, defaults.x, 0.0, 1.0),
-            y: finite_clamp(self.y, defaults.y, 0.0, 1.0),
-            rot_degrees: finite_clamp(self.rot_degrees, defaults.rot_degrees, -180.0, 180.0),
-            repeat: self.repeat.clamp(1, 8),
-            outline: finite_clamp(self.outline, defaults.outline, 0.0, 20.0),
+            size: finite_clamp(
+                self.size,
+                defaults.size,
+                TEXT_PAGE_SIZE_RANGE[0],
+                TEXT_PAGE_SIZE_RANGE[1],
+            ),
+            track: finite_clamp(
+                self.track,
+                defaults.track,
+                TEXT_PAGE_TRACK_RANGE[0],
+                TEXT_PAGE_TRACK_RANGE[1],
+            ),
+            x: finite_clamp(
+                self.x,
+                defaults.x,
+                TEXT_PAGE_UNIT_RANGE[0],
+                TEXT_PAGE_UNIT_RANGE[1],
+            ),
+            y: finite_clamp(
+                self.y,
+                defaults.y,
+                TEXT_PAGE_UNIT_RANGE[0],
+                TEXT_PAGE_UNIT_RANGE[1],
+            ),
+            rot_degrees: finite_clamp(
+                self.rot_degrees,
+                defaults.rot_degrees,
+                TEXT_PAGE_ROTATION_RANGE[0],
+                TEXT_PAGE_ROTATION_RANGE[1],
+            ),
+            repeat: self.repeat.clamp(
+                TEXT_PAGE_REPEAT_RANGE[0] as u32,
+                TEXT_PAGE_REPEAT_RANGE[1] as u32,
+            ),
+            outline: finite_clamp(
+                self.outline,
+                defaults.outline,
+                TEXT_PAGE_OUTLINE_RANGE[0],
+                TEXT_PAGE_OUTLINE_RANGE[1],
+            ),
             ink: unit_rgb(self.ink, defaults.ink),
             bg: unit_rgb(self.bg, defaults.bg),
             shape: self.shape,
-            shape_count: self.shape_count.clamp(1, 24),
-            shape_size: finite_clamp(self.shape_size, defaults.shape_size, 0.02, 1.0),
-            shape_x: finite_clamp(self.shape_x, defaults.shape_x, 0.0, 1.0),
-            shape_y: finite_clamp(self.shape_y, defaults.shape_y, 0.0, 1.0),
+            shape_count: self.shape_count.clamp(
+                TEXT_PAGE_SHAPE_COUNT_RANGE[0] as u32,
+                TEXT_PAGE_SHAPE_COUNT_RANGE[1] as u32,
+            ),
+            shape_size: finite_clamp(
+                self.shape_size,
+                defaults.shape_size,
+                TEXT_PAGE_SHAPE_SIZE_RANGE[0],
+                TEXT_PAGE_SHAPE_SIZE_RANGE[1],
+            ),
+            shape_x: finite_clamp(
+                self.shape_x,
+                defaults.shape_x,
+                TEXT_PAGE_UNIT_RANGE[0],
+                TEXT_PAGE_UNIT_RANGE[1],
+            ),
+            shape_y: finite_clamp(
+                self.shape_y,
+                defaults.shape_y,
+                TEXT_PAGE_UNIT_RANGE[0],
+                TEXT_PAGE_UNIT_RANGE[1],
+            ),
             shape_fill: unit_rgb(self.shape_fill, defaults.shape_fill),
-            shape_stroke: finite_clamp(self.shape_stroke, defaults.shape_stroke, 0.0, 40.0),
+            shape_stroke: finite_clamp(
+                self.shape_stroke,
+                defaults.shape_stroke,
+                TEXT_PAGE_SHAPE_STROKE_RANGE[0],
+                TEXT_PAGE_SHAPE_STROKE_RANGE[1],
+            ),
         }
     }
 }
@@ -742,7 +866,6 @@ impl TextPageEdit {
             let number = value.as_f64()? as f32;
             (number.is_finite() && (min..=max).contains(&number)).then_some(number)
         };
-        let unit = || number(0.0, 1.0);
         Some(match param {
             "body" => {
                 let body = value.as_str()?;
@@ -755,38 +878,26 @@ impl TextPageEdit {
             "shape" => Self::Shape(TextPageShape::from_key(value.as_str()?)?),
             "repeat" => {
                 let repeat = value.as_u64()?;
-                if !(1..=8).contains(&repeat) {
+                if !(TEXT_PAGE_REPEAT_RANGE[0] as u64..=TEXT_PAGE_REPEAT_RANGE[1] as u64)
+                    .contains(&repeat)
+                {
                     return None;
                 }
                 Self::Repeat(repeat as u32)
             }
             "shape_count" => {
                 let count = value.as_u64()?;
-                if !(1..=24).contains(&count) {
+                if !(TEXT_PAGE_SHAPE_COUNT_RANGE[0] as u64..=TEXT_PAGE_SHAPE_COUNT_RANGE[1] as u64)
+                    .contains(&count)
+                {
                     return None;
                 }
                 Self::ShapeCount(count as u32)
             }
-            "size" => Self::Scalar("size", number(0.03, 0.6)?),
-            "track" => Self::Scalar("track", number(-0.1, 0.5)?),
-            "x" => Self::Scalar("x", unit()?),
-            "y" => Self::Scalar("y", unit()?),
-            "rot_degrees" => Self::Scalar("rot_degrees", number(-180.0, 180.0)?),
-            "outline" => Self::Scalar("outline", number(0.0, 20.0)?),
-            "ink_r" => Self::Scalar("ink_r", unit()?),
-            "ink_g" => Self::Scalar("ink_g", unit()?),
-            "ink_b" => Self::Scalar("ink_b", unit()?),
-            "bg_r" => Self::Scalar("bg_r", unit()?),
-            "bg_g" => Self::Scalar("bg_g", unit()?),
-            "bg_b" => Self::Scalar("bg_b", unit()?),
-            "shape_size" => Self::Scalar("shape_size", number(0.02, 1.0)?),
-            "shape_x" => Self::Scalar("shape_x", unit()?),
-            "shape_y" => Self::Scalar("shape_y", unit()?),
-            "shape_fill_r" => Self::Scalar("shape_fill_r", unit()?),
-            "shape_fill_g" => Self::Scalar("shape_fill_g", unit()?),
-            "shape_fill_b" => Self::Scalar("shape_fill_b", unit()?),
-            "shape_stroke" => Self::Scalar("shape_stroke", number(0.0, 40.0)?),
-            _ => return None,
+            _ => {
+                let (key, [min, max]) = text_page_scalar_range(param)?;
+                Self::Scalar(key, number(min, max)?)
+            }
         })
     }
 
@@ -830,6 +941,70 @@ impl TextPageEdit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorder_laws_share_the_parser_tables() {
+        for &(param, range) in TEXT_PAGE_SCALAR_RANGES {
+            assert_eq!(
+                text_page_value_law(param),
+                Some(AuthoringValueLaw::Unit(range)),
+                "{param}"
+            );
+            assert!(TextPageEdit::parse(param, &serde_json::json!(range[0])).is_some());
+            assert!(TextPageEdit::parse(param, &serde_json::json!(range[1])).is_some());
+            let margin = (range[1] - range[0]).abs().max(1.0) * 0.01;
+            assert!(
+                TextPageEdit::parse(param, &serde_json::json!(range[0] - margin)).is_none(),
+                "{param} below range"
+            );
+            assert!(
+                TextPageEdit::parse(param, &serde_json::json!(range[1] + margin)).is_none(),
+                "{param} above range"
+            );
+        }
+
+        for (param, expected) in [
+            (
+                "font",
+                TextPageFont::ALL
+                    .into_iter()
+                    .map(TextPageFont::key)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "shape",
+                TextPageShape::ALL
+                    .into_iter()
+                    .map(TextPageShape::key)
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            assert_eq!(
+                text_page_value_law(param),
+                Some(AuthoringValueLaw::Discrete(expected.clone()))
+            );
+            for token in expected {
+                assert!(TextPageEdit::parse(param, &serde_json::json!(token)).is_some());
+            }
+        }
+
+        for (param, range) in [
+            ("repeat", TEXT_PAGE_REPEAT_RANGE),
+            ("shape_count", TEXT_PAGE_SHAPE_COUNT_RANGE),
+        ] {
+            assert_eq!(
+                text_page_value_law(param),
+                Some(AuthoringValueLaw::Stepped(range))
+            );
+            assert!(TextPageEdit::parse(param, &serde_json::json!(range[0])).is_some());
+            assert!(TextPageEdit::parse(param, &serde_json::json!(range[1])).is_some());
+            assert!(TextPageEdit::parse(param, &serde_json::json!(range[0] - 1)).is_none());
+            assert!(TextPageEdit::parse(param, &serde_json::json!(range[1] + 1)).is_none());
+        }
+
+        assert_eq!(text_page_value_law("body"), None);
+        assert_eq!(text_page_value_law("not_a_field"), None);
+    }
 
     fn pixel(page: &[u8], x: usize, y: usize) -> [u8; 4] {
         let idx = (y * TEXT_PAGE_WIDTH as usize + x) * 4;

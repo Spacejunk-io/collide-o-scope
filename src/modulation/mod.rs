@@ -29,7 +29,7 @@ use crate::effects::EffectUniforms;
 use crate::image_routing::StableLayerId;
 use crate::motion::MotionParams;
 use crate::ntsc::NtscParams;
-use crate::performance::SavedLayerPosition;
+use crate::performance::{AuthoringValueLaw, SavedLayerPosition};
 use crate::spatial::{
     SpatialTransform, ANCHOR_MAX, ANCHOR_MIN, CROP_MAX, POSITION_MAX, POSITION_MIN, SCALE_MAX,
     SCALE_MIN, SKEW_LIMIT_DEGREES,
@@ -2769,63 +2769,37 @@ pub const MONITOR_SOURCE_LIST: &[ModSource] = &[
     ModSource::Lfo(7),
 ];
 
+/// Historical names for the first three configurable bands. They remain
+/// accepted authoring tokens but are excluded from the monitoring strip
+/// because they read the same live values as `audio_band1..3`.
+pub const LEGACY_MOD_SOURCE_ALIASES: &[(&str, ModSource)] = &[
+    ("audio_bass", ModSource::AudioBass),
+    ("audio_mid", ModSource::AudioMid),
+    ("audio_high", ModSource::AudioHigh),
+];
+
+/// Complete accepted source vocabulary in stable monitor order, followed by
+/// the legacy aliases. New distinct sources append to MONITOR_SOURCE_LIST;
+/// aliases append to LEGACY_MOD_SOURCE_ALIASES.
+pub(crate) fn mod_source_authoring_vocab() -> Vec<&'static str> {
+    MONITOR_SOURCE_LIST
+        .iter()
+        .map(ModSource::as_str)
+        .chain(LEGACY_MOD_SOURCE_ALIASES.iter().map(|(key, _)| *key))
+        .collect()
+}
+
 impl ModSource {
     pub fn try_from_str(s: &str) -> Option<Self> {
-        Some(match s {
-            "lfo0" => Self::Lfo(0),
-            "lfo1" => Self::Lfo(1),
-            "lfo2" => Self::Lfo(2),
-            "lfo3" => Self::Lfo(3),
-            "lfo4" => Self::Lfo(4),
-            "lfo5" => Self::Lfo(5),
-            "lfo6" => Self::Lfo(6),
-            "lfo7" => Self::Lfo(7),
-            "audio_level" => Self::AudioLevel,
-            "audio_bass" => Self::AudioBass,
-            "audio_mid" => Self::AudioMid,
-            "audio_high" => Self::AudioHigh,
-            "audio_band1" => Self::AudioBand(0),
-            "audio_band2" => Self::AudioBand(1),
-            "audio_band3" => Self::AudioBand(2),
-            "audio_band4" => Self::AudioBand(3),
-            "audio_band5" => Self::AudioBand(4),
-            "audio_band6" => Self::AudioBand(5),
-            "audio_band7" => Self::AudioBand(6),
-            "audio_band8" => Self::AudioBand(7),
-            "audio_onset" => Self::AudioOnset,
-            "audio_bright" => Self::AudioBright,
-            "audio_noise" => Self::AudioNoise,
-            "midi_a" => Self::Midi(0),
-            "midi_b" => Self::Midi(1),
-            "midi_c" => Self::Midi(2),
-            "midi_d" => Self::Midi(3),
-            "gyro_yaw" => Self::GyroYaw,
-            "gyro_pitch" => Self::GyroPitch,
-            "gyro_roll" => Self::GyroRoll,
-            "pad_x" => Self::PadX,
-            "pad_y" => Self::PadY,
-            "bend1" => Self::Bend(0),
-            "bend2" => Self::Bend(1),
-            "bend3" => Self::Bend(2),
-            "bend4" => Self::Bend(3),
-            "bend5" => Self::Bend(4),
-            "bend6" => Self::Bend(5),
-            "env1" => Self::Envelope(0),
-            "env2" => Self::Envelope(1),
-            "env3" => Self::Envelope(2),
-            "env4" => Self::Envelope(3),
-            "macro1" => Self::Macro(0),
-            "macro2" => Self::Macro(1),
-            "macro3" => Self::Macro(2),
-            "macro4" => Self::Macro(3),
-            "chaos" => Self::Chaos,
-            "drift" => Self::Drift,
-            "spike" => Self::Spike,
-            "video_motion" => Self::VideoMotion,
-            "video_brightness" => Self::VideoBrightness,
-            "video_cut" => Self::VideoCut,
-            _ => return None,
-        })
+        MONITOR_SOURCE_LIST
+            .iter()
+            .copied()
+            .find(|source| source.as_str() == s)
+            .or_else(|| {
+                LEGACY_MOD_SOURCE_ALIASES
+                    .iter()
+                    .find_map(|(key, source)| (*key == s).then_some(*source))
+            })
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -2899,14 +2873,22 @@ pub enum Curve {
 }
 
 impl Curve {
+    pub const ALL: [Self; 5] = [
+        Self::Linear,
+        Self::Exp,
+        Self::Log,
+        Self::SCurve,
+        Self::Steps,
+    ];
+
+    pub fn try_from_str(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == value)
+    }
+
     pub fn from_str(value: &str) -> Self {
-        match value {
-            "exp" => Self::Exp,
-            "log" => Self::Log,
-            "s_curve" => Self::SCurve,
-            "steps" => Self::Steps,
-            _ => Self::Linear,
-        }
+        Self::try_from_str(value).unwrap_or(Self::Linear)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -2918,6 +2900,114 @@ impl Curve {
             Self::Steps => "steps",
         }
     }
+}
+
+pub const ROUTING_DEPTH_RANGE: [f32; 2] = [-1.0, 1.0];
+pub const ROUTING_CURVE_AMOUNT_RANGE: [f32; 2] = [-2.0, 2.0];
+pub const ROUTING_RESPONSE_SECONDS_RANGE: [f32; 2] = [0.0, 10.0];
+
+/// Performance-recordable value law for one existing routing's configuration.
+/// Target remains a refusal because its valid vocabulary depends on the live
+/// stable-address world rather than a fixed one-event scalar law; add/remove
+/// routing are topology actions outside this query entirely.
+pub(crate) fn routing_value_law(param: &str) -> Option<AuthoringValueLaw> {
+    match param {
+        "source" => Some(AuthoringValueLaw::Discrete(mod_source_authoring_vocab())),
+        "depth" => Some(AuthoringValueLaw::Unit(ROUTING_DEPTH_RANGE)),
+        "curve" => Some(AuthoringValueLaw::Discrete(
+            Curve::ALL.into_iter().map(Curve::as_str).collect(),
+        )),
+        "curve_amount" => Some(AuthoringValueLaw::Unit(ROUTING_CURVE_AMOUNT_RANGE)),
+        "attack" | "release" => Some(AuthoringValueLaw::Unit(ROUTING_RESPONSE_SECONDS_RANGE)),
+        "target" => None,
+        _ => None,
+    }
+}
+
+/// Apply one existing-routing configuration value through the same closed
+/// owner table used by live authoring, performance replay, and export replay.
+/// Target changes remain topology-adjacent and are deliberately handled by
+/// the stable-target resolver instead of this scalar/discrete seam.
+pub(crate) fn apply_routing_value(
+    routing: &mut Routing,
+    param: &str,
+    value: &serde_json::Value,
+) -> Result<bool, String> {
+    if routing_value_law(param).is_none() {
+        return Err(format!("routing parameter {param} is not value-authorable"));
+    }
+    match param {
+        "source" => {
+            let token = value
+                .as_str()
+                .ok_or_else(|| "routing source must be a token".to_string())?;
+            let source = ModSource::try_from_str(token)
+                .ok_or_else(|| format!("unknown routing source {token}"))?;
+            if routing.source == source {
+                Ok(false)
+            } else {
+                routing.source = source;
+                routing.reset_runtime();
+                Ok(true)
+            }
+        }
+        "depth" => {
+            let value = finite_routing_number(value, "depth")?
+                .clamp(ROUTING_DEPTH_RANGE[0], ROUTING_DEPTH_RANGE[1]);
+            let changed = routing.depth != value;
+            routing.depth = value;
+            Ok(changed)
+        }
+        "curve" => {
+            let token = value
+                .as_str()
+                .ok_or_else(|| "routing curve must be a token".to_string())?;
+            let curve = Curve::try_from_str(token)
+                .ok_or_else(|| format!("unknown routing curve {token}"))?;
+            if routing.curve == curve {
+                Ok(false)
+            } else {
+                routing.curve = curve;
+                routing.reset_runtime();
+                Ok(true)
+            }
+        }
+        "curve_amount" => {
+            let value = finite_routing_number(value, "curve_amount")?
+                .clamp(ROUTING_CURVE_AMOUNT_RANGE[0], ROUTING_CURVE_AMOUNT_RANGE[1]);
+            if routing.curve_amount == value {
+                Ok(false)
+            } else {
+                routing.curve_amount = value;
+                routing.reset_runtime();
+                Ok(true)
+            }
+        }
+        "attack" | "release" => {
+            let value = finite_routing_number(value, param)?.clamp(
+                ROUTING_RESPONSE_SECONDS_RANGE[0],
+                ROUTING_RESPONSE_SECONDS_RANGE[1],
+            );
+            let slot = if param == "attack" {
+                &mut routing.attack
+            } else {
+                &mut routing.release
+            };
+            let changed = *slot != value;
+            *slot = value;
+            Ok(changed)
+        }
+        _ => unreachable!("routing_value_law admitted only the closed value table"),
+    }
+}
+
+fn finite_routing_number(value: &serde_json::Value, param: &str) -> Result<f32, String> {
+    value
+        .as_f64()
+        .filter(|value| value.is_finite())
+        .map(|value| value as f32)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| format!("routing {param} must be a finite number"))
 }
 
 /// Runtime and persisted configuration for one gyroscope axis.
@@ -5328,6 +5418,66 @@ fn apply_offset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorder_routing_laws_share_the_closed_engine_tables() {
+        let vocab = mod_source_authoring_vocab();
+        assert_eq!(
+            vocab.len(),
+            MONITOR_SOURCE_LIST.len() + LEGACY_MOD_SOURCE_ALIASES.len()
+        );
+        assert_eq!(
+            &vocab[..MONITOR_SOURCE_LIST.len()],
+            MONITOR_SOURCE_LIST
+                .iter()
+                .map(ModSource::as_str)
+                .collect::<Vec<_>>()
+        );
+        let unique = vocab
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), vocab.len());
+        for token in &vocab {
+            assert!(ModSource::try_from_str(token).is_some(), "{token}");
+        }
+        assert_eq!(
+            routing_value_law("source"),
+            Some(AuthoringValueLaw::Discrete(vocab))
+        );
+
+        let curves = Curve::ALL
+            .into_iter()
+            .map(Curve::as_str)
+            .collect::<Vec<_>>();
+        for curve in Curve::ALL {
+            assert_eq!(Curve::try_from_str(curve.as_str()), Some(curve));
+        }
+        assert_eq!(Curve::try_from_str("bezier"), None);
+        assert_eq!(Curve::from_str("bezier"), Curve::Linear);
+        assert_eq!(
+            routing_value_law("curve"),
+            Some(AuthoringValueLaw::Discrete(curves))
+        );
+        assert_eq!(
+            routing_value_law("depth"),
+            Some(AuthoringValueLaw::Unit(ROUTING_DEPTH_RANGE))
+        );
+        assert_eq!(
+            routing_value_law("curve_amount"),
+            Some(AuthoringValueLaw::Unit(ROUTING_CURVE_AMOUNT_RANGE))
+        );
+        assert_eq!(
+            routing_value_law("attack"),
+            Some(AuthoringValueLaw::Unit(ROUTING_RESPONSE_SECONDS_RANGE))
+        );
+        assert_eq!(
+            routing_value_law("release"),
+            Some(AuthoringValueLaw::Unit(ROUTING_RESPONSE_SECONDS_RANGE))
+        );
+        assert_eq!(routing_value_law("target"), None);
+        assert_eq!(routing_value_law("not_a_field"), None);
+    }
 
     fn browser_target_keys<'a>(javascript: &'a str, declaration: &str) -> Vec<&'a str> {
         let body = javascript
