@@ -4,7 +4,7 @@ Date prepared: 2026-08-27
 Topic: `feat/maintenance-ntsc-rs`
 Pinned integration base:
 `48d85ea943069dbcec7c718d42daeac025da4547`
-Status: **compatibility oracle landed on topic; full gate, integration, and
+Status: **compatibility STOP and full gate complete on topic; integration and
 exact-commit CI pending**
 
 This is the §3.8(c) maintenance tranche. It reviews every commit between the
@@ -135,10 +135,14 @@ absent and was not minted.
 
 - Disposition: **EVIDENCE-BACKED COMPATIBILITY STOP**
 - Topic oracle commit: **`6723f97`**
-- Topic evidence commit: **PENDING**
+- Topic evidence commit: **`2b4d8ae`**
 - Topic receipt commit: **PENDING**
 - Integration commit on `feat/web-control-panel`: **PENDING**
 - Exact-commit CI: **PENDING**
+- CI-form six-command gate: **OBSERVED PASS** — formatting and both JavaScript
+  parsers; all-target/all-feature compile; 2,148 tests passed with zero
+  failures and 163 explicitly ignored tests; all six benchmark probes
+  succeeded; and Clippy passed with warnings denied
 - Shipping-pin focused pixel/preset oracle: **OBSERVED PASS**
 - Shipping-pin focused patch JSON/YAML oracle: **OBSERVED PASS**
 - `b3af8c6` comparison: **OBSERVED PASS — byte-identical**
