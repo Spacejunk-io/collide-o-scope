@@ -5,6 +5,8 @@
 //! dropping or replacing it marks that exact worker (source fingerprint plus
 //! generation) retired.  The supervisor is the only code that joins decoder
 //! threads, and it joins only handles which already report `is_finished()`.
+//! At process exit a CRT `atexit` drain waits, bounded, for whatever is
+//! still retiring before `ExitProcess` can terminate it mid-heap-operation.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -550,9 +552,36 @@ fn snapshot_locked(state: &SupervisorState, config: SupervisorConfig) -> Decoder
     }
 }
 
+/// `ExitProcess` terminates every other thread wherever it happens to stand,
+/// so a decoder worker still inside libav* heap operations when the process
+/// exits leaves the CRT heap mid-mutation and shutdown dies with
+/// STATUS_HEAP_CORRUPTION. CRT `atexit` handlers run on the exiting thread
+/// before `ExitProcess`, while worker threads are still alive and joinable,
+/// so this is the last point a bounded drain can retire them. The
+/// application's event loop drains earlier and leaves this an immediate
+/// no-op; test binaries, whose harness exits without any shutdown path,
+/// rely on it. Decoder drop stays signal-only either way.
+extern "C" fn drain_decoder_retirements_at_exit() {
+    let receipt = global_supervisor().drain_with_deadline(DECODER_RETIREMENT_SHUTDOWN_DEADLINE);
+    if !receipt.completed {
+        eprintln!(
+            "decoder retirement drain incomplete at process exit: {} worker(s) still owned after {:?}",
+            receipt.snapshot.owned_workers, receipt.elapsed
+        );
+    }
+}
+
 fn global_supervisor() -> &'static DecoderRetirementSupervisor {
     static SUPERVISOR: OnceLock<DecoderRetirementSupervisor> = OnceLock::new();
-    SUPERVISOR.get_or_init(|| DecoderRetirementSupervisor::new(SupervisorConfig::PRODUCTION))
+    SUPERVISOR.get_or_init(|| {
+        extern "C" {
+            fn atexit(callback: extern "C" fn()) -> std::os::raw::c_int;
+        }
+        // Registration failure keeps the previous exit behavior; refusing
+        // to spawn decoders over it would be worse than the race it closes.
+        let _ = unsafe { atexit(drain_decoder_retirements_at_exit) };
+        DecoderRetirementSupervisor::new(SupervisorConfig::PRODUCTION)
+    })
 }
 
 pub(super) fn admit_decoder_worker(
@@ -708,6 +737,24 @@ mod tests {
         assert!(supervisor.snapshot().owned_workers <= 3);
         wait_until_empty(&supervisor);
         assert_eq!(supervisor.snapshot().completed_workers, 3);
+        supervisor.stop_reaper_after_tests();
+    }
+
+    #[test]
+    fn exit_drain_after_shutdown_drain_is_an_immediate_no_op() {
+        // Models the application path: the event loop drains at shutdown,
+        // then the CRT atexit drain runs against the same supervisor. The
+        // second drain must complete instantly on an already-empty one.
+        let supervisor = test_supervisor(2, 1);
+        let worker = attach_cancel_aware_worker(&supervisor, "drained-twice");
+        worker.retire(1);
+        let first = supervisor.drain_with_deadline(Duration::from_secs(2));
+        assert!(first.completed);
+        assert_eq!(first.snapshot.owned_workers, 0);
+        let second = supervisor.drain_with_deadline(Duration::from_secs(2));
+        assert!(second.completed);
+        assert_eq!(second.snapshot.owned_workers, 0);
+        assert!(second.elapsed < Duration::from_millis(500));
         supervisor.stop_reaper_after_tests();
     }
 
