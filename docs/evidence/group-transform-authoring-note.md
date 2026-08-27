@@ -138,9 +138,11 @@ the pure planner regressions are the reproducible selective-VHS proof.
 ## Closing fields
 
 - Topic implementation commit: **`bd42492`**
-- Topic receipt commit: **PENDING**
-- Integration commit on `feat/web-control-panel`: **PENDING**
-- Exact-commit CI: **PENDING**
+- Topic receipt commit: **`072b69a`**
+- Integration commit on `feat/web-control-panel`: **`d43cffa`**
+- Exact-commit CI: **OBSERVED PASS** — run `33048747275` at `d43cffa`;
+  Linux 24.04, macOS 15, Windows VS 2022, and dependency policy all
+  completed successfully
 - Hosted full gate: **OBSERVED PASS** — the exact six-command CI-form gate
   passed: formatting and both JavaScript parsers; all-target/all-feature
   compile; 2,143 tests passed with zero failures and 163 explicitly ignored
