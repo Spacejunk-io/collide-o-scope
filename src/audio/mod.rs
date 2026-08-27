@@ -826,6 +826,15 @@ impl AudioAnalyzer {
         self.reset_analysis();
     }
 
+    /// Apply the one fail-closed terminal state shared by callback failures
+    /// and a non-loopback stream that stops delivering samples. `stop()`
+    /// also marks an armed recorder tap lost, so Program recording cannot
+    /// silently continue across a broken device clock.
+    fn terminalize_stream_failure(&mut self, error: String) {
+        self.error = error;
+        self.stop();
+    }
+
     /// Arm the recorder's program-PCM tap on the live capture stream and
     /// return the recorder's handle. The tap is the recorder's own clock and
     /// bounded ring — analysis audio is untouched. There is no stream to
@@ -875,18 +884,11 @@ impl AudioAnalyzer {
             .ok()
             .and_then(|mut error| error.take());
         if let Some(error) = runtime_error {
-            self.error = error;
             // Drop the failed stream and zero its sources immediately. The app
             // can now turn the requested enable state off instead of leaving a
             // latched FFT window driving the matrix forever. An armed program
             // tap observes the same failure as a device loss.
-            self.stream = None;
-            self.device_name.clear();
-            self.using_device_fallback = false;
-            self.system_playback_capture = false;
-            self.stream_channels = 0;
-            self.disarm_program_tap();
-            self.reset_analysis();
+            self.terminalize_stream_failure(error);
             return AudioLevels::default();
         }
 
@@ -894,12 +896,9 @@ impl AudioAnalyzer {
         if sample_count == self.last_sample_count {
             if sample_stall_is_terminal(self.system_playback_capture, self.last_sample_at.elapsed())
             {
-                self.error = "audio input stopped delivering samples".to_string();
-                self.stream = None;
-                self.device_name.clear();
-                self.using_device_fallback = false;
-                self.system_playback_capture = false;
-                self.reset_analysis();
+                self.terminalize_stream_failure(
+                    "audio input stopped delivering samples".to_string(),
+                );
                 return AudioLevels::default();
             }
             return self.decay_toward_silence();
@@ -1129,6 +1128,87 @@ mod tests {
             false,
             STALE_STREAM_TIMEOUT - Duration::from_millis(1)
         ));
+    }
+
+    #[test]
+    fn terminal_stream_failure_loses_the_program_tap_and_resets_the_analyzer() {
+        let mut analyzer = AudioAnalyzer::new();
+        analyzer.requested_device = "requested input".to_string();
+        analyzer.devices = vec!["requested input".to_string()];
+        analyzer.system_playback_devices = vec![DEFAULT_SYSTEM_PLAYBACK_SOURCE.to_string()];
+        analyzer.device_name = "active input".to_string();
+        analyzer.using_device_fallback = true;
+        analyzer.system_playback_capture = true;
+        analyzer.stream_channels = 2;
+        analyzer.shared.sample_count.store(7, Ordering::Relaxed);
+        analyzer.shared.samples.lock().unwrap().extend([0.25, -0.5]);
+        analyzer.prev_mags.fill(0.75);
+        analyzer.onset_env = 0.8;
+        analyzer.norm_level.peak = 4.0;
+        analyzer
+            .norm_bands
+            .iter_mut()
+            .for_each(|norm| norm.peak = 3.0);
+        analyzer.norm_flux.peak = 2.0;
+        analyzer.smoothed = AudioLevels {
+            level: 0.9,
+            bands: [0.6; MAX_AUDIO_BANDS],
+            bass: 0.6,
+            mid: 0.6,
+            high: 0.6,
+            onset: 0.6,
+            bright: 0.6,
+            noise: 0.6,
+        };
+        analyzer.display_spectrum.fill(0.5);
+        analyzer.spectrum_peak = 4.0;
+        analyzer.last_sample_count = 1;
+
+        let tap =
+            crate::program_recorder::ProgramAudioTap::new(48_000, 2, "active input".to_string())
+                .unwrap();
+        *analyzer.shared.program_tap.lock().unwrap() = Some(tap.clone());
+
+        analyzer.terminalize_stream_failure("terminal callback error".to_string());
+
+        assert_eq!(analyzer.error, "terminal callback error");
+        assert!(!analyzer.is_running());
+        assert!(analyzer.device_name.is_empty());
+        assert!(!analyzer.using_device_fallback);
+        assert!(!analyzer.system_playback_capture);
+        assert_eq!(analyzer.stream_channels, 0);
+        assert!(tap.device_lost());
+        assert!(analyzer.shared.program_tap.lock().unwrap().is_none());
+        assert!(analyzer.shared.samples.lock().unwrap().is_empty());
+        assert!(analyzer.prev_mags.iter().all(|magnitude| *magnitude == 0.0));
+        assert_eq!(analyzer.onset_env, 0.0);
+        assert_eq!(analyzer.norm_level.peak, 1e-6);
+        assert!(analyzer.norm_bands.iter().all(|norm| norm.peak == 1e-6));
+        assert_eq!(analyzer.norm_flux.peak, 1e-6);
+        assert_eq!(analyzer.smoothed, AudioLevels::default());
+        assert_eq!(analyzer.display_spectrum, [0.0; AUDIO_SPECTRUM_BINS]);
+        assert_eq!(analyzer.spectrum_peak, 1e-9);
+        assert_eq!(analyzer.last_sample_count, 7);
+        assert_eq!(analyzer.requested_device, "requested input");
+        assert_eq!(analyzer.devices, ["requested input"]);
+        assert_eq!(
+            analyzer.system_playback_devices,
+            [DEFAULT_SYSTEM_PLAYBACK_SOURCE]
+        );
+    }
+
+    #[test]
+    fn macos_microphone_disclosure_names_optional_program_recording_exactly_once() {
+        let plist = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/packaging/macos/Info.plist"
+        ));
+        const KEY: &str = "<key>NSMicrophoneUsageDescription</key>";
+        const DISCLOSURE: &str = "<string>collide-o-scope uses live audio to drive visual modulation and can include it in Program recordings when you start recording.</string>";
+
+        assert_eq!(plist.matches(KEY).count(), 1);
+        assert_eq!(plist.matches(DISCLOSURE).count(), 1);
+        assert!(!plist.contains("Nothing is recorded"));
     }
 
     fn accumulate(mags: &[(f32, f32)]) -> (f32, f32, f32, u32) {
