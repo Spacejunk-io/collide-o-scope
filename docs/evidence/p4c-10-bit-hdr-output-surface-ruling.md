@@ -255,7 +255,8 @@ before running.
 - Current SDR8 default: **RETAINED**
 - P4c YUV420P8 integration: **NOT BLOCKED**
 - P010/HDR production admission: **BLOCKED BY ITEM 13**
-- Topic evidence commit: **PENDING**
+- Topic evidence commit: **PASS** —
+  `bcdb99cf93d76cad1536273994f4714e3f84e316`
 - Integration commit on `feat/web-control-panel`: **PENDING**
 - Exact-commit CI: **PENDING**
 - Deterministic implementation/tests: **NOT YET RUN**

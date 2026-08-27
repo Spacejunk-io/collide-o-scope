@@ -60,14 +60,51 @@ Vulkan 26.8.1 result measured 240 frames per source:
 Those seam results authorized integration. They are not an integrated
 total-frame receipt and do not authorize the default flip by themselves.
 
+## Integrated total-frame performance decision
+
+The release-only production fixture ran at exact implementation commit
+`bcdb99cf93d76cad1536273994f4714e3f84e316` on the named Phase-A adapter
+(AMD Radeon RX 6950 XT, Vulkan, driver 26.8.1) with Rust 1.98.0 and FFmpeg
+9.0.1. It warmed 300 accepted frames per policy/source, then collected five
+paired AB/BA runs over 600 aggregate seconds while timing decoder harvest,
+production layer upload/conversion, full Exact composite, temporal and opaque
+output, queue submission, and the completion fence. The ignored raw receipt is
+33,587,500 bytes with SHA-256
+`4fffec11688836c59b5e9d7b05b34bdd85854af1b5041c7f74be73e16aab8c59`.
+
+| Source | Legacy total-frame p50 / p95 / p99 (ms) | Managed total-frame p50 / p95 / p99 (ms) | Managed p99 delta | Paired-run p99 decisions |
+| --- | --- | --- | --- | --- |
+| 720p | 2.4838 / 3.3530 / 6.6311 | 2.3640 / 3.0451 / 6.2583 | -0.3728 ms | fail / fail / fail / pass / pass |
+| 1080p | 4.9042 / 6.7275 / 15.0076 | 3.9890 / 5.3364 / 13.0950 | -1.9126 ms | pass / fail / pass / pass / pass |
+
+The aggregate sample counts were 55,190 legacy / 60,673 managed at 720p and
+28,095 legacy / 34,258 managed at 1080p. In chronological pair order, the
+managed-minus-legacy p99 deltas were +0.0637, +0.0269, +2.1857, -3.3786, and
+-0.1951 ms at 720p, then -2.2629, +3.3081, -0.2336, -7.6710, and -3.2537 ms
+at 1080p.
+
+The aggregate managed p99 improved at both resolutions, but three of five
+720p pairs and one of five 1080p pairs regressed. The fixture therefore passed
+as an execution and evidence capture, while its strict default-flip decision
+was negative (`default_gate.passed=false`; `all_sources_passed=false`). The
+standing directive forbids weakening a keep gate after seeing its result.
+`legacy_rgba` consequently remains the default and no automatic selection was
+added. Reopening requires a fresh prespecified campaign that explains and
+controls the paired variance; this receipt remains evidence of the present
+negative decision, not a favorable-average promotion claim.
+
 ## Closing fields
 
-- Deterministic implementation commit: **PENDING**
+- Deterministic implementation commit: **PASS** —
+  `bcdb99cf93d76cad1536273994f4714e3f84e316`
 - CI-form six-command gate: **PENDING**
-- Integrated total-frame release fixture: **PENDING EXECUTION**
+- Integrated total-frame release fixture: **PASS (EXECUTION); NEGATIVE
+  DEFAULT-FLIP DECISION** — 600 aggregate seconds; ignored receipt 33,587,500
+  bytes; SHA-256
+  `4fffec11688836c59b5e9d7b05b34bdd85854af1b5041c7f74be73e16aab8c59`
 - Topic integration commit on `feat/web-control-panel`: **PENDING**
 - Exact-commit CI: **PENDING**
-- Capability registry regeneration/check: **PENDING**
+- Capability registry regeneration/check: **PASS**
 - Phase-A JSON identity recheck: **PASS** — 4,505 bytes, SHA-256
   `fc682e51a549f33b1b70ed684b575eb8da65d989e69cc648be569c9e9e3e082e`;
   Git blob identity matches `HEAD` at
