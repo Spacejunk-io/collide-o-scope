@@ -6,8 +6,9 @@ Read-only audit snapshot:
 `48d85ea943069dbcec7c718d42daeac025da4547`
 Pinned integration base:
 `a5b0de1584ca0cad95895577c384a06915ae2047`
-Status: **STOP — retain wgpu 29.0.4 and the egui 0.34.3 family until the
-physical GPU/UI matrix is available**
+Status: **integrated evidence-backed STOP; exact-commit CI green — retain
+wgpu 29.0.4 and the egui 0.34.3 family until the physical GPU/UI matrix is
+available**
 
 This closes perfection handover §3.8(d) as a bounded negative result. No
 GPU/UI dependency, source, vendor tree, resource ceiling, action, schema, or
@@ -120,9 +121,14 @@ absent and must not be minted as substitute evidence.
 
 - Disposition: **EVIDENCE-BACKED STOP**
 - Topic evidence commit: **`52f2745`**
-- Topic receipt commit: **PENDING**
-- Integration commit on `feat/web-control-panel`: **PENDING**
-- Exact-commit CI: **PENDING**
+- Topic receipt commit: **`ff978ed4d46058226114cf8180252716a90ca4f7`**
+- Integration commit on `feat/web-control-panel`:
+  **`05c8d6cd399843236ea393e15f41a74d4b793913`**
+- Exact-commit CI: **OBSERVED PASS** —
+  [run 33061058445](https://github.com/Spacejunk-io/collide-o-scope/actions/runs/33061058445)
+  passed at exact head `05c8d6cd399843236ea393e15f41a74d4b793913`:
+  dependency policy in 31 seconds, Linux 24.04 in 522 seconds, macOS 15 in
+  587 seconds, and Windows VS 2022 in 1,023 seconds
 - CI-form six-command gate: **OBSERVED PASS** — 2,148 tests passed,
   163 ignored external/physical seats, six benches green, clippy clean
 - Dependency/source mutation: **NONE**
