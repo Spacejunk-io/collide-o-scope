@@ -171,9 +171,18 @@ evidence.
   `53b74d56a85b0381f824ec886e487a9d8eb8e565`
 - Targeted hardware-free contracts: **PASS** — 16 audio tests plus the
   three-document conditional-mux contract
-- CI-form six-command gate: **PENDING**
-- Topic integration commit on `feat/web-control-panel`: **PENDING**
-- Exact-commit CI: **PENDING**
+- CI-form six-command gate: **OBSERVED PASS** at
+  `820944e7ca37d44666294618827fe7f59d397c88` — fresh rerun completed with
+  2,154 tests passed, 164 ignored external/physical seats, six benches green,
+  and clippy clean
+- Gate anomaly: **BOUNDED AND REPROVED** — the first whole-suite pass exited
+  with Windows `STATUS_HEAP_CORRUPTION` immediately after
+  `render_export::tests::drop_deadline_includes_the_cancel_request`; the exact
+  focused test then passed in 1.01 s and a fresh full six-command gate passed
+- Topic integration commit on `feat/web-control-panel`:
+  **`7fd0221a66d7ed8d87994eb91bf833e40e4fad1c`**
+- Exact-commit CI: **PASS**, run `33069954650` — dependency 34 s,
+  Linux 9m43s, macOS 10m01s, Windows 16m19s
 - Candidate manifest/lock change: **NOT ATTEMPTED**
 - Windows physical audio/MIDI/recorder matrix: **NOT RUN**
 - macOS physical audio/MIDI/recorder matrix: **NOT RUN**
