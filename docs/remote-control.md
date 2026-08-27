@@ -737,11 +737,14 @@ returns to zero, and the error remains visible.
 ### Live recorder, stills, and resampling
 
 **RECORDER** is separate from offline **Render**. **Record program…** opens a
-native final-file picker and starts a video-only capture of the exact final
-Program image after final-program VHS and absolute blackout. The render thread
-only submits to fixed readback/pool/queue capacity; it never waits for FFmpeg. Readback,
-pool, queue, source, and worker drops are counted, and a cadence gap repeats the
-last admitted frame in the video instead of falsifying its duration. **Finish**
+native final-file picker and captures the exact final Program image after
+final-program VHS and absolute blackout. If a live capture stream is running
+when recording starts, the recorder muxes its bounded Program PCM tap;
+otherwise the artifact is video-only and the sidecar reports
+`audio_not_muxed=true`. The render thread only submits to fixed
+readback/pool/queue capacity; it never waits for FFmpeg. Readback, pool, queue,
+source, and worker drops are counted, and a cadence gap repeats the last
+admitted frame in the video instead of falsifying its duration. **Finish**
 stops admission, drains in-flight work, then publishes. **Cancel** removes the
 temporary artifact.
 
@@ -755,9 +758,10 @@ and committed without replacement.
 
 Recorder output has a bounded `.recording.json` truth sidecar. It includes
 capture/program cadence, freeze/blackout observations, drop counters, and an
-audio-clock correlation stamp when available. The current live recorder does
-not mux audio. Offline Render's independent 1× audio policy below is not a live
-recording-audio claim.
+audio-clock correlation stamp when available. An armed recording additionally
+reports captured/silence/drift counts, device-loss truth, and
+`audio_not_muxed=false`. Offline Render's independent 1× audio policy below is
+not the live recorder's policy.
 
 ### Health HUD and StageMap
 

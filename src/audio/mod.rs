@@ -333,6 +333,28 @@ struct SharedAudio {
     program_tap: Mutex<Option<Arc<crate::program_recorder::ProgramAudioTap>>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamHealthPoll {
+    Unavailable,
+    Waiting,
+    Fresh,
+}
+
+/// Publish callback failure truth without waiting for the render thread. The
+/// recorder owns a clone of the tap, so marking it lost before removing the
+/// shared slot makes a paused or blocked visual program observe the broken PCM
+/// clock immediately.
+fn publish_stream_error(shared: &SharedAudio, message: String) {
+    if let Ok(mut slot) = shared.program_tap.lock() {
+        if let Some(tap) = slot.take() {
+            tap.mark_device_lost();
+        }
+    }
+    if let Ok(mut error) = shared.stream_error.lock() {
+        *error = Some(message);
+    }
+}
+
 /// Adaptive normalizer: tracks a slowly-decaying running peak.
 struct AutoNorm {
     peak: f32,
@@ -743,9 +765,7 @@ impl AudioAnalyzer {
         let err_fn = move |e| {
             let message = format!("audio stream error: {e}");
             log::warn!("{message}");
-            if let Ok(mut slot) = error_shared.stream_error.lock() {
-                *slot = Some(message);
-            }
+            publish_stream_error(&error_shared, message);
         };
         let stream_result = match config.sample_format() {
             cpal::SampleFormat::F32 => device.build_input_stream(
@@ -835,6 +855,50 @@ impl AudioAnalyzer {
         self.stop();
     }
 
+    fn poll_stream_health_state(&mut self) -> StreamHealthPoll {
+        self.poll_stream_health_state_for(self.stream.is_some())
+    }
+
+    fn poll_stream_health_state_for(&mut self, stream_active: bool) -> StreamHealthPoll {
+        if !stream_active {
+            return StreamHealthPoll::Unavailable;
+        }
+
+        let runtime_error = self
+            .shared
+            .stream_error
+            .lock()
+            .ok()
+            .and_then(|mut error| error.take());
+        if let Some(error) = runtime_error {
+            self.terminalize_stream_failure(error);
+            return StreamHealthPoll::Unavailable;
+        }
+
+        let sample_count = self.shared.sample_count.load(Ordering::Relaxed);
+        if sample_count == self.last_sample_count {
+            if sample_stall_is_terminal(self.system_playback_capture, self.last_sample_at.elapsed())
+            {
+                self.terminalize_stream_failure(
+                    "audio input stopped delivering samples".to_string(),
+                );
+                return StreamHealthPoll::Unavailable;
+            }
+            return StreamHealthPoll::Waiting;
+        }
+
+        self.last_sample_count = sample_count;
+        self.last_sample_at = Instant::now();
+        StreamHealthPoll::Fresh
+    }
+
+    /// Advance device-error and stall truth even when transport Pause freezes
+    /// FFT/modulation work. Program recording continues to admit frozen video
+    /// frames, so its independent PCM clock must remain live or fail closed.
+    pub fn poll_stream_health(&mut self) {
+        let _ = self.poll_stream_health_state();
+    }
+
     /// Arm the recorder's program-PCM tap on the live capture stream and
     /// return the recorder's handle. The tap is the recorder's own clock and
     /// bounded ring — analysis audio is untouched. There is no stream to
@@ -873,38 +937,11 @@ impl AudioAnalyzer {
 
     /// Analyze the newest buffered samples. Call once per render frame.
     pub fn analyze(&mut self, gain: f32) -> AudioLevels {
-        if self.stream.is_none() {
-            return AudioLevels::default();
+        match self.poll_stream_health_state() {
+            StreamHealthPoll::Unavailable => return AudioLevels::default(),
+            StreamHealthPoll::Waiting => return self.decay_toward_silence(),
+            StreamHealthPoll::Fresh => {}
         }
-
-        let runtime_error = self
-            .shared
-            .stream_error
-            .lock()
-            .ok()
-            .and_then(|mut error| error.take());
-        if let Some(error) = runtime_error {
-            // Drop the failed stream and zero its sources immediately. The app
-            // can now turn the requested enable state off instead of leaving a
-            // latched FFT window driving the matrix forever. An armed program
-            // tap observes the same failure as a device loss.
-            self.terminalize_stream_failure(error);
-            return AudioLevels::default();
-        }
-
-        let sample_count = self.shared.sample_count.load(Ordering::Relaxed);
-        if sample_count == self.last_sample_count {
-            if sample_stall_is_terminal(self.system_playback_capture, self.last_sample_at.elapsed())
-            {
-                self.terminalize_stream_failure(
-                    "audio input stopped delivering samples".to_string(),
-                );
-                return AudioLevels::default();
-            }
-            return self.decay_toward_silence();
-        }
-        self.last_sample_count = sample_count;
-        self.last_sample_at = Instant::now();
 
         // Copy the newest FFT_SIZE samples out of the shared buffer.
         let mut frame = [0.0f32; FFT_SIZE];
@@ -1209,6 +1246,49 @@ mod tests {
         assert_eq!(plist.matches(KEY).count(), 1);
         assert_eq!(plist.matches(DISCLOSURE).count(), 1);
         assert!(!plist.contains("Nothing is recorded"));
+    }
+
+    #[test]
+    fn callback_error_marks_the_program_tap_lost_before_render_thread_polling() {
+        let analyzer = AudioAnalyzer::new();
+        let tap =
+            crate::program_recorder::ProgramAudioTap::new(48_000, 2, "active input".to_string())
+                .unwrap();
+        *analyzer.shared.program_tap.lock().unwrap() = Some(tap.clone());
+
+        publish_stream_error(
+            &analyzer.shared,
+            "audio stream error: device unavailable".to_string(),
+        );
+
+        assert!(tap.device_lost());
+        assert!(analyzer.shared.program_tap.lock().unwrap().is_none());
+        assert_eq!(
+            analyzer.shared.stream_error.lock().unwrap().as_deref(),
+            Some("audio stream error: device unavailable")
+        );
+    }
+
+    #[test]
+    fn paused_health_poll_terminalizes_a_stalled_input_and_loses_the_program_tap() {
+        let mut analyzer = AudioAnalyzer::new();
+        analyzer.device_name = "active input".to_string();
+        analyzer.stream_channels = 2;
+        analyzer.last_sample_at = Instant::now() - STALE_STREAM_TIMEOUT - Duration::from_secs(1);
+        let tap =
+            crate::program_recorder::ProgramAudioTap::new(48_000, 2, "active input".to_string())
+                .unwrap();
+        *analyzer.shared.program_tap.lock().unwrap() = Some(tap.clone());
+
+        let result = analyzer.poll_stream_health_state_for(true);
+
+        assert_eq!(result, StreamHealthPoll::Unavailable);
+        assert_eq!(analyzer.error, "audio input stopped delivering samples");
+        assert!(tap.device_lost());
+        assert!(analyzer.shared.program_tap.lock().unwrap().is_none());
+        assert!(analyzer.device_name.is_empty());
+        assert_eq!(analyzer.stream_channels, 0);
+        assert_eq!(analyzer.smoothed, AudioLevels::default());
     }
 
     fn accumulate(mags: &[(f32, f32)]) -> (f32, f32, f32, u32) {

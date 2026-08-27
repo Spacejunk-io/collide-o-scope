@@ -3431,6 +3431,44 @@ mod tests {
     }
 
     #[test]
+    fn operator_docs_state_the_conditional_live_audio_mux_without_contradiction() {
+        const LAW: &str = "If a live capture stream is running when recording starts, the recorder muxes its bounded Program PCM tap;";
+        let docs = [
+            ("README", include_str!("../README.md")),
+            ("remote control", include_str!("../docs/remote-control.md")),
+            (
+                "professional console",
+                include_str!("../docs/professional-console-and-stage.md"),
+            ),
+        ];
+        let forbidden = [
+            "Recording is currently video-only",
+            "starts a video-only capture",
+            "The current live recorder does not mux audio",
+            "The current recorder is video-only",
+        ];
+
+        for (name, document) in docs {
+            let normalized = document.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert_eq!(
+                normalized.matches(LAW).count(),
+                1,
+                "{name} must state the conditional mux law exactly once"
+            );
+            assert!(
+                normalized.contains("`audio_not_muxed=true`"),
+                "{name} must name video-only sidecar truth"
+            );
+            for contradiction in forbidden {
+                assert!(
+                    !normalized.contains(contradiction),
+                    "{name} retains stale recorder claim: {contradiction}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn device_loss_publishes_with_honest_padding_truth() {
         let output = temp_path("audio-loss.mp4");
         let tap = audio_tap(48_000, 2);

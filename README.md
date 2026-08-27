@@ -856,8 +856,11 @@ name one exact stable post-effects layer or group. Missing targets drop visibly 
 back to Program. Native pickers choose destinations, publication is
 create-new/sync/atomic-no-replace, and auto-import or a new prepared
 `ClipSlotId` occurs only after durable success. Recording is currently
-video-only; timing/drop truth and audio-clock correlation go in a bounded
-`.recording.json` sidecar, but audio is not claimed to be muxed.
+conditional on the live audio source at its start. If a live capture stream is
+running when recording starts, the recorder muxes its bounded Program PCM tap;
+otherwise the artifact is video-only and the sidecar reports
+`audio_not_muxed=true`. Timing, drop, audio-clock, padding, drift, and
+device-loss truth go in the bounded `.recording.json` sidecar.
 
 The stage-health HUD reports bounded frame percentiles/deadlines, per-layer
 decode age/queue/drop health, output identity/mode, and known resource budgets.
