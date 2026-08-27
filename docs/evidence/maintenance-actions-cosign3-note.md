@@ -34,6 +34,12 @@ workflows. The two security-critical signing steps are additionally bound by
 reviewed whole-block SHA-256 values, so an inert wrapper, reordered statement,
 swallowed failure, or hidden assignment changes the admitted body.
 
+The checker also binds each complete reviewed workflow document by SHA-256.
+This closes YAML-equivalent encodings that a line-oriented inventory could
+otherwise miss, including escaped quoted keys and flow-style step mappings.
+Any future workflow edit must therefore update its reviewed digest together
+with the semantic pin/count policy and hostile fixtures.
+
 Checkout v7 and cache v6 use the Node 24 action runtime. Upstream documents
 Actions Runner **2.327.1 or later** as the minimum Node 24 runner. These
 workflows use GitHub-hosted runners and contain no `container:` job. This
@@ -171,7 +177,7 @@ only non-ignored untracked root artifacts at 66,225, 56,984,527, and
 
 ## Closing fields
 
-- Topic implementation commit: **`a8764df`**
+- Topic implementation commits: **`a8764df`**, **`22588b1`**
 - Topic receipt commit: **PENDING**
 - Integration commit on `feat/web-control-panel`: **PENDING**
 - Exact-commit CI: **PENDING**
