@@ -43,7 +43,7 @@ REVIEWED_PACKAGE_ASSEMBLY_STEP_SHA256 = (
     "f327da1c8f9029e9b224bffe95b1d5713b9cee875428c56733ff04f15e468cbb"
 )
 REVIEWED_SBOM_POLICY_SHA256 = (
-    "775741aeb0e652e52a83c59364a27f543ef58ca51b486ed48e127d76f57769e9"
+    "18ca32ac7c13002dc9d498e8c0bfa855c8716c0c00b59cb91d4fe11fd5ef614d"
 )
 REVIEWED_RELEASE_VERIFIER_SHA256 = (
     "904cfa1fac528996daca88ac17799cf0a1f06652cb621a26f6f477f4207801a4"
@@ -2661,11 +2661,11 @@ def validate_reviewed_sbom_policy_digest(policy: str) -> None:
         != REVIEWED_SBOM_POLICY_SHA256
         or 'EXPECTED_REPOSITORY_URL = "https://github.com/Spacejunk-io/collide-o-scope"' not in policy
         or 'return f"{EXPECTED_REPOSITORY_URL}/tree/{commit}"' not in policy
-        or 'EXPECTED_DEPENDENCY_EDGES = 885' not in policy
-        or 'EXPECTED_ROOT_EDGES = 36' not in policy
+        or 'EXPECTED_DEPENDENCY_EDGES = 856' not in policy
+        or 'EXPECTED_ROOT_EDGES = 35' not in policy
         or 'EXPECTED_REWRITTEN_REFERENCES = 13' not in policy
         or 'EXPECTED_SEMANTIC_PROFILE_SHA256 = (' not in policy
-        or '"1605dc0f7f64c42735728495f8a42f85cfb8613c9606311fbe58608a4841ce00"' not in policy
+        or '"d8333dbde0a319d518a7461ee68d8e3617221ddbb0b47b99480c1b43ecd1942b"' not in policy
         or 'object_pairs_hook=_reject_duplicate_keys' not in policy
         or 'parse_constant=_reject_nonfinite_constant' not in policy
         or 'if observed_changes != changed_paths:' not in policy

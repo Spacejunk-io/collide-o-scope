@@ -98,11 +98,9 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state))
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    ws.read_buffer_size(8 * 1024)
+        .on_upgrade(|socket| handle_socket(socket, state))
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
@@ -154,23 +152,91 @@ async fn apply_update(state: &AppState, update: &ParamUpdate) {
     let v = &update.value;
 
     match update.param.as_str() {
-        "pixelate" => if let Some(n) = v.as_f64() { effects.pixelate = n as f32; },
-        "rgb_split" => if let Some(n) = v.as_f64() { effects.rgb_split = n as f32; },
-        "hue_shift" => if let Some(n) = v.as_f64() { effects.hue_shift = n as f32; },
-        "saturation" => if let Some(n) = v.as_f64() { effects.saturation = n as f32; },
-        "brightness" => if let Some(n) = v.as_f64() { effects.brightness = n as f32; },
-        "contrast" => if let Some(n) = v.as_f64() { effects.contrast = n as f32; },
-        "posterize" => if let Some(n) = v.as_f64() { effects.posterize = n as f32; },
-        "invert" => if let Some(b) = v.as_bool() { effects.invert = b; },
-        "grain_intensity" => if let Some(n) = v.as_f64() { effects.grain_intensity = n as f32; },
-        "grain_size" => if let Some(n) = v.as_f64() { effects.grain_size = n as f32; },
-        "grain_algo" => if let Some(n) = v.as_u64() { effects.grain_algo = n as u32; },
-        "color_grain" => if let Some(b) = v.as_bool() { effects.color_grain = b; },
-        "vignette" => if let Some(n) = v.as_f64() { effects.vignette = n as f32; },
-        "color_drift" => if let Some(n) = v.as_f64() { effects.color_drift = n as f32; },
-        "breathe_scale" => if let Some(n) = v.as_f64() { effects.breathe_scale = n as f32; },
-        "breathe_rotation" => if let Some(n) = v.as_f64() { effects.breathe_rotation = n as f32; },
-        "breathe_position" => if let Some(n) = v.as_f64() { effects.breathe_position = n as f32; },
+        "pixelate" => {
+            if let Some(n) = v.as_f64() {
+                effects.pixelate = n as f32;
+            }
+        }
+        "rgb_split" => {
+            if let Some(n) = v.as_f64() {
+                effects.rgb_split = n as f32;
+            }
+        }
+        "hue_shift" => {
+            if let Some(n) = v.as_f64() {
+                effects.hue_shift = n as f32;
+            }
+        }
+        "saturation" => {
+            if let Some(n) = v.as_f64() {
+                effects.saturation = n as f32;
+            }
+        }
+        "brightness" => {
+            if let Some(n) = v.as_f64() {
+                effects.brightness = n as f32;
+            }
+        }
+        "contrast" => {
+            if let Some(n) = v.as_f64() {
+                effects.contrast = n as f32;
+            }
+        }
+        "posterize" => {
+            if let Some(n) = v.as_f64() {
+                effects.posterize = n as f32;
+            }
+        }
+        "invert" => {
+            if let Some(b) = v.as_bool() {
+                effects.invert = b;
+            }
+        }
+        "grain_intensity" => {
+            if let Some(n) = v.as_f64() {
+                effects.grain_intensity = n as f32;
+            }
+        }
+        "grain_size" => {
+            if let Some(n) = v.as_f64() {
+                effects.grain_size = n as f32;
+            }
+        }
+        "grain_algo" => {
+            if let Some(n) = v.as_u64() {
+                effects.grain_algo = n as u32;
+            }
+        }
+        "color_grain" => {
+            if let Some(b) = v.as_bool() {
+                effects.color_grain = b;
+            }
+        }
+        "vignette" => {
+            if let Some(n) = v.as_f64() {
+                effects.vignette = n as f32;
+            }
+        }
+        "color_drift" => {
+            if let Some(n) = v.as_f64() {
+                effects.color_drift = n as f32;
+            }
+        }
+        "breathe_scale" => {
+            if let Some(n) = v.as_f64() {
+                effects.breathe_scale = n as f32;
+            }
+        }
+        "breathe_rotation" => {
+            if let Some(n) = v.as_f64() {
+                effects.breathe_rotation = n as f32;
+            }
+        }
+        "breathe_position" => {
+            if let Some(n) = v.as_f64() {
+                effects.breathe_position = n as f32;
+            }
+        }
         _ => {}
     }
 
