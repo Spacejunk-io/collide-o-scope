@@ -142,10 +142,17 @@ absent and was not minted.
 ## Closing fields
 
 - Disposition: **EVIDENCE-BACKED STOP**
-- Topic evidence commit: **PENDING**
+- Topic evidence commit: **`fe06fdd`**
 - Topic receipt commit: **PENDING**
 - Integration commit on `feat/web-control-panel`: **PENDING**
 - Exact-commit CI: **PENDING**
+- CI-form six-command gate: **OBSERVED PASS** — fresh rerun completed with
+  2,148 tests passed, 163 ignored external/physical seats, six benches green,
+  and clippy clean
+- Gate anomaly: **BOUNDED AND REPROVED** — the first whole-suite pass exited
+  with Windows `STATUS_HEAP_CORRUPTION` after
+  `render_export::tests::drop_deadline_includes_the_cancel_request`; the exact
+  focused test then passed in 1.00 s and a fresh full six-command gate passed
 - Production replacement: **NOT ATTEMPTED**
 - Frozen historical corpus: **NOT YET COMPLETE**
 - Differential campaigns: **NOT RUN**
