@@ -896,7 +896,7 @@ The authoritative, executable capability matrix is [generated here](docs/capabil
 | `supervised_gpu_recovery_phase_a` | Implemented | Implemented | Implemented |
 | `d3d11va_hardware_decode` | Evaluation required | Unavailable on platform | Unavailable on platform |
 | `final_program_vhs` | Implemented | Implemented | Implemented |
-| `live_recorder_audio_mux` | Deferred | Deferred | Deferred |
+| `live_recorder_audio_mux` | Implemented | Implemented | Implemented |
 | `exact_vfr_live_transport` | Deferred | Deferred | Deferred |
 | `spout_input` | Implemented | Unavailable on platform | Unavailable on platform |
 | `advanced_precision` | Implemented | Implemented | Implemented |
