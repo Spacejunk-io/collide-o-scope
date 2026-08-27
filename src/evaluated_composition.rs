@@ -8624,6 +8624,100 @@ mod tests {
     }
 
     #[test]
+    fn nonidentity_group_transform_preserves_selective_vhs_master_bypass_ordering() {
+        // VHS is enabled and one contributing group member bypasses Master.
+        // The group's transform is a frame-local value on the group's own
+        // output-sized materialization step; it must not become a master-rack
+        // node, move the dry/wet partition, or advance topology generation.
+        let base = base_with_ntsc(&[4, 3, 2, 1], &[2], true);
+        let (_, mut composition, master, racks) = grouped_fixture();
+        let identity = advanced(plan(&base, &composition, &master, &racks).unwrap());
+        let identity_signature = identity.topology_signature();
+        let identity_bypass = identity.master().canonical_bypass_layers.clone();
+        let identity_wet = identity.master().canonical_layers.clone();
+        let identity_temporal_path = identity.temporal_master_path();
+
+        let transformed = SpatialTransform {
+            position: [0.25, -0.125],
+            scale: [0.8, 1.2],
+            rotation_deg: 31.0,
+            ..SpatialTransform::default()
+        };
+        composition.group_mut(group_id(10)).unwrap().transform = transformed;
+        let moved = advanced(plan(&base, &composition, &master, &racks).unwrap());
+
+        assert_eq!(moved.topology_signature(), identity_signature);
+        assert_eq!(
+            moved.master().canonical_bypass_layers.as_ref(),
+            identity_bypass.as_ref()
+        );
+        assert_eq!(
+            moved.master().canonical_layers.as_ref(),
+            identity_wet.as_ref()
+        );
+        assert_eq!(moved.temporal_master_path(), identity_temporal_path);
+
+        let group = moved
+            .groups()
+            .iter()
+            .find(|group| group.id == group_id(10))
+            .unwrap();
+        assert_eq!(group.transform, transformed.sanitized());
+        let EvaluatedScopeStep::MaterializeSpatial { pass, application } =
+            &group.execution.steps()[0]
+        else {
+            panic!("group transform must remain on its own materialization step");
+        };
+        assert_eq!(*application, LegacyCanonicalApplication::ScopeLocal);
+        let expected = transformed.sanitized().gpu_uniforms(64, 64, 64, 64);
+        assert_eq!(
+            bytemuck::bytes_of(&pass.spatial),
+            bytemuck::bytes_of(&expected)
+        );
+    }
+
+    #[test]
+    fn nonidentity_group_transform_cannot_hide_ambiguous_master_bypass() {
+        let base = base_with_ntsc(&[4, 3, 2, 1], &[2], true);
+        let (_, mut composition, _, racks) = grouped_fixture();
+        let master = RuntimeVisualRack::try_from_parts(
+            vec![
+                RuntimeVisualNode::authored(
+                    NodeId::new(3).unwrap(),
+                    RuntimeVisualNodeKind::Transform(SpatialTransform::default()),
+                ),
+                RuntimeVisualNode::authored(
+                    NodeId::LEGACY_CANONICAL,
+                    RuntimeVisualNodeKind::LegacyCanonical,
+                ),
+                RuntimeVisualNode::authored(
+                    NodeId::LEGACY_TEMPORAL,
+                    RuntimeVisualNodeKind::LegacyTemporal,
+                ),
+            ],
+            Some(4),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            plan(&base, &composition, &master, &racks),
+            Err(CompositionPlanError::AmbiguousMasterBypass { layers })
+                if layers == vec![layer_id(2)]
+        ));
+
+        composition.group_mut(group_id(10)).unwrap().transform = SpatialTransform {
+            position: [-0.375, 0.2],
+            rotation_deg: -47.0,
+            ..SpatialTransform::default()
+        };
+        assert!(matches!(
+            plan(&base, &composition, &master, &racks),
+            Err(CompositionPlanError::AmbiguousMasterBypass { layers })
+                if layers == vec![layer_id(2)]
+        ));
+    }
+
+    #[test]
     fn no_bypass_master_canonical_remains_global_after_group_composition() {
         let (base, composition, master, racks) = grouped_fixture();
         let advanced = advanced(plan(&base, &composition, &master, &racks).unwrap());

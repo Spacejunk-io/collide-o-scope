@@ -333,6 +333,11 @@
                 <button type="submit">Create group</button>
                 <div id="creative-group-help" class="creative-help">Members must form one contiguous root run. A group remains addressable when empty.</div>
               </form>
+              <div class="transform-toolbar" role="group" aria-label="Preview transform gizmo group-target recovery">
+                <button id="creative-group-gizmo-release" type="button" aria-describedby="creative-group-gizmo-release-help">Release group gizmo target</button>
+                <span id="creative-group-gizmo-release-help" class="creative-help">Session-only recovery: return the preview gizmo to the current master or layer scope, including after its targeted group was deleted.</span>
+              </div>
+              <div id="creative-group-gizmo-release-status" class="creative-status" role="status" aria-live="polite"></div>
               <div id="creative-groups" class="creative-groups" role="list"></div>
               <h4 class="creative-subtitle">ROOT · BACK TO FRONT</h4>
               <div id="creative-root" class="creative-root" role="list"></div>
@@ -437,16 +442,16 @@
                 <label>Fit</label><select aria-label="Master media fit"><option value="stretch">Stretch</option><option value="fit">Fit</option><option value="fill">Fill</option><option value="native">Native</option></select>
               </div>
               <div class="param-row" data-master-transform="crop_left">
-                <label>Crop Left</label><input type="range" min="0" max="0.999" step="0.001" value="0"><span class="value">0.000</span>
+                <label>Crop Left</label><input type="range" min="0" max="0.999755859375" step="0.000244140625" value="0"><span class="value">0.000000000000</span>
               </div>
               <div class="param-row" data-master-transform="crop_top">
-                <label>Crop Top</label><input type="range" min="0" max="0.999" step="0.001" value="0"><span class="value">0.000</span>
+                <label>Crop Top</label><input type="range" min="0" max="0.999755859375" step="0.000244140625" value="0"><span class="value">0.000000000000</span>
               </div>
               <div class="param-row" data-master-transform="crop_right">
-                <label>Crop Right</label><input type="range" min="0" max="0.999" step="0.001" value="0"><span class="value">0.000</span>
+                <label>Crop Right</label><input type="range" min="0" max="0.999755859375" step="0.000244140625" value="0"><span class="value">0.000000000000</span>
               </div>
               <div class="param-row" data-master-transform="crop_bottom">
-                <label>Crop Bottom</label><input type="range" min="0" max="0.999" step="0.001" value="0"><span class="value">0.000</span>
+                <label>Crop Bottom</label><input type="range" min="0" max="0.999755859375" step="0.000244140625" value="0"><span class="value">0.000000000000</span>
               </div>
               <div class="param-row select-row" data-master-transform="edge">
                 <label>Edge</label><select aria-label="Master edge mode"><option value="transparent" selected>Transparent</option><option value="clamp">Clamp</option><option value="repeat">Repeat</option><option value="mirror">Mirror</option></select>

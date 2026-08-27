@@ -4552,6 +4552,47 @@ pub enum WebAction {
         value: serde_json::Value,
         composition_revision: u64,
     },
+    /// Set one absolute authored transform field on a composition group. A
+    /// group is stable-ID addressed and its identity belongs to composition
+    /// topology, so every edit carries the exact composition revision it was
+    /// authored against.
+    #[serde(rename = "set_group_transform")]
+    SetGroupTransform {
+        group_id: String,
+        param: String,
+        value: serde_json::Value,
+        composition_revision: u64,
+    },
+    /// Restore one composition group's exact legacy full-frame transform
+    /// identity. This is an ordered barrier, never a coalescible scalar.
+    #[serde(rename = "reset_group_transform")]
+    ResetGroupTransform {
+        group_id: String,
+        composition_revision: u64,
+    },
+    /// Atomically replace one composition group's complete transform
+    /// (paste/preset). This is an ordered barrier like the layer equivalent.
+    #[serde(rename = "apply_group_transform")]
+    ApplyGroupTransform {
+        group_id: String,
+        transform: SpatialTransform,
+        composition_revision: u64,
+    },
+    /// Select one stable composition group for the native preview gizmo. This
+    /// is session-only control state: it never enters patch/manual history or
+    /// the performance recorder, and it is never quantized.
+    #[serde(rename = "target_group_transform_gizmo")]
+    TargetGroupTransformGizmo {
+        group_id: String,
+        composition_revision: u64,
+    },
+    /// Clear the native preview gizmo's session-only group target. Like the
+    /// target command, this never enters patch/manual history, the performance
+    /// recorder, or a quantized latch. The revision witness prevents a delayed
+    /// browser command from clearing a target selected against a newer
+    /// composition.
+    #[serde(rename = "clear_group_transform_gizmo_target")]
+    ClearGroupTransformGizmoTarget { composition_revision: u64 },
     #[serde(rename = "create_composition_group")]
     CreateCompositionGroup {
         name: String,
@@ -5601,7 +5642,16 @@ impl WebAction {
             )),
             Self::SetCompositionGroupParam {
                 group_id, param, ..
-            } => Some(format!("creative:group:{group_id}:{param}")),
+            } => {
+                if crate::spatial::spatial_transform_value_law(param).is_some() {
+                    Some(format!("creative:group:{group_id}:transform:{param}"))
+                } else {
+                    Some(format!("creative:group:{group_id}:{param}"))
+                }
+            }
+            Self::SetGroupTransform {
+                group_id, param, ..
+            } => Some(format!("creative:group:{group_id}:transform:{param}")),
             Self::SetCompositionGroupMatteParam {
                 group_id, param, ..
             } => Some(format!("creative:group:{group_id}:matte:{param}")),
@@ -5781,6 +5831,8 @@ impl WebAction {
                 | Self::SetPerformanceRecording { .. }
                 | Self::SetPerformancePlayback { .. }
                 | Self::ClearPerformanceTake
+                | Self::TargetGroupTransformGizmo { .. }
+                | Self::ClearGroupTransformGizmoTarget { .. }
                 | Self::TriggerCollisionScore
                 | Self::TriggerRefreshGarden
                 | Self::ClearTemporalEventTrack
@@ -8322,6 +8374,53 @@ mod protocol_tests {
             Some("master:transform:rotation_deg")
         );
 
+        let group_first: WebAction = serde_json::from_str(
+            r#"{"action":"set_group_transform","group_id":"23","param":"position_x","value":0.25,"composition_revision":9}"#,
+        )
+        .unwrap();
+        let group_latest: WebAction = serde_json::from_str(
+            r#"{"action":"set_group_transform","group_id":"23","param":"position_x","value":0.75,"composition_revision":9}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &group_first,
+            WebAction::SetGroupTransform {
+                group_id,
+                param,
+                value,
+                composition_revision: 9,
+            } if group_id == "23" && param == "position_x" && value.as_f64() == Some(0.25)
+        ));
+        assert_eq!(
+            group_first.coalesce_key().as_deref(),
+            Some("creative:group:23:transform:position_x")
+        );
+        assert_eq!(group_first.coalesce_key(), group_latest.coalesce_key());
+
+        // The legacy generic spelling remains accepted, but transform fields
+        // share the canonical key with the dedicated family so old and new
+        // clients cannot reorder two values for the same destination.
+        let legacy_group_transform = WebAction::SetCompositionGroupParam {
+            group_id: "23".into(),
+            param: "position_x".into(),
+            value: serde_json::json!(0.5),
+            composition_revision: 9,
+        };
+        assert_eq!(
+            legacy_group_transform.coalesce_key(),
+            group_first.coalesce_key()
+        );
+        let legacy_group_opacity = WebAction::SetCompositionGroupParam {
+            group_id: "23".into(),
+            param: "opacity".into(),
+            value: serde_json::json!(0.5),
+            composition_revision: 9,
+        };
+        assert_eq!(
+            legacy_group_opacity.coalesce_key().as_deref(),
+            Some("creative:group:23:opacity")
+        );
+
         let first: WebAction = serde_json::from_str(
             r#"{"action":"set_layer_transform","index":2,"layer_id":"17","param":"position_x","value":0.25}"#,
         )
@@ -8344,6 +8443,67 @@ mod protocol_tests {
         assert_eq!(reset.coalesce_key(), None);
         assert_eq!(apply.coalesce_key(), None);
 
+        let group_reset = WebAction::ResetGroupTransform {
+            group_id: "23".into(),
+            composition_revision: 9,
+        };
+        let group_apply = WebAction::ApplyGroupTransform {
+            group_id: "23".into(),
+            transform: SpatialTransform::default(),
+            composition_revision: 9,
+        };
+        assert_eq!(group_reset.coalesce_key(), None);
+        assert_eq!(group_apply.coalesce_key(), None);
+        for action in [&group_first, &group_reset, &group_apply] {
+            assert!(
+                !action.is_priority(),
+                "transform values and ordered reset/apply mirror the ordinary layer family"
+            );
+            assert!(
+                !action.is_performance_only_for_history(),
+                "group transform authoring must enter manual history"
+            );
+        }
+        let group_target = WebAction::TargetGroupTransformGizmo {
+            group_id: "23".into(),
+            composition_revision: 9,
+        };
+        assert_eq!(group_target.coalesce_key(), None);
+        assert!(!group_target.is_priority());
+        assert!(group_target.is_performance_only_for_history());
+        let target_wire = serde_json::to_string(&group_target).unwrap();
+        assert!(target_wire.contains(r#""action":"target_group_transform_gizmo""#));
+        assert!(matches!(
+            serde_json::from_str::<WebAction>(&target_wire).unwrap(),
+            WebAction::TargetGroupTransformGizmo {
+                group_id,
+                composition_revision: 9,
+            } if group_id == "23"
+        ));
+        let clear_group_target = WebAction::ClearGroupTransformGizmoTarget {
+            composition_revision: 9,
+        };
+        assert_eq!(clear_group_target.coalesce_key(), None);
+        assert!(!clear_group_target.is_priority());
+        assert!(clear_group_target.is_performance_only_for_history());
+        assert_eq!(
+            serde_json::to_value(&clear_group_target).unwrap(),
+            serde_json::json!({
+                "action": "clear_group_transform_gizmo_target",
+                "composition_revision": 9,
+            })
+        );
+        assert!(matches!(
+            serde_json::from_value::<WebAction>(serde_json::json!({
+                "action": "clear_group_transform_gizmo_target",
+                "composition_revision": 9,
+            }))
+            .unwrap(),
+            WebAction::ClearGroupTransformGizmoTarget {
+                composition_revision: 9,
+            }
+        ));
+
         let mut coalesced = Vec::new();
         assert_eq!(
             enqueue_bounded(&mut coalesced, first.clone()),
@@ -8356,6 +8516,20 @@ mod protocol_tests {
         assert!(matches!(
             coalesced.as_slice(),
             [WebAction::SetLayerTransform { value, .. }] if value.as_f64() == Some(0.75)
+        ));
+
+        let mut group_coalesced = Vec::new();
+        assert_eq!(
+            enqueue_bounded(&mut group_coalesced, group_first.clone()),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(&mut group_coalesced, group_latest.clone()),
+            EnqueueOutcome::Coalesced
+        );
+        assert!(matches!(
+            group_coalesced.as_slice(),
+            [WebAction::SetGroupTransform { value, .. }] if value.as_f64() == Some(0.75)
         ));
 
         let mut ordered = Vec::new();
@@ -8372,6 +8546,42 @@ mod protocol_tests {
                 WebAction::ApplyLayerTransform { .. },
             ]
         ));
+
+        let mut group_ordered = Vec::new();
+        enqueue_bounded(&mut group_ordered, group_first);
+        enqueue_bounded(&mut group_ordered, group_reset);
+        enqueue_bounded(&mut group_ordered, group_latest);
+        enqueue_bounded(&mut group_ordered, group_apply);
+        assert!(matches!(
+            group_ordered.as_slice(),
+            [
+                WebAction::SetGroupTransform { .. },
+                WebAction::ResetGroupTransform { .. },
+                WebAction::SetGroupTransform { .. },
+                WebAction::ApplyGroupTransform { .. },
+            ]
+        ));
+
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_group_transform","group_id":"23","param":"position_x","value":0.5}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"reset_group_transform","group_id":"23"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"target_group_transform_gizmo","group_id":"23"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"clear_group_transform_gizmo_target"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"apply_group_transform","group_id":"23","transform":{}}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -8421,6 +8631,29 @@ mod protocol_tests {
         }
         assert_eq!(edited, sentinel);
 
+        for (param, value) in &edits {
+            let action = WebAction::SetGroupTransform {
+                group_id: u64::MAX.to_string(),
+                param: (*param).to_string(),
+                value: value.clone(),
+                composition_revision: u64::MAX,
+            };
+            let wire = serde_json::to_string(&action).unwrap();
+            let decoded: WebAction = serde_json::from_str(&wire).unwrap();
+            assert!(matches!(
+                decoded,
+                WebAction::SetGroupTransform {
+                    group_id,
+                    param: decoded_param,
+                    value: decoded_value,
+                    composition_revision,
+                } if group_id == u64::MAX.to_string()
+                    && decoded_param == *param
+                    && decoded_value == (*value).clone()
+                    && composition_revision == u64::MAX
+            ));
+        }
+
         let actions = [
             WebAction::ApplyMasterTransform {
                 transform: sentinel,
@@ -8431,6 +8664,11 @@ mod protocol_tests {
                 index: usize::MAX,
                 layer_id: Some("71".into()),
                 transform: sentinel,
+            },
+            WebAction::ApplyGroupTransform {
+                group_id: "91".into(),
+                transform: sentinel,
+                composition_revision: 17,
             },
         ];
         for action in actions {
@@ -8445,6 +8683,15 @@ mod protocol_tests {
                 } => {
                     assert_eq!(index, usize::MAX);
                     assert_eq!(layer_id.as_deref(), Some("71"));
+                    transform
+                }
+                WebAction::ApplyGroupTransform {
+                    group_id,
+                    transform,
+                    composition_revision,
+                } => {
+                    assert_eq!(group_id, "91");
+                    assert_eq!(composition_revision, 17);
                     transform
                 }
                 _ => panic!("atomic spatial action changed variant"),
@@ -8913,6 +9160,17 @@ mod protocol_tests {
             "action: 'set_layer_transform'",
             "action: 'reset_layer_transform'",
             "action: 'apply_layer_transform'",
+            "function groupTransformControlsHtml(group)",
+            "function currentCreativeGroup(card)",
+            "data-group-transform",
+            ".creative-group-transform",
+            "action: 'set_group_transform'",
+            "action: 'reset_group_transform'",
+            "action: 'apply_group_transform'",
+            "action: 'target_group_transform_gizmo'",
+            "transform-target-gizmo",
+            "composition_revision: compositionRevision",
+            "syncTransformPanel(card.querySelector('.creative-group-transform'), group.transform)",
             "...currentLayerSelector(card, layer, index)",
             "syncTransformPanel(card.querySelector('.layer-transform-body'), layer.transform)",
             "if (!control || !canSync(control)) return",
@@ -8925,6 +9183,33 @@ mod protocol_tests {
                 "missing transform JS contract: {contract}"
             );
         }
+        let quantizable = js
+            .split_once("const QUANTIZABLE_ACTIONS = new Set([")
+            .and_then(|(_, rest)| rest.split_once("]);"))
+            .map(|(actions, _)| actions)
+            .expect("quantizable action table");
+        assert!(quantizable.contains("'set_group_transform'"));
+        for ordered in [
+            "reset_group_transform",
+            "apply_group_transform",
+            "target_group_transform_gizmo",
+        ] {
+            assert!(
+                !quantizable.contains(ordered),
+                "ordered/session group action entered the beat latch: {ordered}"
+            );
+        }
+        assert_eq!(
+            html.matches("max=\"0.999755859375\"").count(),
+            4,
+            "master crop ranges must expose the engine's exact 1 - 1/4096 ceiling"
+        );
+        assert_eq!(
+            js.matches(", 0.999755859375, 0.000244140625, 0]").count(),
+            4,
+            "generated layer/group crop ranges must share the exact engine ceiling"
+        );
+        assert!(!html.contains("max=\"0.999\""));
         let master_targets = js
             .split_once("const MOD_TARGETS = [")
             .and_then(|(_, rest)| rest.split_once("];"))
