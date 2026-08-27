@@ -34,17 +34,17 @@ EXPECTED_TOOL = [{"vendor": "CycloneDX", "name": "cargo-cyclonedx", "version": "
 EXPECTED_TARGET_PROPERTY = [
     {"name": "cdx:rustc:sbom:target:triple", "value": "x86_64-pc-windows-msvc"}
 ]
-EXPECTED_TOP_COMPONENTS = 367
+EXPECTED_TOP_COMPONENTS = 359
 EXPECTED_TARGET_COMPONENTS = 6
-EXPECTED_REGISTRY_COMPONENTS = 365
+EXPECTED_REGISTRY_COMPONENTS = 357
 EXPECTED_GIT_COMPONENTS = 1
-EXPECTED_DEPENDENCY_ROWS = 368
-EXPECTED_DEPENDENCY_EDGES = 885
-EXPECTED_ROOT_EDGES = 36
+EXPECTED_DEPENDENCY_ROWS = 360
+EXPECTED_DEPENDENCY_EDGES = 856
+EXPECTED_ROOT_EDGES = 35
 EXPECTED_LOCAL_DECLARATIONS = 8
 EXPECTED_REWRITTEN_REFERENCES = 13
 EXPECTED_SEMANTIC_PROFILE_SHA256 = (
-    "1605dc0f7f64c42735728495f8a42f85cfb8613c9606311fbe58608a4841ce00"
+    "d8333dbde0a319d518a7461ee68d8e3617221ddbb0b47b99480c1b43ecd1942b"
 )
 SEMANTIC_SOURCE_PLACEHOLDER = "<exact-collide-o-scope-source-commit>"
 SEMANTIC_TIMESTAMP_PLACEHOLDER = "<exact-source-date-epoch>"
@@ -999,10 +999,17 @@ def fixture_document(
             for index, reference in enumerate(registry_refs)
         ],
     ]
+    root_registry_edges = EXPECTED_ROOT_EDGES - 2
+    if not 0 <= root_registry_edges <= len(registry_refs):
+        fail("SBOM fixture root-edge profile is impossible")
     dependencies: list[dict[str, Any]] = [
         {
             "ref": root_ref,
-            "dependsOn": [vendor_ref, target_refs[0], *registry_refs[:34]],
+            "dependsOn": [
+                vendor_ref,
+                target_refs[0],
+                *registry_refs[:root_registry_edges],
+            ],
         },
         {
             "ref": vendor_ref,
@@ -1011,8 +1018,12 @@ def fixture_document(
     ]
     remaining_rows = [git_ref, *registry_refs]
     nonlocal_pool = [git_ref, *registry_refs]
+    base_edges = EXPECTED_ROOT_EDGES + 3 + 2 * len(remaining_rows)
+    three_edge_rows = EXPECTED_DEPENDENCY_EDGES - base_edges
+    if not 0 <= three_edge_rows <= len(remaining_rows):
+        fail("SBOM fixture dependency-edge profile is impossible")
     for row_index, reference in enumerate(remaining_rows):
-        wanted = 3 if row_index < 114 else 2
+        wanted = 3 if row_index < three_edge_rows else 2
         edges: list[str] = []
         cursor = row_index + 1
         while len(edges) < wanted:
