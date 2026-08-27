@@ -4,8 +4,7 @@ Date prepared: 2026-08-27
 Topic: `feat/maintenance-ntsc-rs`
 Pinned integration base:
 `48d85ea943069dbcec7c718d42daeac025da4547`
-Status: **compatibility STOP and full gate complete on topic; integration and
-exact-commit CI pending**
+Status: **integrated compatibility STOP; exact-commit CI green on rerun**
 
 This is the §3.8(c) maintenance tranche. It reviews every commit between the
 shipping ntsc-rs pin and upstream `main`, freezes the application-visible
@@ -136,9 +135,16 @@ absent and was not minted.
 - Disposition: **EVIDENCE-BACKED COMPATIBILITY STOP**
 - Topic oracle commit: **`6723f97`**
 - Topic evidence commit: **`2b4d8ae`**
-- Topic receipt commit: **PENDING**
-- Integration commit on `feat/web-control-panel`: **PENDING**
-- Exact-commit CI: **PENDING**
+- Topic receipt commit: **`c51510a31b2c54d90f6825087026b50a65209def`**
+- Integration commit on `feat/web-control-panel`:
+  **`a5b0de1584ca0cad95895577c384a06915ae2047`**
+- Exact-commit CI: **OBSERVED PASS** —
+  [run 33060694392, attempt 2](https://github.com/Spacejunk-io/collide-o-scope/actions/runs/33060694392/attempts/2)
+  passed at exact head `a5b0de1584ca0cad95895577c384a06915ae2047`:
+  dependency policy in 35 seconds, Linux 24.04 in 540 seconds, macOS 15 in
+  626 seconds, and Windows VS 2022 in 991 seconds. Attempt 1 was cancelled by
+  the later GPU/UI integration push; it was not counted as green and this
+  explicit rerun supplies the exact-head receipt.
 - CI-form six-command gate: **OBSERVED PASS** — formatting and both JavaScript
   parsers; all-target/all-feature compile; 2,148 tests passed with zero
   failures and 163 explicitly ignored tests; all six benchmark probes

@@ -143,7 +143,7 @@ absent and was not minted.
 
 - Disposition: **EVIDENCE-BACKED STOP**
 - Topic evidence commit: **`fe06fdd`**
-- Topic receipt commit: **PENDING**
+- Topic receipt commit: **`7e47d238fbec62184e1f9e4924105862af996101`**
 - Integration commit on `feat/web-control-panel`: **PENDING**
 - Exact-commit CI: **PENDING**
 - CI-form six-command gate: **OBSERVED PASS** — fresh rerun completed with
