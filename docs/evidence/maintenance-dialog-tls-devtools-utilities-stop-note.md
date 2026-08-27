@@ -1,8 +1,11 @@
 # Dialog, TLS, developer-tool, and utility maintenance — evidence-backed STOP
 
-Date prepared: 2026-08-27  
-Topic: `docs/maintenance-dialog-tls-devtools-utilities-stop`  
-Pinned audit base: `05c8d6cd399843236ea393e15f41a74d4b793913`  
+Date prepared: 2026-08-27
+
+Topic: `docs/maintenance-dialog-tls-devtools-utilities-stop`
+
+Pinned audit base: `05c8d6cd399843236ea393e15f41a74d4b793913`
+
 Current integration base: `7fd0221a66d7ed8d87994eb91bf833e40e4fad1c`
 
 Status: **STOP — retain rfd 0.15.4, rcgen 0.13.2, criterion 0.7.0,
