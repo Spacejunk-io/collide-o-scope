@@ -113,9 +113,12 @@ remained absent and was not minted.
 ## Closing fields
 
 - Topic evidence commit: **`a25a55c`**
-- Topic receipt commit: **PENDING**
-- Integration commit on `feat/web-control-panel`: **PENDING**
-- Exact-commit CI: **PENDING**
+- Topic receipt commit: **`176cd65`**
+- Integration commit on `feat/web-control-panel`: **`7e79ed7`**
+- Exact-commit CI: **OBSERVED PASS** —
+  [run 33050176909](https://github.com/Spacejunk-io/collide-o-scope/actions/runs/33050176909)
+  passed at exact head `7e79ed7` across Linux 24.04, macOS 15, Windows
+  VS 2022, and dependency policy
 - Hosted full gate: **OBSERVED PASS** — the exact six-command CI-form gate
   passed: formatting and both JavaScript parsers; all-target/all-feature
   compile; 2,143 tests passed with zero failures and 163 explicitly ignored

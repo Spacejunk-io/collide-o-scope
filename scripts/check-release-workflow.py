@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import hashlib
 import re
 from pathlib import Path
@@ -48,9 +49,598 @@ REVIEWED_RELEASE_VERIFIER_SHA256 = (
     "904cfa1fac528996daca88ac17799cf0a1f06652cb621a26f6f477f4207801a4"
 )
 
+CHECKOUT_ACTION = (
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1"
+)
+CACHE_ACTION = (
+    "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0"
+)
+COSIGN_INSTALLER_ACTION = (
+    "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2"
+)
+ATTEST_BUILD_PROVENANCE_ACTION = (
+    "actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0"
+)
+UPLOAD_ARTIFACT_ACTION = (
+    "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2"
+)
+EXPECTED_WORKFLOW_ACTIONS = {
+    "adversarial.yml": Counter({CHECKOUT_ACTION: 2, CACHE_ACTION: 2}),
+    "ci.yml": Counter({CHECKOUT_ACTION: 2, CACHE_ACTION: 4}),
+    "release-trust.yml": Counter(
+        {
+            CHECKOUT_ACTION: 5,
+            CACHE_ACTION: 1,
+            COSIGN_INSTALLER_ACTION: 2,
+            ATTEST_BUILD_PROVENANCE_ACTION: 2,
+            UPLOAD_ARTIFACT_ACTION: 1,
+        }
+    ),
+}
+PINNED_WORKFLOW_ACTION = re.compile(
+    r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40} # v[0-9]+\.[0-9]+\.[0-9]+"
+)
+COSIGN_RELEASE = "v3.1.3"
+COSIGN_GIT_COMMIT = "11926fa5bbbbde47e88fc006b625a17769b743b2"
+COSIGN_WINDOWS_AMD64_SHA256 = (
+    "9fe59be0eca1271873ce019061335eb1ac419b7059202e797828467ddabe33be"
+)
+SIGSTORE_BUNDLE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle.v0.3+json"
+COSIGN_CERTIFICATE_ISSUER_ARGUMENT = (
+    "--certificate-oidc-issuer https://token.actions.githubusercontent.com"
+)
+COSIGN_CERTIFICATE_IDENTITY_ARGUMENT = (
+    '--certificate-identity "https://github.com/${{ github.repository }}/'
+    '.github/workflows/release-trust.yml@${{ github.ref }}"'
+)
+NATIVE_EXIT_GUARD = "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+REVIEWED_COSIGN_SIGNING_STEP_SHA256 = {
+    "Keyless-sign the checksum manifest": (
+        "e072709fd7b936f7292f6a36f7edaded72c019ab0a2e3ce6af62bf4bbe52b98a"
+    ),
+    "Keyless-sign the frozen final-release receipt": (
+        "d98a46ebddb7db0334b3278921e59453fb7ae03d162d19c77b880d047b6a201a"
+    ),
+}
+COSIGN_INSTALLER_STEP = f"""      - name: Install pinned cosign
+        uses: {COSIGN_INSTALLER_ACTION}
+        with:
+          cosign-release: {COSIGN_RELEASE}"""
+COSIGN_IDENTITY_STEP = f"""      - name: Verify pinned cosign identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cosign = Get-Command cosign -CommandType Application -ErrorAction Stop
+          $actualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $cosign.Source).Hash.ToLowerInvariant()
+          $expectedSha256 = "{COSIGN_WINDOWS_AMD64_SHA256}"
+          if ($actualSha256 -cne $expectedSha256) {{
+            throw "Installed cosign SHA-256 did not match the pinned Windows amd64 artifact"
+          }}
+          $versionJson = & $cosign.Source version --json
+          {NATIVE_EXIT_GUARD}
+          $version = $versionJson | ConvertFrom-Json
+          if (
+            $version.gitVersion -cne "{COSIGN_RELEASE}" -or
+            $version.gitCommit -cne "{COSIGN_GIT_COMMIT}" -or
+            $version.gitTreeState -cne "clean" -or
+            $version.platform -cne "windows/amd64"
+          ) {{
+            throw "Installed cosign version identity did not match the pinned release"
+          }}"""
+
 
 def fail(message: str) -> None:
     raise ValueError(message)
+
+
+def workflow_action_values(workflow: str) -> list[str]:
+    values = []
+    in_named_step = False
+    block_scalar_indent: int | None = None
+    block_scalar_header = re.compile(
+        r"^(?P<indent> *)(?:-\s+)?"
+        r'''(?:[A-Za-z0-9_.-]+|"(?:\\.|[^"])*"|'(?:''|[^'])*'):\s*'''
+        r"[|>](?:[1-9][+-]?|[+-][1-9]?)?\s*(?:#.*)?$"
+    )
+    named_step = re.compile(r"^      - name:\s*[^\r\n]+?\s*$")
+    action_like = re.compile(
+        r'''^ *(?:-\s+)?(?:uses|"uses"|'uses'):\s*'''
+        r"(?P<value>[^\r\n]+?)\s*$"
+    )
+    canonical_action = re.compile(r"^        uses:\s*(?P<value>[^\r\n]+?)\s*$")
+    for line in workflow.splitlines():
+        stripped = line.lstrip(" ")
+        indent = len(line) - len(stripped)
+        if block_scalar_indent is not None:
+            if not stripped or stripped.startswith("#"):
+                continue
+            if indent > block_scalar_indent:
+                continue
+            block_scalar_indent = None
+        if named_step.fullmatch(line) is not None:
+            in_named_step = True
+            continue
+        if stripped and not stripped.startswith("#") and indent <= 6:
+            in_named_step = False
+        match = action_like.fullmatch(line)
+        if match is not None:
+            canonical = canonical_action.fullmatch(line)
+            if canonical is None or not in_named_step:
+                fail(
+                    "workflow action uses must be an unquoted eight-space key "
+                    "inside a canonical named step"
+                )
+            values.append(canonical.group("value"))
+            continue
+        header = block_scalar_header.fullmatch(line)
+        if header is not None:
+            block_scalar_indent = len(header.group("indent"))
+    return values
+
+
+def validate_pinned_workflow_actions(workflows: dict[str, str]) -> None:
+    if set(workflows) != set(EXPECTED_WORKFLOW_ACTIONS):
+        fail("reviewed workflow inventory differs from the exact expected set")
+    for name, expected in EXPECTED_WORKFLOW_ACTIONS.items():
+        values = workflow_action_values(workflows[name])
+        if any(PINNED_WORKFLOW_ACTION.fullmatch(value) is None for value in values):
+            fail(
+                f"every {name} action must use a full lowercase commit SHA and "
+                "its exact reviewed version comment"
+            )
+        if Counter(values) != expected:
+            fail(f"{name} action pins or occurrence counts differ from review")
+
+
+def self_test_pinned_workflow_actions(workflows: dict[str, str]) -> None:
+    validate_pinned_workflow_actions(workflows)
+
+    def changed(name: str, text: str) -> dict[str, str]:
+        mutation = dict(workflows)
+        mutation[name] = text
+        return mutation
+
+    adversarial = workflows["adversarial.yml"]
+    ci = workflows["ci.yml"]
+    checkout_line = f"        uses: {CHECKOUT_ACTION}"
+    cache_line = f"        uses: {CACHE_ACTION}"
+    checkout_step = f"""      - name: Check out source
+{checkout_line}"""
+    run_block_spoof = f"""      - name: Check out source
+        run: |
+          uses: {CHECKOUT_ACTION}"""
+    quoted_run_block_spoof = f'''      - name: Check out source
+        "run": |
+          uses: {CHECKOUT_ACTION}'''
+    env_spoof = f'''      - name: Check out source
+        env:
+          uses: {CHECKOUT_ACTION}
+        run: echo "$env:uses"'''
+    quoted_action = f'''      - name: Check out source
+        "uses": {CHECKOUT_ACTION}'''
+    hostile = [
+        changed("adversarial.yml", adversarial.replace(checkout_line + "\n", "", 1)),
+        changed(
+            "adversarial.yml",
+            adversarial.replace(checkout_step, run_block_spoof, 1),
+        ),
+        changed(
+            "adversarial.yml",
+            adversarial.replace(checkout_step, quoted_run_block_spoof, 1),
+        ),
+        changed(
+            "adversarial.yml",
+            adversarial.replace(checkout_step, env_spoof, 1),
+        ),
+        changed(
+            "adversarial.yml",
+            adversarial.replace(checkout_step, quoted_action, 1),
+        ),
+        changed(
+            "adversarial.yml",
+            adversarial.replace(cache_line, cache_line + "\n" + cache_line, 1),
+        ),
+        changed(
+            "adversarial.yml",
+            adversarial.replace(
+                "3d3c42e5aac5ba805825da76410c181273ba90b1",
+                "3d3c42e5aac5ba805825da76410c181273ba90b0",
+                1,
+            ),
+        ),
+        changed(
+            "adversarial.yml",
+            adversarial.replace("# v7.0.1", "# v7.0.0", 1),
+        ),
+        changed(
+            "adversarial.yml",
+            adversarial
+            + "\n        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v6.0.0\n",
+        ),
+    ]
+    moved = dict(workflows)
+    moved["adversarial.yml"] = adversarial.replace(checkout_line + "\n", "", 1)
+    moved["ci.yml"] = ci.replace(checkout_line, checkout_line + "\n" + checkout_line, 1)
+    hostile.append(moved)
+    for mutation in hostile:
+        if mutation == workflows:
+            fail("workflow-action self-test fixture is absent")
+        try:
+            validate_pinned_workflow_actions(mutation)
+        except ValueError:
+            pass
+        else:
+            fail("workflow-action hostile mutation escaped the policy gate")
+
+
+def workflow_named_step_blocks(workflow: str, name: str) -> list[str]:
+    matches = list(re.finditer(r"(?m)^      - name: ([^\r\n]+)\s*$", workflow))
+    blocks = []
+    for index, match in enumerate(matches):
+        if match.group(1) != name:
+            continue
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(workflow)
+        blocks.append(workflow[match.start() : end].rstrip())
+    return blocks
+
+
+def cosign_command_blocks(workflow: str) -> list[tuple[str, str, bool]]:
+    lines = workflow.splitlines()
+    commands = []
+    index = 0
+    while index < len(lines):
+        match = re.match(
+            r"^cosign (sign|verify)-blob(?:\s|$)", lines[index].strip()
+        )
+        if match is None:
+            index += 1
+            continue
+        kind = match.group(1)
+        command_lines = [lines[index].strip()]
+        end = index
+        while command_lines[-1].endswith("`") and end + 1 < len(lines):
+            end += 1
+            command_lines.append(lines[end].strip())
+        following = end + 1
+        while following < len(lines) and not lines[following].strip():
+            following += 1
+        guarded = (
+            following < len(lines) and lines[following].strip() == NATIVE_EXIT_GUARD
+        )
+        commands.append((kind, "\n".join(command_lines), guarded))
+        index = end + 1
+    return commands
+
+
+def cosign_command_tokens(command: str) -> list[str]:
+    def without_unquoted_comment(line: str) -> str:
+        result = []
+        quote: str | None = None
+        index = 0
+        while index < len(line):
+            character = line[index]
+            if character == "`" and quote != "'" and index + 1 < len(line):
+                result.extend((character, line[index + 1]))
+                index += 2
+                continue
+            if quote == "'":
+                if character == "'" and index + 1 < len(line) and line[index + 1] == "'":
+                    result.extend((character, line[index + 1]))
+                    index += 2
+                    continue
+                if character == "'":
+                    quote = None
+            elif quote == '"':
+                if character == '"':
+                    quote = None
+            elif character in ("'", '"'):
+                quote = character
+            elif character == "#":
+                break
+            result.append(character)
+            index += 1
+        return "".join(result)
+
+    command = "\n".join(
+        without_unquoted_comment(line) for line in command.splitlines()
+    )
+    command = re.sub(r"`\s*\n\s*", " ", command)
+    return re.findall(r'''"(?:`.|[^"])*"|'(?:''|[^'])*'|\S+''', command)
+
+
+def cosign_option_operand(tokens: list[str], option: str) -> str | None:
+    positions = [index for index, token in enumerate(tokens) if token == option]
+    if len(positions) != 1:
+        return None
+    position = positions[0]
+    if position + 1 >= len(tokens) or tokens[position + 1].startswith("--"):
+        return None
+    return tokens[position + 1]
+
+
+def validate_cosign_trust_policy(release: str) -> None:
+    forbidden = (
+        "--new-bundle-format=false",
+        "--insecure-ignore-tlog",
+        "--insecure-ignore-sct",
+        "--certificate-identity-regexp",
+        "--certificate-oidc-issuer-regexp",
+    )
+    if any(value in release for value in forbidden):
+        fail("Cosign trust policy contains a forbidden legacy or insecure option")
+
+    installers = workflow_named_step_blocks(release, "Install pinned cosign")
+    identity_proofs = workflow_named_step_blocks(
+        release, "Verify pinned cosign identity"
+    )
+    if (
+        installers != [COSIGN_INSTALLER_STEP, COSIGN_INSTALLER_STEP]
+        or identity_proofs != [COSIGN_IDENTITY_STEP, COSIGN_IDENTITY_STEP]
+        or release.count(COSIGN_INSTALLER_STEP + "\n\n" + COSIGN_IDENTITY_STEP) != 2
+    ):
+        fail("both Cosign installations must be followed by the exact binary proof")
+
+    commands = cosign_command_blocks(release)
+    sign_commands = [command for command in commands if command[0] == "sign"]
+    verify_commands = [command for command in commands if command[0] == "verify"]
+    if len(sign_commands) != 2 or len(verify_commands) != 5:
+        fail("release trust must contain exactly two sign-blob and five verify-blob calls")
+    issuer_tokens = cosign_command_tokens(COSIGN_CERTIFICATE_ISSUER_ARGUMENT)
+    identity_tokens = cosign_command_tokens(COSIGN_CERTIFICATE_IDENTITY_ARGUMENT)
+    if len(issuer_tokens) != 2 or len(identity_tokens) != 2:
+        fail("internal Cosign identity policy is malformed")
+    for kind, command, guarded in commands:
+        tokens = cosign_command_tokens(command)
+        if cosign_option_operand(tokens, "--bundle") is None or not guarded:
+            fail(f"every Cosign {kind}-blob call must use one bundle and fail immediately")
+        if kind == "sign":
+            if tokens.count("--yes") != 1:
+                fail("every Cosign sign-blob call must remain explicitly non-interactive")
+            continue
+        if (
+            cosign_option_operand(tokens, issuer_tokens[0]) != issuer_tokens[1]
+            or cosign_option_operand(tokens, identity_tokens[0])
+            != identity_tokens[1]
+        ):
+            fail("every Cosign verification must bind the exact workflow identity and issuer")
+
+    signing_steps = {
+        "Keyless-sign the checksum manifest": (
+            "$checksumBundle",
+            "Checksum signature bundle mediaType did not match the pinned schema",
+        ),
+        "Keyless-sign the frozen final-release receipt": (
+            "$bundleDocument",
+            "Final receipt signature bundle mediaType did not match the pinned schema",
+        ),
+    }
+    media_assertions = 0
+    for step_name, (media_variable, failure_message) in signing_steps.items():
+        blocks = workflow_named_step_blocks(release, step_name)
+        if len(blocks) != 1:
+            fail(f"Cosign signing step {step_name!r} is not unique")
+        block = blocks[0]
+        if (
+            hashlib.sha256(block.encode()).hexdigest()
+            != REVIEWED_COSIGN_SIGNING_STEP_SHA256[step_name]
+        ):
+            fail(f"Cosign signing step {step_name!r} differs from its reviewed body")
+        block_commands = cosign_command_blocks(block)
+        if [command[0] for command in block_commands] != ["sign", "verify"]:
+            fail(f"{step_name} must sign, inspect the bundle, then verify")
+        sign_command = block_commands[0][1]
+        bundle_path = cosign_option_operand(
+            cosign_command_tokens(sign_command), "--bundle"
+        )
+        if bundle_path is None:
+            fail(f"{step_name} does not name its signed bundle")
+        media_guard = (
+            f"          {media_variable} = Get-Content -Raw -LiteralPath "
+            f"{bundle_path} | ConvertFrom-Json\n"
+            f"          if ({media_variable}.mediaType -cne "
+            f'"{SIGSTORE_BUNDLE_MEDIA_TYPE}") {{\n'
+            f'            throw "{failure_message}"\n'
+            "          }"
+        )
+        if block.count(media_guard) != 1:
+            fail(f"{step_name} must directly parse and reject a wrong bundle media type")
+        verify_bundle_path = cosign_option_operand(
+            cosign_command_tokens(block_commands[1][1]), "--bundle"
+        )
+        if verify_bundle_path != bundle_path:
+            fail(f"{step_name} does not verify the exact emitted bundle")
+        sign_position = re.search(r"(?m)^ *cosign sign-blob(?:\s|$)", block)
+        verify_position = re.search(r"(?m)^ *cosign verify-blob(?:\s|$)", block)
+        media_position = block.find(media_guard)
+        if sign_position is None or verify_position is None:
+            fail(f"{step_name} does not contain executable sign and verify commands")
+        assignments = list(
+            re.finditer(
+                rf"(?mi)^ *{re.escape(media_variable)}\s*=",
+                block[: verify_position.start()],
+            )
+        )
+        if len(assignments) != 1 or assignments[0].start() != media_position:
+            fail(f"{step_name} can overwrite its parsed bundle before verification")
+        media_assertions += 1
+        positions = (
+            sign_position.start(),
+            media_position,
+            verify_position.start(),
+        )
+        if positions != tuple(sorted(positions)) or len(set(positions)) != 3:
+            fail(f"{step_name} does not inspect its bundle between signing and verification")
+    if media_assertions != 2 or release.count(SIGSTORE_BUNDLE_MEDIA_TYPE) != 2:
+        fail("both and only both signing steps must pin the standardized bundle media type")
+
+
+def self_test_cosign_trust_policy(release: str) -> None:
+    validate_cosign_trust_policy(release)
+    first_sign = "cosign sign-blob --yes --bundle"
+    first_verify = "cosign verify-blob `"
+    checksum_sign = (
+        "          cosign sign-blob --yes --bundle "
+        "release\\SHA256SUMS.sigstore.json release\\SHA256SUMS\n"
+        f"          {NATIVE_EXIT_GUARD}"
+    )
+    checksum_media_type = f'''          $checksumBundle = Get-Content -Raw -LiteralPath release\\SHA256SUMS.sigstore.json | ConvertFrom-Json
+          if ($checksumBundle.mediaType -cne "{SIGSTORE_BUNDLE_MEDIA_TYPE}") {{
+            throw "Checksum signature bundle mediaType did not match the pinned schema"
+          }}'''
+    checksum_throw = (
+        'throw "Checksum signature bundle mediaType did not match the pinned schema"'
+    )
+
+    def comment_first_command(text: str, prefix: str) -> str:
+        lines = text.splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            if not line.strip().startswith(prefix):
+                continue
+            while True:
+                content = lines[index].rstrip("\r\n")
+                newline = lines[index][len(content) :]
+                indent = content[: len(content) - len(content.lstrip())]
+                continued = content.rstrip().endswith("`")
+                lines[index] = f"{indent}# {content.lstrip()}{newline}"
+                if not continued:
+                    return "".join(lines)
+                index += 1
+        fail("Cosign commented-command self-test fixture is absent")
+
+    hostile = [
+        release.replace(COSIGN_IDENTITY_STEP, "", 1),
+        release.replace(COSIGN_WINDOWS_AMD64_SHA256, "0" * 64, 1),
+        release.replace('gitVersion -cne "v3.1.3"', 'gitVersion -cne "v3.1.2"', 1),
+        release.replace(COSIGN_GIT_COMMIT, "0" * 40, 1),
+        release.replace('gitTreeState -cne "clean"', 'gitTreeState -cne "dirty"', 1),
+        release.replace('platform -cne "windows/amd64"', 'platform -cne "linux/amd64"', 1),
+        release.replace("cosign-release: v3.1.3", "cosign-release: v3.1.2", 1),
+        release.replace(first_sign, "cosign sign-blob --yes", 1),
+        release.replace(first_sign, "cosign sign-blob --yes=false --bundle", 1),
+        release.replace(first_sign, "cosign sign-blob --yes --bundle-path", 1),
+        release.replace(first_verify, "cosign version `", 1),
+        comment_first_command(release, first_verify),
+        release.replace(
+            "--bundle release\\SHA256SUMS.sigstore.json `",
+            "--signature release\\SHA256SUMS.sigstore.json `",
+            1,
+        ),
+        release.replace(
+            "--bundle release\\SHA256SUMS.sigstore.json `",
+            "--bundle-path release\\SHA256SUMS.sigstore.json `",
+            1,
+        ),
+        release.replace(
+            "--bundle release\\SHA256SUMS.sigstore.json `",
+            "# --bundle release\\SHA256SUMS.sigstore.json `",
+            1,
+        ),
+        release.replace(
+            "--bundle release\\SHA256SUMS.sigstore.json `",
+            "--bundle release\\WRONG.sigstore.json `",
+            1,
+        ),
+        release.replace(
+            COSIGN_CERTIFICATE_ISSUER_ARGUMENT,
+            "--certificate-oidc-issuer https://issuer.invalid",
+            1,
+        ),
+        release.replace(
+            COSIGN_CERTIFICATE_IDENTITY_ARGUMENT,
+            '--certificate-identity "https://github.com/acme/other/.github/workflows/release-trust.yml@${{ github.ref }}"',
+            1,
+        ),
+        release.replace(
+            COSIGN_CERTIFICATE_IDENTITY_ARGUMENT,
+            "# " + COSIGN_CERTIFICATE_IDENTITY_ARGUMENT,
+            1,
+        ),
+        release.replace("--certificate-identity ", "--certificate-identity-regexp ", 1),
+        release.replace("--certificate-oidc-issuer ", "--certificate-oidc-issuer-regexp ", 1),
+        release.replace(SIGSTORE_BUNDLE_MEDIA_TYPE, "application/example+json", 1),
+        release.replace(
+            'throw "Checksum signature bundle mediaType did not match the pinned schema"',
+            'Write-Warning "Checksum signature bundle mediaType did not match the pinned schema"',
+            1,
+        ),
+        release.replace(
+            'throw "Final receipt signature bundle mediaType did not match the pinned schema"',
+            'Write-Warning "Final receipt signature bundle mediaType did not match the pinned schema"',
+            1,
+        ),
+        release.replace(
+            checksum_throw,
+            f"if ($true) {{\n              {checksum_throw}\n            }}",
+            1,
+        ),
+        release.replace(
+            checksum_throw,
+            f'''try {{
+              {checksum_throw}
+            }} catch {{
+              Write-Warning "Swallowed media-type failure"
+            }}''',
+            1,
+        ),
+        release.replace(
+            checksum_media_type,
+            checksum_media_type
+            + '\n          $checksumBundle = [pscustomobject]@{ mediaType = "trusted" }',
+            1,
+        ),
+        release.replace(
+            checksum_media_type,
+            "          if ($false) {\n"
+            + "  "
+            + checksum_media_type.replace("\n", "\n  ")
+            + "\n          }",
+            1,
+        ),
+        release.replace(
+            first_sign,
+            "cosign sign-blob --new-bundle-format=false --yes --bundle",
+            1,
+        ),
+        release.replace(
+            first_verify, "cosign verify-blob --insecure-ignore-tlog `", 1
+        ),
+        release.replace(
+            first_verify, "cosign verify-blob --insecure-ignore-sct `", 1
+        ),
+        release.replace(
+            checksum_sign,
+            checksum_sign + "\n" + checksum_sign,
+            1,
+        ),
+        release.replace(
+            checksum_sign + "\n" + checksum_media_type,
+            checksum_media_type + "\n" + checksum_sign,
+            1,
+        ),
+    ]
+    guarded_sign = re.search(
+        rf"(?m)^(?P<indent>\s*)cosign sign-blob[^\r\n]*\r?\n"
+        rf"(?P=indent){re.escape(NATIVE_EXIT_GUARD)}\r?\n",
+        release,
+    )
+    if guarded_sign is None:
+        fail("Cosign native-guard self-test fixture is absent")
+    hostile.append(
+        release[: guarded_sign.start()]
+        + guarded_sign.group(0).splitlines()[0]
+        + "\n"
+        + release[guarded_sign.end() :]
+    )
+
+    for mutation in hostile:
+        if mutation == release:
+            fail("Cosign trust self-test fixture is absent")
+        try:
+            validate_cosign_trust_policy(mutation)
+        except ValueError:
+            pass
+        else:
+            fail("Cosign trust hostile mutation escaped the policy gate")
 
 
 def ci_job_section(workflow: str, job_id: str) -> tuple[int, int, str]:
@@ -2540,6 +3130,7 @@ def main() -> int:
         self_test_release_checkout_isolation_and_pretag(release)
         self_test_unequal_reproducibility_workflow(release)
         self_test_reproducible_sbom_workflow(release)
+        self_test_cosign_trust_policy(release)
         sbom_policy = (ROOT / "scripts/cyclonedx_sbom.py").read_text(
             encoding="utf-8"
         )
@@ -2569,22 +3160,16 @@ def main() -> int:
             encoding="utf-8"
         )
         self_test_required_workflow_transport(workflow_gate)
-        workflows = "\n".join(
-            path.read_text(encoding="utf-8")
-            for path in sorted((ROOT / ".github/workflows").glob("*.yml"))
+        workflow_root = ROOT / ".github/workflows"
+        workflow_paths = sorted(
+            [*workflow_root.glob("*.yml"), *workflow_root.glob("*.yaml")]
         )
-        mutable = re.findall(r"^\s*uses:\s*([^\s#]+)", workflows, re.MULTILINE)
-        if any(not re.search(r"@[0-9a-f]{40}$", value) for value in mutable):
-            fail("every workflow action must use a full lowercase commit SHA")
-        expected_actions = {
-            "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
-            "actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830",
-            "sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5",
-            "actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a",
-            "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+        workflow_documents = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in workflow_paths
         }
-        if set(mutable) != expected_actions:
-            fail("workflow action pins differ from the reviewed immutable set")
+        self_test_pinned_workflow_actions(workflow_documents)
+        workflows = "\n".join(workflow_documents.values())
         expected_tools = [
             "(?m)^cargo-auditable v0\\.7\\.5:$",
             '(cargo install --list) -join "`n"',
@@ -2967,7 +3552,7 @@ def main() -> int:
             signing_body,
         ):
             fail("checksum signing commands do not fail immediately on native errors")
-        if release.count("cosign-release: v2.6.5") != 2:
+        if release.count("cosign-release: v3.1.3") != 2:
             fail("both signing and redownload jobs must pin the cosign binary")
         if (
             release.count("actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a") != 2
