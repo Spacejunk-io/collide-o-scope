@@ -326,6 +326,7 @@ function connect() {
         syncRecovery(msg.recovery_available, msg.recovery_status);
         syncPatchSave(msg.patch_save_status || '');
         syncPatchLoad(msg.patch_load_status || '');
+        syncShowBundle(msg.show_bundle || {});
         syncModulation(msg.modulation);
         syncSnapshotBank(msg.morph);
         syncControlFilters(msg.modulation);
@@ -368,6 +369,7 @@ function connect() {
           syncRecovery(op.recovery_available, op.recovery_status);
           syncPatchSave(op.patch_save_status || '');
           syncPatchLoad(op.patch_load_status || '');
+          syncShowBundle(op.show_bundle || {});
           syncControllerRuntime(op.controller_runtime);
           syncOscRuntime(op.osc_runtime);
           syncSpout(op.spout);
@@ -6233,6 +6235,64 @@ function syncPatchLoad(status = '') {
   patchLoadStatus.className = String(status).startsWith('Error:')
     ? 'export-status error'
     : 'export-status success';
+}
+
+document.getElementById('bundle-export').addEventListener('click', () => {
+  if (!sendAction({ action: 'export_show_bundle' })) {
+    syncShowBundle({ status: 'Not connected' });
+  }
+});
+document.getElementById('bundle-preview').addEventListener('click', () => {
+  if (!sendAction({ action: 'preview_show_bundle' })) {
+    syncShowBundle({ status: 'Not connected' });
+  }
+});
+document.getElementById('bundle-import').addEventListener('click', () => {
+  sendAction({ action: 'confirm_show_bundle_import', load: false });
+});
+document.getElementById('bundle-import-load').addEventListener('click', () => {
+  sendAction({ action: 'confirm_show_bundle_import', load: true });
+});
+document.getElementById('bundle-cancel').addEventListener('click', () => {
+  sendAction({ action: 'cancel_show_bundle_import' });
+});
+
+function syncShowBundle(bundle = {}) {
+  const status = document.getElementById('bundle-status');
+  const pendingBox = document.getElementById('bundle-pending');
+  const summary = document.getElementById('bundle-pending-summary');
+  const list = document.getElementById('bundle-pending-entries');
+  if (!status || !pendingBox || !summary || !list) return;
+  const text = bundle.status || '';
+  status.textContent = text;
+  status.className = text.includes('rejected') || text === 'Not connected'
+    ? 'export-status error'
+    : 'export-status';
+  const pending = bundle.pending;
+  if (!pending) {
+    pendingBox.hidden = true;
+    list.textContent = '';
+    return;
+  }
+  pendingBox.hidden = false;
+  const patchDigest = String(pending.patch_sha256 || '').slice(0, 12);
+  summary.textContent = `${pending.path} — ${pending.entry_count} entries, ` +
+    `${pending.expanded_bytes} bytes expanded, patch ${patchDigest}…`;
+  list.textContent = '';
+  for (const entry of pending.entries || []) {
+    const item = document.createElement('li');
+    let line = `${entry.kind}: ${entry.logical_name} (${entry.byte_len} bytes`;
+    if (!entry.authoritative) line += ', non-authoritative';
+    if (entry.license) line += `, license: ${entry.license}`;
+    item.textContent = line + ')';
+    list.appendChild(item);
+  }
+  if (pending.entries_truncated) {
+    const item = document.createElement('li');
+    const shown = (pending.entries || []).length;
+    item.textContent = `… ${pending.entry_count - shown} more entries`;
+    list.appendChild(item);
+  }
 }
 
 let exportActive = false;

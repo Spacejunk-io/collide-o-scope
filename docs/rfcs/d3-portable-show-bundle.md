@@ -1,7 +1,13 @@
 # RFC D3 — portable verified `.cosbundle`
 
-Status: **version-1 deterministic core implemented; operator UI and the
-machine-A / clean-machine-B promotion fixture remain gated**.
+Status: **version-1 deterministic core and the operator UI implemented; the
+machine-A / clean-machine-B promotion fixture remains gated**. The operator
+surface landed in the follow-on tranche
+(`docs/evidence/d3-show-bundle-ui-note.md`): panel Export/Preview/Import
+controls over a wire action family, with the side-effect-free preview
+presented and explicitly confirmed before any import commits — exactly the
+requirement stated below. The capability stays deliberately unadvertised in
+the registry until the cross-machine reproduction receipt exists.
 
 The `COSBNDL\0` container version 1 contains a canonical JSON manifest and an
 uncompressed, contiguous payload. Entries include canonical hostile-round-trip
@@ -37,5 +43,6 @@ Promotion still requires machine-A export / clean-machine-B import plus the
 live-export reproduction fixture. The implemented core already covers missing,
 tamper, compressed/zip-bomb, duplicate, case-fold, traversal, symlink,
 short-read, one-byte-over, disk-full, cancel, crash, and final-name-race
-fixtures. The future operator surface must present the side-effect-free preview
-(total size, logical paths, licenses, roles) before commit.
+fixtures. The operator UI presents the side-effect-free preview (total size,
+logical paths, licenses, roles) before commit, and confirmation re-inspects
+the file and refuses a digest that moved since the preview.
