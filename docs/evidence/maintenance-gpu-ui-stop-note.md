@@ -119,10 +119,12 @@ absent and must not be minted as substitute evidence.
 ## Closing fields
 
 - Disposition: **EVIDENCE-BACKED STOP**
-- Topic evidence commit: **PENDING**
+- Topic evidence commit: **`52f2745`**
 - Topic receipt commit: **PENDING**
 - Integration commit on `feat/web-control-panel`: **PENDING**
 - Exact-commit CI: **PENDING**
+- CI-form six-command gate: **OBSERVED PASS** — 2,148 tests passed,
+  163 ignored external/physical seats, six benches green, clippy clean
 - Dependency/source mutation: **NONE**
 - Physical GPU/UI matrix: **NOT RUN — REQUIRED TO REOPEN**
 - Protected-root and `videos/audit.mp4` recheck: **OBSERVED PASS**
