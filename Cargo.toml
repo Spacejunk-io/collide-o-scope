@@ -27,8 +27,7 @@ serde_yaml = "0.9"
 unsafe-libyaml = "=0.2.11"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "macros", "fs", "io-util", "time"] }
-axum = { version = "0.7", features = ["ws"] }
-tower-http = { version = "0.5", features = ["fs"] }
+axum = { version = "0.8.9", features = ["ws"] }
 futures = "0.3"
 open = "5"
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png", "webp"] }
@@ -39,7 +38,7 @@ midir = "0.10"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 getrandom = "0.3"
 trash = "5"
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 rcgen = { version = "0.13", features = ["x509-parser"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -60,7 +59,7 @@ winresource = "0.1"
 criterion = "0.7"
 loom = "0.7"
 proptest = "1.7"
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29.0"
 
 [build-dependencies]
 sha2 = "0.10"

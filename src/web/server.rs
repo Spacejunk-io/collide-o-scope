@@ -51,6 +51,9 @@ const RESTART_BACKOFF: [Duration; 3] = [
     Duration::from_millis(250),
 ];
 const MAX_WS_MESSAGE_BYTES: usize = super::action_wire::MAX_WEB_ACTION_BYTES;
+// Axum 0.8's WebSocket default grew to 128 KiB. Browser actions are bounded to
+// a much smaller wire contract, so retain a modest per-connection allocation.
+const WS_READ_BUFFER_BYTES: usize = 8 * 1024;
 const MAX_LOGGED_MESSAGE_CHARS: usize = 256;
 const MAX_ACTION_VALUE_DEPTH: usize = 8;
 const MAX_ACTION_VALUE_NODES: usize = 512;
@@ -223,12 +226,12 @@ enum PreparedListener {
         role: ListenerRole,
         listener: TcpListener,
         router: Router,
-        handle: axum_server::Handle,
+        handle: axum_server::Handle<SocketAddr>,
     },
     Tls {
         listener: TcpListener,
         router: Router,
-        handle: axum_server::Handle,
+        handle: axum_server::Handle<SocketAddr>,
         config: axum_server::tls_rustls::RustlsConfig,
     },
 }
@@ -241,7 +244,7 @@ pub struct ControlServerHandle {
     state: Arc<WebState>,
     session: Arc<ControlSession>,
     local_url: Option<ControlAccessUrl>,
-    listeners: Vec<axum_server::Handle>,
+    listeners: Vec<axum_server::Handle<SocketAddr>>,
     stopping: Arc<AtomicBool>,
     finished: mpsc::Receiver<()>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -618,7 +621,7 @@ async fn run_listeners(
                         if crash_role == Some(role) {
                             panic!("injected listener task crash");
                         }
-                        axum_server::from_tcp(listener)
+                        axum_server::from_tcp(listener)?
                             .handle(handle)
                             .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                             .await
@@ -640,7 +643,7 @@ async fn run_listeners(
                         if crash_role == Some(ListenerRole::LanTls) {
                             panic!("injected listener task crash");
                         }
-                        axum_server::from_tcp_rustls(listener, config)
+                        axum_server::from_tcp_rustls(listener, config)?
                             .handle(handle)
                             .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                             .await
@@ -778,8 +781,8 @@ fn control_router(
     };
     Router::new()
         .route("/ws", get(ws_handler))
-        .route("/thumb/:filename", get(thumb_handler))
-        .route("/preview/:filename/:index", get(preview_handler))
+        .route("/thumb/{filename}", get(thumb_handler))
+        .route("/preview/{filename}/{index}", get(preview_handler))
         .route("/library-index", get(library_index_handler))
         .route("/qr.svg", get(qr_handler))
         .route(
@@ -3624,7 +3627,8 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<WebState>>) -> impl IntoResponse {
-    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+    ws.read_buffer_size(WS_READ_BUFFER_BYTES)
+        .max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
         .on_upgrade(|socket| handle_socket(socket, state))
 }
@@ -3668,7 +3672,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
         Arc::new(serde_json::to_string(&*current).unwrap_or_else(|_| "{}".to_string()))
     };
     if sender
-        .send(Message::Text(init_msg.as_ref().clone()))
+        .send(Message::Text(init_msg.as_ref().clone().into()))
         .await
         .is_err()
     {
@@ -3697,7 +3701,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
                     ack
                 }
             };
-            if sender.send(Message::Text(message)).await.is_err() {
+            if sender.send(Message::Text(message.into())).await.is_err() {
                 break;
             }
         }
@@ -4064,6 +4068,68 @@ mod tests {
                 .then(|| value.trim().split(';').next().unwrap().to_string())
             })
             .expect("authenticated query did not mint its listener cookie")
+    }
+
+    #[tokio::test]
+    async fn thumbnail_and_preview_routes_preserve_decoding_arity_and_cache_misses() {
+        let state = WebState::new().unwrap();
+        state
+            .thumbnails
+            .write()
+            .unwrap()
+            .insert("set final.mp4".to_string(), b"thumb-jpeg".to_vec());
+        state.preview_frames.write().unwrap().insert(
+            "set final.mp4".to_string(),
+            vec![b"preview-zero".to_vec(), b"preview-one".to_vec()],
+        );
+        let session = ControlSession::from_seed(FIRST_TEST_TOKEN.to_string()).unwrap();
+        let (address, server) = start_test_router(state, session, ListenerRole::LoopbackIpv4).await;
+
+        for (target, expected_body) in [
+            (
+                format!("/thumb/set%20final.mp4?key={FIRST_TEST_TOKEN}"),
+                "thumb-jpeg",
+            ),
+            (
+                format!("/preview/set%20final.mp4/1?key={FIRST_TEST_TOKEN}"),
+                "preview-one",
+            ),
+        ] {
+            let response = raw_http_get(address, &target, "").await;
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(headers.starts_with("HTTP/1.1 200"), "{target}: {headers}");
+            assert!(headers
+                .to_ascii_lowercase()
+                .contains("content-type: image/jpeg"));
+            assert_eq!(body, expected_body);
+        }
+
+        for target in [
+            format!("/thumb/missing.mp4?key={FIRST_TEST_TOKEN}"),
+            format!("/preview/set%20final.mp4/2?key={FIRST_TEST_TOKEN}"),
+            format!("/preview/set%20final.mp4?key={FIRST_TEST_TOKEN}"),
+            format!("/preview/set%20final.mp4/1/extra?key={FIRST_TEST_TOKEN}"),
+        ] {
+            let response = raw_http_get(address, &target, "").await;
+            assert!(
+                response_headers(&response).starts_with("HTTP/1.1 404"),
+                "{target}: {}",
+                response_headers(&response)
+            );
+        }
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn websocket_buffers_and_wire_frames_remain_bounded() {
+        assert_eq!(WS_READ_BUFFER_BYTES, 8 * 1024);
+        assert_eq!(
+            MAX_WS_MESSAGE_BYTES,
+            super::super::action_wire::MAX_WEB_ACTION_BYTES
+        );
+        assert!(WS_READ_BUFFER_BYTES <= MAX_WS_MESSAGE_BYTES);
     }
 
     #[test]
@@ -4528,6 +4594,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_reconnect_storm_retires_socket_state_and_keeps_fresh_snapshots() {
+        const CLIENTS: usize = 24;
+        const DIRTY_CLIENT: usize = 11;
+        const SENSOR_CLIENT: usize = 5;
+
+        let state = WebState::new().expect("test access token");
+        let session = ControlSession::from_seed(FIRST_TEST_TOKEN.to_string()).unwrap();
+        let (address, server) =
+            start_test_router(state.clone(), session.clone(), ListenerRole::LoopbackIpv4).await;
+        let baseline_receivers = state.tx.receiver_count();
+        assert_eq!(baseline_receivers, 0);
+
+        for client in 0..CLIENTS {
+            let mut request = format!("ws://{address}/ws?key={}", session.token.0)
+                .into_client_request()
+                .unwrap();
+            request.headers_mut().insert(
+                header::ORIGIN,
+                HeaderValue::from_str(&format!("http://{address}")).unwrap(),
+            );
+            let (mut socket, response) = tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio_tungstenite::connect_async(request),
+            )
+            .await
+            .expect("storm WebSocket upgrade timed out")
+            .expect("storm WebSocket upgrade");
+            assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !state.take_snapshot_request() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("storm client did not request a fresh full snapshot");
+            let expected = serde_json::json!({
+                "type": "state",
+                "storm_revision": client,
+            })
+            .to_string();
+            state.publish_serialized_snapshot(expected.clone());
+            let initial = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("storm initial state timed out")
+                .expect("storm server closed before initial state")
+                .expect("storm initial WebSocket frame");
+            let ClientMessage::Text(initial) = initial else {
+                panic!("expected storm initial text state");
+            };
+            assert_eq!(initial.as_str(), expected);
+
+            if client == SENSOR_CLIENT {
+                let queued_before = state.actions.lock().await.len();
+                for payload in [
+                    r#"{"action":"gyro_stream","enabled":true}"#,
+                    r#"{"action":"gyro","alpha":1.0,"beta":2.0,"gamma":3.0}"#,
+                    r#"{"action":"monitor_watch","enabled":true}"#,
+                ] {
+                    socket
+                        .send(ClientMessage::Text(payload.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if state.gyro_status().streamers == 1
+                            && state.monitor_watch_active()
+                            && state.actions.lock().await.len() > queued_before
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("sensor/watch declarations did not become live");
+            }
+
+            let dirty_queue_floor = if client == DIRTY_CLIENT {
+                let queued_before = state.actions.lock().await.len();
+                for payload in [
+                    r#"{"action":"begin_history_gesture","gesture_id":7311}"#,
+                    r#"{"action":"set_param","param":"brightness","value":0.625}"#,
+                ] {
+                    socket
+                        .send(ClientMessage::Text(payload.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while state.actions.lock().await.len() < queued_before + 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("dirty storm gesture did not cross the ingress barrier");
+                Some(queued_before)
+            } else {
+                None
+            };
+
+            // Deliberately omit the WebSocket close handshake. A discarded tab
+            // must retire every socket-owned registry entry and history owner.
+            drop(socket);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if state.tx.receiver_count() == baseline_receivers
+                        && state.gyro_status().streamers == 0
+                        && !state.monitor_watch_active()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("discarded storm client retained socket-owned state");
+
+            if let Some(queued_before) = dirty_queue_floor {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while state.actions.lock().await.len() < queued_before + 3 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("dirty storm disconnect did not queue its End barrier");
+                let queued = state.actions.lock().await;
+                assert!(queued.iter().skip(queued_before).any(|action| matches!(
+                    action.payload(),
+                    WebAction::EndHistoryGesture { gesture_id: 7311 }
+                )));
+                drop(queued);
+                assert!(state.begin_browser_history_gesture(99, 7399).await);
+                state.finish_browser_history_gesture(99, 7399).await;
+            }
+        }
+
+        assert_eq!(state.tx.receiver_count(), baseline_receivers);
+        assert_eq!(state.gyro_status().streamers, 0);
+        assert!(!state.monitor_watch_active());
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn authenticated_websocket_round_trip_dispatches_and_returns_authoritative_state() {
         let state = WebState::new().expect("test access token");
         let session = ControlSession::random().expect("test access token");
@@ -4575,7 +4787,7 @@ mod tests {
         assert_eq!(snapshot.msg_type, "state");
 
         socket
-            .send(ClientMessage::Text("{not-json".to_string()))
+            .send(ClientMessage::Text("{not-json".to_string().into()))
             .await
             .unwrap();
         let transport_refusal =
@@ -4597,7 +4809,8 @@ mod tests {
         socket
             .send(ClientMessage::Text(
                 r#"{"action":"set_proxy_settings","scale":"half","frame_rate":{"fixed":{"numerator":0,"denominator":1}},"include_audio":true}"#
-                    .to_string(),
+                    .to_string()
+                    .into(),
             ))
             .await
             .unwrap();
@@ -4630,7 +4843,7 @@ mod tests {
             r#"{"action":"set_param","param":"brightness","value":0.375}"#,
         ] {
             socket
-                .send(ClientMessage::Text(payload.to_string()))
+                .send(ClientMessage::Text(payload.to_string().into()))
                 .await
                 .unwrap();
         }
@@ -4703,7 +4916,9 @@ mod tests {
 
         socket
             .send(ClientMessage::Text(
-                r#"{"action":"begin_history_gesture","gesture_id":77}"#.to_string(),
+                r#"{"action":"begin_history_gesture","gesture_id":77}"#
+                    .to_string()
+                    .into(),
             ))
             .await
             .unwrap();
@@ -4719,7 +4934,9 @@ mod tests {
         .expect("history Begin did not cross WebSocket ingress");
         socket
             .send(ClientMessage::Text(
-                r#"{"action":"set_param","param":"brightness","value":0.625}"#.to_string(),
+                r#"{"action":"set_param","param":"brightness","value":0.625}"#
+                    .to_string()
+                    .into(),
             ))
             .await
             .unwrap();
@@ -4738,7 +4955,9 @@ mod tests {
         // matching transaction.
         socket
             .send(ClientMessage::Text(
-                r#"{"action":"cancel_history_gesture","gesture_id":77}"#.to_string(),
+                r#"{"action":"cancel_history_gesture","gesture_id":77}"#
+                    .to_string()
+                    .into(),
             ))
             .await
             .unwrap();
