@@ -1,7 +1,7 @@
 # Group transform authoring — action, panel, and gizmo proof note
 
-Date: 2026-08-27  
-Topic: `feat/group-transform-authoring`  
+Date: 2026-08-27
+Topic: `feat/group-transform-authoring`
 Pinned integration base: `0b5584eb0ef3a1bd139a5560804bdf5272dbcda4`
 
 This tranche closes perfection handover §3.6 in its required logical order:
@@ -137,7 +137,7 @@ the pure planner regressions are the reproducible selective-VHS proof.
 
 ## Closing fields
 
-- Topic implementation commit: **PENDING**
+- Topic implementation commit: **`bd42492`**
 - Topic receipt commit: **PENDING**
 - Integration commit on `feat/web-control-panel`: **PENDING**
 - Exact-commit CI: **PENDING**
