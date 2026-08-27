@@ -6745,6 +6745,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ntsc_patch_config_preserves_all_fields_and_canonical_bytes() {
+        const JSON: &str = r#"{"enabled":true,"tape_speed":2,"chroma_loss":0.0078125,"edge_wave_enabled":true,"edge_wave_intensity":3.25,"edge_wave_speed":0.75,"head_switching_enabled":true,"head_switching_height":5,"head_switching_shift":-7.5,"tracking_noise_enabled":true,"tracking_noise_height":7,"tracking_noise_wave":3.5,"tracking_noise_snow":0.375,"snow_intensity":0.25,"composite_noise_intensity":0.125,"luma_noise_intensity":0.0625,"chroma_noise_intensity":0.09375,"luma_smear":0.3125,"composite_sharpening":0.5}"#;
+        const YAML: &str = "enabled: true\ntape_speed: 2\nchroma_loss: 0.0078125\nedge_wave_enabled: true\nedge_wave_intensity: 3.25\nedge_wave_speed: 0.75\nhead_switching_enabled: true\nhead_switching_height: 5\nhead_switching_shift: -7.5\ntracking_noise_enabled: true\ntracking_noise_height: 7\ntracking_noise_wave: 3.5\ntracking_noise_snow: 0.375\nsnow_intensity: 0.25\ncomposite_noise_intensity: 0.125\nluma_noise_intensity: 0.0625\nchroma_noise_intensity: 0.09375\nluma_smear: 0.3125\ncomposite_sharpening: 0.5\n";
+        let params = NtscParams {
+            enabled: true,
+            tape_speed: 2,
+            chroma_loss: 0.007_812_5,
+            edge_wave_enabled: true,
+            edge_wave_intensity: 3.25,
+            edge_wave_speed: 0.75,
+            head_switching_enabled: true,
+            head_switching_height: 5,
+            head_switching_shift: -7.5,
+            tracking_noise_enabled: true,
+            tracking_noise_height: 7,
+            tracking_noise_wave: 3.5,
+            tracking_noise_snow: 0.375,
+            snow_intensity: 0.25,
+            composite_noise_intensity: 0.125,
+            luma_noise_intensity: 0.062_5,
+            chroma_noise_intensity: 0.093_75,
+            luma_smear: 0.312_5,
+            composite_sharpening: 0.5,
+        };
+        let config = NtscConfig::from_params(&params);
+        assert_eq!(serde_json::to_string(&config).unwrap(), JSON);
+        assert_eq!(serde_yaml::to_string(&config).unwrap(), YAML);
+
+        let from_json: NtscConfig = serde_json::from_str(JSON).unwrap();
+        assert_eq!(from_json.to_params(), params);
+        assert_eq!(serde_json::to_string(&from_json).unwrap(), JSON);
+        let from_yaml: NtscConfig = serde_yaml::from_str(YAML).unwrap();
+        assert_eq!(from_yaml.to_params(), params);
+        assert_eq!(serde_yaml::to_string(&from_yaml).unwrap(), YAML);
+    }
+
+    #[test]
     fn the_studies_section_round_trips_and_the_digest_walk_finds_every_rack() {
         use crate::study::{
             StudyAbiVersion, StudyCapability, StudyInstruction, StudyLicenseNotice, StudyMetadata,

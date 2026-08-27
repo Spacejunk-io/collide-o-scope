@@ -4,8 +4,7 @@ Date prepared: 2026-08-27
 Topic: `feat/maintenance-web-stack`
 Pinned integration base:
 `96bcb734b4670ecd9941a8725c7941e5b66f1284`
-Status: **topic implementation and full gate complete; integration and
-exact-commit CI pending**
+Status: **integrated; exact-commit CI green**
 
 This is the §3.8(b) maintenance tranche. It advances the production control
 server from axum 0.7.9 and axum-server 0.7.3 to axum 0.8.9 and axum-server
@@ -138,9 +137,14 @@ absent and was not minted.
 ## Closing fields
 
 - Topic implementation commits: **`8565c85`**, **`462787f`**, **`476511f`**
-- Topic receipt commit: **PENDING**
-- Integration commit on `feat/web-control-panel`: **PENDING**
-- Exact-commit CI: **PENDING**
+- Topic receipt commit: **`f8ca137`**
+- Integration commit on `feat/web-control-panel`:
+  **`48d85ea943069dbcec7c718d42daeac025da4547`**
+- Exact-commit CI: **OBSERVED PASS** —
+  [run 33057959871](https://github.com/Spacejunk-io/collide-o-scope/actions/runs/33057959871)
+  passed at exact head `48d85ea943069dbcec7c718d42daeac025da4547`:
+  dependency policy in 310 seconds, macOS 15 in 498 seconds, Linux 24.04 in
+  529 seconds, and Windows VS 2022 in 1,062 seconds
 - CI-form six-command gate: **OBSERVED PASS** — formatting and both JavaScript
   parsers; all-target/all-feature compile; 2,146 tests passed with zero
   failures and 163 explicitly ignored tests; all six benchmark probes
