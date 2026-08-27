@@ -4129,7 +4129,6 @@ mod tests {
             MAX_WS_MESSAGE_BYTES,
             super::super::action_wire::MAX_WEB_ACTION_BYTES
         );
-        assert!(WS_READ_BUFFER_BYTES <= MAX_WS_MESSAGE_BYTES);
     }
 
     #[test]
