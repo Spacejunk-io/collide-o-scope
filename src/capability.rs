@@ -52,6 +52,7 @@ pub enum CapabilityKey {
     FinalProgramVhs,
     Full16TemporalHistory,
     LiveRecorderAudioMux,
+    MetadataManagedPlanarDelivery,
     NdiInput,
     NdiOutput,
     ProxyBrowserSurface,
@@ -70,7 +71,7 @@ pub enum CapabilityKey {
 
 impl CapabilityKey {
     /// Stable key order is also the generated-document order.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::AcceptedCreativeMutationV1,
         Self::AdvancedPrecision,
         Self::BoundedMeshWarp,
@@ -81,6 +82,7 @@ impl CapabilityKey {
         Self::FinalProgramVhs,
         Self::Full16TemporalHistory,
         Self::LiveRecorderAudioMux,
+        Self::MetadataManagedPlanarDelivery,
         Self::NdiInput,
         Self::NdiOutput,
         Self::ProxyBrowserSurface,
@@ -108,6 +110,7 @@ impl CapabilityKey {
             Self::FinalProgramVhs => "final_program_vhs",
             Self::Full16TemporalHistory => "full16_temporal_history",
             Self::LiveRecorderAudioMux => "live_recorder_audio_mux",
+            Self::MetadataManagedPlanarDelivery => "metadata_managed_planar_delivery",
             Self::NdiInput => "ndi_input",
             Self::NdiOutput => "ndi_output",
             Self::ProxyBrowserSurface => "proxy_browser_surface",
@@ -136,6 +139,7 @@ impl CapabilityKey {
             Self::FinalProgramVhs => "Final-program VHS",
             Self::Full16TemporalHistory => "Full-16 temporal history",
             Self::LiveRecorderAudioMux => "Live recorder audio mux",
+            Self::MetadataManagedPlanarDelivery => "Metadata-managed planar video delivery",
             Self::NdiInput => "NDI input",
             Self::NdiOutput => "NDI output",
             Self::ProxyBrowserSurface => "Browser proxy control",
@@ -398,6 +402,9 @@ pub enum CapabilityLimitation {
     OptionalGpuTimestamps,
     DisplayGeometryIntegrationStopped,
     TransparentGpuContinuityUnavailable,
+    LegacyPackedDeliveryDefault,
+    PlanarAdmissionYuv420p8Only,
+    HdrOutputSurfaceUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -444,6 +451,9 @@ pub struct CapabilityRuntimeFacts {
     /// Device loss reaches the supervised exit/relaunch contract. This fact
     /// intentionally says nothing about unavailable in-process Phase B.
     pub supervised_gpu_recovery_phase_a_integrated: bool,
+    /// Authored metadata-managed YUV420P8 delivery reaches the browser panel,
+    /// production decoder/upload seam, and offline export with legacy default.
+    pub metadata_managed_planar_delivery_integrated: bool,
     pub hardware_decode: CapabilityEvidence,
     pub zero_copy_decode: CapabilityEvidence,
     pub syphon_input: CapabilityEvidence,
@@ -466,6 +476,7 @@ impl CapabilityRuntimeFacts {
             correlated_engine_gpu_timing_integrated: true,
             source_descriptor_color_truth_integrated: true,
             supervised_gpu_recovery_phase_a_integrated: true,
+            metadata_managed_planar_delivery_integrated: true,
             hardware_decode: CapabilityEvidence {
                 platform_supported: true,
                 backend_integrated: windows,
@@ -591,6 +602,9 @@ fn primary_decision(key: CapabilityKey, facts: CapabilityRuntimeFacts) -> Capabi
             CapabilityRejectionReason::MeasuredResourceTradeoff,
         ),
         CapabilityKey::LiveRecorderAudioMux => CapabilityDecision::Implemented,
+        CapabilityKey::MetadataManagedPlanarDelivery => {
+            integrated(facts.metadata_managed_planar_delivery_integrated)
+        }
         CapabilityKey::StraightAlphaKeyFill => CapabilityDecision::Implemented,
         CapabilityKey::SpoutInput | CapabilityKey::SpoutOutput => {
             if matches!(facts.platform, Platform::Windows) {
@@ -696,6 +710,12 @@ fn surfaces(key: CapabilityKey, primary: CapabilityDecision) -> Vec<CapabilitySu
             Surface::LiveRecording,
             primary,
         )],
+        CapabilityKey::MetadataManagedPlanarDelivery => vec![
+            CapabilitySurfaceRecord::new(Surface::BrowserControl, primary),
+            CapabilitySurfaceRecord::new(Surface::LiveProgram, primary),
+            CapabilitySurfaceRecord::new(Surface::OfflineExport, primary),
+            CapabilitySurfaceRecord::new(Surface::Backend, primary),
+        ],
         CapabilityKey::StraightAlphaKeyFill => vec![
             CapabilitySurfaceRecord::new(Surface::BrowserControl, primary),
             CapabilitySurfaceRecord::new(Surface::OfflineExport, primary),
@@ -773,6 +793,11 @@ fn evidence(key: CapabilityKey) -> Vec<EvidenceReceiptId> {
             "full16-history-candidate-receipt",
         ],
         CapabilityKey::LiveRecorderAudioMux => &["live-recorder-audio-mux-note"],
+        CapabilityKey::MetadataManagedPlanarDelivery => &[
+            "p4c-planar-gpu-candidate-receipt",
+            "p4c-planar-integration-note",
+            "p4c-follow-on-closure",
+        ],
         CapabilityKey::ProxyBrowserSurface => &["s8c-browser-proxy-surface-note"],
         CapabilityKey::TransactionalControlListeners => &["p10-capability-campaign-truth-closure"],
         CapabilityKey::CorrelatedEngineGpuTiming => &[
@@ -874,6 +899,24 @@ fn limitations(key: CapabilityKey) -> Vec<CapabilityLimitationRecord> {
             CapabilityLimitationRecord::new(
                 Limitation::ExternalProofRequired,
                 "Ring, drift, and device-loss laws are proven in software with an opt-in ffprobe fixture; a physical audio interface driving a live recording is hardware-matrix proof.",
+            ),
+        ],
+        CapabilityKey::MetadataManagedPlanarDelivery => vec![
+            CapabilityLimitationRecord::new(
+                Limitation::LegacyPackedDeliveryDefault,
+                "Legacy RGBA remains the default until an integrated two-source 720p/1080p total-frame p99 non-regression receipt and an explicit operator decision authorize any default flip or auto-selection.",
+            ),
+            CapabilityLimitationRecord::new(
+                Limitation::PlanarAdmissionYuv420p8Only,
+                "Production admission is limited to progressive YUV420P8 with complete supported color metadata; NV12 and P010 remain converter-contract-only and fall back to packed RGBA.",
+            ),
+            CapabilityLimitationRecord::new(
+                Limitation::HdrOutputSurfaceUnavailable,
+                "Ten-bit/HDR transfer, tone mapping, and a fidelity-preserving output surface are not integrated; HDR and unadmitted formats retain the legacy packed path.",
+            ),
+            CapabilityLimitationRecord::new(
+                Limitation::ExternalProofRequired,
+                "The retained path compiles on all target platforms, but its physical GPU equality evidence names one AMD/Vulkan adapter; additional adapters and backends remain external proof.",
             ),
         ],
         CapabilityKey::StraightAlphaKeyFill => vec![
@@ -1263,6 +1306,57 @@ mod tests {
     }
 
     #[test]
+    fn metadata_managed_planar_delivery_is_implemented_without_flipping_defaults_or_hdr() {
+        for platform in Platform::ALL {
+            let planar = record(CapabilityKey::MetadataManagedPlanarDelivery, platform);
+            assert_eq!(planar.status, CapabilityStatus::Implemented);
+            for surface in [
+                CapabilitySurface::BrowserControl,
+                CapabilitySurface::LiveProgram,
+                CapabilitySurface::OfflineExport,
+                CapabilitySurface::Backend,
+            ] {
+                assert!(planar.surfaces.iter().any(|entry| {
+                    entry.surface == surface && entry.status == CapabilityStatus::Implemented
+                }));
+            }
+            assert!(planar
+                .evidence_receipt_ids
+                .iter()
+                .any(|receipt| { receipt.0 == "p4c-planar-gpu-candidate-receipt" }));
+            for limitation in [
+                CapabilityLimitation::LegacyPackedDeliveryDefault,
+                CapabilityLimitation::PlanarAdmissionYuv420p8Only,
+                CapabilityLimitation::HdrOutputSurfaceUnavailable,
+                CapabilityLimitation::ExternalProofRequired,
+            ] {
+                assert!(
+                    planar
+                        .known_limitations
+                        .iter()
+                        .any(|entry| entry.code == limitation),
+                    "missing P4c limitation {limitation:?}"
+                );
+            }
+        }
+        let planar_source = include_str!("video/planar.rs");
+        let policy_start = planar_source
+            .find("pub enum PlanarDeliveryPolicy")
+            .expect("planar delivery policy must remain declared");
+        let policy_source = &planar_source[policy_start..];
+        let default_marker = policy_source
+            .find("#[default]")
+            .expect("planar delivery policy must keep an explicit Rust default");
+        let legacy_variant = policy_source[default_marker..]
+            .find("LegacyRgba,")
+            .expect("the explicit planar default must remain LegacyRgba");
+        assert!(
+            legacy_variant < 32,
+            "a different planar policy became the default"
+        );
+    }
+
+    #[test]
     fn spout_scope_and_advanced_full16_decisions_are_exact() {
         assert_eq!(
             record(CapabilityKey::SpoutInput, Platform::Windows).status,
@@ -1363,6 +1457,11 @@ mod tests {
                 "Source descriptor and color-truth diagnostics",
             ),
             (
+                CapabilityKey::MetadataManagedPlanarDelivery,
+                "metadata_managed_planar_delivery",
+                "Metadata-managed planar video delivery",
+            ),
+            (
                 CapabilityKey::SupervisedGpuRecoveryPhaseA,
                 "supervised_gpu_recovery_phase_a",
                 "Supervised GPU recovery (Phase A)",
@@ -1448,6 +1547,7 @@ mod tests {
         facts.correlated_engine_gpu_timing_integrated = false;
         facts.source_descriptor_color_truth_integrated = false;
         facts.supervised_gpu_recovery_phase_a_integrated = false;
+        facts.metadata_managed_planar_delivery_integrated = false;
         for key in expected_identity.map(|entry| entry.0) {
             assert_eq!(
                 capability_record(key, facts).status,

@@ -17,7 +17,7 @@ use crate::video::indexed::{
 };
 use crate::video::payload::{DecodedImagePayload, DecodedRasterLayout, DecodedRasterPool};
 use crate::video::planar::{
-    planar_conversion_recipe, prototype_delivery_decision, PlanarConversionRecipe,
+    planar_conversion_recipe, planar_delivery_decision, PlanarConversionRecipe,
     PlanarDeliveryDecision, PlanarDeliveryPolicy, PlanarPixelFormat,
 };
 use crate::video::source_descriptor::{
@@ -1414,7 +1414,7 @@ impl VideoDecoder {
 
     /// The complete per-frame planar admission law: authored policy, the
     /// decoder's actual output format and geometry, and the frozen declared
-    /// truth through the shared `prototype_delivery_decision` ladder.
+    /// truth through the shared `planar_delivery_decision` ladder.
     fn planar_delivery_admits(&self, frame: &VideoFrame) -> bool {
         if self.delivery_policy() != PlanarDeliveryPolicy::MetadataManaged {
             return false;
@@ -1427,7 +1427,7 @@ impl VideoDecoder {
             return false;
         }
         matches!(
-            prototype_delivery_decision(
+            planar_delivery_decision(
                 PlanarDeliveryPolicy::MetadataManaged,
                 PlanarPixelFormat::Yuv420p8,
                 self.source_color_descriptor,

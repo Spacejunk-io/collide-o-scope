@@ -1,20 +1,21 @@
-//! Evidence-gated planar software-delivery prototype.
+//! Metadata-managed planar software delivery and its shared conversion contract.
 //!
-//! This module deliberately does not replace [`super::DecodedVideoFrame`] or
-//! enter the renderer. It freezes the smallest contract that can be measured
-//! first: one immutable, bounded physical allocation can carry tightly packed
+//! One immutable, bounded physical allocation can carry tightly packed
 //! YUV420P, NV12, or P010 planes while frame/PTS/source-generation and codec
-//! motion remain attached to the same owned frame object. The legacy packed
-//! variant retains the exact existing [`DecodedImagePayload`] identity.
+//! motion remain attached to the same owned frame object. Production admission
+//! is intentionally narrower: authored `metadata_managed` delivery accepts
+//! progressive YUV420P8 only, while every other source retains the legacy
+//! packed [`DecodedImagePayload`] identity.
 //!
 //! The CPU conversion routine is an independent matrix/range/chroma-siting
-//! reference. It is not an upload path and refuses HDR transfer functions;
-//! integrating planar textures, tone mapping, pooling, or patch policy remains
-//! behind the P4c measurement gate.
+//! oracle. The GPU upload path derives its recipe from this same contract.
+//! NV12/P010 conversion support does not admit those formats to production,
+//! and HDR transfer functions remain refused until a separate tone-map and
+//! fidelity-preserving output-surface tranche is proven.
 
 #![allow(
     dead_code,
-    reason = "P4c is deliberately stopped at a measured-before-promotion contract; production consumers are forbidden until its GPU gate passes"
+    reason = "the public planar contract deliberately retains converter-only NV12/P010 and compatibility surfaces beyond the narrower production YUV420P8 admission"
 )]
 
 use std::fmt;
@@ -35,7 +36,7 @@ use super::{
 /// bytes. This admits 8K 4:2:0 at 8 or 10 bits while rejecting hostile 16K
 /// material before allocation.
 pub const MAX_PLANAR_FRAME_BYTES: usize = 128 * 1024 * 1024;
-/// A prototype budget cannot be configured above this aggregate ceiling.
+/// A planar budget cannot be configured above this aggregate ceiling.
 pub const MAX_PLANAR_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 /// The CPU oracle is bounded independently because RGBA is larger than 4:2:0.
 pub const MAX_CPU_REFERENCE_RGBA_BYTES: usize = 256 * 1024 * 1024;
@@ -43,7 +44,7 @@ pub const MAX_PLANAR_PLANES: usize = 3;
 
 static NEXT_PLANAR_PAYLOAD_ID: AtomicU64 = AtomicU64::new(1);
 
-/// The only planar software formats admitted by this prototype.
+/// The planar software formats described by the conversion contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanarPixelFormat {
@@ -85,7 +86,7 @@ pub struct PlanarPlaneLayout {
     pub height: u32,
     /// Bytes containing meaningful samples in one tightly stored row.
     pub row_bytes: usize,
-    /// Always equal to `row_bytes` in the immutable prototype allocation.
+    /// Always equal to `row_bytes` in the immutable planar allocation.
     pub stride: usize,
     pub offset: usize,
     pub byte_len: usize,
@@ -280,7 +281,7 @@ pub enum PlanarPlaneInputs<'a> {
     },
 }
 
-/// Aggregate physical-byte ceiling shared by any prototype planar payloads.
+/// Aggregate physical-byte ceiling shared by all planar payloads.
 #[derive(Debug)]
 pub struct PlanarAllocationBudget {
     max_bytes: u64,
@@ -638,7 +639,7 @@ impl PlanarPlane<'_> {
 }
 
 /// Additive policy vocabulary. `LegacyRgba` is intentionally the serde and
-/// Rust default; merely compiling this prototype cannot change an old patch.
+/// Rust default; merely compiling planar support cannot change an old patch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanarDeliveryPolicy {
@@ -701,12 +702,13 @@ pub enum PlanarFallbackReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanarDeliveryDecision {
     PackedRgbaFallback(PlanarFallbackReason),
-    /// Contract-only admission. No production decoder or renderer consumes
-    /// this result until transport and end-to-end P4c gates pass.
+    /// Historical public variant name for an admitted planar delivery. The
+    /// production decoder consumes YUV420P8 results under authored opt-in;
+    /// NV12/P010 results remain converter-contract-only.
     PrototypePlanar(PlanarPixelFormat),
 }
 
-pub fn prototype_delivery_decision(
+pub fn planar_delivery_decision(
     policy: PlanarDeliveryPolicy,
     format: PlanarPixelFormat,
     color: SourceColorDescriptor,
@@ -759,8 +761,18 @@ pub fn prototype_delivery_decision(
     PlanarDeliveryDecision::PrototypePlanar(format)
 }
 
-/// Transitional owned image vocabulary. It is intentionally separate from
-/// the production decoded-frame type until GPU evidence exists.
+/// Compatibility name retained for callers of the Phase-A public contract.
+/// New production code should use [`planar_delivery_decision`].
+pub fn prototype_delivery_decision(
+    policy: PlanarDeliveryPolicy,
+    format: PlanarPixelFormat,
+    color: SourceColorDescriptor,
+    field_order: SourceFieldOrder,
+) -> PlanarDeliveryDecision {
+    planar_delivery_decision(policy, format, color, field_order)
+}
+
+/// Owned image vocabulary shared by the production decoder and upload seams.
 #[derive(Debug, Clone)]
 pub enum DecodedImageDelivery {
     PackedRgba8(DecodedImagePayload),
@@ -811,7 +823,7 @@ impl DecodedDeliveryFrame {
 
     #[allow(
         clippy::result_large_err,
-        reason = "the stopped prototype returns the original frame allocation on an explicit planar refusal; boxing would alter its ownership/identity contract"
+        reason = "the compatibility delivery contract returns the original frame allocation on an explicit planar refusal; boxing would alter its ownership/identity contract"
     )]
     pub fn into_legacy(self) -> Result<DecodedVideoFrame, Self> {
         let Self {
@@ -894,7 +906,7 @@ pub(crate) fn planar_conversion_recipe(
 }
 
 /// The one conversion contract. The CPU oracle consumes it directly and the
-/// evaluation-only GPU twin (`super::planar_gpu`) derives its uniforms from
+/// production GPU converter (`super::planar_gpu`) derives its uniforms from
 /// this same derivation, so the two paths cannot disagree about admission,
 /// coefficients, or siting by construction.
 pub(crate) struct CpuConversionContract {
@@ -1519,7 +1531,7 @@ mod tests {
             ChromaLocation::Left,
         );
         assert_eq!(
-            prototype_delivery_decision(
+            planar_delivery_decision(
                 PlanarDeliveryPolicy::LegacyRgba,
                 PlanarPixelFormat::P010Le,
                 sdr,
@@ -1528,7 +1540,7 @@ mod tests {
             PlanarDeliveryDecision::PackedRgbaFallback(PlanarFallbackReason::LegacyPolicy)
         );
         assert_eq!(
-            prototype_delivery_decision(
+            planar_delivery_decision(
                 PlanarDeliveryPolicy::MetadataManaged,
                 PlanarPixelFormat::P010Le,
                 sdr,
@@ -1539,7 +1551,7 @@ mod tests {
         let mut hdr = sdr;
         hdr.transfer.value = TransferCharacteristic::Pq;
         assert_eq!(
-            prototype_delivery_decision(
+            planar_delivery_decision(
                 PlanarDeliveryPolicy::MetadataManaged,
                 PlanarPixelFormat::P010Le,
                 hdr,
@@ -1548,7 +1560,7 @@ mod tests {
             PlanarDeliveryDecision::PackedRgbaFallback(PlanarFallbackReason::HdrToneMapRequired)
         );
         assert_eq!(
-            prototype_delivery_decision(
+            planar_delivery_decision(
                 PlanarDeliveryPolicy::MetadataManaged,
                 PlanarPixelFormat::P010Le,
                 sdr,

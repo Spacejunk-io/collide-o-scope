@@ -449,6 +449,68 @@
           ]
         },
         {
+          "key": "metadata_managed_planar_delivery",
+          "title": "Metadata-managed planar video delivery",
+          "platform": "windows",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "backend",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p4c-planar-gpu-candidate-receipt",
+            "p4c-planar-integration-note",
+            "p4c-follow-on-closure"
+          ],
+          "known_limitations": [
+            {
+              "code": "legacy_packed_delivery_default",
+              "text": "Legacy RGBA remains the default until an integrated two-source 720p/1080p total-frame p99 non-regression receipt and an explicit operator decision authorize any default flip or auto-selection."
+            },
+            {
+              "code": "planar_admission_yuv420p8_only",
+              "text": "Production admission is limited to progressive YUV420P8 with complete supported color metadata; NV12 and P010 remain converter-contract-only and fall back to packed RGBA."
+            },
+            {
+              "code": "hdr_output_surface_unavailable",
+              "text": "Ten-bit/HDR transfer, tone mapping, and a fidelity-preserving output surface are not integrated; HDR and unadmitted formats retain the legacy packed path."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "The retained path compiles on all target platforms, but its physical GPU equality evidence names one AMD/Vulkan adapter; additional adapters and backends remain external proof."
+            }
+          ]
+        },
+        {
           "key": "ndi_input",
           "title": "NDI input",
           "platform": "windows",
@@ -1520,6 +1582,68 @@
             {
               "code": "external_proof_required",
               "text": "Ring, drift, and device-loss laws are proven in software with an opt-in ffprobe fixture; a physical audio interface driving a live recording is hardware-matrix proof."
+            }
+          ]
+        },
+        {
+          "key": "metadata_managed_planar_delivery",
+          "title": "Metadata-managed planar video delivery",
+          "platform": "macos",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "backend",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p4c-planar-gpu-candidate-receipt",
+            "p4c-planar-integration-note",
+            "p4c-follow-on-closure"
+          ],
+          "known_limitations": [
+            {
+              "code": "legacy_packed_delivery_default",
+              "text": "Legacy RGBA remains the default until an integrated two-source 720p/1080p total-frame p99 non-regression receipt and an explicit operator decision authorize any default flip or auto-selection."
+            },
+            {
+              "code": "planar_admission_yuv420p8_only",
+              "text": "Production admission is limited to progressive YUV420P8 with complete supported color metadata; NV12 and P010 remain converter-contract-only and fall back to packed RGBA."
+            },
+            {
+              "code": "hdr_output_surface_unavailable",
+              "text": "Ten-bit/HDR transfer, tone mapping, and a fidelity-preserving output surface are not integrated; HDR and unadmitted formats retain the legacy packed path."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "The retained path compiles on all target platforms, but its physical GPU equality evidence names one AMD/Vulkan adapter; additional adapters and backends remain external proof."
             }
           ]
         },
@@ -2603,6 +2727,68 @@
             {
               "code": "external_proof_required",
               "text": "Ring, drift, and device-loss laws are proven in software with an opt-in ffprobe fixture; a physical audio interface driving a live recording is hardware-matrix proof."
+            }
+          ]
+        },
+        {
+          "key": "metadata_managed_planar_delivery",
+          "title": "Metadata-managed planar video delivery",
+          "platform": "linux",
+          "status": "implemented",
+          "reason": {
+            "kind": "production_path_integrated"
+          },
+          "surfaces": [
+            {
+              "surface": "browser_control",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "live_program",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "offline_export",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            },
+            {
+              "surface": "backend",
+              "status": "implemented",
+              "reason": {
+                "kind": "production_path_integrated"
+              }
+            }
+          ],
+          "evidence_receipt_ids": [
+            "p4c-planar-gpu-candidate-receipt",
+            "p4c-planar-integration-note",
+            "p4c-follow-on-closure"
+          ],
+          "known_limitations": [
+            {
+              "code": "legacy_packed_delivery_default",
+              "text": "Legacy RGBA remains the default until an integrated two-source 720p/1080p total-frame p99 non-regression receipt and an explicit operator decision authorize any default flip or auto-selection."
+            },
+            {
+              "code": "planar_admission_yuv420p8_only",
+              "text": "Production admission is limited to progressive YUV420P8 with complete supported color metadata; NV12 and P010 remain converter-contract-only and fall back to packed RGBA."
+            },
+            {
+              "code": "hdr_output_surface_unavailable",
+              "text": "Ten-bit/HDR transfer, tone mapping, and a fidelity-preserving output surface are not integrated; HDR and unadmitted formats retain the legacy packed path."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "The retained path compiles on all target platforms, but its physical GPU equality evidence names one AMD/Vulkan adapter; additional adapters and backends remain external proof."
             }
           ]
         },

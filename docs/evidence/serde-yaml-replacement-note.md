@@ -144,8 +144,10 @@ absent and was not minted.
 - Disposition: **EVIDENCE-BACKED STOP**
 - Topic evidence commit: **`fe06fdd`**
 - Topic receipt commit: **`7e47d238fbec62184e1f9e4924105862af996101`**
-- Integration commit on `feat/web-control-panel`: **PENDING**
-- Exact-commit CI: **PENDING**
+- Integration commit on `feat/web-control-panel`:
+  **`e81bddfd6ee823b6247b08f24f5c60cb5de2a011`**
+- Exact-commit CI: **PASS**, run `33063795621` — dependency 30 s,
+  Linux 9m00s, macOS 8m21s, Windows 13m56s
 - CI-form six-command gate: **OBSERVED PASS** — fresh rerun completed with
   2,148 tests passed, 163 ignored external/physical seats, six benches green,
   and clippy clean

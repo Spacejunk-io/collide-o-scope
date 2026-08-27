@@ -6,8 +6,9 @@ documented in [`p4c-planar-gpu-candidate-note.md`](p4c-planar-gpu-candidate-note
 measured the seams and cleared the reopen gate: 62.5% staging reduction,
 delivery p95 down ~70%, upload p95 down 14–28%, CPU/GPU equality within one
 code. This tranche is the integration that receipt authorized — the audit's
-P4c items 10–14, landed as authored, opt-in, per-layer state whose default is
-the exact prior byte path.
+items 10, 11, 12, and 14, landed as authored, opt-in, per-layer state whose
+default is the exact prior byte path. Item 13 (P010/10-bit/HDR fidelity and
+output) remains a separate evidence gate and is not claimed here.
 
 Branch: `feat/p4c-planar-integration` from the P4c candidate merge.
 
@@ -17,7 +18,7 @@ Branch: `feat/p4c-planar-integration` from the P4c candidate merge.
 seam (`materialize_source_image`, formerly `scale_frame`) freezes the source
 descriptor exactly as before on both branches; when the authored policy is
 `metadata_managed` and the complete admission law passes — the shared
-`prototype_delivery_decision` ladder over the frozen declared truth, plus the
+`planar_delivery_decision` ladder over the frozen declared truth, plus the
 frame actually being progressive 8-bit yuv420p at the decoder's geometry —
 the frame's three planes are row-copied into one pooled allocation and
 swscale never runs. Every other frame takes the exact legacy packed path.
@@ -124,3 +125,19 @@ Opt-in, run on the receipt adapter (AMD RX 6950 XT / Vulkan):
 - The Phase A candidate receipt is retained unmodified as the measurement
   that authorized this integration; its `measured_at` names the candidate
   tree, which is exactly what it measured.
+
+## Closing fields
+
+- Candidate integration merge on `feat/web-control-panel`:
+  **`6d3b34cfd19f08b3636dec87a070597bb9cafe1f`**
+- Candidate exact-commit CI: **PASS**, run `33020813773` — dependency 39 s,
+  Linux 445 s, macOS 734 s, Windows 993 s
+- Phase-B integration merge on `feat/web-control-panel`:
+  **`f0a6d4552e9a9220503a8a790d7befaa7a25ded8`**
+- Phase-B exact-commit CI: **PASS**, run `33024841424` — dependency 34 s,
+  Linux 458 s, macOS 635 s, Windows 999 s
+- Default flip / auto-selection: **NOT AUTHORIZED** — requires the integrated
+  paired 720p/1080p total-frame p99 non-regression receipt and an explicit
+  operator decision
+- P010 / 10-bit / HDR output: **DEFERRED — API + PHYSICAL GATE**; see
+  [`p4c-10-bit-hdr-output-surface-ruling.md`](p4c-10-bit-hdr-output-surface-ruling.md)
