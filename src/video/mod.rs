@@ -33,16 +33,17 @@ pub use payload::{
 };
 #[allow(
     unused_imports,
-    reason = "P4c planar delivery is an evidence-gated public prototype, not a promoted renderer path"
+    reason = "the public planar contract includes compatibility and converter-only surfaces not all consumed by the current binary"
 )]
 pub use planar::{
-    prototype_delivery_decision, CpuPlanarConversion, CpuPlanarConversionLaw,
-    CpuPlanarConversionPolicy, DecodedDeliveryFrame, DecodedImageDelivery, PlanarAllocationBudget,
-    PlanarAllocationSnapshot, PlanarConversionError, PlanarDeliveryDecision, PlanarDeliveryPolicy,
-    PlanarDeliverySettings, PlanarFallbackReason, PlanarImageError, PlanarImageLayout,
-    PlanarImagePayload, PlanarPixelFormat, PlanarPlane, PlanarPlaneInput, PlanarPlaneInputs,
-    PlanarPlaneKind, PlanarPlaneLayout, MAX_CPU_REFERENCE_RGBA_BYTES, MAX_PLANAR_BUDGET_BYTES,
-    MAX_PLANAR_FRAME_BYTES, MAX_PLANAR_PLANES,
+    planar_delivery_decision, prototype_delivery_decision, CpuPlanarConversion,
+    CpuPlanarConversionLaw, CpuPlanarConversionPolicy, DecodedDeliveryFrame, DecodedImageDelivery,
+    PlanarAllocationBudget, PlanarAllocationSnapshot, PlanarConversionError,
+    PlanarDeliveryDecision, PlanarDeliveryPolicy, PlanarDeliverySettings, PlanarFallbackReason,
+    PlanarImageError, PlanarImageLayout, PlanarImagePayload, PlanarPixelFormat, PlanarPlane,
+    PlanarPlaneInput, PlanarPlaneInputs, PlanarPlaneKind, PlanarPlaneLayout,
+    MAX_CPU_REFERENCE_RGBA_BYTES, MAX_PLANAR_BUDGET_BYTES, MAX_PLANAR_FRAME_BYTES,
+    MAX_PLANAR_PLANES,
 };
 #[allow(
     unused_imports,

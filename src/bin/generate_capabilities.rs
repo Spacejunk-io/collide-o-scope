@@ -132,6 +132,7 @@ fn validate_registry_audit_boundary() -> Result<(), String> {
             CapabilityKey::TransactionalControlListeners,
             CapabilityKey::CorrelatedEngineGpuTiming,
             CapabilityKey::SourceDescriptorColorTruth,
+            CapabilityKey::MetadataManagedPlanarDelivery,
             CapabilityKey::SupervisedGpuRecoveryPhaseA,
         ] {
             let record = platform
@@ -202,6 +203,37 @@ fn validate_registry_audit_boundary() -> Result<(), String> {
             }) {
                 return Err(format!(
                     "source descriptor truth incorrectly upgrades stopped {surface:?} integration"
+                ));
+            }
+        }
+        let planar = find(CapabilityKey::MetadataManagedPlanarDelivery);
+        for surface in [
+            CapabilitySurface::BrowserControl,
+            CapabilitySurface::LiveProgram,
+            CapabilitySurface::OfflineExport,
+            CapabilitySurface::Backend,
+        ] {
+            if !planar.surfaces.iter().any(|entry| {
+                entry.surface == surface && entry.status == CapabilityStatus::Implemented
+            }) {
+                return Err(format!(
+                    "metadata-managed planar delivery understates integrated {surface:?} support"
+                ));
+            }
+        }
+        for limitation in [
+            CapabilityLimitation::LegacyPackedDeliveryDefault,
+            CapabilityLimitation::PlanarAdmissionYuv420p8Only,
+            CapabilityLimitation::HdrOutputSurfaceUnavailable,
+            CapabilityLimitation::ExternalProofRequired,
+        ] {
+            if !planar
+                .known_limitations
+                .iter()
+                .any(|entry| entry.code == limitation)
+            {
+                return Err(format!(
+                    "metadata-managed planar delivery omits required limitation {limitation:?}"
                 ));
             }
         }

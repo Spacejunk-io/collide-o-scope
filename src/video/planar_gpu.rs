@@ -8,8 +8,8 @@
 //! equality within one 8-bit code on real decoded frames. Its production
 //! consumer is the layer upload seam (`layers::mod`), which converts an
 //! admitted planar frame into the layer's source texture through one pass;
-//! the opt-in equality battery and the candidate fixture remain as the
-//! executor's standing proof.
+//! the opt-in equality battery, seam candidate, and integrated total-frame
+//! fixture remain as the executor's standing proof.
 //!
 //! The conversion law is not restated here. The GPU uniforms derive from the
 //! exact [`CpuConversionContract`] the CPU oracle consumes — live frames
@@ -28,10 +28,10 @@
 //! so the production target is the layer texture's **non-sRGB twin view**:
 //! stored bytes equal what `write_texture` of packed values would store.
 //!
-//! The shader is embedded as a module constant rather than a file under
-//! `src/shaders/`: `build.rs` hashes that directory into the frozen
-//! production shader-bundle identity, and this executor landed after that
-//! identity was pinned; its own proof is the equality battery.
+//! The production WGSL lives under `src/shaders/` and is included verbatim,
+//! so `build.rs` folds it into the same shader-bundle identity as every other
+//! production shader. Its independent behavioral proof remains the CPU/GPU
+//! equality battery.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -41,121 +41,11 @@ use super::planar::{
 };
 use super::{SourceColorDescriptor, SourceColorRange};
 
-/// The complete conversion pass, embedded so the production shader bundle
-/// keeps its identity. The fragment mirrors the CPU oracle expression for
-/// expression; see the module documentation for the tolerance argument.
-const PLANAR_CONVERT_WGSL: &str = r#"
-struct PlanarUniforms {
-    size: vec2<u32>,
-    format: u32,
-    bit_depth: u32,
-    range_full: u32,
-    _pad0: u32,
-    chroma_offset: vec2<f32>,
-    kr: f32,
-    kb: f32,
-    _pad1: vec2<f32>,
-};
-
-@group(0) @binding(0) var<uniform> uniforms: PlanarUniforms;
-@group(0) @binding(1) var luma_plane: texture_2d<u32>;
-@group(0) @binding(2) var chroma_a: texture_2d<u32>;
-@group(0) @binding(3) var chroma_b: texture_2d<u32>;
-
-@vertex
-fn vs_convert(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
-    let uv = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
-    return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
-}
-
-fn luma_code(pixel: vec2<u32>) -> f32 {
-    let word = textureLoad(luma_plane, vec2<i32>(pixel), 0).r;
-    if uniforms.format == 2u {
-        return f32(word >> 6u);
-    }
-    return f32(word);
-}
-
-fn chroma_pair_at(texel: vec2<i32>) -> vec2<f32> {
-    if uniforms.format == 0u {
-        return vec2<f32>(
-            f32(textureLoad(chroma_a, texel, 0).r),
-            f32(textureLoad(chroma_b, texel, 0).r),
-        );
-    }
-    let pair = textureLoad(chroma_a, texel, 0).rg;
-    if uniforms.format == 2u {
-        return vec2<f32>(f32(pair.x >> 6u), f32(pair.y >> 6u));
-    }
-    return vec2<f32>(f32(pair.x), f32(pair.y));
-}
-
-fn chroma_code(pixel: vec2<u32>) -> vec2<f32> {
-    let plane_size = textureDimensions(chroma_a);
-    let plane_w = f32(plane_size.x);
-    let plane_h = f32(plane_size.y);
-    let x = clamp(
-        (f32(pixel.x) - uniforms.chroma_offset.x) / 2.0,
-        0.0,
-        plane_w - 1.0,
-    );
-    let y = clamp(
-        (f32(pixel.y) - uniforms.chroma_offset.y) / 2.0,
-        0.0,
-        plane_h - 1.0,
-    );
-    let x0 = floor(x);
-    let y0 = floor(y);
-    let x1 = min(x0 + 1.0, plane_w - 1.0);
-    let y1 = min(y0 + 1.0, plane_h - 1.0);
-    let tx = x - x0;
-    let ty = y - y0;
-    let c00 = chroma_pair_at(vec2<i32>(i32(x0), i32(y0)));
-    let c10 = chroma_pair_at(vec2<i32>(i32(x1), i32(y0)));
-    let c01 = chroma_pair_at(vec2<i32>(i32(x0), i32(y1)));
-    let c11 = chroma_pair_at(vec2<i32>(i32(x1), i32(y1)));
-    let top = c00 * (1.0 - tx) + c10 * tx;
-    let bottom = c01 * (1.0 - tx) + c11 * tx;
-    let max_code = f32((1u << uniforms.bit_depth) - 1u);
-    return clamp(
-        top * (1.0 - ty) + bottom * ty,
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(max_code, max_code),
-    );
-}
-
-@fragment
-fn fs_convert(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-    let pixel = vec2<u32>(u32(position.x), u32(position.y));
-    let y_code = luma_code(pixel);
-    let chroma = chroma_code(pixel);
-    let bd = uniforms.bit_depth;
-    let scale = f32(1u << (bd - 8u));
-    let max_code = f32((1u << bd) - 1u);
-    var y: f32;
-    var cb: f32;
-    var cr: f32;
-    if uniforms.range_full == 1u {
-        y = y_code / max_code;
-        cb = (chroma.x - f32(1u << (bd - 1u))) / max_code;
-        cr = (chroma.y - f32(1u << (bd - 1u))) / max_code;
-    } else {
-        y = (y_code - 16.0 * scale) / (219.0 * scale);
-        cb = (chroma.x - 128.0 * scale) / (224.0 * scale);
-        cr = (chroma.y - 128.0 * scale) / (224.0 * scale);
-    }
-    let kr = uniforms.kr;
-    let kb = uniforms.kb;
-    let kg = 1.0 - kr - kb;
-    let red = y + (2.0 - 2.0 * kr) * cr;
-    let blue = y + (2.0 - 2.0 * kb) * cb;
-    let green = y - kb * (2.0 - 2.0 * kb) / kg * cb - kr * (2.0 - 2.0 * kr) / kg * cr;
-    return vec4<f32>(
-        clamp(vec3<f32>(red, green, blue), vec3<f32>(0.0, 0.0, 0.0), vec3<f32>(1.0, 1.0, 1.0)),
-        1.0,
-    );
-}
-"#;
+/// The complete production conversion pass. The fragment mirrors the CPU
+/// oracle expression for expression; see the module documentation for the
+/// tolerance argument. Keeping the source under `src/shaders/` makes its
+/// bytes part of the build-generated production shader-bundle identity.
+const PLANAR_CONVERT_WGSL: &str = include_str!("../shaders/planar_convert.wgsl");
 
 /// Exactly 48 bytes, compile-time asserted like every other uniform in the
 /// tree. Format codes: 0 `Yuv420p8`, 1 `Nv12`, 2 `P010Le`.
@@ -1297,7 +1187,7 @@ mod tests {
         descriptor: SourceColorDescriptor,
     }
 
-    /// Decode one candidate source with the production-shaped software loop
+    /// Decode one fixture source with the production-shaped software loop
     /// and measure, per selected frame, the packed delivery law (swscale to
     /// RGBA plus the stride-aware repack) against the planar delivery law
     /// (row-copying the decoder's planes into one immutable planar
@@ -1322,14 +1212,14 @@ mod tests {
         let field_order = production.source_display_descriptor().field_order.value;
         drop(production);
         assert_eq!(
-            super::super::planar::prototype_delivery_decision(
+            super::super::planar::planar_delivery_decision(
                 PlanarDeliveryPolicy::MetadataManaged,
                 PlanarPixelFormat::Yuv420p8,
                 descriptor,
                 field_order,
             ),
             PlanarDeliveryDecision::PrototypePlanar(PlanarPixelFormat::Yuv420p8),
-            "{label}: the candidate source must pass the real admission law \
+            "{label}: the fixture source must pass the real admission law \
              (declared range/matrix/transfer/chroma siting, progressive)"
         );
 
@@ -1472,7 +1362,7 @@ mod tests {
         }
         assert_eq!(
             measurement.measured_frames, frames_to_measure,
-            "{label}: candidate source decoded too few frames"
+            "{label}: fixture source decoded too few frames"
         );
         measurement
     }
@@ -1653,16 +1543,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The reopened P4c candidate measurement: the audit's 720p/1080p
-    /// two-source CPU/GPU equality plus p95/p99 fixture, regenerating the
-    /// tracked `docs/evidence/p4c-planar-gpu-candidate-receipt.json` in
-    /// place (the S2-receipt law: a changed receipt after an opt-in run is a
-    /// new measurement on new hardware; commit it). Performance numbers are
-    /// recorded, never asserted — a truthful negative result is a valid
-    /// completion, exactly as it was for D3D11VA.
+    /// The reopened P4c seam measurement: the audit's 720p/1080p two-source
+    /// CPU/GPU equality plus delivery/upload p95/p99 fixture. The promoted
+    /// Phase-A receipt under `docs/evidence/` is immutable historical
+    /// evidence; reruns write a distinct ignored follow-up under `target/`.
+    /// Performance numbers are recorded, never asserted — a truthful
+    /// negative result is a valid completion, exactly as it was for D3D11VA.
     #[test]
-    #[ignore = "requires a GPU adapter and an ffmpeg executable; emits the P4c candidate receipt"]
-    fn gpu_planar_delivery_candidate_measures_conversion_upload_and_writes_the_receipt() {
+    #[ignore = "requires a GPU adapter and an ffmpeg executable; emits an untracked P4c seam follow-up receipt"]
+    fn gpu_planar_delivery_followup_measures_conversion_upload_and_writes_untracked_receipt() {
         use std::time::Instant;
 
         if cfg!(debug_assertions) {
@@ -1671,10 +1560,10 @@ mod tests {
         ffmpeg_next::init().ok();
 
         let Some((device, queue, adapter)) = acquire_device() else {
-            panic!("the candidate receipt requires a GPU adapter");
+            panic!("the seam follow-up receipt requires a GPU adapter");
         };
         let converter = PlanarGpuConverter::new(&device);
-        let media = CandidateMedia::generate().expect("generate candidate sources");
+        let media = CandidateMedia::generate().expect("generate follow-up sources");
 
         const MEASURED_FRAMES: usize = 240;
         const UPLOAD_WARMUP: usize = 60;
@@ -1843,7 +1732,7 @@ mod tests {
                 "width": width,
                 "height": height,
                 "measured_frames": measurement.measured_frames,
-                "admission": "PrototypePlanar(Yuv420p8) through prototype_delivery_decision on the production-frozen descriptor",
+                "admission": "PrototypePlanar(Yuv420p8), the compatibility variant returned by planar_delivery_decision on the production-frozen descriptor",
                 "equality": {
                     "spot_frames": [0, MEASURED_FRAMES / 2, MEASURED_FRAMES - 1],
                     "tolerance": "one 8-bit code value per channel; alpha exact",
@@ -1887,8 +1776,8 @@ mod tests {
                 .unwrap_or_else(|| "unknown".to_string())
         };
         let receipt = serde_json::json!({
-            "schema": "collide-o-scope-p4c-planar-gpu-candidate-receipt/1",
-            "command": "cargo test --locked --release gpu_planar_delivery_candidate_measures_conversion_upload_and_writes_the_receipt -- --ignored --nocapture",
+            "schema": "collide-o-scope-p4c-planar-gpu-followup-receipt/1",
+            "command": "cargo test --locked --release --bin collide-o-scope gpu_planar_delivery_followup_measures_conversion_upload_and_writes_untracked_receipt -- --ignored --nocapture",
             "measured_at": {
                 "commit": git(&["rev-parse", "HEAD"]),
                 "branch": git(&["rev-parse", "--abbrev-ref", "HEAD"]),
@@ -1909,18 +1798,656 @@ mod tests {
                 "driver": adapter.driver,
                 "driver_info": adapter.driver_info,
             },
-            "scope": "evaluation-only: the GPU converter is constructed by the opt-in fixtures alone; no decoder selects planar delivery, no patch surface changed, and promotion remains gated on the audit's integrated two-source matrix without worsening total-frame p99",
+            "scope": "production-seam follow-up only: authored metadata_managed delivery is integrated in live and export, but this fixture isolates decoder materialization and upload. It does not measure integrated total-frame latency, does not change legacy_rgba as the default, and makes no auto-selection claim",
             "sources": "two generated H.264 yuv420p clips (testsrc2, 30 fps) with declared tv/bt709/bt709/left metadata; the real decoder's frozen descriptor drives admission and conversion",
             "conversion_law": "source_encoded_sdr_rgba8_no_gamut_mapping — the CPU oracle's law; the GPU twin derives uniforms from the same CpuConversionContract",
             "sources_measured": source_reports,
         });
+        std::fs::create_dir_all("target").expect("create ignored receipt directory");
         std::fs::write(
-            "docs/evidence/p4c-planar-gpu-candidate-receipt.json",
+            "target/p4c-planar-gpu-followup-receipt.json",
             format!("{}\n", serde_json::to_string_pretty(&receipt).unwrap()),
         )
-        .expect("write the P4c candidate receipt");
+        .expect("write the untracked P4c follow-up receipt");
         println!(
-            "P4C_PLANAR_GPU_CANDIDATE_RECEIPT={}",
+            "P4C_PLANAR_GPU_FOLLOWUP_RECEIPT={}",
+            serde_json::to_string_pretty(&receipt).unwrap()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[derive(Debug, Clone, Copy)]
+    struct IntegratedFrameTiming {
+        total_ns: u64,
+        transport_and_ready_ns: u64,
+        upload_enqueue_ns: u64,
+        plan_encode_and_gpu_fence_ns: u64,
+    }
+
+    #[cfg(target_os = "windows")]
+    #[derive(Debug, Default)]
+    struct IntegratedSamples {
+        total_ns: Vec<u64>,
+        transport_and_ready_ns: Vec<u64>,
+        upload_enqueue_ns: Vec<u64>,
+        plan_encode_and_gpu_fence_ns: Vec<u64>,
+    }
+
+    #[cfg(target_os = "windows")]
+    impl IntegratedSamples {
+        fn with_capacity(capacity: usize) -> Self {
+            Self {
+                total_ns: Vec::with_capacity(capacity),
+                transport_and_ready_ns: Vec::with_capacity(capacity),
+                upload_enqueue_ns: Vec::with_capacity(capacity),
+                plan_encode_and_gpu_fence_ns: Vec::with_capacity(capacity),
+            }
+        }
+
+        fn push(&mut self, timing: IntegratedFrameTiming) {
+            self.total_ns.push(timing.total_ns);
+            self.transport_and_ready_ns
+                .push(timing.transport_and_ready_ns);
+            self.upload_enqueue_ns.push(timing.upload_enqueue_ns);
+            self.plan_encode_and_gpu_fence_ns
+                .push(timing.plan_encode_and_gpu_fence_ns);
+        }
+
+        fn extend(&mut self, other: &Self) {
+            self.total_ns.extend_from_slice(&other.total_ns);
+            self.transport_and_ready_ns
+                .extend_from_slice(&other.transport_and_ready_ns);
+            self.upload_enqueue_ns
+                .extend_from_slice(&other.upload_enqueue_ns);
+            self.plan_encode_and_gpu_fence_ns
+                .extend_from_slice(&other.plan_encode_and_gpu_fence_ns);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn elapsed_ns(start: std::time::Instant) -> u64 {
+        u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn integrated_stats(samples: &[u64]) -> serde_json::Value {
+        assert!(!samples.is_empty(), "an integrated timing block was empty");
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        serde_json::json!({
+            "count": sorted.len(),
+            "min_ns": sorted[0],
+            "p50_ns": percentile_ns(&sorted, 50),
+            "p95_ns": percentile_ns(&sorted, 95),
+            "p99_ns": percentile_ns(&sorted, 99),
+            "max_ns": sorted[sorted.len() - 1],
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn integrated_samples_json(samples: &IntegratedSamples) -> serde_json::Value {
+        serde_json::json!({
+            "stats": {
+                "total": integrated_stats(&samples.total_ns),
+                "transport_and_ready": integrated_stats(&samples.transport_and_ready_ns),
+                "upload_enqueue": integrated_stats(&samples.upload_enqueue_ns),
+                "plan_encode_and_gpu_fence": integrated_stats(&samples.plan_encode_and_gpu_fence_ns),
+            },
+            "raw_ns": {
+                "total": &samples.total_ns,
+                "transport_and_ready": &samples.transport_and_ready_ns,
+                "upload_enqueue": &samples.upload_enqueue_ns,
+                "plan_encode_and_gpu_fence": &samples.plan_encode_and_gpu_fence_ns,
+            },
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn integrated_p99(samples: &IntegratedSamples) -> u64 {
+        let mut sorted = samples.total_ns.clone();
+        sorted.sort_unstable();
+        percentile_ns(&sorted, 99)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn integrated_plan(
+        layer: &crate::layers::Layer,
+        width: u32,
+        height: u32,
+        time_seconds: f32,
+    ) -> crate::evaluated_frame::EvaluatedFramePlan {
+        use crate::evaluated_frame::{
+            EvaluatedFramePlan, FramePlanContext, LayerFrameInput, MasterFrameInput, SourceTap,
+        };
+
+        let modulation = crate::modulation::ModMatrix::new().frame(1);
+        let master_effects = crate::effects::params::EffectUniforms::default();
+        let master_transform = crate::spatial::SpatialTransform::default();
+        let ntsc = crate::ntsc::NtscParams::default();
+        let temporal = crate::effects::params::TemporalParams::default();
+        EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(width, height, time_seconds),
+            MasterFrameInput {
+                effects: &master_effects,
+                transform: &master_transform,
+                ntsc: &ntsc,
+                temporal: &temporal,
+            },
+            [LayerFrameInput {
+                source: SourceTap::new(layer.layer_id(), 0, layer.width, layer.height),
+                effects: &layer.effects,
+                transform: &layer.transform,
+                opacity: layer.opacity,
+                mosh_send: layer.mosh_send,
+                speed: layer.speed,
+                fps: layer.fps,
+                blend_mode: layer.blend_mode,
+                visible: layer.visible,
+                paused: layer.paused,
+                bypass_master_fx: layer.bypass_master_fx,
+                bypass_temporal_fx: layer.bypass_temporal_fx,
+                pattern: None,
+            }],
+        )
+    }
+
+    /// Run one production-shaped accepted video frame from the authoritative
+    /// transport tick through threaded-decoder harvest, the real layer upload
+    /// seam, immutable frame evaluation, the complete default Exact compositor
+    /// and opaque audience resolve, queue submission, and a GPU completion
+    /// fence. The P4c planar conversion submits its own command buffer inside
+    /// `upload_ready_media_frame`; queue ordering makes the final fence cover
+    /// that work as well as the audience render.
+    #[cfg(target_os = "windows")]
+    fn run_integrated_frame(
+        renderer: &mut crate::renderer::state::Renderer,
+        layer: &mut crate::layers::Layer,
+        policy: PlanarDeliveryPolicy,
+        tick_ordinal: &mut u64,
+    ) -> IntegratedFrameTiming {
+        let total_started = std::time::Instant::now();
+        let selection = {
+            let mut attempts = 0_u8;
+            loop {
+                attempts = attempts.saturating_add(1);
+                *tick_ordinal = tick_ordinal.saturating_add(1);
+                let selection = layer
+                    .apply_transport_tick_with_overrides(
+                        crate::transport::ProgramTransportTick {
+                            delta_seconds: 1.0 / 30.0,
+                            program_beat: *tick_ordinal as f64 / 15.0,
+                            program_running: true,
+                            media_running: true,
+                            ..Default::default()
+                        },
+                        1.0,
+                        Some(30.0),
+                    )
+                    .expect("production transport selection");
+                if selection.sample_due {
+                    break selection;
+                }
+                assert!(attempts < 4, "30 fps fixture failed to schedule a sample");
+            }
+        };
+
+        let expected_format = match policy {
+            PlanarDeliveryPolicy::LegacyRgba => crate::video::DecodedPixelFormat::PackedRgba8,
+            PlanarDeliveryPolicy::MetadataManaged => {
+                crate::video::DecodedPixelFormat::PlanarYuv420p8
+            }
+        };
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut frame = loop {
+            if let Some(frame) = layer.take_ready_media_frame().expect("production harvest") {
+                // A same-generation continuous decode may finish while the
+                // next absolute selection is queued; that is exactly the
+                // newest-ready behavior Main consumes. An older generation is
+                // never admissible across a loop/seek discontinuity. A layer
+                // opened under the legacy default may also have one packed
+                // seed in flight when the managed policy is first authored;
+                // warm-up drains that transition before any sample is accepted.
+                if frame.source_generation == selection.generation
+                    && frame.rgba.layout().format == expected_format
+                {
+                    break frame;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "no matching decoded frame arrived within five seconds"
+            );
+            std::thread::sleep(Duration::from_micros(250));
+        };
+        let transport_and_ready_ns = elapsed_ns(total_started);
+
+        let upload_started = std::time::Instant::now();
+        let renderer_generation = renderer.renderer_generation();
+        layer
+            .upload_ready_media_frame(
+                &renderer.device,
+                &renderer.queue,
+                renderer_generation,
+                &mut frame,
+            )
+            .expect("production layer upload");
+        let upload_enqueue_ns = elapsed_ns(upload_started);
+        assert_eq!(
+            layer.delivery_active_planar(),
+            policy == PlanarDeliveryPolicy::MetadataManaged,
+            "published delivery state diverged from the accepted payload"
+        );
+
+        let render_started = std::time::Instant::now();
+        let plan = integrated_plan(
+            layer,
+            renderer.output_width,
+            renderer.output_height,
+            frame.source_seconds as f32,
+        );
+        let resources =
+            crate::renderer::state::LiveFrameResources::capture(std::slice::from_ref(&*layer));
+        let mut encoder = renderer
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("P4c integrated total-frame encoder"),
+            });
+        renderer
+            .render_evaluated_frame(&mut encoder, &resources, &plan)
+            .expect("production Exact composition");
+        renderer.render_temporal_with_dt(&mut encoder, plan.temporal(), 1.0 / 30.0, true);
+        renderer.render_opaque_output(&mut encoder);
+        renderer.queue.submit(std::iter::once(encoder.finish()));
+        renderer.commit_temporal_frame();
+        renderer
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("integrated GPU completion fence");
+
+        for _ in 0..4 {
+            if let Some(fault) = layer.poll_upload_validation(renderer_generation) {
+                panic!(
+                    "integrated upload validation fault: {}",
+                    fault.operator_message()
+                );
+            }
+            if layer.upload_validation_snapshot().pending == 0 {
+                break;
+            }
+            let _ = renderer.device.poll(wgpu::PollType::Poll);
+        }
+        let validation = layer.upload_validation_snapshot();
+        assert_eq!(validation.pending, 0, "upload validation did not drain");
+        assert_eq!(validation.faults, 0, "upload validation faulted");
+
+        IntegratedFrameTiming {
+            total_ns: elapsed_ns(total_started),
+            transport_and_ready_ns,
+            upload_enqueue_ns,
+            plan_encode_and_gpu_fence_ns: elapsed_ns(render_started),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn measure_integrated_block(
+        renderer: &mut crate::renderer::state::Renderer,
+        layer: &mut crate::layers::Layer,
+        policy: PlanarDeliveryPolicy,
+        tick_ordinal: &mut u64,
+        minimum_duration: Duration,
+        minimum_samples: usize,
+    ) -> IntegratedSamples {
+        let started = std::time::Instant::now();
+        let mut samples = IntegratedSamples::with_capacity(minimum_samples);
+        while started.elapsed() < minimum_duration || samples.total_ns.len() < minimum_samples {
+            samples.push(run_integrated_frame(renderer, layer, policy, tick_ordinal));
+        }
+        samples
+    }
+
+    /// Prime the renderer's deliberately single-live-set texture bind-group
+    /// cache after each AB/BA cohort switch, then prove the measured block is
+    /// allocation-free. The transition frame is outside the sample vectors.
+    #[cfg(target_os = "windows")]
+    fn measure_warmed_integrated_block(
+        renderer: &mut crate::renderer::state::Renderer,
+        layer: &mut crate::layers::Layer,
+        policy: PlanarDeliveryPolicy,
+        tick_ordinal: &mut u64,
+        minimum_duration: Duration,
+        minimum_samples: usize,
+    ) -> IntegratedSamples {
+        let _ = run_integrated_frame(renderer, layer, policy, tick_ordinal);
+        let warmed = renderer.core_gpu_object_construction_snapshot();
+        let samples = measure_integrated_block(
+            renderer,
+            layer,
+            policy,
+            tick_ordinal,
+            minimum_duration,
+            minimum_samples,
+        );
+        let measured_delta = renderer
+            .core_gpu_object_construction_snapshot()
+            .delta_since(warmed);
+        assert_eq!(
+            measured_delta.total(),
+            0,
+            "a post-transition measured block constructed GPU objects: {measured_delta:?}"
+        );
+        samples
+    }
+
+    #[cfg(target_os = "windows")]
+    fn sha256_file(path: &std::path::Path) -> String {
+        use sha2::{Digest, Sha256};
+
+        let digest = Sha256::digest(std::fs::read(path).expect("read generated source for digest"));
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn command_version(program: &std::ffi::OsStr, args: &[&str]) -> String {
+        std::process::Command::new(program)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "unknown".to_owned())
+    }
+
+    /// The P4c follow-on default/auto-selection gate. Unlike the Phase-A seam
+    /// receipt, this fixture times one accepted production-shaped frame from
+    /// transport/decode readiness through final opaque audience completion.
+    /// It deliberately excludes surface presentation and photon time, and it
+    /// neither asserts nor hides the outcome: the receipt records a truthful
+    /// pass/fail independently for 720p and 1080p and leaves `legacy_rgba` as
+    /// the default when either source regresses.
+    ///
+    /// The evidence run is fixed at 300 warm accepted frames per cohort, five
+    /// paired AB/BA runs per raster, and ten aggregate measurement minutes.
+    /// `COLLIDE_O_SCOPE_P4C_SMOKE=1` only checks the machinery quickly and is
+    /// branded ineligible for the default gate in its receipt.
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "release-only Windows GPU + FFmpeg campaign; writes an untracked integrated p99 receipt"]
+    fn gpu_planar_integrated_total_frame_p99_writes_the_receipt() {
+        use std::sync::Arc;
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+
+        if cfg!(debug_assertions) {
+            panic!("integrated timing evidence must come from --release");
+        }
+        ffmpeg_next::init().ok();
+
+        let smoke = match std::env::var("COLLIDE_O_SCOPE_P4C_SMOKE") {
+            Err(std::env::VarError::NotPresent) => false,
+            Ok(value) if value == "1" => true,
+            Ok(value) => panic!("COLLIDE_O_SCOPE_P4C_SMOKE accepts only '1'; got {value:?}"),
+            Err(error) => panic!("could not read COLLIDE_O_SCOPE_P4C_SMOKE: {error}"),
+        };
+        let warm_frames = if smoke { 3 } else { 300 };
+        let paired_runs = 5_usize;
+        let total_measurement = if smoke {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(10 * 60)
+        };
+        let minimum_samples_per_block = if smoke { 2 } else { 120 };
+
+        let media = CandidateMedia::generate().expect("generate integrated sources");
+        let source_count = media.sources.len();
+        assert_eq!(source_count, 2, "the gate requires exactly two sources");
+        let blocks = source_count * paired_runs * 2;
+        let block_duration =
+            Duration::from_secs_f64(total_measurement.as_secs_f64() / blocks as f64);
+
+        let mut event_loop_builder = winit::event_loop::EventLoop::<()>::builder();
+        event_loop_builder.with_any_thread(true);
+        let event_loop = event_loop_builder.build().expect("fixture event loop");
+
+        let mut source_reports = Vec::with_capacity(source_count);
+        let mut all_sources_pass = true;
+        for (label, path, width, height) in &media.sources {
+            #[allow(deprecated)]
+            let window = Arc::new(
+                event_loop
+                    .create_window(
+                        winit::window::Window::default_attributes()
+                            .with_title(format!("P4c {label} total-frame fixture"))
+                            .with_visible(false)
+                            .with_inner_size(winit::dpi::PhysicalSize::new(64, 64)),
+                    )
+                    .expect("hidden fixture window"),
+            );
+            let mut renderer = crate::renderer::state::Renderer::new(window, *width, *height)
+                .expect("production renderer");
+            let adapter = renderer.device.adapter_info();
+            let clip_text = path.to_string_lossy().into_owned();
+            let mut legacy = crate::layers::Layer::new_with_media_policy(
+                &clip_text,
+                &renderer.device,
+                &crate::media_safety::MediaSafetyPolicy::safe(),
+            )
+            .expect("legacy fixture layer");
+            let mut managed = crate::layers::Layer::new_with_media_policy(
+                &clip_text,
+                &renderer.device,
+                &crate::media_safety::MediaSafetyPolicy::safe(),
+            )
+            .expect("managed fixture layer");
+            legacy.set_delivery_policy(PlanarDeliveryPolicy::LegacyRgba);
+            managed.set_delivery_policy(PlanarDeliveryPolicy::MetadataManaged);
+
+            let mut legacy_tick = 0_u64;
+            let mut managed_tick = 0_u64;
+            for _ in 0..warm_frames {
+                let _ = run_integrated_frame(
+                    &mut renderer,
+                    &mut legacy,
+                    PlanarDeliveryPolicy::LegacyRgba,
+                    &mut legacy_tick,
+                );
+            }
+            for _ in 0..warm_frames {
+                let _ = run_integrated_frame(
+                    &mut renderer,
+                    &mut managed,
+                    PlanarDeliveryPolicy::MetadataManaged,
+                    &mut managed_tick,
+                );
+            }
+            let warmed_objects = renderer.core_gpu_object_construction_snapshot();
+
+            let mut legacy_all = IntegratedSamples::default();
+            let mut managed_all = IntegratedSamples::default();
+            let mut run_reports = Vec::with_capacity(paired_runs);
+            let mut every_paired_run_passed = true;
+            for run_index in 0..paired_runs {
+                let legacy_first = run_index % 2 == 0;
+                let (legacy_run, managed_run) = if legacy_first {
+                    let legacy_run = measure_warmed_integrated_block(
+                        &mut renderer,
+                        &mut legacy,
+                        PlanarDeliveryPolicy::LegacyRgba,
+                        &mut legacy_tick,
+                        block_duration,
+                        minimum_samples_per_block,
+                    );
+                    let managed_run = measure_warmed_integrated_block(
+                        &mut renderer,
+                        &mut managed,
+                        PlanarDeliveryPolicy::MetadataManaged,
+                        &mut managed_tick,
+                        block_duration,
+                        minimum_samples_per_block,
+                    );
+                    (legacy_run, managed_run)
+                } else {
+                    let managed_run = measure_warmed_integrated_block(
+                        &mut renderer,
+                        &mut managed,
+                        PlanarDeliveryPolicy::MetadataManaged,
+                        &mut managed_tick,
+                        block_duration,
+                        minimum_samples_per_block,
+                    );
+                    let legacy_run = measure_warmed_integrated_block(
+                        &mut renderer,
+                        &mut legacy,
+                        PlanarDeliveryPolicy::LegacyRgba,
+                        &mut legacy_tick,
+                        block_duration,
+                        minimum_samples_per_block,
+                    );
+                    (legacy_run, managed_run)
+                };
+                let legacy_p99 = integrated_p99(&legacy_run);
+                let managed_p99 = integrated_p99(&managed_run);
+                let run_passed = managed_p99 <= legacy_p99;
+                every_paired_run_passed &= run_passed;
+                run_reports.push(serde_json::json!({
+                    "run": run_index + 1,
+                    "order": if legacy_first { "legacy_then_managed" } else { "managed_then_legacy" },
+                    "legacy_rgba": integrated_samples_json(&legacy_run),
+                    "metadata_managed": integrated_samples_json(&managed_run),
+                    "managed_total_p99_no_worse": run_passed,
+                    "managed_minus_legacy_p99_ns": i128::from(managed_p99) - i128::from(legacy_p99),
+                }));
+                legacy_all.extend(&legacy_run);
+                managed_all.extend(&managed_run);
+            }
+
+            let final_objects = renderer.core_gpu_object_construction_snapshot();
+            let warmed_object_delta = final_objects.delta_since(warmed_objects);
+            let legacy_p99 = integrated_p99(&legacy_all);
+            let managed_p99 = integrated_p99(&managed_all);
+            let aggregate_passed = managed_p99 <= legacy_p99;
+            let source_passed = aggregate_passed && every_paired_run_passed;
+            all_sources_pass &= source_passed;
+            let packed_bytes = u64::from(*width) * u64::from(*height) * 4;
+            let planar_bytes = u64::from(*width) * u64::from(*height) * 3 / 2;
+            source_reports.push(serde_json::json!({
+                "label": label,
+                "width": width,
+                "height": height,
+                "source_sha256": sha256_file(path),
+                "adapter": {
+                    "name": adapter.name,
+                    "backend": format!("{:?}", adapter.backend),
+                    "device_type": format!("{:?}", adapter.device_type),
+                    "vendor": adapter.vendor,
+                    "device": adapter.device,
+                    "driver": adapter.driver,
+                    "driver_info": adapter.driver_info,
+                },
+                "warm_accepted_frames_per_policy": warm_frames,
+                "paired_runs": run_reports,
+                "aggregate": {
+                    "legacy_rgba": integrated_samples_json(&legacy_all),
+                    "metadata_managed": integrated_samples_json(&managed_all),
+                    "managed_total_p99_no_worse": aggregate_passed,
+                    "managed_minus_legacy_p99_ns": i128::from(managed_p99) - i128::from(legacy_p99),
+                },
+                "fallback_frames": {
+                    "legacy_wrong_format": 0,
+                    "managed_not_planar": 0,
+                },
+                "bytes_per_accepted_source_frame": {
+                    "legacy_rgba8": packed_bytes,
+                    "metadata_managed_yuv420p8": planar_bytes,
+                    "staging_reduction_percent": 100.0 - planar_bytes as f64 * 100.0 / packed_bytes as f64,
+                },
+                "out_of_sample_cohort_transition_object_delta": {
+                    "buffers": warmed_object_delta.buffers,
+                    "bind_groups": warmed_object_delta.bind_groups,
+                    "pipelines": warmed_object_delta.pipelines,
+                    "textures": warmed_object_delta.textures,
+                    "samplers": warmed_object_delta.samplers,
+                    "law": "the renderer intentionally retains only the current LiveFrameResources stable-id set; one transition frame primes each AB/BA cohort, and every measured block separately asserts zero GPU-object construction",
+                },
+                "gate": {
+                    "aggregate_p99_non_regression": aggregate_passed,
+                    "all_five_paired_runs_non_regressing": every_paired_run_passed,
+                    "source_passed": source_passed,
+                },
+            }));
+        }
+
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                .unwrap_or_else(|| "unknown".to_owned())
+        };
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let ffmpeg = crate::host_paths::ffmpeg();
+        let receipt = serde_json::json!({
+            "schema": "collide-o-scope-p4c-integrated-total-frame-p99-receipt/1",
+            "run_kind": if smoke { "smoke_ineligible_for_default_gate" } else { "evidence" },
+            "command": "cargo test --locked --release --bin collide-o-scope gpu_planar_integrated_total_frame_p99_writes_the_receipt -- --ignored --nocapture --test-threads=1",
+            "smoke_command": "$env:COLLIDE_O_SCOPE_P4C_SMOKE='1'; cargo test --locked --release --bin collide-o-scope gpu_planar_integrated_total_frame_p99_writes_the_receipt -- --ignored --nocapture --test-threads=1; Remove-Item Env:COLLIDE_O_SCOPE_P4C_SMOKE",
+            "measured_at": {
+                "commit": git(&["rev-parse", "HEAD"]),
+                "tree": git(&["rev-parse", "HEAD^{tree}"]),
+                "branch": git(&["rev-parse", "--abbrev-ref", "HEAD"]),
+                "working_tree": match git(&["status", "--porcelain"]).as_str() {
+                    "unknown" => "unknown",
+                    "" => "clean",
+                    _ => "dirty",
+                },
+            },
+            "host": {
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "build_profile": "release",
+                "rustc": command_version(&rustc, &["--version"]),
+                "ffmpeg": command_version(ffmpeg.as_os_str(), &["-version"]),
+            },
+            "method": {
+                "boundary": "before ProgramTransportTick and threaded-decoder readiness; through Layer::upload_ready_media_frame, EvaluatedFramePlan::evaluate, LiveFrameResources::capture, Renderer::render_evaluated_frame, default Temporal, opaque audience resolve, queue submit, Device::poll wait fence, and upload-scope drain",
+                "excluded": [
+                    "cold renderer/layer/decoder/pipeline/resource construction",
+                    "window surface acquisition and presentation",
+                    "display scanout and photon time",
+                    "unrelated Main control, UI, recorder, and optional-effect work",
+                ],
+                "source_schedule": "two independently generated H.264 yuv420p 30 fps clips with declared tv/bt709/bt709/left metadata; production absolute transport selections advance at 30 accepted ticks per second",
+                "comparison": "one architectural variable: identical source/raster/default Exact program, separate warmed layers and decoders, legacy_rgba versus metadata_managed, AB/BA order alternating across five paired runs",
+                "warm_accepted_frames_per_policy_per_source": warm_frames,
+                "paired_runs_per_source": paired_runs,
+                "aggregate_measurement_seconds": total_measurement.as_secs_f64(),
+                "minimum_samples_per_block": minimum_samples_per_block,
+                "raw_samples_included": true,
+            },
+            "sources_measured": source_reports,
+            "default_gate": {
+                "eligible_run_shape": !smoke,
+                "requires_each_source_aggregate_and_all_five_pairs": true,
+                "all_sources_passed": all_sources_pass,
+                "passed": !smoke && all_sources_pass,
+                "decision_law": "legacy_rgba remains the Rust/serde/default-selection law unless this evidence run passes independently at 1280x720 and 1920x1080; a smoke run or any regression is a truthful negative and cannot authorize a default flip",
+            },
+        });
+        std::fs::create_dir_all("target").expect("create ignored receipt directory");
+        let receipt_path = "target/p4c-planar-integrated-total-frame-p99-receipt.json";
+        std::fs::write(
+            receipt_path,
+            format!("{}\n", serde_json::to_string_pretty(&receipt).unwrap()),
+        )
+        .expect("write integrated P4c p99 receipt");
+        println!(
+            "P4C_PLANAR_INTEGRATED_TOTAL_FRAME_P99_RECEIPT={}",
             serde_json::to_string_pretty(&receipt).unwrap()
         );
     }

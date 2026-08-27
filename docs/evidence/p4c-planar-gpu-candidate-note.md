@@ -2,13 +2,12 @@
 
 The stop receipt ([`p4c-planar-delivery-stop-receipt.md`](p4c-planar-delivery-stop-receipt.md))
 named its own reopen condition: "a dedicated renderer branch and the audit's
-720p/1080p two-source CPU/GPU equality plus p95/p99 fixture." This tranche is
-that reopening, in the `hw_decode`/full-16 shape: **measurement-only**. It
-builds the GPU conversion twin, runs the prescribed equality and percentile
-fixtures on the receipt host, and documents the result. The candidate remains
-**evaluation-only** — no decoder selects planar delivery, no upload path
-changed, no patch surface exists, and whether to pay the integration is a
-further product decision this measurement now informs.
+720p/1080p two-source CPU/GPU equality plus p95/p99 fixture." This note records
+that historical reopening, in the `hw_decode`/full-16 shape: a
+**measurement-only candidate**. At the measured candidate tree no decoder
+selected planar delivery, no upload path changed, and no patch surface
+existed. Phase B subsequently integrated the authored opt-in path; its current
+truth lives in [`p4c-planar-integration-note.md`](p4c-planar-integration-note.md).
 
 Branch: `feat/p4c-planar-delivery` from `a5f9043` (v1.8.1 mainline,
 suite-green on the newest run of every CI suite).
@@ -32,29 +31,31 @@ limited/full normalization, the same reconstruction. Declared tolerance: one
 8-bit code value per channel (`f64` round-half-away versus `f32`
 round-nearest at the quantize boundary), alpha exact.
 
-**The shader is a module constant, not a bundle member.** `build.rs` hashes
-`src/shaders/` into the production shader-bundle identity; an evaluation-only
-shader does not belong in that identity, so it lives in
-`src/video/planar_gpu.rs` and is validated where it runs, at pipeline
-creation inside the opt-in fixtures.
+**Shader identity followed promotion.** At the candidate tree the
+evaluation-only WGSL was a module constant rather than a production bundle
+member. Phase B made the converter a production upload path, and the follow-on
+therefore moved those exact bytes to `src/shaders/planar_convert.wgsl` with an
+`include_str!` consumer. `build.rs` now includes it in the production
+shader-bundle identity; pipeline creation still validates it where it runs.
 
-**No production consumer, audited.** The module carries the S10a
-measurement-only discipline, and
-`no_production_module_consumes_the_planar_gpu_prototype` pins it as a source
-audit: a reference from any other module is a test failure, so promotion
-cannot happen by accident.
+**No production consumer at the candidate tree, audited.** The candidate
+carried the S10a measurement-only discipline and a source audit that rejected
+any production reference. Phase B deliberately removed that stop only after
+this receipt cleared the reopen gate.
 
 ## The measurement
 
-Tracked receipt: [`p4c-planar-gpu-candidate-receipt.json`](p4c-planar-gpu-candidate-receipt.json),
-regenerated in place by the opt-in fixture (the S2-receipt law: a changed
-receipt after an opt-in run is a new measurement on new hardware — commit
-it). Adapter: AMD Radeon RX 6950 XT / Vulkan (driver 26.8.1), release
+Tracked receipt: [`p4c-planar-gpu-candidate-receipt.json`](p4c-planar-gpu-candidate-receipt.json).
+It is immutable evidence for its named candidate commit, branch, dirty-tree
+state, and host. The current follow-up fixture writes a distinct untracked
+`target/p4c-planar-gpu-followup-receipt.json`; it cannot overwrite this Phase-A
+receipt. Adapter: AMD Radeon RX 6950 XT / Vulkan (driver 26.8.1), release
 profile — the fixture refuses to run under debug, because debug timings of
 Rust loops against optimized C are not evidence. Sources: two generated
 H.264 yuv420p clips (720p and 1080p testsrc2 at 30 fps) carrying complete
 declared tv/bt709/bt709/left metadata; the **real decoder's frozen
-descriptor** drives admission through `prototype_delivery_decision` and both
+descriptor** drove admission through the then-public
+`prototype_delivery_decision` compatibility name and both
 conversions, so the fixture cannot invent color truth. 240 measured frames
 per source; upload timings take 60 warm-up plus 240 fenced iterations.
 
@@ -62,15 +63,13 @@ per source; upload timings take 60 warm-up plus 240 fenced iterations.
 |---|---:|---:|---|
 | Staging bytes/frame, packed → planar | 3,686,400 → 1,382,400 | 8,294,400 → 3,110,400 | ≥ 50% reduction — **62.5% both** |
 | CPU/GPU equality on real decoded frames | max Δ 1 code | max Δ 1 code | declared tolerance 1 |
-| Delivery p95 (swscale+repack → plane copy) | 718.7 µs → 219.0 µs (**−69.5%**) | 1,671.1 µs → 503.0 µs (**−69.9%**) | improvement required |
-| Upload p95 (packed write → plane writes + conversion pass) | 621.7 µs → 536.9 µs (**−13.6%**) | 1,111.7 µs → 814.5 µs (**−26.7%**) | improvement required |
+| Delivery p50 / p95 / p99, packed → planar | 648.0 / 726.2 / 1,015.6 µs → 197.2 / 245.8 / 318.8 µs | 1,469.1 / 1,644.1 / 1,831.0 µs → 447.7 / 515.6 / 781.7 µs | improvement required; p95 **−66.2% / −68.6%** |
+| Upload p50 / p95 / p99, packed → planar | 505.6 / 603.4 / 771.9 µs → 358.9 / 488.0 / 757.0 µs | 969.3 / 1,058.9 / 1,148.7 µs → 653.8 / 763.5 / 918.3 µs | improvement required; p95 **−19.1% / −27.9%** |
 
-One honest tail: the 720p planar upload p99 (1,330.5 µs) exceeded the packed
-p99 (833.9 µs) in this run while its p50/p95 improved; the 1080p tail
-improved at every percentile. The audit's promotion clause — "without
-worsening total frame p99" — is a property of the **integrated** two-source
-matrix, which this candidate deliberately does not claim; the receipt records
-the seam percentiles and nothing more.
+Both upload p99 values improved in the immutable receipt. That is still not
+the audit's promotion clause: "without worsening total frame p99" is a
+property of the **integrated** two-source matrix, which this candidate did not
+claim. The receipt records delivery and upload seams, not total-frame latency.
 
 The synthetic equality battery
 (`gpu_planar_conversion_matches_the_cpu_reference_battery`) covers what real
@@ -84,20 +83,18 @@ oracle on the same adapter.
 |---|---|---|
 | Contract unity | GPU uniforms derive from the CPU contract; refusal parity | **Covered, hosted.** `uniforms_are_48_bytes_and_answer_from_the_one_shared_contract`. |
 | Staging arithmetic | ≥ 50% for common 8-bit 4:2:0 | **Covered, hosted.** `planar_staging_bytes_meet_the_audit_reduction_floor` (62.5%; P010's 25% recorded as the fidelity case). |
-| Measurement-only discipline | no production consumer | **Covered, hosted, as a source audit.** |
+| Measurement-only discipline | no production consumer at the candidate tree | **Covered historically, hosted, as a source audit.** |
 | CPU/GPU equality | synthetic battery + real decoded frames | **Covered, opt-in GPU, run on this host.** Battery plus the candidate fixture's three spot frames per source. |
 | Percentiles | 720p/1080p two-source delivery and upload p50/p95/p99 | **Covered, opt-in GPU + ffmpeg CLI, release profile, run on this host.** Recorded, never asserted — a truthful negative would still be a valid receipt, exactly as it was for D3D11VA. |
 | Legacy byte identity | the packed path unmoved | **By absence.** No production module changed behavior; the only non-test edit outside the new module is contract visibility in `planar.rs`. |
 
 ## What the receipt authorizes — and does not
 
-The measured result clears the reopen gate decisively at the delivery seam
-(~70% p95 reduction is the swscale conversion cost itself) and meaningfully
-at the upload seam. Integration — a decoder that selects planar under the
-additive `metadata_managed` policy, pooled plane staging, ledger accounting,
-reverse-cache planar bytes, live/export parity, and the integrated
-total-frame p99 non-regression proof — is the audit's P4c items 10–14 and
-remains its own tranche, taken only if the operator elects it after reading
-this receipt. If a future integrated measurement fails the total-frame
-clause, the stop receipt's disposal instruction stands: retain P4a/P4b and
-leave the prototype unused.
+The measured result cleared the reopen gate decisively at the delivery seam
+and meaningfully at the upload seam. Phase B then integrated authored
+`metadata_managed` delivery, pooled plane staging, ledger accounting,
+reverse-cache planar bytes, and live/export parity for progressive YUV420P8.
+It did not prove the integrated total-frame p99 clause, flip the legacy
+default, admit NV12/P010, or solve the 10-bit/HDR output surface. Those remain
+separate gates, and a failed total-frame receipt must preserve the legacy
+default.
