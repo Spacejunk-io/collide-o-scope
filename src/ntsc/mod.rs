@@ -1374,7 +1374,200 @@ mod tests {
     use super::{linear_byte, linear_to_srgb_byte};
     use crate::layers::BlendMode;
     use crate::renderer::blend::composite_straight;
+    use ntsc_rs::settings::SettingsList;
+    use ntsc_rs::NtscEffect;
+    use sha2::{Digest, Sha256};
     use std::time::{Duration, Instant};
+
+    fn maintenance_all_control_params() -> NtscParams {
+        NtscParams {
+            enabled: true,
+            tape_speed: 2,
+            chroma_loss: 0.007_812_5,
+            edge_wave_enabled: true,
+            edge_wave_intensity: 3.25,
+            edge_wave_speed: 0.75,
+            head_switching_enabled: true,
+            head_switching_height: 5,
+            head_switching_shift: -7.5,
+            tracking_noise_enabled: true,
+            tracking_noise_height: 7,
+            tracking_noise_wave: 3.5,
+            tracking_noise_snow: 0.375,
+            snow_intensity: 0.25,
+            composite_noise_intensity: 0.125,
+            luma_noise_intensity: 0.062_5,
+            chroma_noise_intensity: 0.093_75,
+            luma_smear: 0.312_5,
+            composite_sharpening: 0.5,
+        }
+    }
+
+    fn maintenance_source(width: u32, height: u32, frame: usize) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                pixels.extend_from_slice(&[
+                    (x * 17 + y * 31 + frame * 7) as u8,
+                    (x * x * 3 + y * 11 + frame * 13) as u8,
+                    (x * 5 + y * y * 7 + frame * 19) as u8,
+                    (x * 29 + y * 37 + frame * 23) as u8,
+                ]);
+            }
+        }
+        pixels
+    }
+
+    fn maintenance_campaign(quality: NtscExportQuality) -> Vec<String> {
+        const WIDTH: u32 = 33;
+        const HEIGHT: u32 = 25;
+        const FRAMES: [usize; 4] = [0, 1, 17, 61];
+        let mut state = NtscState::new();
+        state.params = maintenance_all_control_params();
+        FRAMES
+            .into_iter()
+            .map(|frame| {
+                let source = maintenance_source(WIDTH, HEIGHT, frame);
+                let expected_alpha: Vec<_> = source.chunks_exact(4).map(|pixel| pixel[3]).collect();
+                let mut pixels = source.clone();
+                assert!(state.apply_at_reference_frame_with_resolution(
+                    &mut pixels,
+                    WIDTH,
+                    HEIGHT,
+                    frame,
+                    quality,
+                ));
+                assert_eq!(
+                    pixels
+                        .chunks_exact(4)
+                        .map(|pixel| pixel[3])
+                        .collect::<Vec<_>>(),
+                    expected_alpha,
+                    "alpha changed at frame {frame} for {quality:?}",
+                );
+                assert!(
+                    pixels
+                        .chunks_exact(4)
+                        .zip(source.chunks_exact(4))
+                        .any(|(actual, before)| actual[..3] != before[..3]),
+                    "RGB did not change at frame {frame} for {quality:?}",
+                );
+                format!("{:x}", Sha256::digest(&pixels))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn maintenance_pin_preserves_preset_schema_and_pixel_oracles() {
+        const LIVE: [&str; 4] = [
+            "b8063b318c4aa605806c4371fd20c0bfbf330811344a73cc57794eb21bfa2191",
+            "066cefbb71b94ade2cda3039dcdd59c75dbce85569f7ad4500c4b19b5afa5437",
+            "563a12f52753af31ae078ff0b523625f087e5bb50a7868f395098bcf8bb41108",
+            "a83a6589843f193db781390e39d45aecbdca308286fba396f1cf953ca6e1b184",
+        ];
+        const NATIVE: [&str; 4] = [
+            "a468f190a91ffa79bf5598d902addfa8a35c76e348009bf55c8d7ee77575aefb",
+            "d78fc5708a2db73c408a3f42fd0471b16bf2d72a2b74c3f5d4766ab3565c3171",
+            "14e1534486060becc2c59f27a860c84ba582b8387e80386b174689682d62254e",
+            "0aee7c1732578632653c625f35ab88c67e7ac09be9b222258424d2364bbf5c7d",
+        ];
+        const DEFAULT_JSON: &str = r#"{"random_seed":0,"use_field":4,"filter_type":1,"input_luma_filter":2,"chroma_lowpass_in":2,"composite_preemphasis":1,"composite_noise":true,"composite_noise_intensity":0.05,"composite_noise_frequency":0.5,"composite_noise_detail":1,"snow_intensity":0.00025,"snow_anisotropy":0.5,"video_scanline_phase_shift":2,"video_scanline_phase_shift_offset":0,"chroma_demodulation":1,"luma_smear":0.5,"head_switching":true,"head_switching_height":8,"head_switching_offset":3,"head_switching_horizontal_shift":72,"head_switching_start_mid_line":true,"head_switching_mid_line_position":0.95,"head_switching_mid_line_jitter":0.03,"tracking_noise":true,"tracking_noise_height":12,"tracking_noise_wave_intensity":15,"tracking_noise_snow_intensity":0.025,"tracking_noise_snow_anisotropy":0.25,"tracking_noise_noise_intensity":0.25,"ringing":true,"ringing_frequency":0.45,"ringing_power":4,"ringing_scale":4,"luma_noise":true,"luma_noise_intensity":0.01,"luma_noise_frequency":0.5,"luma_noise_detail":1,"chroma_noise":true,"chroma_noise_intensity":0.1,"chroma_noise_frequency":0.05,"chroma_noise_detail":2,"chroma_phase_error":0,"chroma_phase_noise_intensity":0.001,"chroma_delay_horizontal":0,"chroma_delay_vertical":0,"vhs_settings":true,"vhs_tape_speed":2,"vhs_chroma_loss":0.000025,"vhs_sharpen_enabled":true,"vhs_sharpen":0.25,"vhs_sharpen_frequency":1,"vhs_edge_wave_enabled":true,"vhs_edge_wave":0.5,"vhs_edge_wave_speed":4,"vhs_edge_wave_frequency":0.05,"vhs_edge_wave_detail":2,"vhs_chroma_vert_blend":true,"chroma_lowpass_out":2,"scale_settings":true,"bandwidth_scale":1,"vertical_scale":1,"scale_with_video_size":false,"version":1}"#;
+        const CONFIGURED_JSON: &str = r#"{"random_seed":0,"use_field":4,"filter_type":1,"input_luma_filter":2,"chroma_lowpass_in":2,"composite_preemphasis":0.5,"composite_noise":true,"composite_noise_intensity":0.125,"composite_noise_frequency":0.5,"composite_noise_detail":1,"snow_intensity":0.25,"snow_anisotropy":0.5,"video_scanline_phase_shift":2,"video_scanline_phase_shift_offset":0,"chroma_demodulation":1,"luma_smear":0.3125,"head_switching":true,"head_switching_height":5,"head_switching_offset":3,"head_switching_horizontal_shift":-7.5,"head_switching_start_mid_line":true,"head_switching_mid_line_position":0.95,"head_switching_mid_line_jitter":0.03,"tracking_noise":true,"tracking_noise_height":7,"tracking_noise_wave_intensity":3.5,"tracking_noise_snow_intensity":0.375,"tracking_noise_snow_anisotropy":0.25,"tracking_noise_noise_intensity":0.25,"ringing":true,"ringing_frequency":0.45,"ringing_power":4,"ringing_scale":4,"luma_noise":true,"luma_noise_intensity":0.0625,"luma_noise_frequency":0.5,"luma_noise_detail":1,"chroma_noise":true,"chroma_noise_intensity":0.09375,"chroma_noise_frequency":0.05,"chroma_noise_detail":2,"chroma_phase_error":0,"chroma_phase_noise_intensity":0.001,"chroma_delay_horizontal":0,"chroma_delay_vertical":0,"vhs_settings":true,"vhs_tape_speed":3,"vhs_chroma_loss":0.0078125,"vhs_sharpen_enabled":true,"vhs_sharpen":0.25,"vhs_sharpen_frequency":1,"vhs_edge_wave_enabled":true,"vhs_edge_wave":3.25,"vhs_edge_wave_speed":0.75,"vhs_edge_wave_frequency":0.05,"vhs_edge_wave_detail":2,"vhs_chroma_vert_blend":true,"chroma_lowpass_out":2,"scale_settings":true,"bandwidth_scale":1,"vertical_scale":1,"scale_with_video_size":false,"version":1}"#;
+        const DESCRIPTORS: [(u32, &str); 62] = [
+            (36, "random_seed"),
+            (30, "use_field"),
+            (46, "filter_type"),
+            (38, "input_luma_filter"),
+            (0, "chroma_lowpass_in"),
+            (1, "composite_preemphasis"),
+            (52, "composite_noise"),
+            (4, "composite_noise_intensity"),
+            (53, "composite_noise_frequency"),
+            (54, "composite_noise_detail"),
+            (6, "snow_intensity"),
+            (34, "snow_anisotropy"),
+            (2, "video_scanline_phase_shift"),
+            (3, "video_scanline_phase_shift_offset"),
+            (33, "chroma_demodulation"),
+            (45, "luma_smear"),
+            (11, "head_switching"),
+            (12, "head_switching_height"),
+            (13, "head_switching_offset"),
+            (14, "head_switching_horizontal_shift"),
+            (49, "head_switching_start_mid_line"),
+            (50, "head_switching_mid_line_position"),
+            (51, "head_switching_mid_line_jitter"),
+            (15, "tracking_noise"),
+            (16, "tracking_noise_height"),
+            (17, "tracking_noise_wave_intensity"),
+            (18, "tracking_noise_snow_intensity"),
+            (35, "tracking_noise_snow_anisotropy"),
+            (31, "tracking_noise_noise_intensity"),
+            (19, "ringing"),
+            (20, "ringing_frequency"),
+            (21, "ringing_power"),
+            (22, "ringing_scale"),
+            (55, "luma_noise"),
+            (57, "luma_noise_intensity"),
+            (56, "luma_noise_frequency"),
+            (58, "luma_noise_detail"),
+            (42, "chroma_noise"),
+            (5, "chroma_noise_intensity"),
+            (43, "chroma_noise_frequency"),
+            (44, "chroma_noise_detail"),
+            (37, "chroma_phase_error"),
+            (7, "chroma_phase_noise_intensity"),
+            (8, "chroma_delay_horizontal"),
+            (9, "chroma_delay_vertical"),
+            (23, "vhs_settings"),
+            (24, "vhs_tape_speed"),
+            (26, "vhs_chroma_loss"),
+            (47, "vhs_sharpen_enabled"),
+            (27, "vhs_sharpen"),
+            (48, "vhs_sharpen_frequency"),
+            (39, "vhs_edge_wave_enabled"),
+            (28, "vhs_edge_wave"),
+            (29, "vhs_edge_wave_speed"),
+            (40, "vhs_edge_wave_frequency"),
+            (41, "vhs_edge_wave_detail"),
+            (25, "vhs_chroma_vert_blend"),
+            (10, "chroma_lowpass_out"),
+            (61, "scale_settings"),
+            (32, "bandwidth_scale"),
+            (59, "vertical_scale"),
+            (60, "scale_with_video_size"),
+        ];
+
+        let live_first = maintenance_campaign(NtscExportQuality::LiveParity);
+        let live_second = maintenance_campaign(NtscExportQuality::LiveParity);
+        let native_first = maintenance_campaign(NtscExportQuality::Native);
+        let native_second = maintenance_campaign(NtscExportQuality::Native);
+        assert_eq!(live_first, live_second);
+        assert_eq!(native_first, native_second);
+        assert_eq!(live_first, LIVE);
+        assert_eq!(native_first, NATIVE);
+        assert_ne!(live_first, native_first);
+
+        let settings = SettingsList::<NtscEffect>::new();
+        let descriptors: Vec<_> = settings
+            .all_descriptors()
+            .map(|descriptor| (descriptor.id.id, descriptor.id.name))
+            .collect();
+        assert_eq!(descriptors.as_slice(), &DESCRIPTORS);
+        assert_eq!(
+            settings.to_json_string(&NtscEffect::default()).unwrap(),
+            DEFAULT_JSON
+        );
+
+        let mut state = NtscState::new();
+        state.params = maintenance_all_control_params();
+        state.sync_effect_from_params();
+        let configured = settings.to_json_string(&state.effect).unwrap();
+        assert_eq!(configured, CONFIGURED_JSON);
+        let reparsed = settings.from_json(&configured).unwrap();
+        assert_eq!(reparsed, state.effect);
+        assert_eq!(settings.to_json_string(&reparsed).unwrap(), configured);
+    }
 
     #[test]
     fn half_resolution_round_trip_handles_odd_dimensions() {
