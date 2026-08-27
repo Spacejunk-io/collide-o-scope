@@ -64,14 +64,19 @@ pub const MAX_PERFORMANCE_SERIALIZED_BYTES: usize = 512 * 1024;
 /// 64-byte param bound matches the wire gate's `valid_identifier` ceiling.
 pub const MAX_PERFORMANCE_PARAM_BYTES: usize = 64;
 
-/// A discrete law's closed vocabulary is small by construction: the largest
-/// house token vocabulary (the 25 blend modes) fits with room for growth.
-pub const MAX_PERFORMANCE_VOCAB_TOKENS: usize = 32;
+/// A discrete law's closed vocabulary is small by construction. Sixty-four is
+/// large enough for the engine-owned modulation-source table (including its
+/// compatibility aliases) while keeping hostile documents tightly bounded.
+pub const MAX_PERFORMANCE_VOCAB_TOKENS: usize = 64;
 
 /// Domain separator for the canonical checksum. The version literal appears
 /// here as well as in the hashed `version` field, exactly as the gesture track
 /// and the recovery journal repeat theirs.
 pub const PERFORMANCE_CHECKSUM_DOMAIN: &[u8] = b"collide-o-scope/performance-take/v1\0";
+
+/// First append-only control code added by the v2 address-capability tranche.
+/// The take document and checksum domain remain version 1.
+pub const PERFORMANCE_V2_FIRST_CONTROL_CODE: u8 = 15;
 
 /// Fixed width of one encoded event: `tick:u32le`, `address:u16le`,
 /// `value:u16le`.
@@ -92,9 +97,9 @@ const PERFORMANCE_Q16_SCALE: f32 = 65_535.0;
 /// coalescible absolute-value wire action, and a layer is identified by its
 /// saved stack position — the patch-persistent identity morph slots and saved
 /// donor positions already use — never by a process-lifetime live layer ID,
-/// which a patch load deliberately re-mints. Values only, by law: topology,
-/// routes, and safety controls (blackout, freeze, pause) have no address here
-/// and can never enter a take.
+/// which a patch load deliberately re-mints. Values only, by law: topology
+/// (including adding or removing routes) and safety controls (blackout,
+/// freeze, pause) have no address here and can never enter a take.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PerformanceControl {
     /// Master effect value (`set_param`).
@@ -127,6 +132,43 @@ pub enum PerformanceControl {
     MorphPosition,
     /// A gesture-canvas authored scalar (`set_gesture_canvas`).
     GestureCanvas { param: String },
+    /// A master-rack node parameter, addressed by its patch-persistent node ID.
+    RackNodeMaster {
+        node: u64,
+        node_kind: String,
+        param: String,
+    },
+    /// A layer-rack node parameter. The layer uses its saved stack position;
+    /// the node uses its patch-persistent ID.
+    RackNodeLayer {
+        layer: u32,
+        node: u64,
+        node_kind: String,
+        param: String,
+    },
+    /// A composition-group rack node parameter, addressed by the group's and
+    /// node's patch-persistent IDs.
+    RackNodeGroup {
+        group: u64,
+        node: u64,
+        node_kind: String,
+        param: String,
+    },
+    /// A composition-group value.
+    GroupParam { group: u64, param: String },
+    /// A composition-group matte value.
+    GroupMatteParam { group: u64, param: String },
+    /// A text-page value on a saved layer position.
+    LayerText { layer: u32, param: String },
+    /// The closed Morph blend-law token.
+    MorphLaw,
+    /// A Morph glide whose target is part of the address identity and whose
+    /// value lane carries the duration.
+    MorphGlide { target_q16: u16 },
+    /// The closed Morph capture-slot token.
+    MorphCapture,
+    /// One value on a routing entry addressed by saved routing position.
+    Routing { routing: u32, param: String },
 }
 
 impl PerformanceControl {
@@ -149,6 +191,16 @@ impl PerformanceControl {
             Self::BusMix { .. } => 12,
             Self::MorphPosition => 13,
             Self::GestureCanvas { .. } => 14,
+            Self::RackNodeMaster { .. } => 15,
+            Self::RackNodeLayer { .. } => 16,
+            Self::RackNodeGroup { .. } => 17,
+            Self::GroupParam { .. } => 18,
+            Self::GroupMatteParam { .. } => 19,
+            Self::LayerText { .. } => 20,
+            Self::MorphLaw => 21,
+            Self::MorphGlide { .. } => 22,
+            Self::MorphCapture => 23,
+            Self::Routing { .. } => 24,
         }
     }
 
@@ -171,6 +223,16 @@ impl PerformanceControl {
             Self::BusMix { .. } => "bus_mix",
             Self::MorphPosition => "morph_position",
             Self::GestureCanvas { .. } => "gesture_canvas",
+            Self::RackNodeMaster { .. } => "rack_node_master",
+            Self::RackNodeLayer { .. } => "rack_node_layer",
+            Self::RackNodeGroup { .. } => "rack_node_group",
+            Self::GroupParam { .. } => "group_param",
+            Self::GroupMatteParam { .. } => "group_matte_param",
+            Self::LayerText { .. } => "layer_text",
+            Self::MorphLaw => "morph_law",
+            Self::MorphGlide { .. } => "morph_glide",
+            Self::MorphCapture => "morph_capture",
+            Self::Routing { .. } => "routing",
         }
     }
 
@@ -182,7 +244,56 @@ impl PerformanceControl {
             | Self::LayerTransform { layer, .. }
             | Self::LayerVisible { layer }
             | Self::LayerPattern { layer, .. }
-            | Self::MotionLayer { layer, .. } => Some(*layer),
+            | Self::MotionLayer { layer, .. }
+            | Self::RackNodeLayer { layer, .. }
+            | Self::LayerText { layer, .. } => Some(*layer),
+            _ => None,
+        }
+    }
+
+    /// The patch-persistent node ID the control addresses, if any.
+    pub const fn node(&self) -> Option<u64> {
+        match self {
+            Self::RackNodeMaster { node, .. }
+            | Self::RackNodeLayer { node, .. }
+            | Self::RackNodeGroup { node, .. } => Some(*node),
+            _ => None,
+        }
+    }
+
+    /// The patch-persistent composition-group ID the control addresses, if
+    /// any.
+    pub const fn group(&self) -> Option<u64> {
+        match self {
+            Self::RackNodeGroup { group, .. }
+            | Self::GroupParam { group, .. }
+            | Self::GroupMatteParam { group, .. } => Some(*group),
+            _ => None,
+        }
+    }
+
+    /// The rack-node kind captured with a node address, if any.
+    pub fn node_kind(&self) -> Option<&str> {
+        match self {
+            Self::RackNodeMaster { node_kind, .. }
+            | Self::RackNodeLayer { node_kind, .. }
+            | Self::RackNodeGroup { node_kind, .. } => Some(node_kind),
+            _ => None,
+        }
+    }
+
+    /// The Q16 Morph target captured in a glide address, if any.
+    pub const fn target_q16(&self) -> Option<u16> {
+        match self {
+            Self::MorphGlide { target_q16 } => Some(*target_q16),
+            _ => None,
+        }
+    }
+
+    /// The saved routing position the control addresses, if any.
+    pub const fn routing(&self) -> Option<u32> {
+        match self {
+            Self::Routing { routing, .. } => Some(*routing),
             _ => None,
         }
     }
@@ -200,14 +311,34 @@ impl PerformanceControl {
             | Self::Temporal { param }
             | Self::MotionMaster { param }
             | Self::MotionLayer { param, .. }
-            | Self::BusMix { param } => Some(param),
-            Self::GestureCanvas { param } => Some(param),
-            Self::LayerVisible { .. } | Self::BusCrossfade | Self::MorphPosition => None,
+            | Self::BusMix { param }
+            | Self::GestureCanvas { param }
+            | Self::RackNodeMaster { param, .. }
+            | Self::RackNodeLayer { param, .. }
+            | Self::RackNodeGroup { param, .. }
+            | Self::GroupParam { param, .. }
+            | Self::GroupMatteParam { param, .. }
+            | Self::LayerText { param, .. }
+            | Self::Routing { param, .. } => Some(param),
+            Self::LayerVisible { .. }
+            | Self::BusCrossfade
+            | Self::MorphPosition
+            | Self::MorphLaw
+            | Self::MorphGlide { .. }
+            | Self::MorphCapture => None,
         }
     }
 
     fn needs_param(kind: &str) -> bool {
-        !matches!(kind, "layer_visible" | "bus_crossfade" | "morph_position")
+        !matches!(
+            kind,
+            "layer_visible"
+                | "bus_crossfade"
+                | "morph_position"
+                | "morph_law"
+                | "morph_glide"
+                | "morph_capture"
+        )
     }
 
     fn needs_layer(kind: &str) -> bool {
@@ -219,21 +350,94 @@ impl PerformanceControl {
                 | "layer_visible"
                 | "layer_pattern"
                 | "motion_layer"
+                | "rack_node_layer"
+                | "layer_text"
         )
     }
 
+    fn needs_node(kind: &str) -> bool {
+        matches!(
+            kind,
+            "rack_node_master" | "rack_node_layer" | "rack_node_group"
+        )
+    }
+
+    fn needs_group(kind: &str) -> bool {
+        matches!(
+            kind,
+            "rack_node_group" | "group_param" | "group_matte_param"
+        )
+    }
+
+    fn needs_node_kind(kind: &str) -> bool {
+        Self::needs_node(kind)
+    }
+
+    fn needs_target_q16(kind: &str) -> bool {
+        kind == "morph_glide"
+    }
+
+    fn needs_routing(kind: &str) -> bool {
+        kind == "routing"
+    }
+
+    fn parse_nonzero_decimal_id(kind: &str, value: String) -> Result<u64, PerformanceError> {
+        if value.is_empty()
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+            || value.starts_with('0')
+        {
+            return Err(PerformanceError::MalformedAddress(kind.to_string()));
+        }
+        let parsed = value
+            .parse::<u64>()
+            .map_err(|_| PerformanceError::MalformedAddress(kind.to_string()))?;
+        if parsed == 0 || parsed.to_string() != value {
+            return Err(PerformanceError::MalformedAddress(kind.to_string()));
+        }
+        Ok(parsed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn from_parts(
         kind: &str,
         layer: Option<u32>,
         param: Option<String>,
+        node_id: Option<String>,
+        group_id: Option<String>,
+        node_kind: Option<String>,
+        target_q16: Option<u16>,
+        routing: Option<u32>,
     ) -> Result<Self, PerformanceError> {
         let wants_param = Self::needs_param(kind);
         let wants_layer = Self::needs_layer(kind);
-        if wants_param != param.is_some() || wants_layer != layer.is_some() {
+        let wants_node = Self::needs_node(kind);
+        let wants_group = Self::needs_group(kind);
+        let wants_node_kind = Self::needs_node_kind(kind);
+        let wants_target_q16 = Self::needs_target_q16(kind);
+        let wants_routing = Self::needs_routing(kind);
+        if wants_param != param.is_some()
+            || wants_layer != layer.is_some()
+            || wants_node != node_id.is_some()
+            || wants_group != group_id.is_some()
+            || wants_node_kind != node_kind.is_some()
+            || wants_target_q16 != target_q16.is_some()
+            || wants_routing != routing.is_some()
+        {
             return Err(PerformanceError::MalformedAddress(kind.to_string()));
         }
         let param = param.unwrap_or_default();
         let layer = layer.unwrap_or_default();
+        let node = node_id
+            .map(|value| Self::parse_nonzero_decimal_id(kind, value))
+            .transpose()?
+            .unwrap_or_default();
+        let group = group_id
+            .map(|value| Self::parse_nonzero_decimal_id(kind, value))
+            .transpose()?
+            .unwrap_or_default();
+        let node_kind = node_kind.unwrap_or_default();
+        let target_q16 = target_q16.unwrap_or_default();
+        let routing = routing.unwrap_or_default();
         let control = match kind {
             "master" => Self::Master { param },
             "master_transform" => Self::MasterTransform { param },
@@ -250,6 +454,30 @@ impl PerformanceControl {
             "bus_mix" => Self::BusMix { param },
             "morph_position" => Self::MorphPosition,
             "gesture_canvas" => Self::GestureCanvas { param },
+            "rack_node_master" => Self::RackNodeMaster {
+                node,
+                node_kind,
+                param,
+            },
+            "rack_node_layer" => Self::RackNodeLayer {
+                layer,
+                node,
+                node_kind,
+                param,
+            },
+            "rack_node_group" => Self::RackNodeGroup {
+                group,
+                node,
+                node_kind,
+                param,
+            },
+            "group_param" => Self::GroupParam { group, param },
+            "group_matte_param" => Self::GroupMatteParam { group, param },
+            "layer_text" => Self::LayerText { layer, param },
+            "morph_law" => Self::MorphLaw,
+            "morph_glide" => Self::MorphGlide { target_q16 },
+            "morph_capture" => Self::MorphCapture,
+            "routing" => Self::Routing { routing, param },
             other => return Err(PerformanceError::MalformedAddress(other.to_string())),
         };
         control.validate()?;
@@ -264,20 +492,46 @@ impl PerformanceControl {
                 return Err(PerformanceError::ParamBytes(param.len()));
             }
         }
+        if self.node().is_some_and(|node| node == 0) || self.group().is_some_and(|group| group == 0)
+        {
+            return Err(PerformanceError::MalformedAddress(
+                self.kind_token().to_string(),
+            ));
+        }
+        if let Some(node_kind) = self.node_kind() {
+            if node_kind.is_empty() || node_kind.len() > MAX_PERFORMANCE_PARAM_BYTES {
+                return Err(PerformanceError::NodeKindBytes(node_kind.len()));
+            }
+        }
         Ok(())
     }
 
     /// Operator-facing name for diagnostics. Stable, path-free, and never
     /// parsed back — the typed fields are the identity.
     pub fn describe(&self) -> String {
-        match (self.layer(), self.param()) {
-            (Some(layer), Some(param)) => {
-                format!("{}:{layer}:{param}", self.kind_token())
-            }
-            (Some(layer), None) => format!("{}:{layer}", self.kind_token()),
-            (None, Some(param)) => format!("{}:{param}", self.kind_token()),
-            (None, None) => self.kind_token().to_string(),
+        let mut parts = vec![self.kind_token().to_string()];
+        if let Some(layer) = self.layer() {
+            parts.push(layer.to_string());
         }
+        if let Some(group) = self.group() {
+            parts.push(group.to_string());
+        }
+        if let Some(node) = self.node() {
+            parts.push(node.to_string());
+        }
+        if let Some(node_kind) = self.node_kind() {
+            parts.push(node_kind.to_string());
+        }
+        if let Some(target_q16) = self.target_q16() {
+            parts.push(target_q16.to_string());
+        }
+        if let Some(routing) = self.routing() {
+            parts.push(routing.to_string());
+        }
+        if let Some(param) = self.param() {
+            parts.push(param.to_string());
+        }
+        parts.join(":")
     }
 }
 
@@ -496,6 +750,16 @@ struct RawAddress {
     layer: Option<u32>,
     #[serde(default)]
     param: Option<String>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    group_id: Option<String>,
+    #[serde(default)]
+    node_kind: Option<String>,
+    #[serde(default)]
+    target_q16: Option<u16>,
+    #[serde(default)]
+    routing: Option<u32>,
     law: String,
     #[serde(default)]
     min: Option<f32>,
@@ -511,7 +775,16 @@ struct RawAddress {
 
 impl RawAddress {
     fn into_address(self) -> Result<PerformanceAddress, PerformanceError> {
-        let control = PerformanceControl::from_parts(&self.kind, self.layer, self.param)?;
+        let control = PerformanceControl::from_parts(
+            &self.kind,
+            self.layer,
+            self.param,
+            self.node_id,
+            self.group_id,
+            self.node_kind,
+            self.target_q16,
+            self.routing,
+        )?;
         let law = match self.law.as_str() {
             "unit" => match (
                 self.min,
@@ -570,6 +843,11 @@ impl Serialize for PerformanceAddress {
         let mut fields = 2usize;
         fields += usize::from(self.control.layer().is_some());
         fields += usize::from(self.control.param().is_some());
+        fields += usize::from(self.control.node().is_some());
+        fields += usize::from(self.control.group().is_some());
+        fields += usize::from(self.control.node_kind().is_some());
+        fields += usize::from(self.control.target_q16().is_some());
+        fields += usize::from(self.control.routing().is_some());
         fields += match &self.law {
             PerformanceValueLaw::Unit { .. } => 2,
             PerformanceValueLaw::Discrete { .. } => 1,
@@ -580,6 +858,21 @@ impl Serialize for PerformanceAddress {
         state.serialize_field("kind", self.control.kind_token())?;
         if let Some(layer) = self.control.layer() {
             state.serialize_field("layer", &layer)?;
+        }
+        if let Some(node) = self.control.node() {
+            state.serialize_field("node_id", &node.to_string())?;
+        }
+        if let Some(group) = self.control.group() {
+            state.serialize_field("group_id", &group.to_string())?;
+        }
+        if let Some(node_kind) = self.control.node_kind() {
+            state.serialize_field("node_kind", node_kind)?;
+        }
+        if let Some(target_q16) = self.control.target_q16() {
+            state.serialize_field("target_q16", &target_q16)?;
+        }
+        if let Some(routing) = self.control.routing() {
+            state.serialize_field("routing", &routing)?;
         }
         if let Some(param) = self.control.param() {
             state.serialize_field("param", param)?;
@@ -627,6 +920,57 @@ impl PerformanceAddress {
         bytes.extend_from_slice(&(param.len() as u16).to_le_bytes());
         bytes.extend_from_slice(param.as_bytes());
         self.law.encode_canonical(bytes);
+        match &self.control {
+            PerformanceControl::RackNodeMaster {
+                node, node_kind, ..
+            }
+            | PerformanceControl::RackNodeLayer {
+                node, node_kind, ..
+            } => {
+                bytes.extend_from_slice(&node.to_le_bytes());
+                bytes.extend_from_slice(&(node_kind.len() as u16).to_le_bytes());
+                bytes.extend_from_slice(node_kind.as_bytes());
+            }
+            PerformanceControl::RackNodeGroup {
+                group,
+                node,
+                node_kind,
+                ..
+            } => {
+                bytes.extend_from_slice(&group.to_le_bytes());
+                bytes.extend_from_slice(&node.to_le_bytes());
+                bytes.extend_from_slice(&(node_kind.len() as u16).to_le_bytes());
+                bytes.extend_from_slice(node_kind.as_bytes());
+            }
+            PerformanceControl::GroupParam { group, .. }
+            | PerformanceControl::GroupMatteParam { group, .. } => {
+                bytes.extend_from_slice(&group.to_le_bytes());
+            }
+            PerformanceControl::MorphGlide { target_q16 } => {
+                bytes.extend_from_slice(&target_q16.to_le_bytes());
+            }
+            PerformanceControl::Routing { routing, .. } => {
+                bytes.extend_from_slice(&routing.to_le_bytes());
+            }
+            PerformanceControl::Master { .. }
+            | PerformanceControl::MasterTransform { .. }
+            | PerformanceControl::LayerParam { .. }
+            | PerformanceControl::LayerEffect { .. }
+            | PerformanceControl::LayerTransform { .. }
+            | PerformanceControl::LayerVisible { .. }
+            | PerformanceControl::LayerPattern { .. }
+            | PerformanceControl::Ntsc { .. }
+            | PerformanceControl::Temporal { .. }
+            | PerformanceControl::MotionMaster { .. }
+            | PerformanceControl::MotionLayer { .. }
+            | PerformanceControl::BusCrossfade
+            | PerformanceControl::BusMix { .. }
+            | PerformanceControl::MorphPosition
+            | PerformanceControl::GestureCanvas { .. }
+            | PerformanceControl::LayerText { .. }
+            | PerformanceControl::MorphLaw
+            | PerformanceControl::MorphCapture => {}
+        }
     }
 }
 
@@ -666,6 +1010,7 @@ pub enum PerformanceError {
     MalformedAddress(String),
     DuplicateAddress(String),
     ParamBytes(usize),
+    NodeKindBytes(usize),
     VocabTokens(usize),
     TokenBytes(usize),
     DuplicateToken(String),
@@ -721,6 +1066,12 @@ impl fmt::Display for PerformanceError {
                 write!(
                     formatter,
                     "param name is {bytes} bytes; the bound is 1..={MAX_PERFORMANCE_PARAM_BYTES}"
+                )
+            }
+            Self::NodeKindBytes(bytes) => {
+                write!(
+                    formatter,
+                    "node kind is {bytes} bytes; the bound is 1..={MAX_PERFORMANCE_PARAM_BYTES}"
                 )
             }
             Self::VocabTokens(count) => {
@@ -1224,8 +1575,12 @@ impl PerformanceTakeDocument {
 
     pub fn to_json_bytes(&self) -> Result<Vec<u8>, PerformanceError> {
         self.validate()?;
-        let bytes = serde_json::to_vec_pretty(self)
+        let mut bytes = serde_json::to_vec_pretty(self)
             .map_err(|error| PerformanceError::Serialization(error.to_string()))?;
+        // Sidecars are line-oriented text artifacts. Keep one canonical LF so
+        // a stored document can be compared and re-emitted byte-for-byte
+        // without test-only trimming or platform-dependent CRLF rewriting.
+        bytes.push(b'\n');
         validate_document_bytes(bytes.len())?;
         Ok(bytes)
     }
@@ -1662,6 +2017,42 @@ mod tests {
             PerformanceControl::GestureCanvas {
                 param: "radius".to_string(),
             },
+            PerformanceControl::RackNodeMaster {
+                node: 11,
+                node_kind: "color_correct".to_string(),
+                param: "brightness".to_string(),
+            },
+            PerformanceControl::RackNodeLayer {
+                layer: 2,
+                node: 12,
+                node_kind: "pixelate".to_string(),
+                param: "amount".to_string(),
+            },
+            PerformanceControl::RackNodeGroup {
+                group: 21,
+                node: 13,
+                node_kind: "feedback".to_string(),
+                param: "amount".to_string(),
+            },
+            PerformanceControl::GroupParam {
+                group: 21,
+                param: "opacity".to_string(),
+            },
+            PerformanceControl::GroupMatteParam {
+                group: 21,
+                param: "threshold".to_string(),
+            },
+            PerformanceControl::LayerText {
+                layer: 3,
+                param: "size".to_string(),
+            },
+            PerformanceControl::MorphLaw,
+            PerformanceControl::MorphGlide { target_q16: 49_151 },
+            PerformanceControl::MorphCapture,
+            PerformanceControl::Routing {
+                routing: 4,
+                param: "depth".to_string(),
+            },
         ];
         let mut take = PerformanceTake::default();
         for (tick, control) in controls.iter().enumerate() {
@@ -1669,6 +2060,18 @@ mod tests {
                 PerformanceControl::LayerVisible { .. } => (
                     PerformanceValueLaw::Toggle,
                     PerformanceRawValue::Toggle(true),
+                ),
+                PerformanceControl::MorphLaw => (
+                    PerformanceValueLaw::Discrete {
+                        vocab: vec!["linear".to_string(), "equal_power".to_string()],
+                    },
+                    PerformanceRawValue::Token("equal_power".to_string()),
+                ),
+                PerformanceControl::MorphCapture => (
+                    PerformanceValueLaw::Discrete {
+                        vocab: vec!["a".to_string(), "b".to_string()],
+                    },
+                    PerformanceRawValue::Token("b".to_string()),
                 ),
                 _ => (unit_law(), PerformanceRawValue::Continuous(0.5)),
             };
@@ -1680,6 +2083,389 @@ mod tests {
         let bytes = document.to_json_bytes().unwrap();
         let restored = PerformanceTakeDocument::from_json_bytes(&bytes).unwrap();
         assert_eq!(restored.decode().unwrap(), take);
+    }
+
+    #[test]
+    fn append_only_control_codes_and_tokens_are_frozen() {
+        let controls = [
+            (0, "master", master("brightness")),
+            (
+                1,
+                "master_transform",
+                PerformanceControl::MasterTransform {
+                    param: "position_x".to_string(),
+                },
+            ),
+            (
+                2,
+                "layer_param",
+                PerformanceControl::LayerParam {
+                    layer: 1,
+                    param: "opacity".to_string(),
+                },
+            ),
+            (
+                3,
+                "layer_effect",
+                PerformanceControl::LayerEffect {
+                    layer: 1,
+                    param: "pixelate".to_string(),
+                },
+            ),
+            (
+                4,
+                "layer_transform",
+                PerformanceControl::LayerTransform {
+                    layer: 1,
+                    param: "scale_x".to_string(),
+                },
+            ),
+            (
+                5,
+                "layer_visible",
+                PerformanceControl::LayerVisible { layer: 1 },
+            ),
+            (
+                6,
+                "layer_pattern",
+                PerformanceControl::LayerPattern {
+                    layer: 1,
+                    param: "freq_x".to_string(),
+                },
+            ),
+            (
+                7,
+                "ntsc",
+                PerformanceControl::Ntsc {
+                    param: "snow".to_string(),
+                },
+            ),
+            (
+                8,
+                "temporal",
+                PerformanceControl::Temporal {
+                    param: "feedback".to_string(),
+                },
+            ),
+            (
+                9,
+                "motion_master",
+                PerformanceControl::MotionMaster {
+                    param: "amount".to_string(),
+                },
+            ),
+            (
+                10,
+                "motion_layer",
+                PerformanceControl::MotionLayer {
+                    layer: 1,
+                    param: "amount".to_string(),
+                },
+            ),
+            (11, "bus_crossfade", PerformanceControl::BusCrossfade),
+            (
+                12,
+                "bus_mix",
+                PerformanceControl::BusMix {
+                    param: "mix_softness".to_string(),
+                },
+            ),
+            (13, "morph_position", PerformanceControl::MorphPosition),
+            (
+                14,
+                "gesture_canvas",
+                PerformanceControl::GestureCanvas {
+                    param: "radius".to_string(),
+                },
+            ),
+            (
+                15,
+                "rack_node_master",
+                PerformanceControl::RackNodeMaster {
+                    node: 1,
+                    node_kind: "color_correct".to_string(),
+                    param: "brightness".to_string(),
+                },
+            ),
+            (
+                16,
+                "rack_node_layer",
+                PerformanceControl::RackNodeLayer {
+                    layer: 1,
+                    node: 2,
+                    node_kind: "pixelate".to_string(),
+                    param: "amount".to_string(),
+                },
+            ),
+            (
+                17,
+                "rack_node_group",
+                PerformanceControl::RackNodeGroup {
+                    group: 3,
+                    node: 4,
+                    node_kind: "feedback".to_string(),
+                    param: "amount".to_string(),
+                },
+            ),
+            (
+                18,
+                "group_param",
+                PerformanceControl::GroupParam {
+                    group: 3,
+                    param: "opacity".to_string(),
+                },
+            ),
+            (
+                19,
+                "group_matte_param",
+                PerformanceControl::GroupMatteParam {
+                    group: 3,
+                    param: "threshold".to_string(),
+                },
+            ),
+            (
+                20,
+                "layer_text",
+                PerformanceControl::LayerText {
+                    layer: 1,
+                    param: "size".to_string(),
+                },
+            ),
+            (21, "morph_law", PerformanceControl::MorphLaw),
+            (
+                22,
+                "morph_glide",
+                PerformanceControl::MorphGlide { target_q16: 32_768 },
+            ),
+            (23, "morph_capture", PerformanceControl::MorphCapture),
+            (
+                24,
+                "routing",
+                PerformanceControl::Routing {
+                    routing: 2,
+                    param: "depth".to_string(),
+                },
+            ),
+        ];
+        for (code, token, control) in controls {
+            assert_eq!(control.code(), code, "{token} code moved");
+            assert_eq!(control.kind_token(), token, "code {code} token moved");
+        }
+    }
+
+    #[test]
+    fn v2_identity_fields_round_trip_with_exact_wire_types() {
+        let controls = [
+            PerformanceControl::RackNodeGroup {
+                group: u64::MAX,
+                node: 9_007_199_254_740_993,
+                node_kind: "feedback".to_string(),
+                param: "amount".to_string(),
+            },
+            PerformanceControl::MorphGlide { target_q16: 51_234 },
+            PerformanceControl::Routing {
+                routing: 17,
+                param: "depth".to_string(),
+            },
+        ];
+        for control in controls {
+            let address = PerformanceAddress {
+                control: control.clone(),
+                law: unit_law(),
+            };
+            let value = serde_json::to_value(&address).unwrap();
+            match &control {
+                PerformanceControl::RackNodeGroup { group, node, .. } => {
+                    assert_eq!(value["group_id"], group.to_string());
+                    assert_eq!(value["node_id"], node.to_string());
+                    assert!(value["group_id"].is_string());
+                    assert!(value["node_id"].is_string());
+                }
+                PerformanceControl::MorphGlide { target_q16 } => {
+                    assert_eq!(value["target_q16"], u64::from(*target_q16));
+                    assert!(value["target_q16"].is_number());
+                }
+                PerformanceControl::Routing { routing, .. } => {
+                    assert_eq!(value["routing"], u64::from(*routing));
+                    assert!(value["routing"].is_number());
+                }
+                _ => unreachable!(),
+            }
+            let restored: PerformanceAddress = serde_json::from_value(value).unwrap();
+            assert_eq!(restored, address);
+        }
+    }
+
+    #[test]
+    fn v2_address_shapes_refuse_hostile_identity_fields() {
+        let hostile = [
+            serde_json::json!({
+                "kind": "rack_node_master", "node_id": 7,
+                "node_kind": "pixelate", "param": "amount",
+                "law": "unit", "min": 0.0, "max": 1.0
+            }),
+            serde_json::json!({
+                "kind": "rack_node_master", "node_id": "0",
+                "node_kind": "pixelate", "param": "amount",
+                "law": "unit", "min": 0.0, "max": 1.0
+            }),
+            serde_json::json!({
+                "kind": "rack_node_master", "node_id": "01",
+                "node_kind": "pixelate", "param": "amount",
+                "law": "unit", "min": 0.0, "max": 1.0
+            }),
+            serde_json::json!({
+                "kind": "rack_node_master", "node_id": "+1",
+                "node_kind": "pixelate", "param": "amount",
+                "law": "unit", "min": 0.0, "max": 1.0
+            }),
+            serde_json::json!({
+                "kind": "rack_node_master", "node_id": "1",
+                "group_id": "2", "node_kind": "pixelate", "param": "amount",
+                "law": "unit", "min": 0.0, "max": 1.0
+            }),
+            serde_json::json!({
+                "kind": "rack_node_group", "node_id": "1",
+                "group_id": "2", "node_kind": "", "param": "amount",
+                "law": "unit", "min": 0.0, "max": 1.0
+            }),
+            serde_json::json!({
+                "kind": "group_param", "group_id": "18446744073709551616",
+                "param": "opacity", "law": "unit", "min": 0.0, "max": 1.0
+            }),
+            serde_json::json!({
+                "kind": "morph_glide", "target_q16": "65535",
+                "law": "unit", "min": 0.25, "max": 64.0
+            }),
+            serde_json::json!({
+                "kind": "morph_glide", "target_q16": 65535,
+                "param": "duration", "law": "unit", "min": 0.25, "max": 64.0
+            }),
+            serde_json::json!({
+                "kind": "routing", "routing": 0, "group_id": "2",
+                "param": "depth", "law": "unit", "min": -1.0, "max": 1.0
+            }),
+        ];
+        for value in hostile {
+            assert!(
+                serde_json::from_value::<PerformanceAddress>(value).is_err(),
+                "a hostile identity shape reached the typed address table"
+            );
+        }
+
+        assert!(matches!(
+            (PerformanceAddress {
+                control: PerformanceControl::RackNodeMaster {
+                    node: 0,
+                    node_kind: "pixelate".to_string(),
+                    param: "amount".to_string(),
+                },
+                law: unit_law(),
+            })
+            .validate(),
+            Err(PerformanceError::MalformedAddress(_))
+        ));
+        assert_eq!(
+            (PerformanceAddress {
+                control: PerformanceControl::RackNodeMaster {
+                    node: 1,
+                    node_kind: String::new(),
+                    param: "amount".to_string(),
+                },
+                law: unit_law(),
+            })
+            .validate(),
+            Err(PerformanceError::NodeKindBytes(0))
+        );
+    }
+
+    #[test]
+    fn new_canonical_identity_tails_are_binary_and_unambiguous() {
+        let address = PerformanceAddress {
+            control: PerformanceControl::RackNodeGroup {
+                group: 0x0102_0304_0506_0708,
+                node: 0x1112_1314_1516_1718,
+                node_kind: "fx".to_string(),
+                param: "amount".to_string(),
+            },
+            law: PerformanceValueLaw::Toggle,
+        };
+        let mut encoded = Vec::new();
+        address.encode_canonical(&mut encoded);
+        let mut expected_tail = Vec::new();
+        expected_tail.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        expected_tail.extend_from_slice(&0x1112_1314_1516_1718u64.to_le_bytes());
+        expected_tail.extend_from_slice(&2u16.to_le_bytes());
+        expected_tail.extend_from_slice(b"fx");
+        assert!(encoded.ends_with(&expected_tail));
+
+        let glide = PerformanceAddress {
+            control: PerformanceControl::MorphGlide { target_q16: 0xabcd },
+            law: unit_law(),
+        };
+        let mut encoded = Vec::new();
+        glide.encode_canonical(&mut encoded);
+        assert!(encoded.ends_with(&0xabcdu16.to_le_bytes()));
+
+        let routing = PerformanceAddress {
+            control: PerformanceControl::Routing {
+                routing: 0x0102_0304,
+                param: "depth".to_string(),
+            },
+            law: unit_law(),
+        };
+        let mut encoded = Vec::new();
+        routing.encode_canonical(&mut encoded);
+        assert!(encoded.ends_with(&0x0102_0304u32.to_le_bytes()));
+    }
+
+    #[test]
+    fn stored_v1_take_decodes_replays_and_reencodes_byte_exactly() {
+        let literal = include_bytes!("../tests/fixtures/performance-take-v1-brightness.json");
+        let document = PerformanceTakeDocument::from_json_bytes(literal).unwrap();
+        let take = document.decode().unwrap();
+        assert_eq!(
+            take.checksum_hex(),
+            "be4bb410f3984214fc13667f4135208d089d14aefbbff2fb2f6e19ff5a0758d6"
+        );
+        assert_eq!(
+            take.addresses(),
+            &[PerformanceAddress {
+                control: master("brightness"),
+                law: PerformanceValueLaw::Unit {
+                    min: -1.0,
+                    max: 1.0,
+                },
+            }]
+        );
+        assert_eq!(
+            take.events(),
+            &[PerformanceEvent {
+                tick: 7,
+                address: 0,
+                value: 40_959,
+            }]
+        );
+        let mut replay = take.replay();
+        assert!(replay.events_due(6).is_empty());
+        assert_eq!(replay.events_due(7), take.events());
+        assert!(replay.finished());
+        let replayed = take.addresses()[0]
+            .law
+            .decode(take.events()[0].value)
+            .expect("stored v1 value decodes through its stored law");
+        let PerformanceRawValue::Continuous(brightness) = replayed else {
+            panic!("stored v1 brightness must replay on the continuous lane")
+        };
+        assert!(
+            (brightness - 0.25).abs() < 1.0e-4,
+            "stored v1 brightness replayed as {brightness}"
+        );
+
+        let reencoded = PerformanceTakeDocument::capture(&take)
+            .to_json_bytes()
+            .unwrap();
+        assert_eq!(reencoded, literal, "the stored v1 JSON is byte-exact");
     }
 
     #[test]

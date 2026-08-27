@@ -187,6 +187,19 @@ impl SymmetryMode {
         Self::Orbit,
     ];
 
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Cyclic => "cyclic",
+            Self::Dihedral => "dihedral",
+            Self::PlanarP1 => "planar_p1",
+            Self::PlanarPm => "planar_pm",
+            Self::PlanarP2 => "planar_p2",
+            Self::PlanarPmm => "planar_pmm",
+            Self::LogSpiral => "log_spiral",
+            Self::Orbit => "orbit",
+        }
+    }
+
     /// Order of the rotation part of the point group. The radial family scales
     /// with the authored fold count; the planar groups have the fixed point
     /// groups their names declare.
@@ -287,6 +300,16 @@ impl SymmetryBoundary {
         Self::Hold,
         Self::CellularReentry,
     ];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Transparent => "transparent",
+            Self::Mirror => "mirror",
+            Self::Wrap => "wrap",
+            Self::Hold => "hold",
+            Self::CellularReentry => "cellular_reentry",
+        }
+    }
 
     /// Map a folded coordinate back into the unit source domain and report
     /// coverage. Only `Transparent` can report `false`.

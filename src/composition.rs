@@ -12,8 +12,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::image_routing::StableLayerId;
 use crate::mixing_boundary::BusMixerState;
-use crate::performance::SavedLayerPosition;
-use crate::spatial::SpatialTransform;
+use crate::performance::{AuthoringValueLaw, SavedLayerPosition};
+use crate::spatial::{spatial_transform_value_law, SpatialTransform};
 use crate::visual_rack::{
     GroupId, ImageMatte, LegacyRackScope, RackError, RouteCaptureError, RuntimeImageMatte,
     RuntimeRackError, RuntimeVisualRack, VisualRack,
@@ -36,6 +36,47 @@ pub enum BusAssignment {
     B,
     #[default]
     Program,
+}
+
+impl BusAssignment {
+    pub const ALL: [Self; 3] = [Self::Program, Self::A, Self::B];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Program => "program",
+            Self::A => "a",
+            Self::B => "b",
+        }
+    }
+
+    pub fn try_from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|value| value.key() == key)
+    }
+}
+
+/// Engine-owned law for the scalar/discrete group-value authoring seam.
+pub(crate) fn group_value_law(param: &str) -> Option<AuthoringValueLaw> {
+    match param {
+        "opacity" => Some(AuthoringValueLaw::Unit([0.0, 1.0])),
+        "solo" | "bypass" => Some(AuthoringValueLaw::Toggle),
+        "bus" => Some(AuthoringValueLaw::Discrete(
+            BusAssignment::ALL
+                .into_iter()
+                .map(BusAssignment::key)
+                .collect(),
+        )),
+        "name" => None,
+        _ => spatial_transform_value_law(param),
+    }
+}
+
+/// Engine-owned law for the optional image-matte value seam on a group.
+pub(crate) fn group_matte_value_law(param: &str) -> Option<AuthoringValueLaw> {
+    match param {
+        "amount" | "threshold" => Some(AuthoringValueLaw::Unit([0.0, 1.0])),
+        "softness" => Some(AuthoringValueLaw::Unit([0.0, 0.5])),
+        _ => None,
+    }
 }
 
 /// Bounded UTF-8 display name. Identity always remains [`GroupId`].
@@ -2193,6 +2234,38 @@ mod tests {
             .unwrap();
         group.matte = Some(selected_image_matte(1));
         (group, node_id)
+    }
+
+    #[test]
+    fn recorder_group_laws_are_engine_owned_and_refuse_topology() {
+        assert_eq!(
+            group_value_law("opacity"),
+            Some(AuthoringValueLaw::Unit([0.0, 1.0]))
+        );
+        assert_eq!(group_value_law("solo"), Some(AuthoringValueLaw::Toggle));
+        assert_eq!(
+            group_value_law("bus"),
+            Some(AuthoringValueLaw::Discrete(vec!["program", "a", "b"]))
+        );
+        assert_eq!(
+            group_value_law("position_x"),
+            spatial_transform_value_law("position_x")
+        );
+        for refused in ["name", "members", "rack", "matte", "not_a_group_field"] {
+            assert_eq!(group_value_law(refused), None, "{refused}");
+        }
+
+        assert_eq!(
+            group_matte_value_law("softness"),
+            Some(AuthoringValueLaw::Unit([0.0, 0.5]))
+        );
+        for refused in ["tap", "channel", "invert", "route", "not_a_matte_field"] {
+            assert_eq!(group_matte_value_law(refused), None, "{refused}");
+        }
+        for bus in BusAssignment::ALL {
+            assert_eq!(BusAssignment::try_from_key(bus.key()), Some(bus));
+        }
+        assert_eq!(BusAssignment::try_from_key("sidechain"), None);
     }
 
     #[test]

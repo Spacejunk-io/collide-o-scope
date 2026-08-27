@@ -164,9 +164,12 @@ pub fn stage_accepted_mutation(
     // Provenance remains retained on the pending item for bounded diagnostics,
     // but must not participate in equality or the v1 stream.
     let _process_only_origin = mutation.origin;
+    // Collapse only adjacent duplicate delivery. An intervening authored
+    // mutation is an ordering barrier: A→B→A and capture→edit→capture are
+    // three real events even when the first and last canonical payload match.
     if pending
-        .iter()
-        .any(|existing| existing.same_canonical_event(&mutation))
+        .last()
+        .is_some_and(|existing| existing.same_canonical_event(&mutation))
     {
         return StageAcceptedMutation::Duplicate;
     }
@@ -271,6 +274,57 @@ mod tests {
         );
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].origin(), CreativeMutationOrigin::Browser);
+    }
+
+    #[test]
+    fn intervening_values_and_capture_barriers_preserve_return_events() {
+        let mut pending = Vec::new();
+        for value in [0.25, 0.5, 0.25] {
+            assert_eq!(
+                stage_accepted_mutation(
+                    &mut pending,
+                    candidate(ActionSourceClass::Browser, value).accept(),
+                    8,
+                ),
+                StageAcceptedMutation::Inserted
+            );
+        }
+        assert_eq!(pending.len(), 3, "A→B→A is three authored events");
+
+        let capture = || {
+            CreativeMutationCandidate::new(
+                ActionSourceClass::Browser,
+                PerformanceControl::MorphCapture,
+                PerformanceValueLaw::Discrete {
+                    vocab: vec!["a".to_string(), "b".to_string()],
+                },
+                PerformanceRawValue::Token("a".to_string()),
+            )
+            .expect("capture A is representable")
+            .accept()
+        };
+        pending.clear();
+        assert_eq!(
+            stage_accepted_mutation(&mut pending, capture(), 8),
+            StageAcceptedMutation::Inserted
+        );
+        assert_eq!(
+            stage_accepted_mutation(
+                &mut pending,
+                candidate(ActionSourceClass::Browser, 0.5).accept(),
+                8,
+            ),
+            StageAcceptedMutation::Inserted
+        );
+        assert_eq!(
+            stage_accepted_mutation(&mut pending, capture(), 8),
+            StageAcceptedMutation::Inserted
+        );
+        assert_eq!(
+            pending.len(),
+            3,
+            "capture→edit→capture keeps both barrier events"
+        );
     }
 
     #[test]

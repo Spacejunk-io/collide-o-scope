@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "length_ticks": 12,
+  "truncated": false,
+  "incomplete": false,
+  "event_count": 1,
+  "checksum": "be4bb410f3984214fc13667f4135208d089d14aefbbff2fb2f6e19ff5a0758d6",
+  "addresses": [
+    {
+      "kind": "master",
+      "param": "brightness",
+      "law": "unit",
+      "min": -1.0,
+      "max": 1.0
+    }
+  ],
+  "events": [
+    {
+      "tick": 7,
+      "address": 0,
+      "value": 40959
+    }
+  ]
+}
