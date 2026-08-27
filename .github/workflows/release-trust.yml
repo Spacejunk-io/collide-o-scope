@@ -43,7 +43,7 @@ jobs:
       contents: read
     steps:
       - name: Check out candidate tag verifier
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || env.RELEASE_TAG }}
           fetch-depth: 0
@@ -143,7 +143,7 @@ jobs:
       attestations: write
     steps: &windows_release_steps
       - name: Check out dependency-policy source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verification-gate.outputs.commit }}
           path: policy-source
@@ -164,7 +164,7 @@ jobs:
           }
 
       - name: Cache Cargo downloads and release tools
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/bin
@@ -303,7 +303,7 @@ jobs:
           Pop-Location
 
       - name: Check out independent source A
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verification-gate.outputs.commit }}
           path: source-a
@@ -311,7 +311,7 @@ jobs:
           persist-credentials: false
 
       - name: Check out independent source B
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verification-gate.outputs.commit }}
           path: source-b-with-deliberately-different-path-length
@@ -694,9 +694,31 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Install pinned cosign
-        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
-          cosign-release: v2.6.5
+          cosign-release: v3.1.3
+
+      - name: Verify pinned cosign identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cosign = Get-Command cosign -CommandType Application -ErrorAction Stop
+          $actualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $cosign.Source).Hash.ToLowerInvariant()
+          $expectedSha256 = "9fe59be0eca1271873ce019061335eb1ac419b7059202e797828467ddabe33be"
+          if ($actualSha256 -cne $expectedSha256) {
+            throw "Installed cosign SHA-256 did not match the pinned Windows amd64 artifact"
+          }
+          $versionJson = & $cosign.Source version --json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = $versionJson | ConvertFrom-Json
+          if (
+            $version.gitVersion -cne "v3.1.3" -or
+            $version.gitCommit -cne "11926fa5bbbbde47e88fc006b625a17769b743b2" -or
+            $version.gitTreeState -cne "clean" -or
+            $version.platform -cne "windows/amd64"
+          ) {
+            throw "Installed cosign version identity did not match the pinned release"
+          }
 
       - name: Revalidate pre-tag absence after qualification
         if: github.event_name == 'workflow_dispatch'
@@ -738,10 +760,14 @@ jobs:
         run: |
           cosign sign-blob --yes --bundle release\SHA256SUMS.sigstore.json release\SHA256SUMS
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $checksumBundle = Get-Content -Raw -LiteralPath release\SHA256SUMS.sigstore.json | ConvertFrom-Json
+          if ($checksumBundle.mediaType -cne "application/vnd.dev.sigstore.bundle.v0.3+json") {
+            throw "Checksum signature bundle mediaType did not match the pinned schema"
+          }
           cosign verify-blob `
             --bundle release\SHA256SUMS.sigstore.json `
             --certificate-oidc-issuer https://token.actions.githubusercontent.com `
-            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/release-trust.yml@refs/.*$" `
+            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release-trust.yml@${{ github.ref }}" `
             release\SHA256SUMS
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python source-a\scripts\verify-release.py verify --directory release --tag "$env:RELEASE_TAG" --tag-state annotated --commit "${{ steps.source.outputs.commit }}" --require-signature
@@ -858,16 +884,38 @@ jobs:
       id-token: write
     steps:
       - name: Check out verifier
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.reproduce-sign-publish.outputs.commit }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Install pinned cosign
-        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
-          cosign-release: v2.6.5
+          cosign-release: v3.1.3
+
+      - name: Verify pinned cosign identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cosign = Get-Command cosign -CommandType Application -ErrorAction Stop
+          $actualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $cosign.Source).Hash.ToLowerInvariant()
+          $expectedSha256 = "9fe59be0eca1271873ce019061335eb1ac419b7059202e797828467ddabe33be"
+          if ($actualSha256 -cne $expectedSha256) {
+            throw "Installed cosign SHA-256 did not match the pinned Windows amd64 artifact"
+          }
+          $versionJson = & $cosign.Source version --json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = $versionJson | ConvertFrom-Json
+          if (
+            $version.gitVersion -cne "v3.1.3" -or
+            $version.gitCommit -cne "11926fa5bbbbde47e88fc006b625a17769b743b2" -or
+            $version.gitTreeState -cne "clean" -or
+            $version.platform -cne "windows/amd64"
+          ) {
+            throw "Installed cosign version identity did not match the pinned release"
+          }
 
       - name: Redownload published assets
         shell: pwsh
@@ -1005,6 +1053,10 @@ jobs:
           $bundle = "final-release\collide-o-scope-$env:RELEASE_TAG-final-release-receipt.sigstore.json"
           cosign sign-blob --yes --bundle $bundle $receipt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bundleDocument = Get-Content -Raw -LiteralPath $bundle | ConvertFrom-Json
+          if ($bundleDocument.mediaType -cne "application/vnd.dev.sigstore.bundle.v0.3+json") {
+            throw "Final receipt signature bundle mediaType did not match the pinned schema"
+          }
           cosign verify-blob `
             --bundle $bundle `
             --certificate-oidc-issuer https://token.actions.githubusercontent.com `

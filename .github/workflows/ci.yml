@@ -46,7 +46,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install pinned Rust with lint components
         run: |
@@ -55,7 +55,7 @@ jobs:
           cargo --version
 
       - name: Cache Cargo downloads
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -216,7 +216,7 @@ jobs:
       - name: Cache FFmpeg 9.0.1 libraries on Unix
         if: runner.os != 'Windows'
         id: ffmpeg-unix-cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/ffmpeg-9.0.1
           key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-9.0.1-shared-v2
@@ -273,7 +273,7 @@ jobs:
       - name: Cache FFmpeg 9.0.1 shared build on Windows
         if: runner.os == 'Windows'
         id: ffmpeg-windows-cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/ffmpeg-9.0.1-windows
           key: ffmpeg-Windows-${{ runner.arch }}-9.0.1-shared-v2
@@ -372,7 +372,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install pinned Rust
         run: |
@@ -381,7 +381,7 @@ jobs:
           cargo --version
 
       - name: Cache Cargo downloads and verification tools
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/bin
