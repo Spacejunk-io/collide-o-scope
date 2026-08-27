@@ -1,9 +1,8 @@
 # §3.4 — performance-recorder v2 addresses: evidence note
 
-Date: 2026-08-27. Status: hosted implementation and exact local gate observed.
-The labeled GPU/export receipts and topic implementation commit below are also
-observed; integration commit and exact-commit CI remain pending until the
-branch closes.
+Date: 2026-08-27. Status: landed and exact-commit CI green. The hosted gate,
+labeled GPU/export receipts, topic implementation, no-fast-forward integration,
+and complete three-platform CI suite below are all observed.
 
 ## Claim and compatibility boundary
 
@@ -215,8 +214,12 @@ no performance sidecar. The fixture neither requires nor creates
 Closing fields:
 
 - Topic implementation commit: **`7eba14a`**
-- Integration commit on `feat/web-control-panel`: **PENDING**
-- Exact-commit CI: **PENDING**
+- Topic receipt commit: **`3c28fe2`**
+- Integration commit on `feat/web-control-panel`: **`4c0618e`**
+- Exact-commit CI: **OBSERVED PASS** — run `33040649673` at `4c0618e`;
+  `scripts/check-ci-status.py` reported
+  `complete-suites green=1 failed=0 pending=0` after Linux 24.04, macOS 15,
+  Windows VS 2022, and dependency policy all completed successfully
 - Hosted gate result/toolchain: **OBSERVED PASS** — the exact six-command gate
   passed with 2,123 tests passing, zero failures, and only the explicitly
   external/GPU seats ignored; `rustc 1.98.0 (88d9e12ae 2026-08-18)`,
@@ -225,7 +228,9 @@ Closing fields:
   `9.0.1-full_build-www.gyan.dev`
 - Labeled GPU/export receipt: **OBSERVED PASS** — self-provisioned v2 taken /
   untaken / repeat matrix under FFmpeg 9.0.1
-- Protected-root status after integration: **PENDING RE-CHECK**
+- Protected-root status after integration: **OBSERVED PASS** — the three named
+  operator artifacts remain untracked and excluded, and `videos/audit.mp4`
+  remains absent
 
 ## Deliberate non-claims
 

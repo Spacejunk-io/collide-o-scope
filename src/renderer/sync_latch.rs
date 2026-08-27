@@ -172,6 +172,14 @@ impl SyncLatchGpu {
         self.state.has_damage()
     }
 
+    /// The exact per-output-line offsets the creative pass most recently
+    /// applied. The monitoring seam borrows this canonical table directly:
+    /// it must never reconstruct the seeded latch draws or keep a parallel
+    /// diagnostic state that could drift from the pixels.
+    pub fn applied_offsets(&self) -> &[f32] {
+        self.state.applied()
+    }
+
     fn ensure_bind_group(
         &mut self,
         device: &wgpu::Device,
@@ -450,6 +458,24 @@ mod tests {
         drop(mapped);
         staging.unmap();
         rows
+    }
+
+    #[test]
+    fn monitor_seam_borrows_the_one_applied_offset_table() {
+        let source = include_str!("sync_latch.rs").replace("\r\n", "\n");
+        let getter =
+            "pub fn applied_offsets(&self) -> &[f32] {\n        self.state.applied()\n    }";
+        assert_eq!(
+            source.matches(getter).count(),
+            1,
+            "the monitor source must remain a direct read-only view of the canonical applied table"
+        );
+        let canonical_state_field = "\n    state: SyncLatchState,\n";
+        assert_eq!(
+            source.matches(canonical_state_field).count(),
+            1,
+            "the renderer must not grow a second latch state for diagnostics"
+        );
     }
 
     #[test]

@@ -7026,6 +7026,7 @@ impl Renderer {
         &mut self,
         probe: crate::monitor_bay::MonitorProbe,
         gesture_canvas_view: Option<&wgpu::TextureView>,
+        composition: Option<&crate::renderer::composition::CompositionGpuExecutor>,
     ) -> bool {
         let view: &wgpu::TextureView = match probe {
             crate::monitor_bay::MonitorProbe::Program => &self.composite_views[2],
@@ -7039,6 +7040,36 @@ impl Renderer {
                 Some(view) => view,
                 None => return false,
             },
+            crate::monitor_bay::MonitorProbe::NtscLineState => {
+                let rgba =
+                    crate::monitor_bay::reduce_sync_line_state(self.sync_latch.applied_offsets());
+                let stage = self.monitor_bay.get_or_insert_with(|| {
+                    crate::renderer::monitor_bay::MonitorBayGpu::new(&self.device, COMPOSITE_FORMAT)
+                });
+                return stage.schedule_cpu_rgba(&self.device, &self.queue, &rgba);
+            }
+            crate::monitor_bay::MonitorProbe::MeltBandMask => {
+                let Some(view) = self.melting_edge.diagnostic_mask_view() else {
+                    return false;
+                };
+                let stage = self.monitor_bay.get_or_insert_with(|| {
+                    crate::renderer::monitor_bay::MonitorBayGpu::new(&self.device, COMPOSITE_FORMAT)
+                });
+                return stage.schedule_rgba_view(&self.device, &self.queue, view);
+            }
+            crate::monitor_bay::MonitorProbe::MotionField => {
+                let Some(composition) = composition else {
+                    return false;
+                };
+                let stage = self.monitor_bay.get_or_insert_with(|| {
+                    crate::renderer::monitor_bay::MonitorBayGpu::new(&self.device, COMPOSITE_FORMAT)
+                });
+                return composition.schedule_master_motion_monitor(
+                    stage,
+                    &self.device,
+                    &self.queue,
+                );
+            }
         };
         let stage = self.monitor_bay.get_or_insert_with(|| {
             crate::renderer::monitor_bay::MonitorBayGpu::new(&self.device, COMPOSITE_FORMAT)
@@ -7049,6 +7080,23 @@ impl Renderer {
     /// Harvest the oldest completed monitor grid, if any.
     pub fn poll_monitor_bay(&mut self) -> Option<Vec<u8>> {
         self.monitor_bay.as_mut()?.poll()
+    }
+
+    /// Revoke one-shot producer work when the last monitoring-bay observer
+    /// leaves. The reduction pool has no recurring work of its own; the melt
+    /// producer is the only deferred source that can hold a pending capture.
+    pub fn disarm_monitor_bay_sources(&mut self) {
+        self.melting_edge.disarm_diagnostic_mask();
+        if let Some(stage) = self.monitor_bay.as_mut() {
+            stage.invalidate_samples();
+        }
+    }
+
+    /// Ask the B8 seat to retain this frame's exact pre-melt band mask. The
+    /// request is consumed by `render_melting_edge`; without this call the
+    /// creative pass allocates and encodes no diagnostic surface.
+    pub fn request_monitor_melt_mask(&mut self) {
+        self.melting_edge.request_diagnostic_mask();
     }
 
     pub fn publish_program_tap(&mut self) {

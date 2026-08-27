@@ -13356,11 +13356,28 @@ mod protocol_tests {
             serde_json::from_str(r#"{"action":"set_monitor_bay","enabled":true}"#).unwrap();
         assert_eq!(bay.coalesce_key().as_deref(), Some("stage:monitor-bay"));
         assert!(bay.is_performance_only_for_history());
-        let probe: WebAction =
-            serde_json::from_str(r#"{"action":"set_monitor_probe","probe":"program_tap"}"#)
-                .unwrap();
-        assert_eq!(probe.coalesce_key().as_deref(), Some("stage:monitor-probe"));
-        assert!(probe.is_performance_only_for_history());
+        let probe_tokens = [
+            "program",
+            "program_tap",
+            "gesture_canvas",
+            "ntsc_line_state",
+            "melt_band_mask",
+            "motion_field",
+        ];
+        assert_eq!(
+            crate::monitor_bay::MonitorProbe::ALL.map(|probe| probe.key()),
+            probe_tokens,
+            "the protocol test follows the engine's frozen append-only order"
+        );
+        for token in probe_tokens {
+            let probe: WebAction = serde_json::from_value(serde_json::json!({
+                "action": "set_monitor_probe",
+                "probe": token,
+            }))
+            .unwrap();
+            assert_eq!(probe.coalesce_key().as_deref(), Some("stage:monitor-probe"));
+            assert!(probe.is_performance_only_for_history());
+        }
         let watch: WebAction =
             serde_json::from_str(r#"{"action":"monitor_watch","enabled":true}"#).unwrap();
         assert!(watch.coalesce_key().is_none());
@@ -13388,10 +13405,33 @@ mod protocol_tests {
         ));
         assert!(js.contains("sendAction({ action: 'set_monitor_probe', probe })"));
         assert!(js.contains("syncMonitorBay(msg.monitor_bay)"));
+        let panel_allowlist =
+            "['program', 'program_tap', 'gesture_canvas', 'ntsc_line_state', 'melt_band_mask', 'motion_field']";
+        assert_eq!(
+            js.matches(panel_allowlist).count(),
+            2,
+            "event and snapshot sync must share the exact closed vocabulary"
+        );
         let html = include_str!("../../static/index.html");
         assert!(html.contains("id=\"monitor-bay-group\""));
         assert!(html.contains("id=\"monitor-bay-waveform\""));
         assert!(html.contains("id=\"monitor-bay-scope\""));
+        let probe_select = html
+            .split_once("<select id=\"monitor-bay-probe\">")
+            .expect("monitor probe select")
+            .1
+            .split_once("</select>")
+            .expect("monitor probe select closes")
+            .0;
+        for token in probe_tokens {
+            assert_eq!(
+                probe_select
+                    .matches(&format!("<option value=\"{token}\">"))
+                    .count(),
+                1,
+                "the panel must offer each probe exactly once: {token}"
+            );
+        }
     }
 
     #[test]

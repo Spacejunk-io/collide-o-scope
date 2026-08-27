@@ -29,6 +29,7 @@ use crate::renderer::compositor::{MatteChannelCode, MatteCompositeUniforms, Reso
 use crate::renderer::corruption::{
     CorruptionGpuExecutor, CorruptionGpuUniforms, CorruptionPassPipeline,
 };
+use crate::renderer::monitor_bay::MonitorBayGpu;
 use crate::renderer::motion::{
     MotionFieldReadParity, MotionFrameInput, MotionGpuError, MotionGpuFieldSource,
     MotionGpuFieldSpec, MotionGpuResources, MotionGpuScopeSpec, MotionRuntimeDiagnostic,
@@ -1000,6 +1001,38 @@ impl CompositionGpuExecutor {
         self.prepared
             .as_ref()
             .map(|prepared| prepared.host.temporal_state_metrics())
+    }
+
+    /// Truthful snapshot/status seam for the exact motion field routed into
+    /// Master. An open frame reports its staged validity; otherwise the last
+    /// committed validity is reported. No other scope can satisfy this query.
+    pub(crate) fn master_motion_monitor_available(&self) -> bool {
+        self.prepared
+            .as_ref()
+            .and_then(|prepared| prepared.motion.as_ref())
+            .is_some_and(MotionGpuResources::master_motion_monitor_available)
+    }
+
+    /// Schedule the monitor visualization from the exact staged primitive or
+    /// derived parity used by Master in the just-submitted composition frame.
+    /// This is intentionally callable before `commit_frame_history`; after
+    /// commit there is no staged source and the request refuses rather than
+    /// falling back to retained or first-available motion bytes.
+    pub(crate) fn schedule_master_motion_monitor(
+        &self,
+        stage: &mut MonitorBayGpu,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> bool {
+        let Some(source) = self
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.motion.as_ref())
+            .and_then(MotionGpuResources::staged_master_motion_monitor_source)
+        else {
+            return false;
+        };
+        stage.schedule_motion_field(device, queue, source.vectors, source.gates, source.grid)
     }
 
     #[cfg_attr(

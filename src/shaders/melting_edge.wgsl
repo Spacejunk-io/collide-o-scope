@@ -64,25 +64,15 @@ fn coverage_at(uv: vec2f) -> f32 {
     );
 }
 
-// Coherent 601 YIQ round trip — the B3 feedback-rig matrices.
-fn melt_rgb_to_yiq(rgb: vec3f) -> vec3f {
-    return vec3f(
-        dot(rgb, vec3f(0.299, 0.587, 0.114)),
-        dot(rgb, vec3f(0.596, -0.274, -0.322)),
-        dot(rgb, vec3f(0.211, -0.523, 0.312)),
-    );
-}
+struct MeltBandSample {
+    band: f32,
+    normal: vec2f,
+};
 
-fn melt_yiq_to_rgb(yiq: vec3f) -> vec3f {
-    return vec3f(
-        yiq.x + 0.956 * yiq.y + 0.621 * yiq.z,
-        yiq.x - 0.272 * yiq.y - 0.647 * yiq.z,
-        yiq.x - 1.106 * yiq.y + 1.703 * yiq.z,
-    );
-}
-
-@fragment
-fn fs_melt(@location(0) uv: vec2f) -> @location(0) vec4f {
+// The single band oracle shared by the creative melt and its monitor mask.
+// This follows `melt_band_and_normal` and `melt_creep_band` in
+// `mixing_boundary.rs` expression for expression.
+fn melt_band_sample(uv: vec2f) -> MeltBandSample {
     // The four-point probe: X aspect-corrected, the resulting normal
     // deliberately not — the shipped anisotropy is the law.
     let r = 0.004 + melt.width * 0.085;
@@ -107,6 +97,31 @@ fn fs_melt(@location(0) uv: vec2f) -> @location(0) vec4f {
     // into the background while the background never eats the shape.
     let centre = coverage_at(uv);
     band *= mix(1.0, 1.0 - centre, melt.creep);
+    return MeltBandSample(band, en);
+}
+
+// Coherent 601 YIQ round trip — the B3 feedback-rig matrices.
+fn melt_rgb_to_yiq(rgb: vec3f) -> vec3f {
+    return vec3f(
+        dot(rgb, vec3f(0.299, 0.587, 0.114)),
+        dot(rgb, vec3f(0.596, -0.274, -0.322)),
+        dot(rgb, vec3f(0.211, -0.523, 0.312)),
+    );
+}
+
+fn melt_yiq_to_rgb(yiq: vec3f) -> vec3f {
+    return vec3f(
+        yiq.x + 0.956 * yiq.y + 0.621 * yiq.z,
+        yiq.x - 0.272 * yiq.y - 0.647 * yiq.z,
+        yiq.x - 1.106 * yiq.y + 1.703 * yiq.z,
+    );
+}
+
+@fragment
+fn fs_melt(@location(0) uv: vec2f) -> @location(0) vec4f {
+    let sample = melt_band_sample(uv);
+    let band = sample.band;
+    let en = sample.normal;
 
     let bd = en * band * melt.melt * 0.055;
     var color = textureSampleLevel(
@@ -147,4 +162,14 @@ fn fs_melt(@location(0) uv: vec2f) -> @location(0) vec4f {
         color = mix(color, held, clamp(band * melt.hold, 0.0, cap));
     }
     return color;
+}
+
+// A monitor-only observation of the exact active melt band. The host does
+// not dispatch this entry point for an inactive melt; it clears the target to
+// opaque zero instead, so the disabled effect can never display a latent edge
+// as though it were acting on the programme.
+@fragment
+fn fs_melt_mask(@location(0) uv: vec2f) -> @location(0) vec4f {
+    let band = melt_band_sample(uv).band;
+    return vec4f(band, band, band, 1.0);
 }
