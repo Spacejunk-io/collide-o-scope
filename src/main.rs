@@ -5292,6 +5292,10 @@ struct LiveCaptureSession {
     cancel_requested: bool,
     artifact_name: String,
     deferred_history: Option<DeferredPerformanceHistory>,
+    /// Armed program-PCM tap for this recording; the same handle stamps every
+    /// frame intent with the recorder's audio clock. `None` records the exact
+    /// video-only artifact.
+    audio_tap: Option<std::sync::Arc<program_recorder::ProgramAudioTap>>,
     worker: LiveCaptureWorker,
 }
 
@@ -5342,10 +5346,10 @@ impl LiveCaptureSession {
             program_frozen,
             media_frozen,
             blackout,
-            // The current foundation is intentionally video-only. The durable
-            // report states `audio_not_muxed=true`; fabricating an analyzer
-            // clock here would imply sample-accurate PCM ownership Main lacks.
-            audio_clock: None,
+            // The armed tap's delivered-frame counter is the owned Program
+            // PCM clock; a session without a tap stays truthfully video-only
+            // rather than fabricating a clock Main does not own.
+            audio_clock: self.audio_tap.as_ref().map(|tap| tap.clock_stamp()),
         };
         let LiveCaptureBackendDecision::Ready(backend) =
             live_capture_backend(self.target, plan, self.backend)
@@ -14812,14 +14816,37 @@ impl App {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "recording.mp4".into());
+        // Program audio is muxed exactly when a live capture stream exists to
+        // own the PCM clock. A recording started without one stays truthfully
+        // video-only instead of implying audio the program never had.
+        let audio_tap = if self.audio.is_running() {
+            match self.audio.arm_program_tap() {
+                Ok(tap) => Some(tap),
+                Err(error) => {
+                    log::warn!("recording proceeds without audio: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let recorder =
-            program_recorder::ProgramRecorder::spawn(program_recorder::RecorderConfig {
+            match program_recorder::ProgramRecorder::spawn(program_recorder::RecorderConfig {
                 dimensions,
                 frame_rate: program_recorder::RecorderFrameRate::FPS_30,
                 output_path,
                 target,
                 purpose,
-            })?;
+                audio_tap: audio_tap.clone(),
+            }) {
+                Ok(recorder) => recorder,
+                Err(error) => {
+                    if audio_tap.is_some() {
+                        self.audio.disarm_program_tap();
+                    }
+                    return Err(error);
+                }
+            };
         let generation = self.allocate_live_capture_generation();
         self.set_capture_starting_snapshot(artifact_name.clone());
         self.live_capture = Some(LiveCaptureSession {
@@ -14839,6 +14866,7 @@ impl App {
             cancel_requested: false,
             artifact_name,
             deferred_history: None,
+            audio_tap,
             worker: LiveCaptureWorker::Recording(recorder),
         });
         self.output_error.clear();
@@ -14888,6 +14916,7 @@ impl App {
             cancel_requested: false,
             artifact_name,
             deferred_history: None,
+            audio_tap: None,
             worker: LiveCaptureWorker::StillWaiting {
                 config,
                 pixels: Some(pixels),
@@ -15497,7 +15526,7 @@ impl App {
             dropped_queue_full: counters.dropped_queue_full,
             rejected_metadata: counters.rejected_metadata,
             encoder_failures: counters.encoder_failures,
-            audio_not_muxed: true,
+            audio_not_muxed: session.audio_tap.is_none(),
             artifact_name: session.artifact_name.clone(),
             error,
         }
@@ -15578,6 +15607,11 @@ impl App {
             .live_capture
             .take()
             .expect("terminal capture event has an active session");
+        if session.audio_tap.take().is_some() {
+            // The recording owns the armed tap for exactly its own life; any
+            // terminal outcome releases the analyzer's tee.
+            self.audio.disarm_program_tap();
+        }
         match terminal {
             program_recorder::RecorderTerminalEvent::Succeeded(committed) => {
                 let counters = committed.counters;
@@ -15593,7 +15627,7 @@ impl App {
                     dropped_queue_full: counters.dropped_queue_full,
                     rejected_metadata: counters.rejected_metadata,
                     encoder_failures: counters.encoder_failures,
-                    audio_not_muxed: true,
+                    audio_not_muxed: !committed.audio_muxed,
                     artifact_name: session.artifact_name,
                     error: String::new(),
                 };
@@ -40918,6 +40952,7 @@ mod app_state_tests {
             cancel_requested: false,
             artifact_name: "capture.png".into(),
             deferred_history: None,
+            audio_tap: None,
             worker: LiveCaptureWorker::StillWaiting {
                 config: program_recorder::StillSnapshotConfig {
                     dimensions,

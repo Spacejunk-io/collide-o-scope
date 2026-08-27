@@ -5,6 +5,7 @@
 //! waits for FFmpeg or filesystem I/O. A successful terminal event is the
 //! sole authority for importing or publishing a new clip slot.
 
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read as _, Write as _};
@@ -27,12 +28,31 @@ use crate::visual_rack::GroupId;
 pub const RECORDER_FRAME_POOL_CAPACITY: usize = 4;
 pub const RECORDER_FRAME_QUEUE_CAPACITY: usize = 2;
 pub const RECORDER_MAX_POOL_BYTES: u64 = 128 * 1024 * 1024;
-pub const RECORDER_REPORT_SCHEMA_VERSION: u16 = 2;
+pub const RECORDER_REPORT_SCHEMA_VERSION: u16 = 3;
 pub const RECORDER_MAX_REPORT_BYTES: usize = 64 * 1024;
+
+/// Seconds of device audio the bounded program-PCM ring retains before the
+/// overflow law discards the oldest frames as an explicit, counted gap.
+pub const RECORDER_AUDIO_RING_SECONDS: u32 = 4;
+/// Absolute sample ceiling for the program-PCM ring (8 MiB of f32 samples),
+/// intersected with the duration-derived capacity above.
+pub const RECORDER_AUDIO_RING_MAX_SAMPLES: usize = 2_097_152;
+/// Hard byte cap for the staged raw-PCM capture temp. Reaching it marks the
+/// audio capture truncated; the remainder of the artifact is padded silence.
+pub const RECORDER_MAX_AUDIO_TEMP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// One bounded drift correction fires when the device clock has slipped this
+/// far (as a fraction of one second) against the program capture cadence.
+pub const RECORDER_AUDIO_DRIFT_THRESHOLD_SECONDS: f64 = 0.25;
 
 const RECORDER_EVENT_QUEUE_CAPACITY: usize = 1;
 const RECORDER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const RECORDER_FINISH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bounded wait at finish for the device to deliver the tail of the audio
+/// timeline before the mux pads the exact remainder with silence.
+const RECORDER_AUDIO_FINISH_GRACE: Duration = Duration::from_millis(500);
+/// Silence is written in bounded chunks so one large gap cannot allocate a
+/// proportional buffer.
+const RECORDER_AUDIO_SILENCE_CHUNK_SAMPLES: usize = 65_536;
 const RECORDER_WORKER_EXIT_GRACE: Duration = Duration::from_secs(2);
 const MAX_DUPLICATION_GAP_FRAMES: u64 = 2_400;
 const MAX_ERROR_CHARS: usize = 1_024;
@@ -278,6 +298,9 @@ pub struct RecorderConfig {
     pub output_path: PathBuf,
     pub target: CaptureTarget,
     pub purpose: CapturePurpose,
+    /// Armed program-PCM source. `None` keeps the exact video-only path and
+    /// the truthful `audio_not_muxed` report.
+    pub audio_tap: Option<Arc<ProgramAudioTap>>,
 }
 
 impl RecorderConfig {
@@ -299,6 +322,202 @@ pub struct AudioClockStamp {
 impl AudioClockStamp {
     fn validate(self) -> bool {
         (8_000..=384_000).contains(&self.sample_rate) && (1..=32).contains(&self.channels)
+    }
+}
+
+struct AudioTapRing {
+    /// Interleaved device samples, always a whole number of frames.
+    samples: VecDeque<f32>,
+    /// Absolute frame index of the oldest retained sample frame.
+    head_frame: u64,
+    /// Total frames the device has delivered since arm: the PCM clock.
+    delivered_frames: u64,
+    /// Single-reader cursor; `None` until the recorder anchors it.
+    reader_frame: Option<u64>,
+}
+
+/// The recorder-owned Program PCM clock and bounded ring.
+///
+/// The audio callback thread pushes interleaved device samples through
+/// [`ProgramAudioTap::push_interleaved`]; the recorder worker is the single
+/// reader. `delivered_frames` advances only when the device actually delivers
+/// samples — it is the clock every captured video frame is stamped with — and
+/// a span the bounded ring had to discard on overflow is recovered by the
+/// reader as an explicit, counted silence gap rather than a silent timeline
+/// shift. Analysis audio is deliberately not this clock: the analyzer's FFT
+/// ring keeps its own law and neither can starve the other.
+pub struct ProgramAudioTap {
+    ring: std::sync::Mutex<AudioTapRing>,
+    sample_rate: u32,
+    channels: u16,
+    device_name: String,
+    capacity_samples: usize,
+    device_lost: AtomicBool,
+}
+
+impl std::fmt::Debug for ProgramAudioTap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProgramAudioTap")
+            .field("sample_rate", &self.sample_rate)
+            .field("channels", &self.channels)
+            .field("device_name", &self.device_name)
+            .field("capacity_samples", &self.capacity_samples)
+            .field("device_lost", &self.device_lost.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl ProgramAudioTap {
+    pub fn new(sample_rate: u32, channels: u16, device_name: String) -> Result<Arc<Self>, String> {
+        let probe = AudioClockStamp {
+            sample_position: 0,
+            sample_rate,
+            channels,
+        };
+        if !probe.validate() {
+            return Err(format!(
+                "program audio tap rate {sample_rate} Hz / {channels} channels is unsupported"
+            ));
+        }
+        let duration_capacity = (sample_rate as usize)
+            .saturating_mul(RECORDER_AUDIO_RING_SECONDS as usize)
+            .saturating_mul(channels as usize);
+        let mut capacity_samples = duration_capacity.min(RECORDER_AUDIO_RING_MAX_SAMPLES);
+        // Whole frames only, and never a ring too small to hold one frame.
+        capacity_samples -= capacity_samples % channels as usize;
+        if capacity_samples < channels as usize {
+            return Err("program audio tap ring capacity is below one frame".into());
+        }
+        Ok(Arc::new(Self {
+            ring: std::sync::Mutex::new(AudioTapRing {
+                samples: VecDeque::with_capacity(capacity_samples),
+                head_frame: 0,
+                delivered_frames: 0,
+                reader_frame: None,
+            }),
+            sample_rate,
+            channels,
+            device_name,
+            capacity_samples,
+            device_lost: AtomicBool::new(false),
+        }))
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    fn lock_ring(&self) -> std::sync::MutexGuard<'_, AudioTapRing> {
+        match self.ring.lock() {
+            Ok(ring) => ring,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Callback-side push of interleaved device samples. A trailing partial
+    /// frame is discarded; a channel-layout mismatch marks the tap lost
+    /// instead of writing frames on the wrong lattice.
+    pub fn push_interleaved(&self, samples: &mut dyn Iterator<Item = f32>, channel_count: u16) {
+        if channel_count != self.channels {
+            self.mark_device_lost();
+            return;
+        }
+        let channels = self.channels as usize;
+        let mut ring = self.lock_ring();
+        let mut frame = [0.0f32; 32];
+        loop {
+            let mut filled = 0;
+            for slot in frame.iter_mut().take(channels) {
+                match samples.next() {
+                    Some(sample) => {
+                        *slot = if sample.is_finite() {
+                            sample.clamp(-4.0, 4.0)
+                        } else {
+                            0.0
+                        };
+                        filled += 1;
+                    }
+                    None => break,
+                }
+            }
+            if filled < channels {
+                break;
+            }
+            while ring.samples.len() + channels > self.capacity_samples {
+                for _ in 0..channels {
+                    ring.samples.pop_front();
+                }
+                ring.head_frame += 1;
+            }
+            ring.samples.extend(frame.iter().copied().take(channels));
+            ring.delivered_frames += 1;
+        }
+    }
+
+    pub fn mark_device_lost(&self) {
+        self.device_lost.store(true, Ordering::Release);
+    }
+
+    pub fn device_lost(&self) -> bool {
+        self.device_lost.load(Ordering::Acquire)
+    }
+
+    /// The Program PCM clock: what the device has delivered so far.
+    pub fn clock_stamp(&self) -> AudioClockStamp {
+        let ring = self.lock_ring();
+        AudioClockStamp {
+            sample_position: ring.delivered_frames,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        }
+    }
+
+    fn delivered_frames(&self) -> u64 {
+        self.lock_ring().delivered_frames
+    }
+
+    /// Anchor the single reader at an absolute frame index, discarding any
+    /// retained audio recorded before the first accepted video frame.
+    fn begin_read_at(&self, anchor_frame: u64) {
+        let channels = self.channels as usize;
+        let mut ring = self.lock_ring();
+        while ring.head_frame < anchor_frame && ring.samples.len() >= channels {
+            for _ in 0..channels {
+                ring.samples.pop_front();
+            }
+            ring.head_frame += 1;
+        }
+        if ring.head_frame < anchor_frame && ring.samples.is_empty() {
+            // Nothing delivered past the anchor yet; the cursor still starts
+            // there so the first delivered frame is not misread as a gap.
+            ring.head_frame = ring.head_frame.max(ring.delivered_frames);
+        }
+        ring.reader_frame = Some(anchor_frame);
+    }
+
+    /// Drain everything available. The returned count is the exact number of
+    /// frames the bounded ring discarded before the reader arrived — the
+    /// underrun law's explicit silence gap.
+    fn take_available(&self, out: &mut Vec<f32>) -> u64 {
+        let channels = self.channels as usize;
+        let mut ring = self.lock_ring();
+        let Some(reader) = ring.reader_frame else {
+            return 0;
+        };
+        let gap_frames = ring.head_frame.saturating_sub(reader);
+        let popped_frames = (ring.samples.len() / channels) as u64;
+        out.extend(ring.samples.drain(..));
+        ring.head_frame += popped_frames;
+        ring.reader_frame = Some(ring.head_frame);
+        gap_frames
     }
 }
 
@@ -528,6 +747,9 @@ pub struct CommittedCapture {
     pub dimensions: RecorderDimensions,
     pub frame_rate: RecorderFrameRate,
     pub counters: RecorderCounters,
+    /// True when the committed artifact carries a muxed AAC program-audio
+    /// stream; false is the exact video-only publication.
+    pub audio_muxed: bool,
 }
 
 /// Post-commit instruction for Main. It deliberately contains no ClipSlotId:
@@ -587,10 +809,23 @@ pub struct ProgramRecorder {
 
 impl ProgramRecorder {
     pub fn spawn(config: RecorderConfig) -> Result<Self, String> {
-        Self::spawn_with_factory(config, Box::new(spawn_ffmpeg_sink))
+        Self::spawn_with_hooks(
+            config,
+            Box::new(spawn_ffmpeg_sink),
+            Box::new(run_capture_mux),
+        )
     }
 
+    #[cfg(test)]
     fn spawn_with_factory(config: RecorderConfig, factory: SinkFactory) -> Result<Self, String> {
+        Self::spawn_with_hooks(config, factory, Box::new(run_capture_mux))
+    }
+
+    fn spawn_with_hooks(
+        config: RecorderConfig,
+        factory: SinkFactory,
+        mux_runner: MuxRunner,
+    ) -> Result<Self, String> {
         let frame_bytes = config.validate()?;
         let (pool_tx, pool_rx) = mpsc::sync_channel(RECORDER_FRAME_POOL_CAPACITY);
         let (work_tx, work_rx) = mpsc::sync_channel(RECORDER_FRAME_QUEUE_CAPACITY);
@@ -610,6 +845,7 @@ impl ProgramRecorder {
                     event_tx,
                     worker_shared,
                     factory,
+                    mux_runner,
                 );
             })
             .map_err(|error| format!("start recorder worker: {error}"))?;
@@ -998,19 +1234,448 @@ fn supervise_encoder_process(
     Ok((stdin, finish_requested, completion, supervisor))
 }
 
+/// Everything the finish-time audio mux needs, resolved before any process
+/// is spawned. The fixture mux runner asserts against this exact plan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaptureMuxPlan {
+    pub video_temp: PathBuf,
+    pub audio_temp: PathBuf,
+    pub output_temp: PathBuf,
+    pub sample_rate: u32,
+    pub channels: u16,
+    /// Exact rational CFR duration of the encoded video, in seconds.
+    pub duration_secs: f64,
+}
+
+/// The finish-time mux invocation: video stream copied, raw program PCM
+/// encoded to AAC, padded and trimmed to the exact CFR video duration —
+/// the offline exporter's own audio law.
+fn capture_mux_args(plan: &CaptureMuxPlan) -> Vec<OsString> {
+    let duration = format!("{:.6}", plan.duration_secs);
+    let mut args: Vec<OsString> = ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    args.push(plan.video_temp.as_os_str().to_owned());
+    args.extend(
+        [
+            "-f".to_owned(),
+            "f32le".to_owned(),
+            "-ar".to_owned(),
+            plan.sample_rate.to_string(),
+            "-ac".to_owned(),
+            plan.channels.to_string(),
+            "-i".to_owned(),
+        ]
+        .into_iter()
+        .map(OsString::from),
+    );
+    args.push(plan.audio_temp.as_os_str().to_owned());
+    args.extend(
+        [
+            "-map".to_owned(),
+            "0:v:0".to_owned(),
+            "-map".to_owned(),
+            "1:a:0".to_owned(),
+            "-c:v".to_owned(),
+            "copy".to_owned(),
+            "-filter:a".to_owned(),
+            format!("asetpts=PTS-STARTPTS,apad,atrim=end={duration}"),
+            "-c:a".to_owned(),
+            "aac".to_owned(),
+            "-b:a".to_owned(),
+            "192k".to_owned(),
+            "-map_metadata".to_owned(),
+            "-1".to_owned(),
+            "-t".to_owned(),
+            duration,
+            "-movflags".to_owned(),
+            "+faststart".to_owned(),
+            "-f".to_owned(),
+            "mp4".to_owned(),
+        ]
+        .into_iter()
+        .map(OsString::from),
+    );
+    args.push(plan.output_temp.as_os_str().to_owned());
+    args
+}
+
+type MuxRunner =
+    Box<dyn FnOnce(&CaptureMuxPlan, &Arc<RecorderShared>) -> Result<(), String> + Send>;
+
+/// Spawn the bounded finish-time mux helper and babysit it: cancel kills it,
+/// the absolute finish deadline kills it, and a failure surfaces the bounded
+/// captured stderr. There is no stdin; the inputs are complete staged temps.
+fn run_capture_mux(plan: &CaptureMuxPlan, shared: &Arc<RecorderShared>) -> Result<(), String> {
+    let stderr_path = sibling_temp_path(&plan.output_temp, "mux-log")?;
+    let stderr_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&stderr_path)
+        .map_err(|error| format!("reserve recording mux log: {error}"))?;
+    let mut child = match Command::new(crate::host_paths::ffmpeg())
+        .args(capture_mux_args(plan))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(&stderr_path);
+            return Err(format!("start recording audio mux: {error}"));
+        }
+    };
+    let started = Instant::now();
+    let result = loop {
+        if shared.cancel.load(Ordering::Acquire) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break Err("recording cancelled".to_string());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break Ok(()),
+            Ok(Some(status)) => {
+                let detail = read_bounded_file(&stderr_path, MAX_ERROR_CHARS).unwrap_or_default();
+                break Err(if detail.is_empty() {
+                    format!("recording audio mux exited with {status}")
+                } else {
+                    format!("recording audio mux exited with {status}: {detail}")
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("poll recording audio mux: {error}"));
+            }
+        }
+        if started.elapsed() >= RECORDER_FINISH_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            break Err("recording audio mux timed out and was reaped".to_string());
+        }
+        std::thread::sleep(RECORDER_POLL_INTERVAL);
+    };
+    let _ = std::fs::remove_file(&stderr_path);
+    result
+}
+
+/// Per-artifact audio truth, serialized into the durable recording report.
+#[derive(Debug, Clone, Serialize)]
+struct RecorderAudioReport {
+    device: String,
+    sample_rate: u32,
+    channels: u16,
+    /// Program-PCM clock position anchored to the first accepted video frame.
+    anchor_sample_position: u64,
+    /// Real device frames written to the artifact's audio timeline.
+    captured_frames: u64,
+    /// Explicit silence written for ring-overflow gaps and for an armed
+    /// source that never delivered.
+    silence_gap_frames: u64,
+    /// Bounded drift-correction insertions (device clock slow).
+    drift_inserted_frames: u64,
+    /// Bounded drift-correction drops (device clock fast).
+    drift_dropped_frames: u64,
+    device_lost: bool,
+    capture_truncated: bool,
+    muxed_duration_secs: f64,
+}
+
+/// Worker-side program-PCM capture: drains the tap ring into a staged raw
+/// f32le temp, fills every discarded span with explicit counted silence, and
+/// applies the bounded drift-correction law against the frame clock stamps.
+struct RecorderAudioCapture {
+    tap: Arc<ProgramAudioTap>,
+    temp_path: PathBuf,
+    mux_temp_path: PathBuf,
+    writer: Option<BufWriter<File>>,
+    anchor: Option<(u64, u64)>,
+    captured_frames: u64,
+    silence_gap_frames: u64,
+    drift_inserted_frames: u64,
+    drift_dropped_frames: u64,
+    pending_drop_frames: u64,
+    bytes_written: u64,
+    truncated: bool,
+    device_lost: bool,
+    scratch: Vec<f32>,
+}
+
+impl RecorderAudioCapture {
+    fn open(
+        tap: Arc<ProgramAudioTap>,
+        temp_path: PathBuf,
+        mux_temp_path: PathBuf,
+    ) -> Result<Self, String> {
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)
+            .map_err(|error| format!("open recording audio temp: {error}"))?;
+        Ok(Self {
+            tap,
+            temp_path,
+            mux_temp_path,
+            writer: Some(BufWriter::new(file)),
+            anchor: None,
+            captured_frames: 0,
+            silence_gap_frames: 0,
+            drift_inserted_frames: 0,
+            drift_dropped_frames: 0,
+            pending_drop_frames: 0,
+            bytes_written: 0,
+            truncated: false,
+            device_lost: false,
+            scratch: Vec::new(),
+        })
+    }
+
+    fn total_file_frames(&self) -> u64 {
+        self.captured_frames + self.silence_gap_frames + self.drift_inserted_frames
+    }
+
+    /// Anchor audio file position zero to the first accepted video frame's
+    /// clock stamp. Audio armed without a stamp is a contract violation, not
+    /// a guessable alignment.
+    fn anchor_at(&mut self, metadata: RecorderFrameMetadata) -> Result<(), String> {
+        if self.anchor.is_some() {
+            return Ok(());
+        }
+        let Some(stamp) = metadata.audio_clock else {
+            return Err(
+                "recording audio is armed but the accepted frame carries no audio clock"
+                    .to_string(),
+            );
+        };
+        if stamp.sample_rate != self.tap.sample_rate() || stamp.channels != self.tap.channels() {
+            return Err(format!(
+                "recording audio clock {} Hz / {} ch does not match the armed tap ({} Hz / {} ch)",
+                stamp.sample_rate,
+                stamp.channels,
+                self.tap.sample_rate(),
+                self.tap.channels()
+            ));
+        }
+        self.tap.begin_read_at(stamp.sample_position);
+        self.anchor = Some((stamp.sample_position, metadata.capture_index));
+        Ok(())
+    }
+
+    fn write_raw_samples(&mut self, samples: &[f32]) -> Result<(), String> {
+        if samples.is_empty() || self.truncated {
+            return Ok(());
+        }
+        let bytes = samples.len() as u64 * 4;
+        if self.bytes_written.saturating_add(bytes) > RECORDER_MAX_AUDIO_TEMP_BYTES {
+            self.truncated = true;
+            return Ok(());
+        }
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| "recording audio temp writer is closed".to_string())?;
+        for sample in samples {
+            writer
+                .write_all(&sample.to_le_bytes())
+                .map_err(|error| format!("write recording audio temp: {error}"))?;
+        }
+        self.bytes_written += bytes;
+        Ok(())
+    }
+
+    fn write_silence_frames(&mut self, frames: u64) -> Result<u64, String> {
+        if frames == 0 || self.truncated {
+            return Ok(0);
+        }
+        let channels = self.tap.channels() as u64;
+        let mut remaining_samples = frames.saturating_mul(channels);
+        let chunk =
+            vec![0.0f32; RECORDER_AUDIO_SILENCE_CHUNK_SAMPLES.min(remaining_samples as usize)];
+        let mut written_samples = 0u64;
+        while remaining_samples > 0 && !self.truncated {
+            let take = (chunk.len() as u64).min(remaining_samples) as usize;
+            self.write_raw_samples(&chunk[..take])?;
+            if self.truncated {
+                break;
+            }
+            written_samples += take as u64;
+            remaining_samples -= take as u64;
+        }
+        Ok(written_samples / channels)
+    }
+
+    /// Drain the ring: recovered gaps become explicit silence, a pending
+    /// drift drop consumes real frames, and the remainder lands in the temp.
+    fn pump(&mut self) -> Result<(), String> {
+        if self.anchor.is_none() || self.truncated {
+            return Ok(());
+        }
+        if self.tap.device_lost() {
+            self.device_lost = true;
+        }
+        self.scratch.clear();
+        let gap_frames = self.tap.take_available(&mut self.scratch);
+        if gap_frames > 0 {
+            let written = self.write_silence_frames(gap_frames)?;
+            self.silence_gap_frames += written;
+        }
+        let channels = self.tap.channels() as usize;
+        let mut start_frame = 0usize;
+        if self.pending_drop_frames > 0 {
+            let available = (self.scratch.len() / channels) as u64;
+            let dropped = available.min(self.pending_drop_frames);
+            self.pending_drop_frames -= dropped;
+            self.drift_dropped_frames += dropped;
+            start_frame = dropped as usize;
+        }
+        let scratch = std::mem::take(&mut self.scratch);
+        let result = self.write_raw_samples(&scratch[start_frame * channels..]);
+        let written_frames = (scratch.len() / channels).saturating_sub(start_frame) as u64;
+        self.scratch = scratch;
+        result?;
+        if !self.truncated {
+            self.captured_frames += written_frames;
+        }
+        Ok(())
+    }
+
+    /// The bounded drift-correction law. The stamp was taken on the render
+    /// thread at the frame's capture intent, so the measurement compares the
+    /// device clock against the program capture cadence directly and is
+    /// immune to worker or encoder lag.
+    fn correct_drift(
+        &mut self,
+        metadata: RecorderFrameMetadata,
+        frame_rate: RecorderFrameRate,
+    ) -> Result<(), String> {
+        let (Some((anchor_position, anchor_index)), Some(stamp)) =
+            (self.anchor, metadata.audio_clock)
+        else {
+            return Ok(());
+        };
+        if self.truncated || self.device_lost {
+            return Ok(());
+        }
+        let rate = self.tap.sample_rate() as u128;
+        let expected = u128::from(metadata.capture_index.saturating_sub(anchor_index))
+            * rate
+            * u128::from(frame_rate.denominator)
+            / u128::from(frame_rate.numerator);
+        let raw =
+            i128::from(stamp.sample_position.saturating_sub(anchor_position)) - expected as i128;
+        let net_correction =
+            i128::from(self.drift_dropped_frames) - i128::from(self.drift_inserted_frames);
+        let drift = raw - net_correction + i128::from(self.pending_drop_frames);
+        let threshold =
+            (self.tap.sample_rate() as f64 * RECORDER_AUDIO_DRIFT_THRESHOLD_SECONDS) as i128;
+        if drift >= threshold {
+            self.pending_drop_frames += drift as u64;
+        } else if drift <= -threshold {
+            let inserted = self.write_silence_frames((-drift) as u64)?;
+            self.drift_inserted_frames += inserted;
+        }
+        Ok(())
+    }
+
+    /// Finish the audio timeline: bounded grace for the device to deliver the
+    /// tail, one final drain, explicit full silence for an armed source that
+    /// never delivered, then flush and durably sync the staged temp.
+    fn finish(
+        &mut self,
+        encoded_frames: u64,
+        frame_rate: RecorderFrameRate,
+        shared: &Arc<RecorderShared>,
+    ) -> Result<(), String> {
+        let target_frames =
+            mux_target_audio_frames(encoded_frames, frame_rate, self.tap.sample_rate());
+        if let Some((anchor_position, _)) = self.anchor {
+            let grace_started = Instant::now();
+            while !self.tap.device_lost()
+                && !self.truncated
+                && self.tap.delivered_frames().saturating_sub(anchor_position) < target_frames
+                && grace_started.elapsed() < RECORDER_AUDIO_FINISH_GRACE
+            {
+                if shared.cancel.load(Ordering::Acquire) {
+                    return Err("recording cancelled".into());
+                }
+                std::thread::sleep(RECORDER_POLL_INTERVAL);
+            }
+        }
+        self.pump()?;
+        if self.total_file_frames() == 0 {
+            // An armed source that never delivered a single frame still
+            // publishes a fully explicit silent timeline: the mux must never
+            // see an empty raw input.
+            let written = self.write_silence_frames(target_frames.max(1))?;
+            self.silence_gap_frames += written;
+        }
+        if self.tap.device_lost() {
+            self.device_lost = true;
+        }
+        let writer = self
+            .writer
+            .take()
+            .ok_or_else(|| "recording audio temp writer is closed".to_string())?;
+        let file = writer
+            .into_inner()
+            .map_err(|error| format!("flush recording audio temp: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("sync recording audio temp: {error}"))?;
+        Ok(())
+    }
+
+    fn report(&self, muxed_duration_secs: f64) -> RecorderAudioReport {
+        RecorderAudioReport {
+            device: self.tap.device_name().to_string(),
+            sample_rate: self.tap.sample_rate(),
+            channels: self.tap.channels(),
+            anchor_sample_position: self.anchor.map(|(position, _)| position).unwrap_or(0),
+            captured_frames: self.captured_frames,
+            silence_gap_frames: self.silence_gap_frames,
+            drift_inserted_frames: self.drift_inserted_frames,
+            drift_dropped_frames: self.drift_dropped_frames,
+            device_lost: self.device_lost,
+            capture_truncated: self.truncated,
+            muxed_duration_secs,
+        }
+    }
+}
+
+/// Exact rational CFR duration of `encoded_frames` at `frame_rate`.
+fn capture_video_duration_secs(encoded_frames: u64, frame_rate: RecorderFrameRate) -> f64 {
+    encoded_frames as f64 * frame_rate.denominator as f64 / frame_rate.numerator as f64
+}
+
+/// Audio frames required to cover the encoded video timeline, rounded up.
+fn mux_target_audio_frames(
+    encoded_frames: u64,
+    frame_rate: RecorderFrameRate,
+    sample_rate: u32,
+) -> u64 {
+    let numerator =
+        u128::from(encoded_frames) * u128::from(frame_rate.denominator) * u128::from(sample_rate);
+    let denominator = u128::from(frame_rate.numerator);
+    (numerator.div_ceil(denominator)).min(u128::from(u64::MAX)) as u64
+}
+
 struct TempArtifactGuard {
-    media: PathBuf,
-    report: PathBuf,
+    paths: Vec<PathBuf>,
     armed: bool,
 }
 
 impl TempArtifactGuard {
-    fn new(media: PathBuf, report: PathBuf) -> Self {
+    fn new() -> Self {
         Self {
-            media,
-            report,
+            paths: Vec::new(),
             armed: true,
         }
+    }
+
+    fn track(&mut self, path: PathBuf) {
+        self.paths.push(path);
     }
 
     fn disarm(&mut self) {
@@ -1021,11 +1686,12 @@ impl TempArtifactGuard {
 impl Drop for TempArtifactGuard {
     fn drop(&mut self) {
         if self.armed {
-            cleanup_paths([self.media.as_path(), self.report.as_path()]);
+            cleanup_paths(self.paths.iter().map(PathBuf::as_path));
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recorder_worker(
     config: RecorderConfig,
     frame_bytes: usize,
@@ -1034,9 +1700,18 @@ fn recorder_worker(
     event_tx: SyncSender<RecorderTerminalEvent>,
     shared: Arc<RecorderShared>,
     factory: SinkFactory,
+    mux_runner: MuxRunner,
 ) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_recorder_worker(&config, frame_bytes, &pool_tx, &work_rx, &shared, factory)
+        run_recorder_worker(
+            &config,
+            frame_bytes,
+            &pool_tx,
+            &work_rx,
+            &shared,
+            factory,
+            mux_runner,
+        )
     }));
     let terminal = match result {
         Ok(Ok(capture)) => {
@@ -1072,6 +1747,7 @@ fn run_recorder_worker(
     work_rx: &Receiver<RecorderWorkItem>,
     shared: &Arc<RecorderShared>,
     factory: SinkFactory,
+    mux_runner: MuxRunner,
 ) -> Result<CommittedCapture, String> {
     for _ in 0..RECORDER_FRAME_POOL_CAPACITY {
         pool_tx
@@ -1085,8 +1761,26 @@ fn run_recorder_worker(
     // Arm cleanup as soon as the first file exists. In particular, a failure
     // to reserve the report temp must not strand the already-reserved media
     // temp beside the requested artifact.
-    let mut temp_guard = TempArtifactGuard::new(temp_path.clone(), report_temp.clone());
+    let mut temp_guard = TempArtifactGuard::new();
+    temp_guard.track(temp_path.clone());
     reserve_temp(&report_temp)?;
+    temp_guard.track(report_temp.clone());
+    let mut audio = match config.audio_tap.as_ref() {
+        Some(tap) => {
+            let audio_temp = sibling_temp_path(&config.output_path, "recording-audio")?;
+            reserve_temp(&audio_temp)?;
+            temp_guard.track(audio_temp.clone());
+            let mux_temp = sibling_temp_path(&config.output_path, "recording-mux")?;
+            reserve_temp(&mux_temp)?;
+            temp_guard.track(mux_temp.clone());
+            Some(RecorderAudioCapture::open(
+                tap.clone(),
+                audio_temp,
+                mux_temp,
+            )?)
+        }
+        None => None,
+    };
     let mut sink = factory(config, &temp_path, shared.clone())?;
     shared.phase.store(PHASE_RECORDING, Ordering::Release);
 
@@ -1139,8 +1833,16 @@ fn run_recorder_worker(
                 if let Some(previous) = last_frame.replace(item.pixels) {
                     let _ = pool_tx.try_send(previous);
                 }
+                if let Some(audio) = audio.as_mut() {
+                    audio.anchor_at(item.metadata)?;
+                    audio.pump()?;
+                    audio.correct_drift(item.metadata, config.frame_rate)?;
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(audio) = audio.as_mut() {
+                    audio.pump()?;
+                }
                 if shared.finish_requested.load(Ordering::Acquire) {
                     let started = *finish_idle_since.get_or_insert_with(Instant::now);
                     // One empty poll after the finish flag proves the bounded
@@ -1179,6 +1881,10 @@ fn run_recorder_worker(
     if first_metadata.is_none() {
         return Err("recording ended before any frame was accepted".into());
     }
+    let encoded_frames = shared.counters.encoded.load(Ordering::Acquire);
+    if let Some(audio) = audio.as_mut() {
+        audio.finish(encoded_frames, config.frame_rate, shared)?;
+    }
     if let Err(error) = sink.finish() {
         shared
             .counters
@@ -1187,24 +1893,57 @@ fn run_recorder_worker(
         return Err(error);
     }
     sync_path(&temp_path)?;
+    let (commit_media_temp, audio_report) = match audio.as_ref() {
+        Some(audio) => {
+            let duration_secs = capture_video_duration_secs(encoded_frames, config.frame_rate);
+            let plan = CaptureMuxPlan {
+                video_temp: temp_path.clone(),
+                audio_temp: audio.temp_path.clone(),
+                output_temp: audio.mux_temp_path.clone(),
+                sample_rate: audio.tap.sample_rate(),
+                channels: audio.tap.channels(),
+                duration_secs,
+            };
+            if let Err(error) = mux_runner(&plan, shared) {
+                shared
+                    .counters
+                    .encoder_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+            sync_path(&audio.mux_temp_path)?;
+            (
+                audio.mux_temp_path.clone(),
+                Some(audio.report(duration_secs)),
+            )
+        }
+        None => (temp_path.clone(), None),
+    };
     let counters = shared.counters.snapshot();
     let requested_final_capture_index = shared.finish_capture_index.load(Ordering::Acquire);
+    let audio_muxed = audio_report.is_some();
     let report = RecorderReport::new(
         config,
         counters,
         first_metadata.expect("guarded metadata"),
         last_metadata.expect("guarded metadata"),
         requested_final_capture_index,
+        audio_report,
     );
     write_report_temp(&report_temp, &report)?;
     commit_artifact_pair_linearized(
         &shared.publication,
-        &temp_path,
+        &commit_media_temp,
         &config.output_path,
         &report_temp,
         &report_path,
     )?;
     temp_guard.disarm();
+    if let Some(audio) = audio.as_ref() {
+        // The staged intermediates behind a committed mux are no longer part
+        // of any transaction; remove them now that the guard is disarmed.
+        cleanup_paths([temp_path.as_path(), audio.temp_path.as_path()]);
+    }
     Ok(CommittedCapture {
         media_path: config.output_path.clone(),
         report_path,
@@ -1213,6 +1952,7 @@ fn run_recorder_worker(
         dimensions: config.dimensions,
         frame_rate: config.frame_rate,
         counters,
+        audio_muxed,
     })
 }
 
@@ -1254,6 +1994,9 @@ struct RecorderReport {
     /// recovered by duplicating the last encoded picture.
     requested_final_capture_index: u64,
     audio_not_muxed: bool,
+    /// Present exactly when a program-PCM source was armed and muxed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio: Option<RecorderAudioReport>,
     target: ReportTarget,
     purpose: ReportPurpose,
 }
@@ -1284,6 +2027,7 @@ impl RecorderReport {
         first_frame: RecorderFrameMetadata,
         last_accepted_frame: RecorderFrameMetadata,
         requested_final_capture_index: u64,
+        audio: Option<RecorderAudioReport>,
     ) -> Self {
         Self::for_capture(
             &config.output_path,
@@ -1298,6 +2042,7 @@ impl RecorderReport {
             first_frame,
             last_accepted_frame,
             requested_final_capture_index,
+            audio,
         )
     }
 
@@ -1319,6 +2064,7 @@ impl RecorderReport {
             metadata,
             metadata,
             metadata.capture_index,
+            None,
         )
     }
 
@@ -1336,6 +2082,7 @@ impl RecorderReport {
         first_frame: RecorderFrameMetadata,
         last_accepted_frame: RecorderFrameMetadata,
         requested_final_capture_index: u64,
+        audio: Option<RecorderAudioReport>,
     ) -> Self {
         let target = match capture_target {
             CaptureTarget::Program => ReportTarget::Program,
@@ -1374,7 +2121,8 @@ impl RecorderReport {
             first_frame,
             last_accepted_frame,
             requested_final_capture_index,
-            audio_not_muxed: true,
+            audio_not_muxed: audio.is_none(),
+            audio,
             target,
             purpose,
         }
@@ -1520,8 +2268,10 @@ fn publish_still(
     let report_path = recorder_report_path(&config.output_path);
     let report_temp = sibling_temp_path(&report_path, "still-report")?;
     reserve_temp(&media_temp)?;
-    let mut temp_guard = TempArtifactGuard::new(media_temp.clone(), report_temp.clone());
+    let mut temp_guard = TempArtifactGuard::new();
+    temp_guard.track(media_temp.clone());
     reserve_temp(&report_temp)?;
+    temp_guard.track(report_temp.clone());
     if cancel.load(Ordering::Acquire) || publication.cancelled() {
         return Err("still snapshot cancelled".into());
     }
@@ -1575,6 +2325,7 @@ fn publish_still(
         dimensions: config.dimensions,
         frame_rate: RecorderFrameRate::FPS_30,
         counters,
+        audio_muxed: false,
     })
 }
 
@@ -1801,6 +2552,7 @@ mod tests {
             output_path: path,
             target: CaptureTarget::Program,
             purpose: CapturePurpose::External,
+            audio_tap: None,
         }
     }
 
@@ -2387,6 +3139,7 @@ mod tests {
             dimensions: RecorderDimensions::new(2, 2).unwrap(),
             frame_rate: RecorderFrameRate::FPS_30,
             counters: RecorderCounters::default(),
+            audio_muxed: false,
         };
         assert_eq!(
             capture.publication_intent(),
@@ -2396,5 +3149,567 @@ mod tests {
                 activate: true,
             }
         );
+    }
+
+    fn audio_tap(rate: u32, channels: u16) -> Arc<ProgramAudioTap> {
+        ProgramAudioTap::new(rate, channels, "fixture-device".into()).unwrap()
+    }
+
+    fn config_with_audio(path: PathBuf, tap: Arc<ProgramAudioTap>) -> RecorderConfig {
+        RecorderConfig {
+            audio_tap: Some(tap),
+            ..config(path)
+        }
+    }
+
+    fn ramp_value(frame: u64) -> f32 {
+        (frame % 1_000) as f32 / 1_000.0
+    }
+
+    fn push_ramp_frames(tap: &ProgramAudioTap, start_frame: u64, frames: u64) {
+        let channels = tap.channels() as u64;
+        let mut samples = Vec::with_capacity((frames * channels) as usize);
+        for frame in start_frame..start_frame + frames {
+            for _ in 0..channels {
+                samples.push(ramp_value(frame));
+            }
+        }
+        tap.push_interleaved(&mut samples.into_iter(), tap.channels());
+    }
+
+    type CapturedMux = Arc<Mutex<Option<(CaptureMuxPlan, Vec<u8>)>>>;
+
+    /// Fixture mux: records the exact plan, snapshots the staged PCM before
+    /// the worker removes it, and stands in for the committed media by
+    /// copying the video temp into the mux output temp.
+    fn capturing_mux_runner(captured: CapturedMux) -> MuxRunner {
+        Box::new(move |plan, _shared| {
+            let audio = std::fs::read(&plan.audio_temp).map_err(|error| error.to_string())?;
+            std::fs::copy(&plan.video_temp, &plan.output_temp)
+                .map_err(|error| error.to_string())?;
+            *captured.lock().unwrap() = Some((plan.clone(), audio));
+            Ok(())
+        })
+    }
+
+    fn submit_frame_with_clock(recorder: &ProgramRecorder, index: u64, tap: &ProgramAudioTap) {
+        let RecorderAcquire::Lease(mut lease) = recorder.try_acquire_frame() else {
+            panic!("preallocated recorder lease unavailable");
+        };
+        lease.pixels_mut().fill(index as u8);
+        let mut meta = metadata(index);
+        meta.audio_clock = Some(tap.clock_stamp());
+        assert_eq!(recorder.try_submit(lease, meta), RecorderSubmit::Accepted);
+    }
+
+    fn staged_temp_residue(output: &Path) -> Vec<PathBuf> {
+        let parent = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let needle = output
+            .file_name()
+            .expect("test output names a file")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::read_dir(parent)
+            .expect("test temp directory is listable")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                name.contains(&needle) && name.ends_with(".tmp")
+            })
+            .collect()
+    }
+
+    fn report_json(output: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(recorder_report_path(output)).unwrap()).unwrap()
+    }
+
+    fn cleanup_capture_outputs(output: &Path) {
+        let _ = std::fs::remove_file(recorder_report_path(output));
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn program_audio_tap_clock_and_bounded_ring_overflow_law() {
+        // 8 kHz mono: the duration bound (4 s = 32,000 frames) governs.
+        let tap = audio_tap(8_000, 1);
+        push_ramp_frames(&tap, 0, 40_000);
+        assert_eq!(tap.clock_stamp().sample_position, 40_000);
+        tap.begin_read_at(0);
+        let mut out = Vec::new();
+        let gap = tap.take_available(&mut out);
+        assert_eq!(
+            gap, 8_000,
+            "overflow drops oldest and the reader observes the exact discarded span"
+        );
+        assert_eq!(out.len(), 32_000);
+        assert_eq!(out[0], ramp_value(8_000));
+        // Later delivery continues contiguously with no phantom gap.
+        push_ramp_frames(&tap, 40_000, 100);
+        out.clear();
+        assert_eq!(tap.take_available(&mut out), 0);
+        assert_eq!(out.len(), 100);
+        assert_eq!(out[0], ramp_value(40_000));
+    }
+
+    #[test]
+    fn program_audio_tap_anchor_discards_only_pre_anchor_audio() {
+        let tap = audio_tap(48_000, 2);
+        push_ramp_frames(&tap, 0, 4_800);
+        tap.begin_read_at(1_600);
+        let mut out = Vec::new();
+        assert_eq!(tap.take_available(&mut out), 0);
+        assert_eq!(out.len(), (4_800 - 1_600) * 2);
+        assert_eq!(out[0], ramp_value(1_600));
+    }
+
+    #[test]
+    fn program_audio_tap_sanitizes_input_and_refuses_the_wrong_layout() {
+        let tap = audio_tap(48_000, 2);
+        // A non-finite sample lands as neutral silence and the trailing
+        // partial frame is discarded rather than shifting the lattice.
+        tap.push_interleaved(&mut [f32::NAN, 0.25, 0.5].iter().copied(), 2);
+        assert_eq!(tap.clock_stamp().sample_position, 1);
+        tap.begin_read_at(0);
+        let mut out = Vec::new();
+        assert_eq!(tap.take_available(&mut out), 0);
+        assert_eq!(out, vec![0.0, 0.25]);
+        assert!(!tap.device_lost());
+        tap.push_interleaved(&mut [0.0f32; 4].iter().copied(), 4);
+        assert!(
+            tap.device_lost(),
+            "a channel-layout mismatch is a device loss, never a relattice"
+        );
+        assert!(ProgramAudioTap::new(4_000, 2, String::new()).is_err());
+        assert!(ProgramAudioTap::new(48_000, 0, String::new()).is_err());
+        assert!(ProgramAudioTap::new(48_000, 33, String::new()).is_err());
+    }
+
+    #[test]
+    fn capture_mux_args_follow_the_export_audio_law() {
+        let plan = CaptureMuxPlan {
+            video_temp: PathBuf::from("v.tmp"),
+            audio_temp: PathBuf::from("a.tmp"),
+            output_temp: PathBuf::from("o.tmp"),
+            sample_rate: 48_000,
+            channels: 2,
+            duration_secs: 0.1,
+        };
+        let args = capture_mux_args(&plan)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                "v.tmp",
+                "-f",
+                "f32le",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-i",
+                "a.tmp",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "copy",
+                "-filter:a",
+                "asetpts=PTS-STARTPTS,apad,atrim=end=0.100000",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-map_metadata",
+                "-1",
+                "-t",
+                "0.100000",
+                "-movflags",
+                "+faststart",
+                "-f",
+                "mp4",
+                "o.tmp",
+            ]
+        );
+    }
+
+    #[test]
+    fn audio_mux_receives_anchored_pcm_and_the_exact_rational_duration() {
+        let output = temp_path("audio-mux.mp4");
+        let tap = audio_tap(48_000, 2);
+        let captured: CapturedMux = Arc::new(Mutex::new(None));
+        let mut recorder = ProgramRecorder::spawn_with_hooks(
+            config_with_audio(output.clone(), tap.clone()),
+            fixture_sink_factory(),
+            capturing_mux_runner(captured.clone()),
+        )
+        .expect("start recorder");
+        wait_until_recording(&recorder);
+        // Real-time-equivalent audio for the three video frames plus one frame
+        // of slack, so the finish drain never waits out its grace period.
+        push_ramp_frames(&tap, 0, 6_400);
+        for index in 0..3 {
+            submit_fixture_frame(&recorder, index);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        recorder.request_finish(2);
+        let event = wait_recorder_terminal(&mut recorder);
+        let RecorderTerminalEvent::Succeeded(committed) = event else {
+            panic!("unexpected recorder terminal event: {event:?}");
+        };
+        assert!(committed.audio_muxed);
+        let (plan, audio_bytes) = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the audio mux must run for an armed recording");
+        assert_eq!(plan.sample_rate, 48_000);
+        assert_eq!(plan.channels, 2);
+        assert!((plan.duration_secs - 0.1).abs() < 1e-9);
+        // The staged PCM starts at the first accepted frame's clock stamp.
+        assert_eq!(audio_bytes.len(), 6_400 * 2 * 4);
+        let first = f32::from_le_bytes(audio_bytes[0..4].try_into().unwrap());
+        assert_eq!(first, ramp_value(0));
+        let value = report_json(&output);
+        assert_eq!(value["schema_version"], RECORDER_REPORT_SCHEMA_VERSION);
+        assert_eq!(value["audio_not_muxed"], false);
+        assert_eq!(value["audio"]["captured_frames"], 6_400);
+        assert_eq!(value["audio"]["silence_gap_frames"], 0);
+        assert_eq!(value["audio"]["drift_inserted_frames"], 0);
+        assert_eq!(value["audio"]["drift_dropped_frames"], 0);
+        assert_eq!(value["audio"]["device_lost"], false);
+        assert_eq!(value["audio"]["device"], "fixture-device");
+        assert!(output.exists());
+        assert!(
+            staged_temp_residue(&output).is_empty(),
+            "a committed mux leaves no staged intermediates behind"
+        );
+        cleanup_capture_outputs(&output);
+    }
+
+    #[test]
+    fn a_recording_without_audio_keeps_the_exact_video_only_path() {
+        let output = temp_path("no-audio.mp4");
+        let captured: CapturedMux = Arc::new(Mutex::new(None));
+        let mut recorder = ProgramRecorder::spawn_with_hooks(
+            config(output.clone()),
+            fixture_sink_factory(),
+            capturing_mux_runner(captured.clone()),
+        )
+        .expect("start recorder");
+        wait_until_recording(&recorder);
+        submit_fixture_frame(&recorder, 0);
+        recorder.request_finish(0);
+        let event = wait_recorder_terminal(&mut recorder);
+        let RecorderTerminalEvent::Succeeded(committed) = event else {
+            panic!("unexpected recorder terminal event: {event:?}");
+        };
+        assert!(!committed.audio_muxed);
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "no mux may run for a video-only recording"
+        );
+        let value = report_json(&output);
+        assert_eq!(value["audio_not_muxed"], true);
+        assert!(value.get("audio").is_none());
+        cleanup_capture_outputs(&output);
+    }
+
+    #[test]
+    fn device_loss_publishes_with_honest_padding_truth() {
+        let output = temp_path("audio-loss.mp4");
+        let tap = audio_tap(48_000, 2);
+        let captured: CapturedMux = Arc::new(Mutex::new(None));
+        let mut recorder = ProgramRecorder::spawn_with_hooks(
+            config_with_audio(output.clone(), tap.clone()),
+            fixture_sink_factory(),
+            capturing_mux_runner(captured.clone()),
+        )
+        .expect("start recorder");
+        wait_until_recording(&recorder);
+        push_ramp_frames(&tap, 0, 1_600);
+        submit_fixture_frame(&recorder, 0);
+        std::thread::sleep(Duration::from_millis(5));
+        submit_fixture_frame(&recorder, 1);
+        tap.mark_device_lost();
+        recorder.request_finish(1);
+        let event = wait_recorder_terminal(&mut recorder);
+        let RecorderTerminalEvent::Succeeded(committed) = event else {
+            panic!("unexpected recorder terminal event: {event:?}");
+        };
+        assert!(committed.audio_muxed, "a lost device still publishes audio");
+        let (plan, _) = captured.lock().unwrap().take().expect("mux ran");
+        assert!((plan.duration_secs - 2.0 / 30.0).abs() < 1e-9);
+        let value = report_json(&output);
+        assert_eq!(value["audio"]["device_lost"], true);
+        assert_eq!(value["audio"]["captured_frames"], 1_600);
+        assert_eq!(value["audio_not_muxed"], false);
+        cleanup_capture_outputs(&output);
+    }
+
+    #[test]
+    fn armed_audio_that_never_delivers_publishes_explicit_full_silence() {
+        let output = temp_path("audio-silent.mp4");
+        let tap = audio_tap(48_000, 2);
+        tap.mark_device_lost();
+        let captured: CapturedMux = Arc::new(Mutex::new(None));
+        let mut recorder = ProgramRecorder::spawn_with_hooks(
+            config_with_audio(output.clone(), tap.clone()),
+            fixture_sink_factory(),
+            capturing_mux_runner(captured.clone()),
+        )
+        .expect("start recorder");
+        wait_until_recording(&recorder);
+        submit_frame_with_clock(&recorder, 0, &tap);
+        std::thread::sleep(Duration::from_millis(5));
+        submit_frame_with_clock(&recorder, 1, &tap);
+        recorder.request_finish(1);
+        let event = wait_recorder_terminal(&mut recorder);
+        let RecorderTerminalEvent::Succeeded(_) = event else {
+            panic!("unexpected recorder terminal event: {event:?}");
+        };
+        let (_, audio_bytes) = captured.lock().unwrap().take().expect("mux ran");
+        // Two encoded frames at 30 fps demand 3,200 stereo frames of audio;
+        // the never-delivering source becomes explicit zeroed PCM, never an
+        // empty raw input the mux could misread.
+        assert_eq!(audio_bytes.len(), 3_200 * 2 * 4);
+        assert!(audio_bytes.iter().all(|byte| *byte == 0));
+        let value = report_json(&output);
+        assert_eq!(value["audio"]["captured_frames"], 0);
+        assert_eq!(value["audio"]["silence_gap_frames"], 3_200);
+        assert_eq!(value["audio"]["device_lost"], true);
+        cleanup_capture_outputs(&output);
+    }
+
+    #[test]
+    fn cancel_removes_every_staged_temp_including_audio_and_mux() {
+        let output = temp_path("audio-cancel.mp4");
+        let tap = audio_tap(48_000, 2);
+        let captured: CapturedMux = Arc::new(Mutex::new(None));
+        let mut recorder = ProgramRecorder::spawn_with_hooks(
+            config_with_audio(output.clone(), tap.clone()),
+            fixture_sink_factory(),
+            capturing_mux_runner(captured.clone()),
+        )
+        .expect("start recorder");
+        wait_until_recording(&recorder);
+        push_ramp_frames(&tap, 0, 1_600);
+        submit_fixture_frame(&recorder, 0);
+        recorder.cancel();
+        let event = wait_recorder_terminal(&mut recorder);
+        assert!(matches!(event, RecorderTerminalEvent::Cancelled));
+        assert!(!output.exists());
+        assert!(!recorder_report_path(&output).exists());
+        assert!(
+            staged_temp_residue(&output).is_empty(),
+            "cancel must remove the video, report, audio, and mux temps"
+        );
+    }
+
+    #[test]
+    fn mux_failure_fails_the_recording_and_removes_the_temps() {
+        let output = temp_path("audio-mux-fail.mp4");
+        let tap = audio_tap(48_000, 2);
+        tap.mark_device_lost();
+        let mut recorder = ProgramRecorder::spawn_with_hooks(
+            config_with_audio(output.clone(), tap.clone()),
+            fixture_sink_factory(),
+            Box::new(|_, _| Err("fixture mux refused".to_string())),
+        )
+        .expect("start recorder");
+        wait_until_recording(&recorder);
+        submit_frame_with_clock(&recorder, 0, &tap);
+        recorder.request_finish(0);
+        let event = wait_recorder_terminal(&mut recorder);
+        let RecorderTerminalEvent::Failed(error) = event else {
+            panic!("unexpected recorder terminal event: {event:?}");
+        };
+        assert!(error.contains("fixture mux refused"));
+        assert_eq!(recorder.snapshot().counters.encoder_failures, 1);
+        assert!(!output.exists());
+        assert!(!recorder_report_path(&output).exists());
+        assert!(staged_temp_residue(&output).is_empty());
+    }
+
+    #[test]
+    fn drift_correction_is_bounded_counted_and_direction_correct() {
+        let output = temp_path("drift.mp4");
+        let audio_temp = sibling_temp_path(&output, "audio").unwrap();
+        let mux_temp = sibling_temp_path(&output, "mux").unwrap();
+        reserve_temp(&audio_temp).unwrap();
+        reserve_temp(&mux_temp).unwrap();
+        let tap = audio_tap(48_000, 1);
+        let mut capture =
+            RecorderAudioCapture::open(tap.clone(), audio_temp.clone(), mux_temp.clone()).unwrap();
+        let stamp = |index: u64, position: u64| RecorderFrameMetadata {
+            capture_index: index,
+            capture_time_ns: index,
+            program_time_ns: index,
+            visual_epoch: 1,
+            program_frozen: false,
+            media_frozen: false,
+            blackout: false,
+            audio_clock: Some(AudioClockStamp {
+                sample_position: position,
+                sample_rate: 48_000,
+                channels: 1,
+            }),
+        };
+        // A mismatched clock layout is refused at the anchor, never guessed.
+        let mut hostile = stamp(0, 0);
+        hostile.audio_clock = Some(AudioClockStamp {
+            sample_position: 0,
+            sample_rate: 44_100,
+            channels: 1,
+        });
+        assert!(capture.anchor_at(hostile).is_err());
+        capture.anchor_at(stamp(0, 0)).unwrap();
+        // In sync at exactly one program second: nothing to correct.
+        capture
+            .correct_drift(stamp(30, 48_000), RecorderFrameRate::FPS_30)
+            .unwrap();
+        assert_eq!(capture.pending_drop_frames, 0);
+        assert_eq!(capture.drift_inserted_frames, 0);
+        // Fast device clock: +20,000 frames beyond two program seconds trips
+        // the quarter-second threshold and schedules one bounded drop.
+        capture
+            .correct_drift(stamp(60, 96_000 + 20_000), RecorderFrameRate::FPS_30)
+            .unwrap();
+        assert_eq!(capture.pending_drop_frames, 20_000);
+        // The pending drop consumes real frames at the next pump.
+        push_ramp_frames(&tap, 0, 30_000);
+        capture.pump().unwrap();
+        assert_eq!(capture.drift_dropped_frames, 20_000);
+        assert_eq!(capture.captured_frames, 10_000);
+        // With the correction accounted, the same steady offset is no drift.
+        capture
+            .correct_drift(stamp(61, 97_600 + 20_000), RecorderFrameRate::FPS_30)
+            .unwrap();
+        assert_eq!(capture.pending_drop_frames, 0);
+        // Slow device clock: −20,000 frames inserts explicit counted silence.
+        let mut slow =
+            RecorderAudioCapture::open(tap.clone(), audio_temp.clone(), mux_temp.clone()).unwrap();
+        slow.anchor_at(stamp(0, 0)).unwrap();
+        slow.correct_drift(stamp(30, 48_000 - 20_000), RecorderFrameRate::FPS_30)
+            .unwrap();
+        assert_eq!(slow.drift_inserted_frames, 20_000);
+        assert_eq!(slow.pending_drop_frames, 0);
+        drop(capture);
+        drop(slow);
+        cleanup_paths([audio_temp.as_path(), mux_temp.as_path()]);
+    }
+
+    /// The tranche's gate fixture: a real recording of a clocked test signal
+    /// whose audio stream, duration, and A/V offset are verified by ffprobe.
+    /// Opt-in like `effects_audit`: it requires the ffmpeg and ffprobe CLIs.
+    #[test]
+    #[ignore = "requires the ffmpeg and ffprobe CLIs on this host"]
+    fn recorder_audio_mux_end_to_end_duration_and_offset_verified_by_ffprobe() {
+        let output = temp_path("audio-e2e.mp4");
+        let tap = audio_tap(48_000, 2);
+        let mut recorder = ProgramRecorder::spawn(RecorderConfig {
+            dimensions: RecorderDimensions::new(64, 64).unwrap(),
+            frame_rate: RecorderFrameRate::FPS_30,
+            output_path: output.clone(),
+            target: CaptureTarget::Program,
+            purpose: CapturePurpose::External,
+            audio_tap: Some(tap.clone()),
+        })
+        .expect("start recorder");
+        wait_until_recording(&recorder);
+        // Three seconds: 90 CFR frames, each paired with its exact 1,600
+        // stereo frames of clocked ramp signal.
+        for index in 0..90u64 {
+            push_ramp_frames(&tap, index * 1_600, 1_600);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let RecorderAcquire::Lease(mut lease) = recorder.try_acquire_frame() {
+                    lease.pixels_mut().fill((index % 255) as u8);
+                    if recorder.try_submit(lease, metadata(index)) == RecorderSubmit::Accepted {
+                        break;
+                    }
+                }
+                assert!(Instant::now() < deadline, "recorder never accepted frame");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        recorder.request_finish(89);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let event = loop {
+            if let Some(event) = recorder.poll_terminal() {
+                break event;
+            }
+            assert!(Instant::now() < deadline, "recorder terminal timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let RecorderTerminalEvent::Succeeded(committed) = event else {
+            panic!("unexpected recorder terminal event: {event:?}");
+        };
+        assert!(committed.audio_muxed);
+        let probe = Command::new(crate::host_paths::ffprobe())
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,codec_name,start_time,duration",
+                "-of",
+                "json",
+            ])
+            .arg(&output)
+            .output()
+            .expect("run ffprobe");
+        assert!(probe.status.success(), "ffprobe failed: {probe:?}");
+        let value: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+        let streams = value["streams"].as_array().expect("ffprobe streams");
+        let field = |stream: &serde_json::Value, key: &str| -> f64 {
+            stream[key]
+                .as_str()
+                .and_then(|text| text.parse::<f64>().ok())
+                .unwrap_or(f64::NAN)
+        };
+        let video = streams
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .expect("video stream present");
+        let audio = streams
+            .iter()
+            .find(|stream| stream["codec_type"] == "audio")
+            .expect("audio stream present");
+        assert_eq!(audio["codec_name"], "aac");
+        let video_duration = field(video, "duration");
+        let audio_duration = field(audio, "duration");
+        assert!(
+            (video_duration - 3.0).abs() < 0.05,
+            "video duration {video_duration} strayed from 3.0"
+        );
+        assert!(
+            (audio_duration - 3.0).abs() < 0.2,
+            "audio duration {audio_duration} strayed from 3.0"
+        );
+        let offset = field(audio, "start_time") - field(video, "start_time");
+        assert!(
+            offset.abs() < 0.06,
+            "A/V start offset {offset} exceeds the container tolerance"
+        );
+        let value = report_json(&output);
+        assert_eq!(value["audio_not_muxed"], false);
+        assert_eq!(value["audio"]["device_lost"], false);
+        cleanup_capture_outputs(&output);
     }
 }

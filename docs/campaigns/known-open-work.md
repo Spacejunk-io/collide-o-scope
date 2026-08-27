@@ -12,11 +12,18 @@ live and export. Current status: Deferred; average-FPS cadence remains truthful.
 
 ## Live recorder audio mux
 
-First establish one owned Program PCM clock, bounded ring and underrun law,
-bounded drift correction, and transactional cancel/failure publication. Cover
-missing, short, long, discontinuous, and device-loss audio. Analysis audio is
-not Program audio. Current status: Deferred; live receipts remain
-`audio_not_muxed`.
+The ruled ladder landed whole: one owned Program PCM clock (the recorder's
+`ProgramAudioTap`, teed from the capture callback before the analysis
+downmix — analysis audio remains its own ring), a bounded ring whose overflow
+is recovered by the reader as an explicit counted silence gap, bounded
+drift correction against the per-frame clock stamps, and the mux inside the
+existing transactional no-replace publication with cancel/failure cleanup.
+Missing audio keeps the exact video-only path; short and long audio are
+padded/trimmed to the exact CFR duration by the export audio law; discontinuous
+and device-loss audio become counted silence in the durable report. Current
+status: Implemented; evidence in
+`docs/evidence/live-recorder-audio-mux-note.md`, physical audio-interface proof
+remains with the hardware matrix below.
 
 ## Physical venue and hardware matrix
 

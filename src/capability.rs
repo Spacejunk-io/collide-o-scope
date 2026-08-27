@@ -380,6 +380,7 @@ pub enum CapabilityLimitation {
     OriginalMediaUsedForExport,
     AsynchronousFinalProgramLatency,
     VideoOnlyRecorder,
+    LiveAudioCaptureRequired,
     AverageFrameRateCadence,
     WindowsOnly,
     LiveSourceIsBlackOffline,
@@ -584,9 +585,7 @@ fn primary_decision(key: CapabilityKey, facts: CapabilityRuntimeFacts) -> Capabi
         CapabilityKey::Full16TemporalHistory => CapabilityDecision::RejectedByMeasurement(
             CapabilityRejectionReason::MeasuredResourceTradeoff,
         ),
-        CapabilityKey::LiveRecorderAudioMux => {
-            CapabilityDecision::Deferred(CapabilityDeferredReason::OwnedProgramPcmUnavailable)
-        }
+        CapabilityKey::LiveRecorderAudioMux => CapabilityDecision::Implemented,
         CapabilityKey::SpoutInput | CapabilityKey::SpoutOutput => {
             if matches!(facts.platform, Platform::Windows) {
                 CapabilityDecision::Implemented
@@ -757,7 +756,7 @@ fn evidence(key: CapabilityKey) -> Vec<EvidenceReceiptId> {
             "s12c-full16-history-candidate-note",
             "full16-history-candidate-receipt",
         ],
-        CapabilityKey::LiveRecorderAudioMux => &["b9-performance-recorder-note"],
+        CapabilityKey::LiveRecorderAudioMux => &["live-recorder-audio-mux-note"],
         CapabilityKey::ProxyBrowserSurface => &["s8c-browser-proxy-surface-note"],
         CapabilityKey::TransactionalControlListeners => &["p10-capability-campaign-truth-closure"],
         CapabilityKey::CorrelatedEngineGpuTiming => &[
@@ -848,10 +847,16 @@ fn limitations(key: CapabilityKey) -> Vec<CapabilityLimitationRecord> {
             Limitation::AsynchronousFinalProgramLatency,
             "Live VHS is an asynchronous final-program replacement; export runs the corresponding synchronous stage.",
         )],
-        CapabilityKey::LiveRecorderAudioMux => vec![CapabilityLimitationRecord::new(
-            Limitation::VideoOnlyRecorder,
-            "The live recorder publishes video and explicitly reports audio_not_muxed=true.",
-        )],
+        CapabilityKey::LiveRecorderAudioMux => vec![
+            CapabilityLimitationRecord::new(
+                Limitation::LiveAudioCaptureRequired,
+                "Program audio is muxed exactly when the live audio capture stream is running at recording start; otherwise the artifact stays video-only and reports audio_not_muxed=true.",
+            ),
+            CapabilityLimitationRecord::new(
+                Limitation::ExternalProofRequired,
+                "Ring, drift, and device-loss laws are proven in software with an opt-in ffprobe fixture; a physical audio interface driving a live recording is hardware-matrix proof.",
+            ),
+        ],
         CapabilityKey::ExactVfrLiveTransport => vec![CapabilityLimitationRecord::new(
             Limitation::AverageFrameRateCadence,
             "Live public cadence is derived from the stream average frame rate, not an exact PTS timeline.",
@@ -1208,16 +1213,22 @@ mod tests {
     }
 
     #[test]
-    fn recorder_audio_and_exact_vfr_cannot_be_upgraded_by_a_label() {
+    fn recorder_audio_mux_is_implemented_and_exact_vfr_stays_deferred() {
+        // The recorder half of the former pair landed with its own owned
+        // Program PCM clock; the source-text pins hold the implementation to
+        // the truthful report law rather than a label.
         assert_eq!(
             record(CapabilityKey::LiveRecorderAudioMux, Platform::Windows).status,
-            CapabilityStatus::Deferred
+            CapabilityStatus::Implemented
         );
         assert_eq!(
             record(CapabilityKey::ExactVfrLiveTransport, Platform::Windows).status,
             CapabilityStatus::Deferred
         );
-        assert!(include_str!("program_recorder.rs").contains("audio_not_muxed: true"));
+        let recorder = include_str!("program_recorder.rs");
+        assert!(recorder.contains("audio_not_muxed: audio.is_none()"));
+        assert!(recorder.contains("pub struct ProgramAudioTap"));
+        assert!(recorder.contains("fn correct_drift"));
         assert!(include_str!("video/decoder.rs").contains("stream.avg_frame_rate()"));
     }
 

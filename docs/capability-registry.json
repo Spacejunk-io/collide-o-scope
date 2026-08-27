@@ -421,28 +421,30 @@
           "key": "live_recorder_audio_mux",
           "title": "Live recorder audio mux",
           "platform": "windows",
-          "status": "deferred",
+          "status": "implemented",
           "reason": {
-            "kind": "deferred",
-            "detail": "owned_program_pcm_unavailable"
+            "kind": "production_path_integrated"
           },
           "surfaces": [
             {
               "surface": "live_recording",
-              "status": "deferred",
+              "status": "implemented",
               "reason": {
-                "kind": "deferred",
-                "detail": "owned_program_pcm_unavailable"
+                "kind": "production_path_integrated"
               }
             }
           ],
           "evidence_receipt_ids": [
-            "b9-performance-recorder-note"
+            "live-recorder-audio-mux-note"
           ],
           "known_limitations": [
             {
-              "code": "video_only_recorder",
-              "text": "The live recorder publishes video and explicitly reports audio_not_muxed=true."
+              "code": "live_audio_capture_required",
+              "text": "Program audio is muxed exactly when the live audio capture stream is running at recording start; otherwise the artifact stays video-only and reports audio_not_muxed=true."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "Ring, drift, and device-loss laws are proven in software with an opt-in ffprobe fixture; a physical audio interface driving a live recording is hardware-matrix proof."
             }
           ]
         },
@@ -1447,28 +1449,30 @@
           "key": "live_recorder_audio_mux",
           "title": "Live recorder audio mux",
           "platform": "macos",
-          "status": "deferred",
+          "status": "implemented",
           "reason": {
-            "kind": "deferred",
-            "detail": "owned_program_pcm_unavailable"
+            "kind": "production_path_integrated"
           },
           "surfaces": [
             {
               "surface": "live_recording",
-              "status": "deferred",
+              "status": "implemented",
               "reason": {
-                "kind": "deferred",
-                "detail": "owned_program_pcm_unavailable"
+                "kind": "production_path_integrated"
               }
             }
           ],
           "evidence_receipt_ids": [
-            "b9-performance-recorder-note"
+            "live-recorder-audio-mux-note"
           ],
           "known_limitations": [
             {
-              "code": "video_only_recorder",
-              "text": "The live recorder publishes video and explicitly reports audio_not_muxed=true."
+              "code": "live_audio_capture_required",
+              "text": "Program audio is muxed exactly when the live audio capture stream is running at recording start; otherwise the artifact stays video-only and reports audio_not_muxed=true."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "Ring, drift, and device-loss laws are proven in software with an opt-in ffprobe fixture; a physical audio interface driving a live recording is hardware-matrix proof."
             }
           ]
         },
@@ -2481,28 +2485,30 @@
           "key": "live_recorder_audio_mux",
           "title": "Live recorder audio mux",
           "platform": "linux",
-          "status": "deferred",
+          "status": "implemented",
           "reason": {
-            "kind": "deferred",
-            "detail": "owned_program_pcm_unavailable"
+            "kind": "production_path_integrated"
           },
           "surfaces": [
             {
               "surface": "live_recording",
-              "status": "deferred",
+              "status": "implemented",
               "reason": {
-                "kind": "deferred",
-                "detail": "owned_program_pcm_unavailable"
+                "kind": "production_path_integrated"
               }
             }
           ],
           "evidence_receipt_ids": [
-            "b9-performance-recorder-note"
+            "live-recorder-audio-mux-note"
           ],
           "known_limitations": [
             {
-              "code": "video_only_recorder",
-              "text": "The live recorder publishes video and explicitly reports audio_not_muxed=true."
+              "code": "live_audio_capture_required",
+              "text": "Program audio is muxed exactly when the live audio capture stream is running at recording start; otherwise the artifact stays video-only and reports audio_not_muxed=true."
+            },
+            {
+              "code": "external_proof_required",
+              "text": "Ring, drift, and device-loss laws are proven in software with an opt-in ffprobe fixture; a physical audio interface driving a live recording is hardware-matrix proof."
             }
           ]
         },

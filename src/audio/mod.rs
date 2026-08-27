@@ -325,6 +325,12 @@ struct SharedAudio {
     /// Runtime failures arrive on cpal's callback thread and are consumed by
     /// the render thread on its next analysis pass.
     stream_error: Mutex<Option<String>>,
+    /// Recorder-armed program-PCM tap. The capture callback tees the raw
+    /// interleaved device samples into it before the mono analysis downmix;
+    /// analysis audio is deliberately not the program-PCM clock. Any stream
+    /// stop, restart, or runtime failure marks the armed tap lost — a
+    /// restarted stream is a discontinuity the recorder must not paper over.
+    program_tap: Mutex<Option<Arc<crate::program_recorder::ProgramAudioTap>>>,
 }
 
 /// Adaptive normalizer: tracks a slowly-decaying running peak.
@@ -429,6 +435,9 @@ pub struct AudioAnalyzer {
     last_sample_count: u64,
     last_sample_at: Instant,
     system_playback_capture: bool,
+    /// Channel count of the live stream's device configuration; zero while
+    /// stopped. The program tap pins this layout at arm time.
+    stream_channels: u16,
     /// Preference used to open the current/most recently attempted stream.
     /// Empty means the system default, matching `ModMatrix::audio_device`.
     requested_device: String,
@@ -459,6 +468,7 @@ impl AudioAnalyzer {
                 sample_rate: AtomicU32::new(48000),
                 sample_count: AtomicU64::new(0),
                 stream_error: Mutex::new(None),
+                program_tap: Mutex::new(None),
             }),
             stream: None,
             fft,
@@ -475,6 +485,7 @@ impl AudioAnalyzer {
             last_sample_count: 0,
             last_sample_at: Instant::now(),
             system_playback_capture: false,
+            stream_channels: 0,
             requested_device: String::new(),
             using_device_fallback: false,
             device_name: String::new(),
@@ -607,6 +618,9 @@ impl AudioAnalyzer {
         if self.stream.is_some() {
             return;
         }
+        // A new stream is a new clock; a tap armed against any earlier stream
+        // must observe a loss rather than continue on a different timeline.
+        self.disarm_program_tap();
         self.requested_device.clear();
         self.requested_device.push_str(preferred);
         self.device_name.clear();
@@ -710,6 +724,21 @@ impl AudioAnalyzer {
             }
         };
 
+        // The recorder's program-PCM tee runs on the raw interleaved samples
+        // before the mono analysis downmix, so the muxed audio keeps the
+        // device layout while analysis keeps its own independent ring.
+        let tap_shared = self.shared.clone();
+        let tap_channels = channels as u16;
+        let tee = move |samples: &mut dyn Iterator<Item = f32>| {
+            let tap = match tap_shared.program_tap.lock() {
+                Ok(slot) => slot.clone(),
+                Err(_) => None,
+            };
+            if let Some(tap) = tap {
+                tap.push_interleaved(samples, tap_channels);
+            }
+        };
+
         let error_shared = self.shared.clone();
         let err_fn = move |e| {
             let message = format!("audio stream error: {e}");
@@ -722,6 +751,7 @@ impl AudioAnalyzer {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &config.into(),
                 move |data: &[f32], _| {
+                    tee(&mut data.iter().copied());
                     let mut mono = data
                         .chunks(channels)
                         .map(|f| f.iter().sum::<f32>() / channels as f32);
@@ -733,6 +763,7 @@ impl AudioAnalyzer {
             cpal::SampleFormat::I16 => device.build_input_stream(
                 &config.into(),
                 move |data: &[i16], _| {
+                    tee(&mut data.iter().map(|&s| s as f32 / i16::MAX as f32));
                     let mut mono = data.chunks(channels).map(|f| {
                         f.iter().map(|&s| s as f32 / i16::MAX as f32).sum::<f32>() / channels as f32
                     });
@@ -744,6 +775,7 @@ impl AudioAnalyzer {
             cpal::SampleFormat::U16 => device.build_input_stream(
                 &config.into(),
                 move |data: &[u16], _| {
+                    tee(&mut data.iter().map(|&s| s as f32 / u16::MAX as f32 * 2.0 - 1.0));
                     let mut mono = data.chunks(channels).map(|f| {
                         f.iter()
                             .map(|&s| s as f32 / u16::MAX as f32 * 2.0 - 1.0)
@@ -775,6 +807,7 @@ impl AudioAnalyzer {
                 self.device_name = device_name;
                 self.using_device_fallback = using_fallback;
                 self.system_playback_capture = loopback;
+                self.stream_channels = channels as u16;
                 self.stream = Some(stream);
             }
             Err(e) => {
@@ -788,7 +821,45 @@ impl AudioAnalyzer {
         self.device_name.clear();
         self.using_device_fallback = false;
         self.system_playback_capture = false;
+        self.stream_channels = 0;
+        self.disarm_program_tap();
         self.reset_analysis();
+    }
+
+    /// Arm the recorder's program-PCM tap on the live capture stream and
+    /// return the recorder's handle. The tap is the recorder's own clock and
+    /// bounded ring — analysis audio is untouched. There is no stream to
+    /// fabricate a clock from while stopped, so arming then is a refusal.
+    pub fn arm_program_tap(
+        &mut self,
+    ) -> Result<Arc<crate::program_recorder::ProgramAudioTap>, String> {
+        if !self.is_running() {
+            return Err("no live audio capture stream to record".into());
+        }
+        let sample_rate = self.shared.sample_rate.load(Ordering::Relaxed);
+        let tap = crate::program_recorder::ProgramAudioTap::new(
+            sample_rate,
+            self.stream_channels,
+            self.device_name.clone(),
+        )?;
+        let Ok(mut slot) = self.shared.program_tap.lock() else {
+            return Err("program audio tap slot is unavailable".into());
+        };
+        if let Some(previous) = slot.take() {
+            previous.mark_device_lost();
+        }
+        *slot = Some(tap.clone());
+        Ok(tap)
+    }
+
+    /// Disarm any armed program tap. The recorder's retained handle observes
+    /// the loss and pushes stop immediately. Idempotent.
+    pub fn disarm_program_tap(&mut self) {
+        if let Ok(mut slot) = self.shared.program_tap.lock() {
+            if let Some(previous) = slot.take() {
+                previous.mark_device_lost();
+            }
+        }
     }
 
     /// Analyze the newest buffered samples. Call once per render frame.
@@ -807,11 +878,14 @@ impl AudioAnalyzer {
             self.error = error;
             // Drop the failed stream and zero its sources immediately. The app
             // can now turn the requested enable state off instead of leaving a
-            // latched FFT window driving the matrix forever.
+            // latched FFT window driving the matrix forever. An armed program
+            // tap observes the same failure as a device loss.
             self.stream = None;
             self.device_name.clear();
             self.using_device_fallback = false;
             self.system_playback_capture = false;
+            self.stream_channels = 0;
+            self.disarm_program_tap();
             self.reset_analysis();
             return AudioLevels::default();
         }
